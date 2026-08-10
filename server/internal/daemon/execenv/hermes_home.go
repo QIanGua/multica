@@ -400,7 +400,7 @@ func prepareHermesHome(hermesHome, sourceHome string, sourceMustExist bool, work
 		if err := mountHermesMemories(hermesHome, memoryStore, logger); err != nil {
 			return fmt.Errorf("mount agent memories: %w", err)
 		}
-	} else if err := os.MkdirAll(filepath.Join(hermesHome, hermesMemoriesEntry), 0o700); err != nil {
+	} else if err := detachHermesMemories(hermesHome); err != nil {
 		return fmt.Errorf("create task memories dir: %w", err)
 	}
 

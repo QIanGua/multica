@@ -57,15 +57,19 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 
 // gcStats accumulates byte counts and per-pattern hit counts for one GC cycle.
 type gcStats struct {
-	cleaned             int            // whole task dirs removed (issue done/cancelled)
-	orphaned            int            // whole task dirs removed (no meta / unreachable issue)
-	skipped             int            // task dirs left untouched
-	artifactDirs        int            // task dirs that had at least one artifact reclaimed
-	artifactRemoved     int            // count of removed artifact subdirs
-	storesReclaimed     int            // per-issue Codex session stores reclaimed past their TTL
-	repoCachesReclaimed int            // bare repo caches under .repos evicted past their TTL
-	bytesReclaimed      int64          // total bytes freed in this cycle
-	byPattern           map[string]int // configured basename or managed path label -> reclaim count
+	cleaned         int // whole task dirs removed (issue done/cancelled)
+	orphaned        int // whole task dirs removed (no meta / unreachable issue)
+	skipped         int // task dirs left untouched
+	artifactDirs    int // task dirs that had at least one artifact reclaimed
+	artifactRemoved int // count of removed artifact subdirs
+	storesReclaimed int // per-conversation Codex session stores reclaimed past their TTL
+	// hermesMemoryStoresReclaimed is counted separately from storesReclaimed:
+	// the two stores hold different things on different TTLs, so folding them
+	// into one number would make either figure unreadable for an operator.
+	hermesMemoryStoresReclaimed int            // per-agent Hermes memory stores reclaimed past their TTL
+	repoCachesReclaimed         int            // bare repo caches under .repos evicted past their TTL
+	bytesReclaimed              int64          // total bytes freed in this cycle
+	byPattern                   map[string]int // configured basename or managed path label -> reclaim count
 }
 
 // runGC performs a single GC scan across all workspace directories.
@@ -114,11 +118,11 @@ func (d *Daemon) runGC(ctx context.Context) {
 	// bounded lifecycle. Retention is much longer than the Codex one — these are
 	// a few markdown files, and reclaiming them is user-visible amnesia.
 	if storesRemoved, storeBytes := execenv.PruneHermesMemoryStores(d.cfg.Profile, d.cfg.GCHermesMemoryTTL, time.Now(), d.reserveStoreForDeletion, d.logger); storesRemoved > 0 {
-		stats.storesReclaimed += storesRemoved
+		stats.hermesMemoryStoresReclaimed += storesRemoved
 		stats.bytesReclaimed += storeBytes
 	}
 
-	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.repoCachesReclaimed > 0 {
+	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 {
 		d.logger.Info("gc: cycle complete",
 			"cleaned", stats.cleaned,
 			"orphaned", stats.orphaned,
@@ -126,6 +130,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 			"artifact_dirs", stats.artifactDirs,
 			"artifact_removed", stats.artifactRemoved,
 			"codex_session_stores_reclaimed", stats.storesReclaimed,
+			"hermes_memory_stores_reclaimed", stats.hermesMemoryStoresReclaimed,
 			"repo_caches_reclaimed", stats.repoCachesReclaimed,
 			"bytes_reclaimed", stats.bytesReclaimed,
 			"by_pattern", stats.byPattern,

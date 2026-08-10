@@ -166,6 +166,136 @@ func TestPrepareHermesHomeMemoryStoreRollback(t *testing.T) {
 	}
 }
 
+// TestPrepareHermesHomeRollbackDetachesExistingStoreLink is the regression test
+// for the rollback switch on a reused workdir. The overlay still carries the
+// link to the persistent store from the previous run, and MkdirAll would follow
+// it and silently succeed — leaving the task writing to a store the daemon no
+// longer marks active, and the GC free to reclaim it mid-task.
+func TestPrepareHermesHomeRollbackDetachesExistingStoreLink(t *testing.T) {
+	t.Parallel()
+	sharedHome := t.TempDir()
+	store := filepath.Join(t.TempDir(), "hermes-state", "agent-1", "default")
+	hermesHome := filepath.Join(t.TempDir(), "hermes-home")
+	skills := []SkillContextForEnv{{Name: "deploy", Content: "# Deploy"}}
+
+	// Run once with the store mounted, as a pre-rollback task would.
+	if err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, store, testLogger()); err != nil {
+		t.Fatalf("prepare with store: %v", err)
+	}
+	mustWrite(t, filepath.Join(hermesHome, "memories", "MEMORY.md"), "persistent memory")
+
+	// Operator flips MULTICA_HERMES_TASK_MEMORY=1; the same overlay is reused.
+	if err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", testLogger()); err != nil {
+		t.Fatalf("prepare after rollback: %v", err)
+	}
+
+	fi, err := os.Lstat(filepath.Join(hermesHome, "memories"))
+	if err != nil {
+		t.Fatalf("lstat memories: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("rollback left the store link in place; the task still writes to the persistent store")
+	}
+	if _, err := os.Stat(filepath.Join(hermesHome, "memories", "MEMORY.md")); !os.IsNotExist(err) {
+		t.Fatalf("rollback should give the task an empty memories dir (err = %v)", err)
+	}
+	// The store itself must survive, so flipping the switch back restores memory.
+	if _, err := os.Stat(filepath.Join(store, "MEMORY.md")); err != nil {
+		t.Fatalf("rollback destroyed the persistent store: %v", err)
+	}
+}
+
+// TestPrepareHermesHomeRollbackKeepsTaskLocalMemories checks the other reuse
+// case: with no store, an existing real memories dir is this task's own memory
+// and must be preserved across reuse.
+func TestPrepareHermesHomeRollbackKeepsTaskLocalMemories(t *testing.T) {
+	t.Parallel()
+	sharedHome := t.TempDir()
+	hermesHome := filepath.Join(t.TempDir(), "hermes-home")
+	skills := []SkillContextForEnv{{Name: "deploy", Content: "# Deploy"}}
+
+	if err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", testLogger()); err != nil {
+		t.Fatalf("first prepare: %v", err)
+	}
+	mustWrite(t, filepath.Join(hermesHome, "memories", "MEMORY.md"), "task memory")
+
+	if err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", testLogger()); err != nil {
+		t.Fatalf("reuse prepare: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hermesHome, "memories", "MEMORY.md")); err != nil {
+		t.Fatalf("reuse dropped the task's own memory: %v", err)
+	}
+}
+
+// TestMigrateHermesTaskMemoriesFailureKeepsSource is the regression test for
+// migration data loss: when an entry cannot be carried over, the source must
+// survive and the overlay must fail, because the caller deletes the source
+// directory as soon as migration reports success.
+func TestMigrateHermesTaskMemoriesFailureKeepsSource(t *testing.T) {
+	t.Parallel()
+	taskDir := t.TempDir()
+	storeDir := t.TempDir()
+
+	mustWrite(t, filepath.Join(taskDir, "MEMORY.md"), "first")
+	mustWrite(t, filepath.Join(taskDir, "USER.md"), "second")
+	// Make one entry uncopyable the way a cross-filesystem move fails: a
+	// directory whose contents cannot be read.
+	blocked := filepath.Join(taskDir, "blocked")
+	if err := os.MkdirAll(blocked, 0o700); err != nil {
+		t.Fatalf("create blocked dir: %v", err)
+	}
+	mustWrite(t, filepath.Join(blocked, "note.md"), "unreadable")
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatalf("chmod blocked dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+
+	err := migrateHermesTaskMemories(taskDir, storeDir, testLogger())
+	if err == nil {
+		t.Fatalf("migration reported success despite an unreadable entry; the caller would delete the source")
+	}
+
+	// Source intact.
+	for _, name := range []string{"MEMORY.md", "USER.md"} {
+		if _, statErr := os.Stat(filepath.Join(taskDir, name)); statErr != nil {
+			t.Fatalf("source %s was lost on a failed migration: %v", name, statErr)
+		}
+	}
+	// Store rolled back — a half-populated store would read as accumulated
+	// memory on the next run and block the retry.
+	left, readErr := os.ReadDir(storeDir)
+	if readErr != nil {
+		t.Fatalf("read store: %v", readErr)
+	}
+	if len(left) != 0 {
+		t.Fatalf("failed migration left %d entries in the store, want 0", len(left))
+	}
+}
+
+// TestMigrateHermesTaskMemoriesCopiesRatherThanMoves pins the cross-filesystem
+// property: migration must not depend on rename, and must carry nested dirs.
+func TestMigrateHermesTaskMemoriesCopiesRatherThanMoves(t *testing.T) {
+	t.Parallel()
+	taskDir := t.TempDir()
+	storeDir := t.TempDir()
+
+	mustWrite(t, filepath.Join(taskDir, "MEMORY.md"), "top level")
+	mustWrite(t, filepath.Join(taskDir, "notes", "deep", "note.md"), "nested")
+
+	if err := migrateHermesTaskMemories(taskDir, storeDir, testLogger()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	for _, rel := range []string{"MEMORY.md", filepath.Join("notes", "deep", "note.md")} {
+		if _, err := os.Stat(filepath.Join(storeDir, rel)); err != nil {
+			t.Fatalf("store is missing %s: %v", rel, err)
+		}
+		// Copy, not move: the source stays until the caller removes the dir.
+		if _, err := os.Stat(filepath.Join(taskDir, rel)); err != nil {
+			t.Fatalf("migration moved %s instead of copying it: %v", rel, err)
+		}
+	}
+}
+
 // TestPrepareHermesHomeMigratesTaskLocalMemories covers the upgrade path: a
 // workdir reused from a pre-store daemon still holds a real memories/ dir, whose
 // contents must move into the (empty) store rather than be dropped.

@@ -160,7 +160,8 @@ func hashHermesHomePath(path string) string {
 // A real memories/ directory left by an older daemon (or by a task that ran with
 // the rollback switch on) is migrated into the store rather than discarded — but
 // only into an empty store, so an upgrade never overwrites memory the agent has
-// already accumulated.
+// already accumulated. A migration that cannot complete fails the overlay rather
+// than dropping the directory it could not carry over.
 func mountHermesMemories(hermesHome, storeDir string, logger *slog.Logger) error {
 	if err := os.MkdirAll(storeDir, 0o700); err != nil {
 		return fmt.Errorf("create hermes memory store %s: %w", storeDir, err)
@@ -174,7 +175,11 @@ func mountHermesMemories(hermesHome, storeDir string, logger *slog.Logger) error
 				return nil
 			}
 		} else if fi.IsDir() {
-			migrateHermesTaskMemories(dst, storeDir, logger)
+			// Fails closed: the source dir below is only removed once every entry
+			// is safely in the store.
+			if err := migrateHermesTaskMemories(dst, storeDir, logger); err != nil {
+				return err
+			}
 		}
 		if err := os.RemoveAll(dst); err != nil {
 			return fmt.Errorf("remove stale memories path %s: %w", dst, err)
@@ -193,26 +198,83 @@ func mountHermesMemories(hermesHome, storeDir string, logger *slog.Logger) error
 	return nil
 }
 
-// migrateHermesTaskMemories moves the contents of a pre-existing task-local
-// memories dir into an empty store. Best-effort: a partial move still leaves the
-// task with a working (if incomplete) memory dir, and losing scratch memory from
-// a task that predates the store is not worth failing the overlay over.
-func migrateHermesTaskMemories(taskDir, storeDir string, logger *slog.Logger) {
+// migrateHermesTaskMemories copies the contents of a pre-existing task-local
+// memories dir into an empty store, so upgrading a daemon does not drop what an
+// in-flight task had already remembered.
+//
+// It copies rather than moves, and is all-or-nothing: the caller only removes
+// the source directory after this returns nil. A move would be faster but fails
+// across filesystems (the workspaces root and the Multica profile dir can live
+// on different volumes), and a partial move leaves data in neither place once
+// the caller cleans up. On any failure the copies made so far are rolled back —
+// otherwise a later run would find a half-populated store, read it as memory the
+// agent had accumulated, and refuse to migrate the rest — the source is left
+// untouched, and the error fails the overlay closed.
+//
+// Non-regular entries (symlinks, sockets) are skipped, matching copyDirTree:
+// a memories dir holds markdown, and copying a link verbatim could point the
+// store outside itself.
+func migrateHermesTaskMemories(taskDir, storeDir string, logger *slog.Logger) error {
 	stored, err := os.ReadDir(storeDir)
 	if err != nil || len(stored) > 0 {
-		return // store already holds this agent's memory — never overwrite it
+		return nil // store already holds this agent's memory — never overwrite it
 	}
 	entries, err := os.ReadDir(taskDir)
 	if err != nil || len(entries) == 0 {
-		return
+		return nil
 	}
+
+	copied := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		src := filepath.Join(taskDir, entry.Name())
-		if err := os.Rename(src, filepath.Join(storeDir, entry.Name())); err != nil {
-			logger.Warn("execenv: migrate task-local hermes memory failed", "entry", src, "error", err)
+		dst := filepath.Join(storeDir, entry.Name())
+		if err := copyHermesMemoryEntry(src, dst, entry); err != nil {
+			// dst first: a failed directory copy can leave a partial tree behind.
+			for _, done := range append(copied, dst) {
+				if rmErr := os.RemoveAll(done); rmErr != nil {
+					logger.Warn("execenv: roll back partial hermes memory migration failed", "entry", done, "error", rmErr)
+				}
+			}
+			return fmt.Errorf("migrate task-local hermes memory %s into %s: %w", src, storeDir, err)
 		}
+		copied = append(copied, dst)
 	}
-	logger.Info("execenv: migrated task-local hermes memories into agent store", "store", storeDir, "entries", len(entries))
+	logger.Info("execenv: migrated task-local hermes memories into agent store", "store", storeDir, "entries", len(copied))
+	return nil
+}
+
+// copyHermesMemoryEntry copies one entry of a memories dir into the store,
+// preserving the directory/file split. Anything else is skipped.
+func copyHermesMemoryEntry(src, dst string, entry os.DirEntry) error {
+	switch {
+	case entry.IsDir():
+		return copyDirTree(src, dst)
+	case entry.Type().IsRegular():
+		return copyFile(src, dst)
+	default:
+		return nil
+	}
+}
+
+// detachHermesMemories gives the overlay a real, task-local memories dir. It is
+// the rollback path (MULTICA_HERMES_TASK_MEMORY), so it must actively replace a
+// link left by a previous run against the persistent store: a reused overlay
+// still carries that link, and MkdirAll would follow it and silently succeed,
+// leaving the task writing to a store the daemon no longer guards from the GC.
+// An existing real directory is kept — that is this task's own memory.
+func detachHermesMemories(hermesHome string) error {
+	dst := filepath.Join(hermesHome, hermesMemoriesEntry)
+	if fi, err := os.Lstat(dst); err == nil {
+		if fi.Mode()&os.ModeSymlink == 0 && fi.IsDir() {
+			return nil
+		}
+		if err := os.RemoveAll(dst); err != nil {
+			return fmt.Errorf("detach memories path %s: %w", dst, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat memories path %s: %w", dst, err)
+	}
+	return os.MkdirAll(dst, 0o700)
 }
 
 // touchHermesMemoryStore refreshes storeDir's mtime — the signal the GC reads as
