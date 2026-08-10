@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -52,9 +53,16 @@ func TestDeleteWorkspace_FailsFastWhenRollupLockHeld(t *testing.T) {
 		holder.Release()
 		t.Fatalf("hold advisory lock 4246: %v", err)
 	}
+	// Idempotent: the deadline branch below releases the holder early to
+	// unblock the handler, and the defer still runs afterwards. A second
+	// Exec/Release on a returned pgxpool connection panics, which would
+	// replace the assertion failure with a stack trace.
+	var releaseOnce sync.Once
 	releaseHolder := func() {
-		_, _ = holder.Exec(context.Background(), `SELECT pg_advisory_unlock(4246)`)
-		holder.Release()
+		releaseOnce.Do(func() {
+			_, _ = holder.Exec(context.Background(), `SELECT pg_advisory_unlock(4246)`)
+			holder.Release()
+		})
 	}
 	defer releaseHolder()
 
