@@ -27,9 +27,14 @@
 -- own implicit transaction, so the lock still covers exactly one tick.
 --
 -- The one behaviour change: the TTL prune at the end used to run after an
--- explicit unlock and now runs inside the locked transaction. It is a bounded
--- DELETE against task_usage_hourly_dirty (indexed on enqueued_at), and the
--- only thing it delays is the next tick, which would return 0 anyway.
+-- explicit unlock and now runs inside the locked transaction, so whatever it
+-- costs is added to the window in which 4246 is unavailable — to the next
+-- tick, to a backfill run, and to a workspace delete, which now waits on 4246
+-- under a 10 s budget and answers 503 when it runs out. The prune is an
+-- index-driven DELETE (task_usage_hourly_dirty.enqueued_at) with no row cap:
+-- in steady state each tick already drains the queue and it deletes nothing,
+-- but after a long pause it has a real backlog to clear. Watch rollup duration
+-- and workspace-delete 503s together if that ever happens.
 CREATE OR REPLACE FUNCTION rollup_task_usage_hourly()
 RETURNS BIGINT
 LANGUAGE plpgsql
@@ -83,8 +88,9 @@ BEGIN
         RAISE;
     END;
 
-    -- TTL prune. Idempotent, bounded, and safe to run under the lock: the
-    -- next tick is 5 minutes away and would find nothing to do anyway.
+    -- TTL prune. Idempotent, and in steady state a no-op because each tick
+    -- already drains the queue. It runs under the transaction-scoped lock —
+    -- see the note at the top for what that costs after a long pause.
     PERFORM prune_task_usage_hourly_dirty();
     RETURN v_rows;
 END;

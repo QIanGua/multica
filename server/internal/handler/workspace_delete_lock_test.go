@@ -35,6 +35,11 @@ func TestDeleteWorkspace_FailsFastWhenRollupLockHeld(t *testing.T) {
 	}
 	ctx := context.Background()
 
+	// Taking 4246 by hand is exactly what the rollup family's cross-binary
+	// guard exists to serialise: internal/scheduler runs in parallel against
+	// the same database, and its own 4246 tests read the lock's state (MUL-3980).
+	lockRollupSingleton(t)
+
 	setWorkspaceDeleteLockTimeoutForTest(t, 500*time.Millisecond)
 
 	// Hold 4246 on a pinned connection for the duration of the request, the
@@ -115,6 +120,11 @@ func TestDeleteWorkspace_SucceedsWhenRollupLockIsFree(t *testing.T) {
 		t.Skip("DATABASE_URL not set; skipping live-Postgres workspace delete lock test")
 	}
 	ctx := context.Background()
+
+	// The teardown itself waits on 4246 under a 500 ms budget, so a rollup
+	// test holding that lock in the parallel internal/scheduler binary would
+	// turn this "uncontended" delete into a 503. Same guard, same reason.
+	lockRollupSingleton(t)
 
 	setWorkspaceDeleteLockTimeoutForTest(t, 500*time.Millisecond)
 

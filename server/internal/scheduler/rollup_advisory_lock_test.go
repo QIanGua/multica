@@ -71,8 +71,19 @@ func TestRollupTaskUsageHourlyDoesNotLeakAdvisoryLockOnCancel(t *testing.T) {
 	if _, err := runner.Exec(ctx, `SET statement_timeout = 500`); err != nil {
 		t.Fatalf("set statement_timeout: %v", err)
 	}
+	// The singleton guard serialises the rollup tests, but 4246 is also taken
+	// by every workspace teardown, so internal/handler's delete tests can hold
+	// it for a moment in the binary running alongside this one. A tick that
+	// loses that race returns 0 immediately instead of blocking on the row
+	// lock, which is a lost attempt rather than a result — retry it.
 	var rows int64
-	err = runner.QueryRow(ctx, `SELECT rollup_task_usage_hourly()`).Scan(&rows)
+	for attempt := 0; attempt < 20; attempt++ {
+		err = runner.QueryRow(ctx, `SELECT rollup_task_usage_hourly()`).Scan(&rows)
+		if err != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if err == nil {
 		t.Fatalf("expected the rollup tick to be cancelled, got rows=%d", rows)
 	}
@@ -100,13 +111,19 @@ func TestRollupTaskUsageHourlyDoesNotLeakAdvisoryLockOnCancel(t *testing.T) {
 		t.Fatal("cancelled rollup tick leaked advisory lock 4246 — every later tick reports no work and DeleteWorkspace blocks forever (MUL-5983)")
 	}
 
-	// And the lock must be free for the next waiter, which is what the
-	// workspace teardown actually needs.
+	// And the lock must become available to the next waiter, which is what the
+	// workspace teardown actually needs. Bounded retry for the same reason as
+	// above: a delete test in the parallel binary may hold 4246 right now.
 	var acquired bool
-	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := pool.QueryRow(waitCtx, `SELECT pg_try_advisory_xact_lock(4246)`).Scan(&acquired); err != nil {
-		t.Fatalf("probe advisory lock 4246: %v", err)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := pool.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(4246)`).Scan(&acquired); err != nil {
+			t.Fatalf("probe advisory lock 4246: %v", err)
+		}
+		if acquired || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	if !acquired {
 		t.Fatal("advisory lock 4246 is still held after a cancelled rollup tick")
