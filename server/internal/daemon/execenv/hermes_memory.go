@@ -272,6 +272,8 @@ func migrateHermesTaskMemories(taskDir, storeDir string, logger *slog.Logger) er
 // newHermesMemoryStaging creates the scratch directory the migration copies
 // into. It is a sibling of the store so the promoting rename stays within one
 // filesystem, and dot-prefixed so it is obvious it is not a profile's store.
+// MkdirTemp already creates it 0700, the same mode the store itself is created
+// with, so there is no follow-up chmod that could fail and strand it.
 func newHermesMemoryStaging(storeDir string) (string, error) {
 	parent := filepath.Dir(storeDir)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
@@ -281,9 +283,6 @@ func newHermesMemoryStaging(storeDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create hermes memory staging dir in %s: %w", parent, err)
 	}
-	if err := os.Chmod(staging, 0o700); err != nil {
-		return "", fmt.Errorf("chmod hermes memory staging dir %s: %w", staging, err)
-	}
 	return staging, nil
 }
 
@@ -291,19 +290,37 @@ func newHermesMemoryStaging(storeDir string) (string, error) {
 // reporting whether this caller won. The empty store dir (if any) is removed
 // first: os.Remove only succeeds on an empty directory, so a store another task
 // already populated makes this a no-op, and Windows rejects a rename onto an
-// existing directory outright. Losing the race is not an error — the winner's
-// store holds the same agent's memory.
+// existing directory outright.
+//
+// Losing the race is not an error — the winner's store holds the same agent's
+// memory — but it has to be positively confirmed, never inferred from any
+// failure. The caller deletes the source directory whenever this returns
+// (false, nil), so a permission error, a read-only filesystem or a Windows
+// sharing violation must fail closed instead of passing for "someone else
+// published".
 func promoteHermesMemoryStaging(staging, storeDir string) (bool, error) {
 	if err := os.Remove(storeDir); err != nil && !os.IsNotExist(err) {
-		return false, nil // non-empty: another task published first
+		if hermesMemoryStorePopulated(storeDir) {
+			return false, nil // non-empty: another task published first
+		}
+		return false, fmt.Errorf("clear empty hermes memory store %s before publishing: %w", storeDir, err)
 	}
 	if err := os.Rename(staging, storeDir); err != nil {
-		if entries, readErr := os.ReadDir(storeDir); readErr == nil && len(entries) > 0 {
+		if hermesMemoryStorePopulated(storeDir) {
 			return false, nil // lost a narrow race between the remove and the rename
 		}
 		return false, fmt.Errorf("publish hermes memory store %s: %w", storeDir, err)
 	}
 	return true, nil
+}
+
+// hermesMemoryStorePopulated reports whether storeDir is *confirmed* to hold
+// entries. Anything it cannot confirm — an unreadable directory, a path that is
+// not a directory — is false, so a caller asking "did another task publish?"
+// treats uncertainty as no.
+func hermesMemoryStorePopulated(storeDir string) bool {
+	entries, err := os.ReadDir(storeDir)
+	return err == nil && len(entries) > 0
 }
 
 // copyHermesMemoryEntry copies one entry of a memories dir into the staging

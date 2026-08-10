@@ -403,6 +403,64 @@ func TestMigrateHermesTaskMemoriesConcurrentFirstWriterWins(t *testing.T) {
 	}
 }
 
+// TestPromoteHermesMemoryStagingClassifiesRemoveFailures covers the publish
+// latch. Losing the race must be positively confirmed, never inferred from any
+// os.Remove failure: the caller deletes the task's source directory on
+// (false, nil), so a permission or I/O error there is a data-loss path.
+func TestPromoteHermesMemoryStagingClassifiesRemoveFailures(t *testing.T) {
+	t.Parallel()
+
+	// A genuinely non-empty store means another task published first.
+	t.Run("populated store loses the race", func(t *testing.T) {
+		t.Parallel()
+		parent := t.TempDir()
+		storeDir := filepath.Join(parent, "default")
+		mustWrite(t, filepath.Join(storeDir, "MEMORY.md"), "winner")
+		staging := filepath.Join(parent, ".default.migrating-x")
+		mustWrite(t, filepath.Join(staging, "MEMORY.md"), "loser")
+
+		promoted, err := promoteHermesMemoryStaging(staging, storeDir)
+		if err != nil {
+			t.Fatalf("a populated store should be a lost race, not an error: %v", err)
+		}
+		if promoted {
+			t.Fatalf("promote clobbered a store another task had published")
+		}
+		got, readErr := os.ReadFile(filepath.Join(storeDir, "MEMORY.md"))
+		if readErr != nil || string(got) != "winner" {
+			t.Fatalf("winner's store was modified: content=%q err=%v", got, readErr)
+		}
+	})
+
+	// An empty store that cannot be removed is an I/O failure, not a race.
+	t.Run("unremovable empty store fails closed", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores directory permissions")
+		}
+		parent := t.TempDir()
+		storeDir := filepath.Join(parent, "default")
+		if err := os.MkdirAll(storeDir, 0o700); err != nil {
+			t.Fatalf("create store: %v", err)
+		}
+		staging := filepath.Join(parent, ".default.migrating-x")
+		mustWrite(t, filepath.Join(staging, "MEMORY.md"), "irreplaceable")
+
+		// Removing a directory needs write permission on its parent.
+		if err := os.Chmod(parent, 0o500); err != nil {
+			t.Fatalf("chmod parent: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+
+		promoted, err := promoteHermesMemoryStaging(staging, storeDir)
+		if promoted {
+			t.Fatalf("promote reported success against an unremovable store")
+		}
+		if err == nil {
+			t.Fatalf("a permission error was reported as a lost race; the caller would delete the source")
+		}
+	})
+}
+
 // TestMigrateHermesTaskMemoriesCopiesRatherThanMoves pins the cross-filesystem
 // property: migration must not depend on rename, and must carry nested dirs.
 func TestMigrateHermesTaskMemoriesCopiesRatherThanMoves(t *testing.T) {
