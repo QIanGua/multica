@@ -1,9 +1,11 @@
 package execenv
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -269,6 +271,135 @@ func TestMigrateHermesTaskMemoriesFailureKeepsSource(t *testing.T) {
 	}
 	if len(left) != 0 {
 		t.Fatalf("failed migration left %d entries in the store, want 0", len(left))
+	}
+}
+
+// TestMountHermesMemoriesUnreadableStoreKeepsSource covers the entry-point I/O
+// error: an unreadable store must not read as "nothing to migrate", because the
+// caller deletes the source directory the moment migration reports success.
+func TestMountHermesMemoriesUnreadableStoreKeepsSource(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	hermesHome := t.TempDir()
+	memories := filepath.Join(hermesHome, "memories")
+	mustWrite(t, filepath.Join(memories, "MEMORY.md"), "irreplaceable")
+
+	storeDir := filepath.Join(t.TempDir(), "store")
+	if err := os.MkdirAll(storeDir, 0o700); err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	if err := os.Chmod(storeDir, 0o000); err != nil {
+		t.Fatalf("chmod store: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(storeDir, 0o700) })
+
+	if err := mountHermesMemories(hermesHome, storeDir, testLogger()); err == nil {
+		t.Fatalf("mount reported success against an unreadable store; the source would be deleted")
+	}
+	if _, err := os.Stat(filepath.Join(memories, "MEMORY.md")); err != nil {
+		t.Fatalf("source memory was lost after a failed mount: %v", err)
+	}
+}
+
+// TestMigrateHermesTaskMemoriesRefusesUnsupportedEntries checks that an entry
+// the migration will not copy fails closed instead of being skipped — a skip
+// plus the caller's source deletion is a silent loss.
+func TestMigrateHermesTaskMemoriesRefusesUnsupportedEntries(t *testing.T) {
+	t.Parallel()
+	taskDir := t.TempDir()
+	storeDir := filepath.Join(t.TempDir(), "store")
+
+	mustWrite(t, filepath.Join(taskDir, "MEMORY.md"), "regular")
+	if err := os.Symlink(filepath.Join(taskDir, "MEMORY.md"), filepath.Join(taskDir, "LINK.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if err := migrateHermesTaskMemories(taskDir, storeDir, testLogger()); err == nil {
+		t.Fatalf("migration skipped a symlink and reported success")
+	}
+	if _, err := os.Stat(filepath.Join(taskDir, "MEMORY.md")); err != nil {
+		t.Fatalf("source was lost on a refused migration: %v", err)
+	}
+	if _, err := os.Stat(storeDir); !os.IsNotExist(err) {
+		t.Fatalf("refused migration left a store behind (err = %v)", err)
+	}
+	// A nested symlink must be refused too — copyDirTree would have skipped it.
+	nested := t.TempDir()
+	mustWrite(t, filepath.Join(nested, "notes", "note.md"), "regular")
+	if err := os.Symlink(filepath.Join(nested, "notes", "note.md"), filepath.Join(nested, "notes", "link.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := migrateHermesTaskMemories(nested, filepath.Join(t.TempDir(), "store"), testLogger()); err == nil {
+		t.Fatalf("migration skipped a nested symlink and reported success")
+	}
+}
+
+// TestMigrateHermesTaskMemoriesConcurrentFirstWriterWins covers two tasks of the
+// same agent migrating at once, which is reachable in the window right after a
+// daemon upgrade. Exactly one store must be published, and it must be one task's
+// complete tree — never a mix of both.
+func TestMigrateHermesTaskMemoriesConcurrentFirstWriterWins(t *testing.T) {
+	t.Parallel()
+	storeDir := filepath.Join(t.TempDir(), "agent", "default")
+
+	const tasks = 4
+	sources := make([]string, tasks)
+	for i := range sources {
+		sources[i] = t.TempDir()
+		// Same filenames, distinct contents: a store that interleaves the two
+		// would be detectable as a mixed marker set.
+		mustWrite(t, filepath.Join(sources[i], "MEMORY.md"), fmt.Sprintf("task-%d", i))
+		mustWrite(t, filepath.Join(sources[i], "USER.md"), fmt.Sprintf("task-%d", i))
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, tasks)
+	start := make(chan struct{})
+	for i := range sources {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = migrateHermesTaskMemories(sources[i], storeDir, testLogger())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent migration %d failed: %v", i, err)
+		}
+	}
+
+	memory, err := os.ReadFile(filepath.Join(storeDir, "MEMORY.md"))
+	if err != nil {
+		t.Fatalf("store is missing MEMORY.md after concurrent migration: %v", err)
+	}
+	user, err := os.ReadFile(filepath.Join(storeDir, "USER.md"))
+	if err != nil {
+		t.Fatalf("store is missing USER.md after concurrent migration: %v", err)
+	}
+	if string(memory) != string(user) {
+		t.Fatalf("store interleaved two tasks: MEMORY.md=%q USER.md=%q", memory, user)
+	}
+
+	// Every source survives: a task that lost the race must not have had its
+	// directory reported as migrated.
+	for i, src := range sources {
+		if _, err := os.Stat(filepath.Join(src, "MEMORY.md")); err != nil {
+			t.Fatalf("source %d was consumed by the migration: %v", i, err)
+		}
+	}
+	// No staging directories left behind next to the store.
+	siblings, err := os.ReadDir(filepath.Dir(storeDir))
+	if err != nil {
+		t.Fatalf("read store parent: %v", err)
+	}
+	if len(siblings) != 1 {
+		t.Fatalf("expected only the store next to itself, got %d entries", len(siblings))
 	}
 }
 
