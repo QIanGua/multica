@@ -304,6 +304,55 @@ func TestParseClaudeAPIModelsPageEffortCapabilities(t *testing.T) {
 	}
 }
 
+// TestParseClaudeAPIModelsPageTreatsUnreadableEffortAsUndescribed guards the
+// one shape this parser was never validated against a live response: an effort
+// block that says `supported: true` but names no level we recognise.
+//
+// Read literally that is "supported, with zero levels", which projects to an
+// empty allow-list and HIDES the picker — and because the shape would be the
+// same for every model in the catalog, one upstream rename would silently take
+// the thinking picker away from every Claude model at once, on exactly the
+// hosts where discovery works. Since the hand-maintained table is still correct
+// in that situation, unreadable must degrade to "not described" (nil) and leave
+// it in charge, not to "no levels".
+//
+// `supported: false` stays a real answer: that one is unambiguous.
+func TestParseClaudeAPIModelsPageTreatsUnreadableEffortAsUndescribed(t *testing.T) {
+	t.Parallel()
+
+	body := `{"data":[
+		{"id":"drifted","capabilities":{"effort":{"supported":true,
+			"levels":{"low":{"supported":true},"high":{"supported":true}}}}},
+		{"id":"renamed","capabilities":{"effort":{"supported":true,
+			"minimal":{"supported":true},"ultra":{"supported":true}}}},
+		{"id":"explicitly-unsupported","capabilities":{"effort":{"supported":false}}}
+	],"has_more":false}`
+
+	models, _, _, ok := parseClaudeAPIModelsPage([]byte(body))
+	if !ok {
+		t.Fatal("a page with an unfamiliar effort shape is still a valid catalog page")
+	}
+	byID := map[string]claudeAPIModel{}
+	for _, m := range models {
+		byID[m.ID] = m
+	}
+	for _, id := range []string{"drifted", "renamed"} {
+		if got := byID[id].EffortLevels; got != nil {
+			t.Fatalf("%s: effort levels = %v, want nil so the static table stays in charge", id, got)
+		}
+		// The consequence that actually matters: the picker survives.
+		allow := claudeEffortAllowForModel("claude-opus-5", map[string]map[string]bool{
+			"claude-opus-5": byID[id].EffortLevels,
+		})
+		if len(projectClaudeLevels(claudeStaticEffortFullSuperset, allow)) == 0 {
+			t.Fatalf("%s: unreadable effort shape wiped out the thinking picker", id)
+		}
+	}
+	if got := byID["explicitly-unsupported"].EffortLevels; got == nil || len(got) != 0 {
+		t.Fatalf("explicit supported:false = %v, want an empty non-nil map (a real 'no levels' answer)", got)
+	}
+}
+
 func TestParseClaudeAPIModelsPageRejectsNonCatalog(t *testing.T) {
 	t.Parallel()
 

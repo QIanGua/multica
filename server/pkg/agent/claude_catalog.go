@@ -256,7 +256,28 @@ func parseClaudeAPIModelsPage(body []byte) (models []claudeAPIModel, hasMore boo
 					}
 				}
 			}
-			entry.EffortLevels = levels
+			if effort.Supported && len(levels) == 0 {
+				// "Supported, but no level we recognise" is not an answer, it is
+				// a shape we cannot read — a renamed or re-nested level block.
+				// Taking it literally would mean "supported with zero levels",
+				// which hides the picker; and since the shape is the same for
+				// every entry in the catalog, one upstream rename would do that
+				// to every Claude model at once, precisely on the hosts where
+				// discovery works. Fall back to undescribed so the
+				// hand-maintained table — still correct here — stays in charge.
+				//
+				// This is the one branch of the schema not validated against a
+				// live response (no Anthropic credential on the machine this was
+				// written on), so it fails toward the known-good answer.
+				slog.Debug("Anthropic Models API reported effort support with no recognised level; using the static per-model table for this model",
+					"model", id,
+				)
+				entry.EffortLevels = nil
+			} else {
+				// An explicit `supported: false` keeps its empty (non-nil) map:
+				// that one is unambiguous, and hiding the picker is correct.
+				entry.EffortLevels = levels
+			}
 		}
 		out = append(out, entry)
 	}
