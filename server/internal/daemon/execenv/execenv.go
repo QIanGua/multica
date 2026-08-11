@@ -86,6 +86,11 @@ type PrepareParams struct {
 	// blocklisted keys) used to expand ${VAR} in Hermes external_dirs so it
 	// matches what the Hermes child process actually sees. Only used for hermes.
 	HermesEnv map[string]string
+	// ReasonixHome is the agent's REASONIX_HOME override (custom_env), so the
+	// per-task reasonix.toml restates the permissions from the same user config
+	// the Reasonix child will read. Empty resolves the home the daemon itself
+	// would use. Only used for reasonix.
+	ReasonixHome string
 	// CodexCustomArgs are the effective Codex CLI args this task launches with
 	// (daemon defaults + profile-fixed + per-agent custom_args). Only the
 	// Windows sandbox decision reads them, to honor a `-c windows.sandbox=...`
@@ -408,7 +413,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// reasonix.toml. Degraded, not fatal: without it the task still runs under
 	// the backend's fail-closed question handling.
 	if params.Provider == "reasonix" {
-		if err := writeReasonixProjectConfig(workDir, manifest, logger); err != nil {
+		if err := writeReasonixProjectConfig(workDir, params.ReasonixHome, manifest, logger); err != nil {
 			logger.Warn("execenv: write reasonix project config failed", "error", err)
 		}
 	}
@@ -501,6 +506,9 @@ type ReuseParams struct {
 	HermesSourceMustExist bool
 	HermesEnv             map[string]string
 	HermesMemoryStore     string
+	// ReasonixHome mirrors PrepareParams.ReasonixHome on reuse so the rewritten
+	// reasonix.toml keeps restating the owner's current permissions.
+	ReasonixHome string
 	// CodexCustomArgs mirrors PrepareParams.CodexCustomArgs on reuse so the
 	// Windows sandbox decision honors a `-c windows.sandbox=...` override here
 	// too (MUL-4957).
@@ -634,7 +642,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	// prior run's reasonix.toml, so without this the next turn would run with
 	// the tool available again.
 	if params.Provider == "reasonix" {
-		if err := writeReasonixProjectConfig(params.WorkDir, manifest, logger); err != nil {
+		if err := writeReasonixProjectConfig(params.WorkDir, params.ReasonixHome, manifest, logger); err != nil {
 			logger.Warn("execenv: refresh reasonix project config failed", "error", err)
 		}
 	}
