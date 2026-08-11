@@ -6,35 +6,87 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/spf13/cobra"
 )
 
+// stubDaemon is a fake daemon on a real health port. It serves /shutdown as
+// well as /health so `daemon stop` can complete through its graceful path:
+// without that endpoint stop falls back to process.Kill() on whatever PID the
+// health body advertises, which for a hardcoded PID means signalling an
+// unrelated process on the developer's machine.
+type stubDaemon struct {
+	port int
+
+	mu        sync.Mutex
+	stopped   bool
+	shutdowns int
+}
+
+func (s *stubDaemon) shutdownCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shutdowns
+}
+
 // serveHealthAs stands up a stub daemon on the health port that `profile`
 // hashes to, answering with the identity `reports` claims. A nil reports map
 // means a pre-#6694 daemon: alive, but unable to say who it is.
-func serveHealthAs(t *testing.T, profile string, reports map[string]any) int {
+//
+// pid is what the stub advertises. Tests that reach the kill path must pass a
+// process they own; the identity tests never get that far, so they leave it at
+// the current process's PID, which is never signalled because they stop at the
+// refusal.
+func serveHealthAs(t *testing.T, profile string, reports map[string]any) *stubDaemon {
+	t.Helper()
+	return serveHealthAsPID(t, profile, reports, os.Getpid())
+}
+
+func serveHealthAsPID(t *testing.T, profile string, reports map[string]any, pid int) *stubDaemon {
 	t.Helper()
 	port := healthPortForProfile(profile)
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		t.Skipf("health port %d for profile %q is busy on this machine: %v", port, profile, err)
 	}
+	stub := &stubDaemon{port: port}
 
-	body := map[string]any{"status": "running", "pid": 4242, "uptime": "1h0m0s", "cli_version": "v0.4.23"}
+	body := map[string]any{"status": "running", "pid": pid, "uptime": "1h0m0s", "cli_version": "v0.4.23"}
 	for k, v := range reports {
 		body[k] = v
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		stub.mu.Lock()
+		stopped := stub.stopped
+		stub.mu.Unlock()
+		if stopped {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "stopped"})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(body)
+	})
+	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		stub.mu.Lock()
+		stub.stopped = true
+		stub.shutdowns++
+		stub.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
 	})
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
-	return port
+	return stub
 }
 
 func TestDaemonIdentityMismatch(t *testing.T) {
@@ -115,17 +167,36 @@ func TestDaemonLifecycleRefusesForeignDaemon(t *testing.T) {
 	}
 }
 
-// A daemon too old to identify itself must keep working: stop still reports
-// against it rather than refusing.
+// A daemon too old to identify itself must keep working: stop runs to
+// completion against it rather than refusing.
+//
+// The stub advertises a process this test owns and started, so even if stop
+// ever fell through to its forced-kill branch the signal could only reach that
+// child — never an unrelated process that happens to hold the same PID.
 func TestDaemonStopAcceptsDaemonWithoutProfileField(t *testing.T) {
 	clearDaemonTaskEnv(t)
 	mkProfiles(t, "legacy")
-	serveHealthAs(t, "legacy", nil)
+
+	victim := exec.Command("sleep", "30")
+	if err := victim.Start(); err != nil {
+		t.Fatalf("start stand-in daemon process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = victim.Process.Kill()
+		_ = victim.Wait()
+	})
+
+	stub := serveHealthAsPID(t, "legacy", nil, victim.Process.Pid)
 
 	err := runDaemonStop(daemonStatusCmdFor(t, "legacy", ""), nil)
-	var mismatch *daemonProfileMismatchError
-	if errors.As(err, &mismatch) {
-		t.Fatal("a daemon that predates the profile field must not be refused")
+	if err != nil {
+		t.Fatalf("runDaemonStop = %v, want nil: a daemon that predates the profile field must not be refused", err)
+	}
+	// Asserting the outcome, not just the absence of a refusal: stop must have
+	// gone through the graceful endpoint, which is also what proves it never
+	// reached the branch that signals a PID.
+	if got := stub.shutdownCount(); got != 1 {
+		t.Fatalf("shutdown requests = %d, want 1 — stop should have shut the daemon down gracefully", got)
 	}
 }
 
@@ -133,7 +204,7 @@ func TestDaemonStatusReportsPortConflictInsteadOfClaimingItsOwn(t *testing.T) {
 	t.Run("table says stopped and names the occupant", func(t *testing.T) {
 		clearDaemonTaskEnv(t)
 		mkProfiles(t, "collide-ab", "collide-ba")
-		port := serveHealthAs(t, "collide-ab", map[string]any{"profile": "collide-ab"})
+		stub := serveHealthAs(t, "collide-ab", map[string]any{"profile": "collide-ab"})
 
 		out, err := captureStdout(t, func() error {
 			return runDaemonStatus(daemonStatusCmdFor(t, "collide-ba", ""), nil)
@@ -147,7 +218,7 @@ func TestDaemonStatusReportsPortConflictInsteadOfClaimingItsOwn(t *testing.T) {
 		if strings.Contains(out, "running (pid 4242") {
 			t.Errorf("stdout = %q, must not report another profile's daemon as this one's", out)
 		}
-		if !strings.Contains(out, "collide-ab") || !strings.Contains(out, fmt.Sprint(port)) {
+		if !strings.Contains(out, "collide-ab") || !strings.Contains(out, fmt.Sprint(stub.port)) {
 			t.Errorf("stdout = %q, should name the occupying profile and the shared port", out)
 		}
 	})
@@ -215,6 +286,127 @@ func TestDaemonStatusShowsWhoManagesTheDaemon(t *testing.T) {
 		}
 		if strings.Contains(out, "Managed by") {
 			t.Errorf("stdout = %q, a standalone daemon must not grow a Managed by row", out)
+		}
+	})
+}
+
+// Inside a daemon-managed task the health port is injected by the host daemon
+// rather than derived from a profile hash, so there is no collision to detect.
+// The task's own profile is necessarily empty (--profile is rejected there),
+// so verifying identity would compare that empty profile against a named-
+// profile host and report a phantom conflict — breaking the standing contract
+// that `daemon status` in a task reports on the daemon hosting it.
+func TestDaemonStatusInTaskContextReportsNamedProfileHost(t *testing.T) {
+	setup := func(t *testing.T) {
+		t.Helper()
+		clearDaemonTaskEnv(t)
+		mkProfiles(t)
+		stub := serveHealthAs(t, "host-named-profile", map[string]any{
+			"profile": "host-named-profile", "launched_by": "desktop",
+		})
+		t.Setenv("MULTICA_TASK_ID", "task-test")
+		t.Setenv("MULTICA_DAEMON_PORT", strconv.Itoa(stub.port))
+	}
+
+	t.Run("table reports the host as running", func(t *testing.T) {
+		setup(t)
+		out, err := captureStdout(t, func() error {
+			return runDaemonStatus(daemonStatusCmdFor(t, "", ""), nil)
+		})
+		if err != nil {
+			t.Fatalf("runDaemonStatus = %v, want nil", err)
+		}
+		if !strings.Contains(out, "running") {
+			t.Fatalf("stdout = %q, want the hosting daemon reported as running", out)
+		}
+		if strings.Contains(out, "hashes to the same port") {
+			t.Fatalf("stdout = %q, a named-profile host must not be reported as a port conflict", out)
+		}
+	})
+
+	t.Run("json reports the host as running", func(t *testing.T) {
+		setup(t)
+		out, err := captureStdout(t, func() error {
+			return runDaemonStatus(daemonStatusCmdFor(t, "", "json"), nil)
+		})
+		if err != nil {
+			t.Fatalf("runDaemonStatus = %v, want nil", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(out), &payload); err != nil {
+			t.Fatalf("stdout is not valid JSON: %v\n%s", err, out)
+		}
+		if payload["status"] != "running" {
+			t.Fatalf("status = %v, want running (host daemon)", payload["status"])
+		}
+		if _, ok := payload["port_conflict"]; ok {
+			t.Fatalf("payload = %v, must not report a conflict against the injected host port", payload)
+		}
+	})
+}
+
+// A profile field that is present but not a string is a daemon answering
+// wrongly, not an older daemon unable to answer. Collapsing it to "" would
+// read as a match for the default profile and hand lifecycle commands a daemon
+// whose identity was never established, so it fails closed.
+func TestDaemonIdentityRejectsUnreadableProfileField(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  any
+	}{
+		{"null", nil},
+		{"number", 42.0},
+		{"object", map[string]any{"name": "dev"}},
+		{"bool", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Target the default profile: that is where the dropped type check
+			// used to turn an unreadable value into a silent match.
+			err := daemonIdentityMismatch(map[string]any{"profile": tc.raw}, "", 19589)
+			var mismatch *daemonProfileMismatchError
+			if !errors.As(err, &mismatch) {
+				t.Fatalf("daemonIdentityMismatch = %v, want a refusal", err)
+			}
+			if !mismatch.Unreadable {
+				t.Fatalf("mismatch = %+v, want it flagged as an unreadable identity", mismatch)
+			}
+			if !strings.Contains(mismatch.Error(), "unreadable profile identity") {
+				t.Errorf("error %q should say the identity could not be read", mismatch.Error())
+			}
+		})
+	}
+}
+
+func TestDaemonRefusesDaemonWithUnreadableIdentity(t *testing.T) {
+	t.Run("stop refuses", func(t *testing.T) {
+		clearDaemonTaskEnv(t)
+		mkProfiles(t, "unreadable")
+		serveHealthAs(t, "unreadable", map[string]any{"profile": nil})
+
+		err := runDaemonStop(daemonStatusCmdFor(t, "unreadable", ""), nil)
+		var mismatch *daemonProfileMismatchError
+		if !errors.As(err, &mismatch) || !mismatch.Unreadable {
+			t.Fatalf("runDaemonStop = %v, want a refusal on an unreadable identity", err)
+		}
+	})
+
+	t.Run("status does not claim it", func(t *testing.T) {
+		clearDaemonTaskEnv(t)
+		mkProfiles(t, "unreadable")
+		serveHealthAs(t, "unreadable", map[string]any{"profile": nil})
+
+		out, err := captureStdout(t, func() error {
+			return runDaemonStatus(daemonStatusCmdFor(t, "unreadable", ""), nil)
+		})
+		if err != nil {
+			t.Fatalf("runDaemonStatus = %v, want nil", err)
+		}
+		if strings.Contains(out, "running (pid") {
+			t.Fatalf("stdout = %q, must not report an unverified daemon as this profile's", out)
+		}
+		if !strings.Contains(out, "could not be read") {
+			t.Fatalf("stdout = %q, should explain that the identity could not be read", out)
 		}
 	})
 }

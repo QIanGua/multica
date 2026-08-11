@@ -284,19 +284,47 @@ func healthPortForProfile(profile string) int {
 }
 
 // daemonProfileMismatchError reports that the daemon answering on a profile's
-// health port belongs to a different profile.
+// health port is not that profile's daemon.
 type daemonProfileMismatchError struct {
 	Want string // profile the caller asked to act on
-	Got  string // profile the daemon on that port reports
+	Got  string // profile the daemon on that port reports; unset when Unreadable
 	Port int
+	// Unreadable marks a daemon that answered the profile field with something
+	// that is not a string. It claimed an identity we cannot read, so it must
+	// not be credited as ours — see daemonIdentityMismatch.
+	Unreadable bool
 }
 
 func (e *daemonProfileMismatchError) Error() string {
+	if e.Unreadable {
+		return fmt.Sprintf(
+			"port %d is serving a daemon that reported an unreadable profile identity\n"+
+				"Refusing to act on it as %s: an identity that cannot be read cannot be confirmed to be yours.",
+			e.Port, describeProfile(e.Want))
+	}
 	return fmt.Sprintf(
 		"port %d is serving profile %s, not %s\n"+
 			"Both profile names hash to the same health port, so this command would have acted on the wrong daemon.\n"+
 			"Run it against %s directly, or rename one of the profiles.",
 		e.Port, describeProfile(e.Got), describeProfile(e.Want), describeProfile(e.Got))
+}
+
+// statusNote is the one-line explanation `daemon status` prints under its
+// verdict, where the command has not failed and there is no error to render.
+func (e *daemonProfileMismatchError) statusNote() string {
+	if e.Unreadable {
+		return fmt.Sprintf("Note: port %d is serving a daemon whose profile identity could not be read.", e.Port)
+	}
+	return fmt.Sprintf("Note: port %d is serving %s, which hashes to the same port.",
+		e.Port, describeProfile(e.Got))
+}
+
+// statusJSON is the additive `port_conflict` object for --output json.
+func (e *daemonProfileMismatchError) statusJSON() map[string]any {
+	if e.Unreadable {
+		return map[string]any{"port": e.Port, "unreadable_identity": true}
+	}
+	return map[string]any{"port": e.Port, "profile": e.Got}
 }
 
 // describeProfile renders a profile name for humans, naming the default
@@ -327,7 +355,16 @@ func daemonIdentityMismatch(health map[string]any, profile string, port int) err
 	if !ok {
 		return nil
 	}
-	got, _ := raw.(string)
+	got, isString := raw.(string)
+	if !isString {
+		// Present but malformed (null, a number) is NOT the same as absent.
+		// Dropping the type check would collapse such a value to "" and, for a
+		// caller targeting the default profile, read as a match — handing the
+		// lifecycle commands a daemon whose identity was never established.
+		// Absence is a daemon too old to answer; this is a daemon answering
+		// wrongly, so it fails closed.
+		return &daemonProfileMismatchError{Want: profile, Port: port, Unreadable: true}
+	}
 	if got == profile {
 		return nil
 	}
@@ -1331,19 +1368,23 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 	// as ours would be the same lie in a new place: this profile's daemon is
 	// not running, and the port is simply occupied. Say exactly that, and keep
 	// the top-level verdict "stopped" so scripts reading it stay correct.
+	//
+	// Only outside a daemon-managed task. There the port comes from the host
+	// daemon's own injection rather than a profile hash, so no collision is
+	// possible — and the task's profile is necessarily empty (--profile is
+	// rejected) while the host may run a named one, which would make every
+	// named-profile host look like a conflict and break the standing contract
+	// that `daemon status` in a task reports on the daemon hosting it.
 	var conflict *daemonProfileMismatchError
-	if daemonAlive(health) {
+	if daemonAlive(health) && !inDaemonManagedExecutionContext() {
 		errors.As(daemonIdentityMismatch(health, profile, healthPort), &conflict)
 	}
 
 	if output == "json" {
 		if conflict != nil {
 			return cli.PrintJSON(os.Stdout, map[string]any{
-				"status": "stopped",
-				"port_conflict": map[string]any{
-					"port":    conflict.Port,
-					"profile": conflict.Got,
-				},
+				"status":        "stopped",
+				"port_conflict": conflict.statusJSON(),
 			})
 		}
 		return cli.PrintJSON(os.Stdout, health)
@@ -1356,8 +1397,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 
 	if conflict != nil {
 		fmt.Fprintf(os.Stdout, "%s: stopped\n", label)
-		fmt.Fprintf(os.Stdout, "Note: port %d is serving %s, which hashes to the same port.\n",
-			conflict.Port, describeProfile(conflict.Got))
+		fmt.Fprintln(os.Stdout, conflict.statusNote())
 		return nil
 	}
 
