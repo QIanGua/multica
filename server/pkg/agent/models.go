@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -289,10 +290,28 @@ func ModelKnownIncompatibleWithProvider(providerType, model string) bool {
 	if !ok {
 		return false
 	}
-	if accepted[model] {
+	if accepted[modelIDForCapabilityLookup(providerType, model)] {
 		return false
 	}
 	return isRuntimeSpecificModelID(model)
+}
+
+// claudeContextWindowTagRe recognises Claude Code's trailing context-window
+// model modifier (for example, claude-opus-5[1m]). Keep this narrower than a
+// generic bracket suffix: capability lookup may inherit the base model's
+// effort catalog only when the modifier is syntactically a context size.
+var claudeContextWindowTagRe = regexp.MustCompile(`\[[1-9][0-9]*[km]\]$`)
+
+// modelIDForCapabilityLookup returns the catalog identity for a runtime-native
+// model string. It never changes the value persisted on the agent or passed to
+// the provider CLI. Claude context-window variants share their base model's
+// capabilities; every other provider and malformed/unknown modifier retains
+// exact-match behavior.
+func modelIDForCapabilityLookup(providerType, model string) string {
+	if providerType != "claude" {
+		return model
+	}
+	return claudeContextWindowTagRe.ReplaceAllString(model, "")
 }
 
 func acceptedModelIDsForProvider(providerType string) (map[string]bool, bool) {

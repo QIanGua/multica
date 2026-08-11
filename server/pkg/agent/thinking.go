@@ -643,7 +643,7 @@ func ValidateThinkingLevel(ctx context.Context, providerType, executablePath, mo
 		return false, err
 	}
 	models := catalog.Models
-	target := model
+	target := modelIDForCapabilityLookup(providerType, model)
 	if target == "" {
 		// Default model = the entry the catalog marks as Default. If no
 		// entry is flagged, fall through to the no-match return; that
