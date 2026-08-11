@@ -32,9 +32,11 @@ const reasonixProjectConfigFile = "reasonix.toml"
 //
 // Deny is a replacing list, not an additive one: for the duration of a task in
 // this workdir this is the effective deny list, so a deny rule in the runtime
-// owner's global config does not apply here. That is accepted — the daemon
-// already constrains these runs through --workspace-only and the ACP permission
-// policy, which is where task-level restriction belongs.
+// owner's global config does not apply here. That is a deliberate, accepted
+// widening of what the agent may run in a task workdir — not something the
+// daemon's other constraints (--workspace-only, the ACP permission policy) make
+// equivalent. Extending the global list instead would mean parsing the runtime
+// owner's config to restate it, which is its own failure mode.
 const reasonixProjectConfig = `# Managed by Multica. Written per task, removed when the task env is cleaned up.
 # Edits are not preserved.
 

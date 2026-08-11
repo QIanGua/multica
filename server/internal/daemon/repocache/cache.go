@@ -61,11 +61,6 @@ var agentGitExcludePatterns = []string{
 	".deveco",
 	"CODEBUDDY.md",
 	".codebuddy",
-	// Reasonix's project config, written per task to deny the `ask` tool.
-	// Excluding it only hides the daemon's own copy: a repository that tracks
-	// its own reasonix.toml keeps it (git ignores excludes for tracked paths),
-	// and the daemon never overwrites one it did not create.
-	"reasonix.toml",
 }
 
 const repoCacheGitTimeout = 10 * time.Minute
