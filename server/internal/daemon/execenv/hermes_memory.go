@@ -339,9 +339,9 @@ func copyHermesMemoryEntry(src, dst string, entry os.DirEntry) error {
 }
 
 // copyHermesMemoryTree copies a directory under a memories dir recursively.
-// Unlike copyDirTree it refuses (rather than skips) nested symlinks and other
-// irregular files, for the same reason: this copy is the only thing standing
-// between the source and its deletion.
+// It refuses (rather than silently skips) nested symlinks and other irregular
+// files: this copy is the only thing standing between the source and its
+// deletion.
 func copyHermesMemoryTree(src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {

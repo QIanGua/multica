@@ -325,7 +325,7 @@ func TestMigrateHermesTaskMemoriesRefusesUnsupportedEntries(t *testing.T) {
 	if _, err := os.Stat(storeDir); !os.IsNotExist(err) {
 		t.Fatalf("refused migration left a store behind (err = %v)", err)
 	}
-	// A nested symlink must be refused too — copyDirTree would have skipped it.
+	// A nested symlink must be refused too, not silently skipped.
 	nested := t.TempDir()
 	mustWrite(t, filepath.Join(nested, "notes", "note.md"), "regular")
 	if err := os.Symlink(filepath.Join(nested, "notes", "note.md"), filepath.Join(nested, "notes", "link.md")); err != nil {
