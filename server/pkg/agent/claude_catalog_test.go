@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 )
 
 func envFrom(pairs map[string]string) func(string) string {
@@ -521,42 +523,93 @@ func TestListModelsClaudeNeverAddsDiscoveredModelIDs(t *testing.T) {
 
 // ── Effort allow-list resolution ─────────────────────────────────────
 
-// TestClaudeEffortAllowForModelPrecedence: discovery answers where it spoke,
-// the hand table answers where it did not, and an unknown model keeps the
-// pre-existing "no per-model restriction" behaviour.
-func TestClaudeEffortAllowForModelPrecedence(t *testing.T) {
+// TestClaudeEffortAllowForModelOnlyNarrows is the fail-closed invariant for the
+// dynamic effort path.
+//
+// The runtime-scoped credential that answers discovery is not necessarily the
+// one a task executes with: an agent can set its own ANTHROPIC_API_KEY *and*
+// ANTHROPIC_BASE_URL (documented router/proxy mode). So a discovered answer may
+// only shrink what this build already shipped — widening would publish a level
+// the executing gateway might not serve, which is the failure the whole issue
+// is about.
+func TestClaudeEffortAllowForModelOnlyNarrows(t *testing.T) {
 	t.Parallel()
 
-	discovered := map[string]map[string]bool{
-		// Deliberately contradicts claudeModelEffortAllow, which grants
-		// claude-opus-5 all five levels: the publisher wins over the transcript.
-		"claude-opus-5": {"low": true, "medium": true, "high": true},
-		"legacy-model":  {},
+	const model = "claude-haiku-4-5-20251001" // static baseline: low/medium/high
+
+	baseline := claudeModelEffortAllow[model]
+	if len(baseline) != 3 || baseline["xhigh"] || baseline["max"] {
+		t.Fatalf("test assumes a low/medium/high baseline for %s, got %v", model, baseline)
 	}
 
-	if got := claudeEffortAllowForModel("claude-opus-5", discovered); len(got) != 3 || got["xhigh"] {
-		t.Fatalf("discovered model allow = %v, want the API's three levels", got)
+	// Widening attempt: discovery claims two levels the baseline withholds.
+	widened := claudeEffortAllowForModel(model, map[string]map[string]bool{
+		model: {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
+	})
+	for _, level := range []string{"xhigh", "max"} {
+		if widened[level] {
+			t.Fatalf("discovery widened %s to include %q; allow = %v", model, level, widened)
+		}
 	}
-	// Not described by the API → hand table, exactly as before.
-	want := claudeModelEffortAllow["claude-haiku-4-5-20251001"]
-	if got := claudeEffortAllowForModel("claude-haiku-4-5-20251001", discovered); len(got) != len(want) {
-		t.Fatalf("undescribed model allow = %v, want the static table %v", got, want)
+	if len(widened) != 3 {
+		t.Fatalf("allow = %v, want the baseline's three levels", widened)
 	}
-	// `effort.supported: false` → an empty non-nil map, which projects to no
-	// levels and hides the picker rather than inheriting the CLI superset.
-	got := claudeEffortAllowForModel("legacy-model", discovered)
-	if got == nil || len(got) != 0 {
-		t.Fatalf("unsupported-effort model allow = %v, want an empty non-nil map", got)
+
+	// Narrowing: this direction is the point — a level Anthropic stops
+	// supporting disappears without waiting for a Multica release.
+	narrowed := claudeEffortAllowForModel(model, map[string]map[string]bool{
+		model: {"low": true, "medium": true},
+	})
+	if len(narrowed) != 2 || narrowed["high"] {
+		t.Fatalf("allow = %v, want the discovered narrowing to low/medium", narrowed)
 	}
-	if levels := projectClaudeLevels(claudeStaticEffortFullSuperset, got); len(levels) != 0 {
-		t.Fatalf("unsupported-effort model projected %v, want no levels", levels)
+
+	// `effort.supported: false` narrows to nothing, which hides the picker.
+	empty := claudeEffortAllowForModel(model, map[string]map[string]bool{model: {}})
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("allow = %v, want an empty non-nil map", empty)
 	}
-	// Unknown to both → nil means "no restriction", the pre-existing behaviour.
-	if got := claudeEffortAllowForModel("who-knows", discovered); got != nil {
+	if levels := projectClaudeLevels(claudeStaticEffortFullSuperset, empty); len(levels) != 0 {
+		t.Fatalf("projected %v, want no levels", levels)
+	}
+}
+
+// TestClaudeEffortAllowForModelWithoutBaselineIgnoresDiscovery: nil is the
+// sentinel for "no curated per-model restriction", not a known-unrestricted set.
+// There is nothing to intersect, and narrowing it would invent a limit out of a
+// context that may not be the executing one.
+func TestClaudeEffortAllowForModelWithoutBaselineIgnoresDiscovery(t *testing.T) {
+	t.Parallel()
+
+	if _, hasBaseline := claudeModelEffortAllow["claude-sonnet-5"]; hasBaseline {
+		t.Skip("claude-sonnet-5 gained a static baseline; pick another unbaselined model")
+	}
+	got := claudeEffortAllowForModel("claude-sonnet-5", map[string]map[string]bool{
+		"claude-sonnet-5": {"low": true},
+	})
+	if got != nil {
+		t.Fatalf("allow = %v, want nil (discovery ignored without a baseline)", got)
+	}
+	if got := claudeEffortAllowForModel("who-knows", nil); got != nil {
 		t.Fatalf("unknown model allow = %v, want nil", got)
 	}
-	if got := claudeEffortAllowForModel("claude-opus-5", nil); len(got) != 5 {
-		t.Fatalf("with no discovery at all, allow = %v, want the static table's five levels", got)
+}
+
+// TestClaudeEffortAllowForModelWithoutDiscoveryIsStatic: the no-credential path
+// must be exactly the hand table.
+func TestClaudeEffortAllowForModelWithoutDiscoveryIsStatic(t *testing.T) {
+	t.Parallel()
+
+	for model, want := range claudeModelEffortAllow {
+		got := claudeEffortAllowForModel(model, nil)
+		if len(got) != len(want) {
+			t.Fatalf("%s: allow = %v, want the static table %v", model, got, want)
+		}
+		for level := range want {
+			if !got[level] {
+				t.Fatalf("%s: allow = %v, missing %q from the static table", model, got, level)
+			}
+		}
 	}
 }
 
@@ -677,6 +730,62 @@ func TestClaudeAPICatalogCachesFailures(t *testing.T) {
 	// would put a doomed network call in front of a correct static answer.
 	if calls != 1 {
 		t.Fatalf("fetched %d times, want 1 (failures are cached too)", calls)
+	}
+}
+
+// TestClaudeAPICatalogCollapsesConcurrentMisses covers the race the fetch mutex
+// exists for: without it every concurrent cache miss issues its own request to
+// an external API, and whichever finishes LAST wins the cache — so a failure
+// could overwrite a fresh success.
+func TestClaudeAPICatalogCollapsesConcurrentMisses(t *testing.T) {
+	// Mutates package-global cache and the fetch hook; must stay serial.
+	resetClaudeAPICatalogForTests()
+	defer resetClaudeAPICatalogForTests()
+
+	const callers = 8
+	var mu sync.Mutex
+	calls := 0
+	release := make(chan struct{})
+
+	original := claudeAPICatalogFetch
+	claudeAPICatalogFetch = func(context.Context) ([]claudeAPIModel, bool) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		// Hold the winner inside the fetch so every other caller is queued
+		// behind it — without serialisation they would each start their own.
+		<-release
+		return []claudeAPIModel{{ID: "claude-opus-5", EffortLevels: map[string]bool{"high": true}}}, true
+	}
+	defer func() { claudeAPICatalogFetch = original }()
+
+	var wg sync.WaitGroup
+	results := make([]bool, callers)
+	counts := make([]int, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			models, ok := claudeAPICatalog(context.Background())
+			results[i] = ok
+			counts[i] = len(models)
+		}()
+	}
+	// Give the goroutines time to pile up on the fetch mutex before releasing.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("made %d fetches for %d concurrent misses, want 1", got, callers)
+	}
+	for i := range callers {
+		if !results[i] || counts[i] != 1 {
+			t.Fatalf("caller %d got (models=%d, ok=%v), want the winner's snapshot", i, counts[i], results[i])
+		}
 	}
 }
 

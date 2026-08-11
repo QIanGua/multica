@@ -37,13 +37,17 @@ import (
 //
 // So discovery here is CREDENTIAL-GATED, and its absence is not a failure:
 //
-//   - Credential present  → the API supplies each model's real effort catalog.
+//   - Credential present  → the API may NARROW a model's hand-maintained effort
+//     catalog (never widen it — see claudeEffortAllowForModel).
 //   - Credential absent   → behaviour is byte-for-byte what it was before this
 //     file existed. No request is made.
 //
-// It refines the effort catalog ONLY. The model LIST stays static, because that
-// one cannot be made sound at this layer — see "Why the model LIST stays static"
-// below.
+// Both of the hand-maintained tables therefore survive this file: the model list
+// stays static outright ("Why the model LIST stays static" below), and the
+// per-model effort table stays the baseline that discovery can only shrink.
+// Neither can be replaced from here, because a runtime-scoped answer cannot
+// speak for the per-agent credential and base URL a task actually executes
+// with. Deleting them needs agent-scoped discovery, which is a protocol change.
 //
 // Three rules keep the gate honest:
 //
@@ -411,18 +415,48 @@ func claudeAPICatalogCached() (models []claudeAPIModel, ok, fresh bool) {
 // claudeEffortAllowForModel decides which effort levels a model may offer,
 // before the local CLI's own superset narrows them further.
 //
-// Discovery wins where it spoke, because `capabilities.effort` is the same fact
-// claudeModelEffortAllow was hand-transcribing — from the publisher rather than
-// from a release-note read. Where it stayed silent (no credential, or a model
-// the API did not describe) the hand table answers exactly as before. A model
-// neither source describes gets nil, which means "no per-model restriction" and
-// leaves the CLI superset in charge — the pre-existing behaviour for an
-// unrecognised model.
+// Discovery may only NARROW the hand-maintained baseline. It never adds a level
+// claudeModelEffortAllow did not already grant, and it is ignored entirely for a
+// model with no baseline.
+//
+// An earlier cut let discovery win outright, on the theory that which levels a
+// model accepts is a property of the model rather than of the account asking.
+// That is true of Anthropic's first-party API and false in general: an agent can
+// set its own ANTHROPIC_BASE_URL ("router/proxy mode" is a documented use of the
+// per-agent custom env, alongside ANTHROPIC_API_KEY), so the deployment behind a
+// model id at execution time need not be the one the runtime-scoped catalog
+// asked. Gateway A answering `xhigh` for a model that gateway B does not serve
+// at that level would have published a level the task then silently ran without
+// — the same "advertised but doesn't work" failure that removed the dynamic
+// model list, one layer down.
+//
+// Intersecting is what makes the direction safe rather than the source
+// trustworthy: whatever the discovery credential turns out to describe, the
+// result is a subset of what this build already shipped, so no answer from the
+// wrong context can widen the picker. What it still buys is the fail-closed
+// direction — a level Anthropic stops supporting on an existing model
+// disappears without waiting for a Multica release.
+//
+// A model with no baseline is skipped rather than narrowed: nil is the sentinel
+// for "no curated per-model restriction", not a known-unrestricted set, so there
+// is nothing here to intersect and narrowing it would be inventing a limit out
+// of a context that may not be the executing one.
 func claudeEffortAllowForModel(modelID string, discovered map[string]map[string]bool) map[string]bool {
-	if levels, ok := discovered[modelID]; ok && levels != nil {
-		return levels
+	baseline := claudeModelEffortAllow[modelID]
+	if baseline == nil {
+		return nil
 	}
-	return claudeModelEffortAllow[modelID]
+	levels, ok := discovered[modelID]
+	if !ok || levels == nil {
+		return baseline
+	}
+	narrowed := make(map[string]bool, len(baseline))
+	for level := range baseline {
+		if levels[level] {
+			narrowed[level] = true
+		}
+	}
+	return narrowed
 }
 
 // claudeDiscoveredEffortAllow indexes a snapshot by model id, keeping only the
