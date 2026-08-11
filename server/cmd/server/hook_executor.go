@@ -9,8 +9,9 @@ import (
 	"github.com/multica-ai/multica/server/pkg/featureflag"
 )
 
-// hookExecutorTick is how often the executor polls for runnable executions. It
-// stays dormant (a cheap flag check) while automation_event_hooks is off.
+// hookExecutorTick is how often the executor polls for runnable executions. With
+// execution off for every workspace the matcher records no `queued` rows at all, so
+// the poll finds nothing and the tick costs one indexed lookup.
 const hookExecutorTick = 2 * time.Second
 
 // runHookExecutor is the Event Hooks executor loop (MUL-4332 PR3 §7.2).

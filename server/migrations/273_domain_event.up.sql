@@ -52,10 +52,12 @@ CREATE TABLE IF NOT EXISTS domain_event (
     causation_action_index INT,
     hop_count              INT NOT NULL DEFAULT 0,
 
-    -- Single-consumer outbox lease. Claimed by the matcher; with the engine off
-    -- for a workspace its rows are claimed and dispatched undecided, so they stay
-    -- 'pending'. PR3's matcher claims via lease_token/lease_expires_at and
-    -- advances dispatch_status.
+    -- Single-consumer outbox lease. The matcher claims a row via
+    -- lease_token/lease_expires_at and advances dispatch_status. It drains EVERY
+    -- workspace: with Event Hooks off for a workspace the row is still claimed and
+    -- marked 'dispatched', just with no decisions recorded, so a disabled workspace
+    -- neither accumulates a backlog that starves an enabled one in the seq-ordered
+    -- candidate window, nor replays that backlog when it is switched on.
     dispatch_status        TEXT NOT NULL DEFAULT 'pending'
                                CHECK (dispatch_status IN ('pending', 'dispatching', 'dispatched', 'failed')),
     attempts               INT NOT NULL DEFAULT 0,

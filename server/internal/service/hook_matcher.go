@@ -45,9 +45,14 @@ import (
 // whose stored config cannot be parsed is isolated as one terminal `failed` row
 // instead of starving the healthy rules on the same event.
 //
-// This slice does NOT run actions — a fired hook lands `queued` for the executor
-// (a later slice). With no executor and the automation_event_hooks flag off
-// (the matcher loop is gated on it), production behaviour is unchanged.
+// The matcher never runs actions: a fired hook lands `queued` for the executor. It
+// only lands `queued` when automation_event_hook_execution is on for that workspace —
+// otherwise the decision is recorded in a terminal status the executor can never
+// claim, so an observation period can never fire retroactively.
+//
+// The loop itself is NOT gated: automation_event_hooks is evaluated per candidate
+// row's workspace, and an event from a workspace that has it off is claimed and
+// dispatched with no decisions.
 
 const (
 	hookExecQueued  = "queued"

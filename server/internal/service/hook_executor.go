@@ -44,8 +44,13 @@ import (
 // path to become transaction-aware first, so its effect can bind in the same
 // transaction as the enqueue (§4: "task / comment / inbox 可在同一事务内绑定
 // effect"); until then it is left unimplemented rather than run without that
-// guarantee. The executor loop is gated on the default-off automation_event_hooks
-// flag, so production behaviour is unchanged.
+// guarantee.
+//
+// The loop itself is NOT gated: automation_event_hook_execution is evaluated per
+// claimed row's workspace (the claim queue is global, so a process-wide answer cannot
+// be right for every workspace at once). A row outside the enabled set is handed back
+// unrun with its attempt refunded. Both flags default to off, so no action runs until
+// a workspace is deliberately enabled.
 
 const (
 	hookExecRunning   = "running"

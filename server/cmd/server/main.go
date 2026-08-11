@@ -436,9 +436,10 @@ func main() {
 	// Domain event retention (MUL-4332) — still an explicit no-op, wired for
 	// visibility; the real sweep needs the terminal-execution predicate (TTL=90d).
 	go runDomainEventRetention(sweepCtx)
-	// Event Hooks matcher (MUL-4332 PR3) — consumes the domain_event outbox and
-	// records queued/skipped hook_execution decisions. Gated on the
-	// automation_event_hooks flag (default off), so it is dormant until enabled.
+	// Event Hooks matcher/executor (MUL-4332). The matcher always polls: both flags
+	// are evaluated PER WORKSPACE against the row in hand, so one process-wide answer
+	// cannot gate the loop. With the flags off it still drains the outbox, recording
+	// no decisions and running no actions.
 	go runHookMatcher(sweepCtx, h.HookService, flags)
 	go runHookExecutor(sweepCtx, h.HookService, flags)
 	go heartbeatScheduler.Run(sweepCtx)

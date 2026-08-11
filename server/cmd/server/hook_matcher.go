@@ -9,8 +9,10 @@ import (
 	"github.com/multica-ai/multica/server/pkg/featureflag"
 )
 
-// hookMatcherTick is how often the matcher polls the outbox. It stays dormant
-// (a cheap flag check) while automation_event_hooks is off.
+// hookMatcherTick is how often the matcher polls the outbox. It polls on every tick
+// regardless of the flags — see runHookMatcher for why the gate cannot live here —
+// so with Event Hooks off the work per tick is one bounded, indexed candidate read
+// plus the claim/dispatch of whatever it finds, and no decisions.
 const hookMatcherTick = 2 * time.Second
 
 // runHookMatcher is the durable Event Hooks matcher loop (MUL-4332 PR3).
