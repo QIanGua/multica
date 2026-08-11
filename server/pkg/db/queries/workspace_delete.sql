@@ -16,30 +16,49 @@ SELECT set_config('multica.workspace_teardown', 'on', true);
 -- minutes, and an unbounded wait here hangs the delete request (MUL-5983).
 SELECT pg_advisory_xact_lock(4246);
 
+-- name: ListWorkspaceTaskOwnerAgents :many
+SELECT id FROM agent WHERE agent.workspace_id = $1;
+
+-- name: ListWorkspaceTaskOwnerIssues :many
+SELECT id FROM issue WHERE issue.workspace_id = $1;
+
+-- name: ListWorkspaceTaskOwnerRuntimes :many
+SELECT id FROM agent_runtime WHERE agent_runtime.workspace_id = $1;
+
+-- name: ListTaskIDsByAgent :many
+-- One owner key per call, on purpose. All three ownership paths must stay
+-- (nothing enforces that a task's agent/runtime/issue share a workspace), but
+-- expressing them as `OR agent_id IN (subquery) OR ...` — or as a UNION of
+-- joins, or as `= ANY($1::uuid[])` over a whole workspace's agents — makes the
+-- planner estimate a proportional share of the global table and fall back to a
+-- Seq Scan on agent_task_queue. A single-key equality is the only form whose
+-- row estimate stays small enough to be index-driven regardless of how the
+-- workspace's tasks are distributed, so the loop lives in the caller
+-- (MUL-5999). Uses idx_agent_task_queue_agent.
+SELECT id FROM agent_task_queue WHERE agent_id = $1;
+
+-- name: ListTaskIDsByIssue :many
+-- Uses idx_agent_task_queue_issue_id. See ListTaskIDsByAgent for why this is
+-- one key per call.
+SELECT id FROM agent_task_queue WHERE issue_id = $1;
+
+-- name: ListTaskIDsByRuntime :many
+-- Uses idx_agent_task_queue_runtime_id (migration 273). Before that index the
+-- only runtime_id indexes were partial, so this path had no index at all. See
+-- ListTaskIDsByAgent for why this is one key per call.
+SELECT id FROM agent_task_queue WHERE runtime_id = $1;
+
 -- name: PrepareWorkspaceDeletionLinks :exec
 -- Break self-references and the task/run cycle explicitly before deleting
 -- either side. This keeps their ordering in the application-owned graph
 -- instead of relying on ON DELETE SET NULL actions.
+--
+-- $2 is the workspace's task id set, collected by the caller through the
+-- ListTaskIDsBy* queries above and reused by DeleteWorkspaceLeafData and
+-- DeleteWorkspaceTasks so all three steps act on one consistent snapshot.
 WITH
-ws_agents AS MATERIALIZED (
-    SELECT id FROM agent WHERE agent.workspace_id = $1
-),
-ws_runtimes AS MATERIALIZED (
-    SELECT id FROM agent_runtime WHERE agent_runtime.workspace_id = $1
-),
-ws_issues AS MATERIALIZED (
-    SELECT id FROM issue WHERE issue.workspace_id = $1
-),
 ws_tasks AS MATERIALIZED (
-    -- Keep all three ownership paths until the application enforces that a
-    -- task's agent/runtime/issue always belong to the same workspace. The OR
-    -- can scan globally, but simplifying it before that invariant exists
-    -- would turn a performance optimization into a tenant-cleanup bug.
-    SELECT id
-    FROM agent_task_queue
-    WHERE agent_id IN (SELECT id FROM ws_agents)
-       OR issue_id IN (SELECT id FROM ws_issues)
-       OR runtime_id IN (SELECT id FROM ws_runtimes)
+    SELECT id FROM unnest(@task_ids::uuid[]) AS t(id)
 ),
 detached_tasks AS (
     UPDATE agent_task_queue
@@ -66,12 +85,10 @@ WHERE webhook_delivery.workspace_id = $1
   AND replayed_from_delivery_id IS NOT NULL;
 
 -- name: DeleteWorkspaceLeafData :exec
+-- $2 is the same task id snapshot PrepareWorkspaceDeletionLinks received.
 WITH
 ws_agents AS MATERIALIZED (
     SELECT id FROM agent WHERE workspace_id = $1
-),
-ws_runtimes AS MATERIALIZED (
-    SELECT id FROM agent_runtime WHERE workspace_id = $1
 ),
 ws_issues AS MATERIALIZED (
     SELECT id FROM issue WHERE workspace_id = $1
@@ -86,11 +103,7 @@ ws_squads AS MATERIALIZED (
     SELECT id FROM squad WHERE workspace_id = $1
 ),
 ws_tasks AS MATERIALIZED (
-    SELECT id
-    FROM agent_task_queue
-    WHERE agent_id IN (SELECT id FROM ws_agents)
-       OR issue_id IN (SELECT id FROM ws_issues)
-       OR runtime_id IN (SELECT id FROM ws_runtimes)
+    SELECT id FROM unnest(@task_ids::uuid[]) AS t(id)
 ),
 ws_sessions AS MATERIALIZED (
     SELECT id FROM chat_session WHERE workspace_id = $1
@@ -121,11 +134,16 @@ deleted_task_messages AS (
     DELETE FROM task_message
     WHERE task_id IN (SELECT id FROM ws_tasks)
 ),
+-- Every task_token row carries workspace_id NOT NULL (migration 108), so the
+-- workspace key alone covers this workspace's tokens, and migration 274 gives
+-- it an index. The former `OR task_id IN (…) OR agent_id IN (…)` arms only ever
+-- added tokens whose workspace_id points at a DIFFERENT workspace while their
+-- task or agent lives here — and task_id / agent_id are both NOT NULL with
+-- ON DELETE CASCADE, so `delete tasks` and `delete agents` below remove exactly
+-- those rows. Keeping the OR cost a full scan of task_token (MUL-5999).
 deleted_task_tokens AS (
     DELETE FROM task_token
     WHERE workspace_id = $1
-       OR task_id IN (SELECT id FROM ws_tasks)
-       OR agent_id IN (SELECT id FROM ws_agents)
 ),
 deleted_hourly_dirty AS (
     DELETE FROM task_usage_hourly_dirty WHERE workspace_id = $1
@@ -307,10 +325,10 @@ SET state = CASE
 WHERE channel_media_pending_object.workspace_id = $1;
 
 -- name: DeleteWorkspaceTasks :exec
+-- Deletes by primary key from the id snapshot the caller collected, so the plan
+-- is a pkey lookup instead of the three-way OR's Seq Scan (MUL-5999).
 DELETE FROM agent_task_queue
-WHERE agent_id IN (SELECT id FROM agent WHERE agent.workspace_id = $1)
-   OR issue_id IN (SELECT id FROM issue WHERE issue.workspace_id = $1)
-   OR runtime_id IN (SELECT id FROM agent_runtime WHERE agent_runtime.workspace_id = $1);
+WHERE id = ANY(@task_ids::uuid[]);
 
 -- name: DeleteWorkspaceChatMessages :exec
 DELETE FROM chat_message

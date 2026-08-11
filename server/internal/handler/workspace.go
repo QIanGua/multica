@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -795,6 +796,78 @@ func failWorkspaceDelete(w http.ResponseWriter, r *http.Request, workspaceID, st
 	writeError(w, http.StatusInternalServerError, "failed to delete workspace")
 }
 
+// collectWorkspaceTaskIDs resolves every agent_task_queue row a workspace owns,
+// one owner key at a time.
+//
+// agent_task_queue has no workspace_id, and all three ownership paths have to
+// stay: nothing in the schema or the application enforces that a task's agent,
+// runtime and issue belong to the same workspace, so dropping a path would turn
+// a performance fix into a tenant-cleanup bug. What changed is HOW the set is
+// resolved. Expressing the three paths inside one statement — as the previous
+// `OR agent_id IN (subquery) OR …`, as a UNION of joins, or as
+// `agent_id = ANY($1)` over the whole workspace's agents — leaves the planner
+// estimating that the workspace owns a proportional share of the global table,
+// which it costs as a Seq Scan over every row in agent_task_queue. Measured on a
+// 1.2M-row synthetic copy of the prod shape (937 agents / 109 issues / 12
+// runtimes): OR form and 937-element array form both Seq Scan (~25k buffers);
+// single-key equality is a Bitmap Index Scan (~8 buffers per key).
+//
+// The returned ids are deduplicated because a task can be reachable through more
+// than one path, and the same snapshot feeds
+// PrepareWorkspaceDeletionLinks / DeleteWorkspaceLeafData / DeleteWorkspaceTasks
+// so every step acts on one consistent set inside the teardown transaction.
+func collectWorkspaceTaskIDs(ctx context.Context, qtx *db.Queries, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
+	seen := make(map[[16]byte]struct{})
+	taskIDs := make([]pgtype.UUID, 0)
+	appendTasks := func(ids []pgtype.UUID) {
+		for _, id := range ids {
+			if _, dup := seen[id.Bytes]; dup {
+				continue
+			}
+			seen[id.Bytes] = struct{}{}
+			taskIDs = append(taskIDs, id)
+		}
+	}
+
+	agentIDs, err := qtx.ListWorkspaceTaskOwnerAgents(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace agents: %w", err)
+	}
+	for _, agentID := range agentIDs {
+		ids, err := qtx.ListTaskIDsByAgent(ctx, agentID)
+		if err != nil {
+			return nil, fmt.Errorf("list tasks by agent: %w", err)
+		}
+		appendTasks(ids)
+	}
+
+	issueIDs, err := qtx.ListWorkspaceTaskOwnerIssues(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace issues: %w", err)
+	}
+	for _, issueID := range issueIDs {
+		ids, err := qtx.ListTaskIDsByIssue(ctx, issueID)
+		if err != nil {
+			return nil, fmt.Errorf("list tasks by issue: %w", err)
+		}
+		appendTasks(ids)
+	}
+
+	runtimeIDs, err := qtx.ListWorkspaceTaskOwnerRuntimes(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace runtimes: %w", err)
+	}
+	for _, runtimeID := range runtimeIDs {
+		ids, err := qtx.ListTaskIDsByRuntime(ctx, runtimeID)
+		if err != nil {
+			return nil, fmt.Errorf("list tasks by runtime: %w", err)
+		}
+		appendTasks(ids)
+	}
+
+	return taskIDs, nil
+}
+
 func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 	workspaceID := workspaceIDFromURL(r, "id")
 
@@ -872,6 +945,7 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 	// set-based delete scoped by workspace_id; the legacy cascades remain only
 	// as an expand-phase safety net until a later schema contract.
 	ctx := r.Context()
+	var workspaceTaskIDs []pgtype.UUID
 	deleteSteps := []struct {
 		name string
 		run  func() error
@@ -881,8 +955,27 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.SetWorkspaceTeardownMode(ctx) },
 		},
 		{
+			// Resolve the workspace's task set once, index-driven, and reuse
+			// it for every task-keyed step below. See collectWorkspaceTaskIDs
+			// for why this is a per-owner-key loop instead of one statement.
+			name: "collect workspace tasks",
+			run: func() error {
+				ids, err := collectWorkspaceTaskIDs(ctx, qtx, requester.WorkspaceID)
+				if err != nil {
+					return err
+				}
+				workspaceTaskIDs = ids
+				return nil
+			},
+		},
+		{
 			name: "prepare relationship graph",
-			run:  func() error { return qtx.PrepareWorkspaceDeletionLinks(ctx, requester.WorkspaceID) },
+			run: func() error {
+				return qtx.PrepareWorkspaceDeletionLinks(ctx, db.PrepareWorkspaceDeletionLinksParams{
+					WorkspaceID: requester.WorkspaceID,
+					TaskIds:     workspaceTaskIDs,
+				})
+			},
 		},
 		{
 			name: "delete chat pins",
@@ -899,7 +992,12 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		},
 		{
 			name: "delete leaf data",
-			run:  func() error { return qtx.DeleteWorkspaceLeafData(ctx, requester.WorkspaceID) },
+			run: func() error {
+				return qtx.DeleteWorkspaceLeafData(ctx, db.DeleteWorkspaceLeafDataParams{
+					WorkspaceID: requester.WorkspaceID,
+					TaskIds:     workspaceTaskIDs,
+				})
+			},
 		},
 		{
 			name: "delete autopilot runs",
@@ -907,7 +1005,7 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		},
 		{
 			name: "delete tasks",
-			run:  func() error { return qtx.DeleteWorkspaceTasks(ctx, requester.WorkspaceID) },
+			run:  func() error { return qtx.DeleteWorkspaceTasks(ctx, workspaceTaskIDs) },
 		},
 		{
 			name: "delete chat messages",
