@@ -10,18 +10,26 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// reasonixHomeWith writes a Reasonix user config.toml into a fresh home and
-// returns the home, so a test never reads the machine's real ~/.reasonix.
-func reasonixHomeWith(t *testing.T, config string) string {
+// reasonixEnvWith writes a Reasonix user config.toml into a fresh home and
+// returns the task env pointing at it, so a test never reads the machine's real
+// Reasonix config.
+func reasonixEnvWith(t *testing.T, config string) map[string]string {
 	t.Helper()
 	home := t.TempDir()
-	if config == "" {
-		return home
+	if config != "" {
+		if err := os.WriteFile(filepath.Join(home, reasonixUserConfigFile), []byte(config), 0o600); err != nil {
+			t.Fatalf("seed reasonix user config: %v", err)
+		}
 	}
-	if err := os.WriteFile(filepath.Join(home, reasonixUserConfigFile), []byte(config), 0o600); err != nil {
-		t.Fatalf("seed reasonix user config: %v", err)
+	return map[string]string{"REASONIX_HOME": home}
+}
+
+// assertTaskDenyList checks the deny rules in a written per-task reasonix.toml.
+func assertTaskDenyList(t *testing.T, path string, want []string) {
+	t.Helper()
+	if got := taskDenyList(t, path); !slices.Equal(got, want) {
+		t.Fatalf("deny = %v, want %v", got, want)
 	}
-	return home
 }
 
 // taskDenyList decodes the deny rules from a written per-task reasonix.toml.
@@ -51,7 +59,7 @@ func TestPrepareDeniesReasonixAskTool(t *testing.T) {
 		TaskID:         "b1b2c3d4-e5f6-7890-abcd-ef1234567890",
 		AgentName:      "Reasonix Agent",
 		Provider:       "reasonix",
-		ReasonixHome:   reasonixHomeWith(t, ""),
+		ReasonixEnv:    reasonixEnvWith(t, ""),
 		Task:           TaskContextForEnv{IssueID: "b1b2c3d4-e5f6-7890-abcd-ef1234567890"},
 	}, testLogger())
 	if err != nil {
@@ -82,7 +90,7 @@ func TestReuseRewritesReasonixAskDeny(t *testing.T) {
 		TaskID:         "c1b2c3d4-e5f6-7890-abcd-ef1234567890",
 		AgentName:      "Reasonix Agent",
 		Provider:       "reasonix",
-		ReasonixHome:   reasonixHomeWith(t, "[permissions]\ndeny = [\"bash\"]\n"),
+		ReasonixEnv:    reasonixEnvWith(t, "[permissions]\ndeny = [\"bash\"]\n"),
 		Task:           TaskContextForEnv{IssueID: "c1b2c3d4-e5f6-7890-abcd-ef1234567890"},
 	}
 	env, err := Prepare(params, testLogger())
@@ -98,7 +106,7 @@ func TestReuseRewritesReasonixAskDeny(t *testing.T) {
 		WorkspacesRoot: params.WorkspacesRoot,
 		WorkDir:        env.WorkDir,
 		Provider:       "reasonix",
-		ReasonixHome:   params.ReasonixHome,
+		ReasonixEnv:    params.ReasonixEnv,
 		Task:           params.Task,
 	}, testLogger())
 	if reused == nil {
@@ -115,7 +123,7 @@ func TestReuseRewritesReasonixAskDeny(t *testing.T) {
 // a global `deny = ["bash"]` must still deny bash inside the task.
 func TestReasonixProjectConfigMergesOwnerPermissions(t *testing.T) {
 	t.Parallel()
-	home := reasonixHomeWith(t, `[permissions]
+	env := reasonixEnvWith(t, `[permissions]
 deny = ["bash", "config_write"]
 allow = ["read"]
 
@@ -124,7 +132,7 @@ default = "some-model"
 `)
 	workDir := t.TempDir()
 
-	if err := writeReasonixProjectConfig(workDir, home, &sidecarManifest{}, testLogger()); err != nil {
+	if err := writeReasonixProjectConfig(workDir, env, &sidecarManifest{}, testLogger()); err != nil {
 		t.Fatalf("writeReasonixProjectConfig: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(workDir, reasonixProjectConfigFile))
@@ -159,10 +167,10 @@ default = "some-model"
 // merge must not append a duplicate rule.
 func TestReasonixProjectConfigKeepsOwnerAskDeny(t *testing.T) {
 	t.Parallel()
-	home := reasonixHomeWith(t, "[permissions]\ndeny = [\"ask\", \"bash\"]\n")
+	env := reasonixEnvWith(t, "[permissions]\ndeny = [\"ask\", \"bash\"]\n")
 	workDir := t.TempDir()
 
-	if err := writeReasonixProjectConfig(workDir, home, &sidecarManifest{}, testLogger()); err != nil {
+	if err := writeReasonixProjectConfig(workDir, env, &sidecarManifest{}, testLogger()); err != nil {
 		t.Fatalf("writeReasonixProjectConfig: %v", err)
 	}
 	got := taskDenyList(t, filepath.Join(workDir, reasonixProjectConfigFile))
@@ -189,7 +197,7 @@ func TestReasonixProjectConfigSkipsUnreadableOwnerConfig(t *testing.T) {
 			t.Parallel()
 			workDir := t.TempDir()
 			manifest := &sidecarManifest{}
-			if err := writeReasonixProjectConfig(workDir, reasonixHomeWith(t, tc.config), manifest, testLogger()); err != nil {
+			if err := writeReasonixProjectConfig(workDir, reasonixEnvWith(t, tc.config), manifest, testLogger()); err != nil {
 				t.Fatalf("writeReasonixProjectConfig: %v", err)
 			}
 			if _, err := os.Stat(filepath.Join(workDir, reasonixProjectConfigFile)); !os.IsNotExist(err) {
@@ -216,7 +224,7 @@ func TestReasonixProjectConfigKeepsRepositoryFile(t *testing.T) {
 	// reports success so the task still runs (with ask enabled, caught by the
 	// backend's fail-closed question handling).
 	manifest := &sidecarManifest{}
-	if err := writeReasonixProjectConfig(workDir, reasonixHomeWith(t, ""), manifest, testLogger()); err != nil {
+	if err := writeReasonixProjectConfig(workDir, reasonixEnvWith(t, ""), manifest, testLogger()); err != nil {
 		t.Fatalf("writeReasonixProjectConfig: %v", err)
 	}
 	data, err := os.ReadFile(configPath)
@@ -229,30 +237,6 @@ func TestReasonixProjectConfigKeepsRepositoryFile(t *testing.T) {
 	// Nothing was created, so cleanup must not claim the user's file.
 	if len(manifest.Files) != 0 {
 		t.Fatalf("manifest recorded a file it did not write: %+v", manifest.Files)
-	}
-}
-
-// TestReasonixUserConfigPathResolution pins the home the task config is derived
-// from: the agent's override first, then the daemon's own environment.
-func TestReasonixUserConfigPathResolution(t *testing.T) {
-	daemonHome := t.TempDir()
-	t.Setenv("REASONIX_HOME", daemonHome)
-
-	agentHome := t.TempDir()
-	if got, want := reasonixUserConfigPath(agentHome), filepath.Join(agentHome, reasonixUserConfigFile); got != want {
-		t.Fatalf("path with an agent override = %q, want %q", got, want)
-	}
-	if got, want := reasonixUserConfigPath(""), filepath.Join(daemonHome, reasonixUserConfigFile); got != want {
-		t.Fatalf("path without an override = %q, want %q", got, want)
-	}
-
-	t.Setenv("REASONIX_HOME", "")
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skipf("no user home dir: %v", err)
-	}
-	if got, want := reasonixUserConfigPath(""), filepath.Join(home, ".reasonix", reasonixUserConfigFile); got != want {
-		t.Fatalf("default path = %q, want %q", got, want)
 	}
 }
 

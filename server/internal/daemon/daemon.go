@@ -5872,13 +5872,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			defer d.unmarkActiveStore(store)
 		}
 	}
-	// Reasonix keeps credentials and config in REASONIX_HOME, which an agent's
-	// custom_env may re-point. The per-task reasonix.toml has to restate the
-	// permissions from that same home, so the deny rules the runtime owner set
-	// there survive the task-scoped config that overrides them.
-	var reasonixHome string
+	// Reasonix locates its user config from the environment (REASONIX_HOME, and
+	// the platform config dirs behind it), which an agent's custom_env may
+	// re-point or clear. The per-task reasonix.toml has to restate the
+	// permissions from whichever config the child ends up loading, so the deny
+	// rules the runtime owner set there survive the task-scoped config that
+	// overrides them — hence the same sanitized env the child is launched with.
+	var reasonixEnv map[string]string
 	if provider == "reasonix" {
-		reasonixHome = sanitizeAgentEnv(agentEnvOverrides)["REASONIX_HOME"]
+		reasonixEnv = sanitizeAgentEnv(agentEnvOverrides)
 	}
 	// Guard this task's per-issue Codex session store from the GC for the whole
 	// task, starting before Prepare/Reuse mounts it — so a prune that samples the
@@ -5907,7 +5909,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			HermesSourceMustExist: hermesSourceMustExist,
 			HermesEnv:             hermesEnv,
 			HermesMemoryStore:     hermesMemoryStore,
-			ReasonixHome:          reasonixHome,
+			ReasonixEnv:           reasonixEnv,
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
 		})
@@ -5933,7 +5935,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			HermesSourceMustExist: hermesSourceMustExist,
 			HermesEnv:             hermesEnv,
 			HermesMemoryStore:     hermesMemoryStore,
-			ReasonixHome:          reasonixHome,
+			ReasonixEnv:           reasonixEnv,
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
 		}

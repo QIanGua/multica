@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -19,8 +18,8 @@ import (
 // interactive sessions alone.
 const reasonixProjectConfigFile = "reasonix.toml"
 
-// reasonixUserConfigFile is the runtime owner's own Reasonix config, read from
-// REASONIX_HOME (see reasonixUserConfigPath). It is never written to — the
+// reasonixUserConfigFile is the runtime owner's own Reasonix config; where it
+// lives is resolved in reasonix_user_config.go. It is never written to — the
 // daemon only reads the permissions the owner set there.
 const reasonixUserConfigFile = "config.toml"
 
@@ -51,26 +50,6 @@ const reasonixProjectConfigHeader = `# Managed by Multica. Written per task, rem
 # the tool instead lets the model take its own decision and keep going.
 
 `
-
-// reasonixUserConfigPath resolves the user config.toml the task's Reasonix will
-// read, from the same REASONIX_HOME the child process gets: the agent's
-// custom_env override when it set one, else the daemon's own environment, else
-// the platform default. Empty when even the home directory cannot be resolved,
-// which the caller treats as "no owner config".
-func reasonixUserConfigPath(homeOverride string) string {
-	home := strings.TrimSpace(homeOverride)
-	if home == "" {
-		home = strings.TrimSpace(os.Getenv("REASONIX_HOME"))
-	}
-	if home == "" {
-		userHome, err := os.UserHomeDir()
-		if err != nil {
-			return ""
-		}
-		home = filepath.Join(userHome, ".reasonix")
-	}
-	return filepath.Join(home, reasonixUserConfigFile)
-}
 
 // reasonixOwnerPermissions returns the [permissions] table the runtime owner
 // configured, or nil when there is no config or no such table. An unreadable or
@@ -169,8 +148,9 @@ func reasonixProjectConfig(userConfigPath string) ([]byte, error) {
 
 // writeReasonixProjectConfig lays down the per-task reasonix.toml in workDir,
 // denying the `ask` tool on top of the runtime owner's own permissions.
-// reasonixHome is the agent's REASONIX_HOME override, empty to resolve the home
-// the daemon itself would use.
+// taskEnv is the agent's sanitized custom_env, which decides — together with the
+// daemon's own environment — which user config the Reasonix child will load
+// (reasonix_user_config.go).
 //
 // A reasonix.toml that came with the repository is left untouched: sidecar
 // cleanup is a pure deletion of paths the daemon created, so it must never
@@ -180,11 +160,11 @@ func reasonixProjectConfig(userConfigPath string) ([]byte, error) {
 //
 // The same holds when the owner's config cannot be read or restated: the daemon
 // writes nothing rather than a table that silently drops their deny rules.
-func writeReasonixProjectConfig(workDir, reasonixHome string, manifest *sidecarManifest, logger *slog.Logger) error {
+func writeReasonixProjectConfig(workDir string, taskEnv map[string]string, manifest *sidecarManifest, logger *slog.Logger) error {
 	if workDir == "" {
 		return nil
 	}
-	userConfig := reasonixUserConfigPath(reasonixHome)
+	userConfig := reasonixEnv(taskEnv).userConfigLoadPath()
 	content, err := reasonixProjectConfig(userConfig)
 	if err != nil {
 		if logger != nil {
