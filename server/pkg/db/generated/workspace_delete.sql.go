@@ -189,6 +189,13 @@ deleted_labels AS (
 ),
 deleted_properties AS (
     DELETE FROM issue_property WHERE issue_property.workspace_id = $1
+),
+deleted_issue_views AS (
+    DELETE FROM issue_view WHERE issue_view.workspace_id = $1
+),
+deleted_issue_view_preferences AS (
+    DELETE FROM issue_view_preference
+    WHERE issue_view_preference.workspace_id = $1
 )
 DELETE FROM quick_action WHERE quick_action.workspace_id = $1
 `
@@ -283,6 +290,9 @@ deleted_draft_restores AS (
     DELETE FROM chat_draft_restore
     WHERE chat_session_id IN (SELECT id FROM ws_sessions)
        OR task_id IN (SELECT id FROM ws_tasks)
+),
+deleted_agent_builder_drafts AS (
+    DELETE FROM agent_builder_draft WHERE workspace_id = $1
 ),
 deleted_comment_reactions AS (
     DELETE FROM comment_reaction WHERE workspace_id = $1
@@ -430,6 +440,9 @@ SET state = CASE
 WHERE channel_media_pending_object.workspace_id = $1
 `
 
+// Same no-FK chore as chat_draft_restore above. Matched on workspace_id rather
+// than the session set because that column exists precisely so this statement
+// does not have to join through chat_session, which it deletes in this same CTE.
 // Keep the two-system cleanup ledger until object storage has been settled.
 // Moving every row out of pending also prevents a concurrent media bind from
 // attaching an object after the workspace teardown commits. The reconciler
@@ -496,9 +509,12 @@ const lockTaskUsageRollupForWorkspaceDelete = `-- name: LockTaskUsageRollupForWo
 SELECT pg_advisory_xact_lock(4246)
 `
 
-// The hourly rollup uses session advisory lock 4246. The transaction-scoped
-// lock shares that namespace: an in-flight rollup finishes first, then no new
-// rollup can write the workspace's aggregates until this delete commits.
+// Advisory lock 4246 is the hourly rollup family's key: the rollup function
+// takes it per transaction (migration 272) and the backfill commands take it
+// per session. An in-flight rollup finishes first, then no new rollup can
+// write the workspace's aggregates until this delete commits. The caller
+// bounds this wait with SET LOCAL lock_timeout — batch jobs hold 4246 for
+// minutes, and an unbounded wait here hangs the delete request (MUL-5983).
 func (q *Queries) LockTaskUsageRollupForWorkspaceDelete(ctx context.Context) error {
 	_, err := q.db.Exec(ctx, lockTaskUsageRollupForWorkspaceDelete)
 	return err
