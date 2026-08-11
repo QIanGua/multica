@@ -25,12 +25,29 @@ type HealthResponse struct {
 	// lifecycle CLI (`daemon start/stop`) acts on the host process namespace,
 	// so a foreign-OS daemon can't be started/stopped by the app even though
 	// /health is reachable. See #3916.
-	OS         string `json:"os"`
-	Uptime     string `json:"uptime"`
+	OS     string `json:"os"`
+	Uptime string `json:"uptime"`
+	// Profile names the CLI profile this daemon was started with, empty for
+	// the default profile. Health ports are derived by hashing the profile
+	// name into a 1000-port range, so two names can collide and a caller has
+	// no other way to tell whose daemon answered: `--profile a daemon stop`
+	// would happily kill profile b's daemon (#6694).
+	//
+	// Deliberately NOT omitempty. The empty string is a real answer — "I am
+	// the default profile's daemon" — and must stay distinguishable from a
+	// pre-#6694 daemon that cannot identify itself at all. Callers key off
+	// the field's presence, so collapsing the two would make every default
+	// daemon look unidentifiable.
+	Profile    string `json:"profile"`
 	DaemonID   string `json:"daemon_id"`
 	DeviceName string `json:"device_name"`
 	ServerURL  string `json:"server_url"`
 	CLIVersion string `json:"cli_version"`
+	// LaunchedBy is "desktop" when the Electron app spawned this daemon, empty
+	// for a standalone one. Already reported to the server on registration;
+	// surfaced here so `daemon status` can say who manages the daemon instead
+	// of leaving the user to guess why a daemon they never started is running.
+	LaunchedBy string `json:"launched_by,omitempty"`
 	// ActiveTaskCount remains the compatibility/safety count of every claimed
 	// handleTask lifecycle. The additive counters split actual provider
 	// execution from local-directory parking for throughput and diagnostics.
@@ -117,6 +134,8 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 			PID:                   os.Getpid(),
 			OS:                    runtime.GOOS,
 			Uptime:                time.Since(startedAt).Truncate(time.Second).String(),
+			Profile:               d.cfg.Profile,
+			LaunchedBy:            d.cfg.LaunchedBy,
 			DaemonID:              d.cfg.DaemonID,
 			DeviceName:            d.cfg.DeviceName,
 			ServerURL:             d.cfg.ServerBaseURL,
