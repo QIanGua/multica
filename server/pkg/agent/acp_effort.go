@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"time"
 )
 
 // acp_effort.go holds the provider-neutral half of ACP reasoning-effort
@@ -166,10 +167,12 @@ func parseACPEffortOption(raw json.RawMessage) (acpEffortOption, bool) {
 // would wave it through, and the task would silently run at the default — the
 // exact fake switch this whole path exists to prevent.
 //
-// Models other than the current one keep a nil Thinking, which hides the picker
-// for them. Reading a real per-model catalog means driving the session's own
-// `model` config option once per model and consuming each refreshed response;
-// that is a follow-up, not something to fake here.
+// Models other than the current one keep a nil Thinking here. Reading a real
+// per-model catalog means driving the session's own `model` config option once
+// per model and consuming each refreshed response — that is what
+// probeACPPerModelEffort does, on top of this function rather than instead of
+// it: the current model's catalog arrives free with the handshake, so probing
+// it again would spend a session rebuild on an answer we already hold.
 func annotateACPThinkingForSessionModel(models []Model, sessionResult json.RawMessage) {
 	option, ok := parseACPEffortOption(sessionResult)
 	if !ok || len(option.Choices) == 0 {
@@ -193,6 +196,157 @@ func annotateACPThinkingForSessionModel(models []Model, sessionResult json.RawMe
 // Taking it as a function keeps this helper independent of which client struct
 // a given backend spawned.
 type acpRequestFn func(ctx context.Context, method string, params any) (json.RawMessage, error)
+
+// probeACPPerModelEffort reads the real effort catalog of every model the
+// discovery session did NOT open on, by driving the session's own `model`
+// config option and consuming each refreshed response.
+//
+// This is the other half of annotateACPThinkingForSessionModel, which can only
+// describe the one model the handshake happened to start on. The protocol
+// mechanism is the same one applyACPEffortOption uses in the other direction:
+// `session/set_config_option` returns the session's refreshed `configOptions`,
+// and because those options depend on each other, the effort option in that
+// response describes the model we just switched to. That is the only way to
+// learn a per-model catalog over ACP — there is no "describe model X" call.
+//
+// Three properties make this safe to run inside discovery rather than on a
+// user-visible path:
+//
+//   - It is additive. A model we cannot probe — budget exhausted, transport
+//     gone, switch unconfirmed — keeps the nil Thinking it already had, which
+//     hides its picker exactly as before. The failure mode is the status quo,
+//     never a wrong catalog.
+//   - It costs no extra process. The session is already open and about to be
+//     killed; discovery runs in the daemon's background model-list task, so the
+//     cost lands on a snapshot the model-catalog cache serves for hours.
+//   - It cannot touch the user's config. Callers that probe run discovery under
+//     an isolated state dir (acpDiscoveryProvider.isolatedStateEnv), so a
+//     runtime that persists the selected model writes to a temp dir we delete.
+//     Do NOT enable probing for a provider without that isolation: switching
+//     models would rewrite the model the user's own CLI opens on.
+//
+// The switch is confirmed against the runtime's own answer before the catalog
+// is attributed to a model. Without that check, a runtime that accepts the call
+// and stays on the previous model would have its catalog copied onto every
+// sibling — the "picker offers `low` on pro, task silently runs at default"
+// failure this whole path exists to prevent (MUL-5991).
+//
+// budget bounds the whole sweep. It is checked between models rather than
+// enforced per request: the ACP transport is a single shared stdout scanner, so
+// one hung switch can only be cut short by the discovery context that owns the
+// child process. Overshoot is bounded by that context, and the models parsed
+// before it still return.
+func probeACPPerModelEffort(
+	ctx context.Context,
+	request acpRequestFn,
+	backend string,
+	logger *slog.Logger,
+	sessionID string,
+	sessionResult json.RawMessage,
+	models []Model,
+	budget time.Duration,
+) {
+	if request == nil || sessionID == "" || len(models) == 0 {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	configID, ok := acpModelConfigID(sessionResult)
+	if !ok {
+		// The catalog came from the legacy `models.availableModels` block
+		// rather than a `model` config option, so there is no option id to
+		// address. Nothing to probe with; the session's own model keeps the
+		// catalog annotate already gave it.
+		logger.Debug("ACP session advertises no model config option; skipping per-model effort probing",
+			"backend", backend,
+		)
+		return
+	}
+
+	deadline := time.Now().Add(budget)
+	probed, unavailable, skipped := 0, 0, 0
+	for i := range models {
+		// The session's current model already carries the catalog the handshake
+		// handed us for free. Re-probing it would spend a session rebuild to
+		// re-learn what we know.
+		if models[i].Thinking != nil {
+			continue
+		}
+		if models[i].ID == "" {
+			continue
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			skipped++
+			continue
+		}
+
+		result, err := request(ctx, "session/set_config_option", map[string]any{
+			"sessionId": sessionID,
+			"configId":  configID,
+			"value":     models[i].ID,
+		})
+		if err != nil {
+			// The transport is shared across every probe, so a request error
+			// means the child process or the session is gone, not that this one
+			// model is special. Stop rather than retry the same failure per
+			// model; the catalog parsed so far is still returned.
+			logger.Debug("ACP per-model effort probing stopped early",
+				"backend", backend,
+				"model", models[i].ID,
+				"probed", probed,
+				"error", err,
+			)
+			skipped += len(models) - i
+			return
+		}
+
+		current, confirmed := acpConfigOptionCurrentValue(result, configID)
+		if !confirmed || current != models[i].ID {
+			// The runtime took the call without moving. Attributing the
+			// response's effort option to this model would describe whichever
+			// model the session is really on.
+			logger.Warn("runtime did not confirm the model switch; leaving this model without an effort catalog",
+				"backend", backend,
+				"config_id", configID,
+				"requested_model", models[i].ID,
+				"effective_model", current,
+			)
+			continue
+		}
+
+		option, ok := parseACPEffortOption(result)
+		if !ok || len(option.Choices) == 0 {
+			// A model whose provider protocol has no effort dial (reasonix
+			// resolves several to none). Absence is the right answer here, not
+			// a failure: nil Thinking hides the picker for this model alone.
+			unavailable++
+			continue
+		}
+		models[i].Thinking = &ModelThinking{
+			SupportedLevels: option.Choices,
+			DefaultLevel:    option.CurrentValue,
+		}
+		probed++
+	}
+
+	if skipped > 0 {
+		logger.Warn("ACP per-model effort probing did not cover every model; those models show no thinking picker",
+			"backend", backend,
+			"probed", probed,
+			"no_effort_option", unavailable,
+			"skipped", skipped,
+			"budget", budget.String(),
+		)
+		return
+	}
+	logger.Debug("ACP per-model effort probing complete",
+		"backend", backend,
+		"probed", probed,
+		"no_effort_option", unavailable,
+	)
+}
 
 // applyACPEffortOption pushes a persisted thinking level onto a live ACP
 // session using the selector that session advertised.

@@ -148,10 +148,14 @@ func ListModels(ctx context.Context, providerType, executablePath string) (Catal
 	}
 	switch providerType {
 	case "claude":
-		models := claudeStaticModels()
-		annotateClaudeThinking(ctx, models, executablePath)
-		// Claude's catalog is static by design, not by failure: there is no
-		// discovery step to fall back from, so this is authoritative.
+		// Claude has no CLI-side discovery to fall back from, so the static
+		// catalog is authoritative rather than a stand-in — never Fallback:true.
+		// Where the host carries an Anthropic credential the Models API refines
+		// it (new models, real per-model effort); where it does not, this is the
+		// static catalog it has always been. See claude_catalog.go.
+		discovered, discoveredOK := claudeAPICatalog(ctx)
+		models := mergeClaudeModels(claudeStaticModels(), discovered, discoveredOK)
+		annotateClaudeThinking(ctx, models, executablePath, discovered, discoveredOK)
 		return Catalog{Models: models}, nil
 	case "codex":
 		return cachedDiscovery(discoveryCacheKey(providerType, executablePath), func() (Catalog, error) {
@@ -1525,27 +1529,63 @@ func acpConfigOptionCurrentValue(raw json.RawMessage, configID string) (string, 
 	return value, value != ""
 }
 
+// reasonixDiscoveryTimeout and reasonixEffortProbeBudget bound the per-model
+// effort sweep described in discoverReasonixModels.
+//
+// The sweep costs one `session/set_config_option{model}` per model, and each
+// one makes reasonix rebuild the session controller. That per-switch cost has
+// not been measured against a real binary, so these are sized to be safe
+// without it rather than tuned to it: the budget is what the sweep may spend,
+// and the timeout leaves the handshake its original allowance on top. A switch
+// slow enough to blow the budget simply ends the sweep early — the remaining
+// models keep the nil Thinking they have today.
+//
+// Keep timeout > budget. The budget is checked between models, so the last
+// switch can start just under it; the difference is the headroom that lets a
+// slow one finish instead of dying with the process (and the reason
+// codebuddy's discovery-timeout incident, #6180, does not repeat here).
+const (
+	reasonixDiscoveryTimeout  = 45 * time.Second
+	reasonixEffortProbeBudget = 25 * time.Second
+)
+
 // discoverReasonixModels drives a short Reasonix ACP session and parses the
 // model configOptions advertised by session/new. Authentication and provider
 // configuration remain owned by `reasonix setup`; discovery failure therefore
 // falls back to manual model entry like the other ACP runtimes.
 //
-// The same handshake carries the effort selector, so annotate picks it up for
-// free — no second process and no reasonix-specific parser.
+// The same handshake carries the effort selector for the model the session
+// opened on, so annotate picks that one up for free. Every other model needs
+// its own answer, because reasonix derives the effort vocabulary from the
+// current model's provider entry — `deepseek-v4-flash` advertises `low` while
+// `deepseek-v4-pro` does not, and a model whose protocol resolves to none has
+// no effort option at all. probe reads those by driving the session's `model`
+// config option once per remaining model (see probeACPPerModelEffort).
 //
-// Only the session's current model gets a catalog: reasonix derives the effort
-// vocabulary from the current model's provider entry, so the advertised list
-// describes that model alone. Every other model keeps a nil Thinking and shows
-// no picker until per-model probing exists. See
-// annotateACPThinkingForSessionModel.
+// Doing that here, inside discovery, rather than on demand when the user picks
+// a model, is what keeps the cost off every user-visible path: this runs in the
+// daemon's background model-list task and its result is cached per runtime for
+// hours. It also removes the old dependency on which model the daemon host
+// happens to default to — before, that choice decided which single model got a
+// picker, and changing it silently moved the picker to another model once the
+// cache expired.
 func discoverReasonixModels(ctx context.Context, executablePath string) ([]Model, error) {
 	return discoverACPModels(ctx, executablePath, acpDiscoveryProvider{
-		defaultBin:       "reasonix",
-		clientName:       "multica-model-discovery",
-		acpArgs:          reasonixACPLaunchArgs(),
-		tmpdirPrefix:     "multica-reasonix-discovery-",
+		defaultBin:   "reasonix",
+		clientName:   "multica-model-discovery",
+		acpArgs:      reasonixACPLaunchArgs(),
+		tmpdirPrefix: "multica-reasonix-discovery-",
+		// Load-bearing for probe, not just hygiene: the sweep changes the
+		// session's model, and reasonix persists session config under its state
+		// home. Isolating it keeps discovery from rewriting the model the
+		// user's own `reasonix` opens on.
 		isolatedStateEnv: "REASONIX_STATE_HOME",
 		annotate:         annotateACPThinkingForSessionModel,
+		probe: func(ctx context.Context, request acpRequestFn, sessionID string, sessionResult json.RawMessage, models []Model) {
+			probeACPPerModelEffort(ctx, request, "reasonix", slog.Default(),
+				sessionID, sessionResult, models, reasonixEffortProbeBudget)
+		},
+		timeout: reasonixDiscoveryTimeout,
 	})
 }
 
@@ -1638,6 +1678,22 @@ type acpDiscoveryProvider struct {
 	// ignores. CodeBuddy uses it to read its effort catalog out of the same
 	// handshake, which is why it needs no separate discovery call at all.
 	annotate func([]Model, json.RawMessage)
+	// probe runs after annotate with the discovery session still live, so a
+	// provider can ask the session questions the single session/new response
+	// cannot answer — reasonix drives the `model` config option to read each
+	// model's real effort catalog. It receives the same slice annotate saw and
+	// enriches it in place.
+	//
+	// It must never fail discovery: whatever it could not learn stays absent,
+	// and the catalog parsed from session/new is returned either way. It is
+	// also the reason a probing provider needs isolatedStateEnv — see
+	// probeACPPerModelEffort.
+	probe func(ctx context.Context, request acpRequestFn, sessionID string, sessionResult json.RawMessage, models []Model)
+	// timeout overrides how long the whole handshake may take. Zero means
+	// acpDiscoveryTimeout. Raise it only for a provider that does real work
+	// past session/new (probe above); the plain handshake providers must stay
+	// on the short default so a wedged CLI cannot hold the model-list task.
+	timeout time.Duration
 	// inspectInit receives the raw initialize result before any session is
 	// created. It is for reading capability facts the handshake already
 	// carries — Kimi reads `agentInfo.version` to gate a feature on the CLI
@@ -1646,6 +1702,12 @@ type acpDiscoveryProvider struct {
 	// nothing useful here must degrade, not abort.
 	inspectInit func(json.RawMessage)
 }
+
+// acpDiscoveryTimeout bounds a plain initialize + session/new handshake. It is
+// deliberately short: model discovery runs on a heartbeat action, so a wedged
+// CLI holds the daemon's model-list task for exactly this long. Providers that
+// do more than handshake raise it via acpDiscoveryProvider.timeout.
+const acpDiscoveryTimeout = 15 * time.Second
 
 // discoverACPModels runs the ACP handshake for any agent CLI that
 // implements the standard `initialize` + `session/new` flow and
@@ -1666,7 +1728,11 @@ func discoverACPModels(ctx context.Context, executablePath string, p acpDiscover
 	if _, err := exec.LookPath(executablePath); err != nil {
 		return fail("executable lookup", err)
 	}
-	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	timeout := p.timeout
+	if timeout <= 0 {
+		timeout = acpDiscoveryTimeout
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var isolatedStateDir string
 	if p.isolatedStateEnv != "" {
@@ -1839,6 +1905,20 @@ func discoverACPModels(ctx context.Context, executablePath string, p acpDiscover
 	if p.annotate != nil {
 		p.annotate(models, sessionResult)
 	}
+	if p.probe != nil {
+		// Deliberately after the runCtx check above: probing is enrichment, so
+		// a session that ran out of budget mid-sweep must still return the
+		// catalog session/new already gave us. The adapter drops the params
+		// type down to the shared acpRequestFn shape; every probe call passes a
+		// map, which is what requestACP takes.
+		p.probe(runCtx, func(_ context.Context, method string, params any) (json.RawMessage, error) {
+			paramsMap, ok := params.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("ACP discovery probe: unsupported params type %T", params)
+			}
+			return requestACP(method, paramsMap)
+		}, extractACPSessionID(sessionResult), sessionResult, models)
+	}
 	return models, nil
 }
 
@@ -1976,8 +2056,7 @@ func parseACPConfigOptionModels(raw json.RawMessage) []Model {
 		configOptions = resp.ConfigOptionsSnake
 	}
 	for _, opt := range configOptions {
-		if !strings.EqualFold(strings.TrimSpace(opt.ID), "model") &&
-			!strings.EqualFold(strings.TrimSpace(opt.Category), "model") {
+		if !acpOptionIsModelSelector(opt.ID, opt.Category) {
 			continue
 		}
 		currentValue := strings.TrimSpace(opt.CurrentValue)
@@ -1999,6 +2078,52 @@ func parseACPConfigOptionModels(raw json.RawMessage) []Model {
 		}
 	}
 	return nil
+}
+
+// acpOptionIsModelSelector reports whether an ACP config option is the model
+// picker. Matching either the id or the category keeps the shapes different
+// backends emit working without a per-runtime table, and keeping it in one
+// place means the parser that reads the catalog and the prober that drives it
+// can never disagree about which option is the model.
+func acpOptionIsModelSelector(id, category string) bool {
+	return strings.EqualFold(strings.TrimSpace(id), "model") ||
+		strings.EqualFold(strings.TrimSpace(category), "model")
+}
+
+// acpModelConfigID returns the config id to send to session/set_config_option
+// to change the session's model, as advertised by a session/new (or
+// session/resume) response.
+//
+// Reports false when the response carries no addressable model option: an agent
+// that publishes its catalog through the legacy `models.availableModels` block
+// has no config id to drive, and an option we can read but not address is
+// useless. Callers treat that as "this runtime cannot be probed per model"
+// rather than as an error.
+func acpModelConfigID(raw json.RawMessage) (string, bool) {
+	type acpConfigOptionHeader struct {
+		ID       string `json:"id"`
+		Category string `json:"category"`
+	}
+	var resp struct {
+		ConfigOptions      []acpConfigOptionHeader `json:"configOptions"`
+		ConfigOptionsSnake []acpConfigOptionHeader `json:"config_options"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", false
+	}
+	configOptions := resp.ConfigOptions
+	if len(configOptions) == 0 {
+		configOptions = resp.ConfigOptionsSnake
+	}
+	for _, opt := range configOptions {
+		if !acpOptionIsModelSelector(opt.ID, opt.Category) {
+			continue
+		}
+		if id := strings.TrimSpace(opt.ID); id != "" {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // acpModelEntry builds one dropdown entry from an ACP-advertised model id

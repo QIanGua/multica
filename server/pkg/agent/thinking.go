@@ -33,6 +33,10 @@ type thinkingCacheKey struct {
 	provider       string
 	executablePath string
 	cliVersion     string
+	// catalogFingerprint identifies the discovered model catalog the mapping was
+	// built from, for providers whose per-model capabilities come from something
+	// other than the binary itself. Empty when the catalog is purely static.
+	catalogFingerprint string
 }
 
 type thinkingCacheEntry struct {
@@ -128,11 +132,17 @@ var claudeStaticEffortFullSuperset = []string{"low", "medium", "high", "xhigh", 
 
 // annotateClaudeThinking populates each entry's Thinking field by
 // running `claude --help` once and projecting the parsed superset
-// through claudeModelEffortAllow. Errors are silently absorbed so a
+// through the per-model allow-list. Errors are silently absorbed so a
 // missing CLI doesn't break model listing — the UI just hides the
 // picker for that model.
-func annotateClaudeThinking(ctx context.Context, models []Model, executablePath string) {
-	mapping := loadClaudeThinkingByModel(ctx, executablePath)
+//
+// discovered is the Anthropic Models API snapshot (see claude_catalog.go). It
+// supplies the per-model allow-list where it described a model; everywhere else
+// the hand-maintained claudeModelEffortAllow answers as before. Both are then
+// narrowed by the local CLI's `--effort` superset, because the installed binary
+// is what has to accept the flag.
+func annotateClaudeThinking(ctx context.Context, models []Model, executablePath string, discovered []claudeAPIModel, discoveredOK bool) {
+	mapping := loadClaudeThinkingByModel(ctx, executablePath, models, discovered, discoveredOK)
 	for i := range models {
 		if t, ok := mapping[models[i].ID]; ok && t != nil {
 			models[i].Thinking = t
@@ -140,21 +150,30 @@ func annotateClaudeThinking(ctx context.Context, models []Model, executablePath 
 	}
 }
 
-func loadClaudeThinkingByModel(ctx context.Context, executablePath string) map[string]*ModelThinking {
+func loadClaudeThinkingByModel(ctx context.Context, executablePath string, models []Model, discovered []claudeAPIModel, discoveredOK bool) map[string]*ModelThinking {
 	if executablePath == "" {
 		executablePath = "claude"
 	}
 	version, _ := DetectVersion(ctx, executablePath)
-	key := thinkingCacheKey{provider: "claude", executablePath: executablePath, cliVersion: version}
+	// The fingerprint is part of the key, not decoration: without it a snapshot
+	// that gains a model (or changes one's effort capabilities) would keep
+	// serving the mapping built from the previous one for the whole TTL, and the
+	// new model would show no picker despite discovery having found it.
+	key := thinkingCacheKey{
+		provider:           "claude",
+		executablePath:     executablePath,
+		cliVersion:         version,
+		catalogFingerprint: claudeCatalogFingerprint(discovered, discoveredOK),
+	}
 	if cached, ok := thinkingCacheGet(key); ok {
 		return cached
 	}
 
 	superset := claudeEffortSuperset(ctx, executablePath)
+	discoveredAllow := claudeDiscoveredEffortAllow(discovered, discoveredOK)
 	result := map[string]*ModelThinking{}
-	for _, m := range claudeStaticModels() {
-		allow := claudeModelEffortAllow[m.ID]
-		levels := projectClaudeLevels(superset, allow)
+	for _, m := range models {
+		levels := projectClaudeLevels(superset, claudeEffortAllowForModel(m.ID, discoveredAllow))
 		if len(levels) == 0 {
 			continue
 		}
