@@ -11,6 +11,56 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteTaskBatch = `-- name: DeleteTaskBatch :exec
+WITH
+batch AS MATERIALIZED (
+    SELECT id FROM unnest($1::uuid[]) AS t(id)
+),
+deleted_task_usage AS (
+    DELETE FROM task_usage WHERE task_id IN (SELECT id FROM batch)
+),
+deleted_task_messages AS (
+    DELETE FROM task_message WHERE task_id IN (SELECT id FROM batch)
+),
+deleted_task_tokens AS (
+    DELETE FROM task_token WHERE task_id IN (SELECT id FROM batch)
+),
+deleted_channel_outbound_cards AS (
+    DELETE FROM channel_outbound_card_message WHERE task_id IN (SELECT id FROM batch)
+),
+deleted_lark_outbound_cards AS (
+    DELETE FROM lark_outbound_card_message WHERE task_id IN (SELECT id FROM batch)
+),
+deleted_draft_restores AS (
+    DELETE FROM chat_draft_restore WHERE task_id IN (SELECT id FROM batch)
+)
+DELETE FROM agent_task_queue WHERE id IN (SELECT id FROM batch)
+`
+
+// Deletes one bounded batch of tasks together with everything that hangs off
+// them, every arm keyed by task_id against an existing index, then the task rows
+// by primary key. The legacy FK cascades stay a safety net only: this statement
+// is what actually removes the rows, so teardown keeps working when they go.
+func (q *Queries) DeleteTaskBatch(ctx context.Context, taskIds []pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteTaskBatch, taskIds)
+	return err
+}
+
+const deleteTaskTokensByAgent = `-- name: DeleteTaskTokensByAgent :exec
+DELETE FROM task_token WHERE agent_id = $1
+`
+
+// The third explicit task_token path. workspace_id (in DeleteWorkspaceLeafData)
+// and task_id (in DeleteTaskBatch) do not cover a token whose own workspace_id
+// points at a neighbour while its agent lives here, and teardown must not fall
+// back on the agent_id cascade for it. Uses idx_task_token_agent_id
+// (migration 275); one agent key per call for the same planner reason as
+// ListTaskIDsByAgentBatch.
+func (q *Queries) DeleteTaskTokensByAgent(ctx context.Context, agentID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteTaskTokensByAgent, agentID)
+	return err
+}
+
 const deleteWorkspaceAdministration = `-- name: DeleteWorkspaceAdministration :exec
 WITH
 deleted_members AS (
@@ -186,9 +236,6 @@ ws_skills AS MATERIALIZED (
 ws_squads AS MATERIALIZED (
     SELECT id FROM squad WHERE workspace_id = $1
 ),
-ws_tasks AS MATERIALIZED (
-    SELECT id FROM unnest($2::uuid[]) AS t(id)
-),
 ws_sessions AS MATERIALIZED (
     SELECT id FROM chat_session WHERE workspace_id = $1
 ),
@@ -210,14 +257,6 @@ ws_channel_installations AS MATERIALIZED (
 ws_lark_installations AS MATERIALIZED (
     SELECT id FROM lark_installation WHERE workspace_id = $1
 ),
-deleted_task_usage AS (
-    DELETE FROM task_usage
-    WHERE task_id IN (SELECT id FROM ws_tasks)
-),
-deleted_task_messages AS (
-    DELETE FROM task_message
-    WHERE task_id IN (SELECT id FROM ws_tasks)
-),
 deleted_task_tokens AS (
     DELETE FROM task_token
     WHERE workspace_id = $1
@@ -234,17 +273,14 @@ deleted_attachments AS (
 deleted_channel_outbound_cards AS (
     DELETE FROM channel_outbound_card_message
     WHERE chat_session_id IN (SELECT id FROM ws_sessions)
-       OR task_id IN (SELECT id FROM ws_tasks)
 ),
 deleted_lark_outbound_cards AS (
     DELETE FROM lark_outbound_card_message
     WHERE chat_session_id IN (SELECT id FROM ws_sessions)
-       OR task_id IN (SELECT id FROM ws_tasks)
 ),
 deleted_draft_restores AS (
     DELETE FROM chat_draft_restore
     WHERE chat_session_id IN (SELECT id FROM ws_sessions)
-       OR task_id IN (SELECT id FROM ws_tasks)
 ),
 deleted_agent_builder_drafts AS (
     DELETE FROM agent_builder_draft WHERE workspace_id = $1
@@ -395,19 +431,15 @@ SET state = CASE
 WHERE channel_media_pending_object.workspace_id = $1
 `
 
-type DeleteWorkspaceLeafDataParams struct {
-	WorkspaceID pgtype.UUID   `json:"workspace_id"`
-	TaskIds     []pgtype.UUID `json:"task_ids"`
-}
-
-// $2 is the same task id snapshot PrepareWorkspaceDeletionLinks received.
-// Every task_token row carries workspace_id NOT NULL (migration 108), so the
-// workspace key alone covers this workspace's tokens, and migration 274 gives
-// it an index. The former `OR task_id IN (…) OR agent_id IN (…)` arms only ever
-// added tokens whose workspace_id points at a DIFFERENT workspace while their
-// task or agent lives here — and task_id / agent_id are both NOT NULL with
-// ON DELETE CASCADE, so `delete tasks` and `delete agents` below remove exactly
-// those rows. Keeping the OR cost a full scan of task_token (MUL-5999).
+// Everything task-keyed moved to DeleteTaskBatch, which runs in bounded batches
+// before this step; what is left is keyed by the workspace or by one of the
+// workspace-scoped id sets below.
+// One of three explicit task_token paths. This is the workspace-keyed one;
+// DeleteTaskBatch covers task_id and DeleteTaskTokensByAgent covers agent_id, so
+// a token whose workspace_id points at a neighbour while its task or agent lives
+// here is still removed by this teardown rather than by the FK cascade. The
+// former single statement combined all three with OR, which cost a full scan of
+// task_token (MUL-5999); split, each path is an index scan.
 // Same no-FK chore as chat_draft_restore above. Matched on workspace_id rather
 // than the session set because that column exists precisely so this statement
 // does not have to join through chat_session, which it deletes in this same CTE.
@@ -415,8 +447,8 @@ type DeleteWorkspaceLeafDataParams struct {
 // Moving every row out of pending also prevents a concurrent media bind from
 // attaching an object after the workspace teardown commits. The reconciler
 // performs the idempotent object delete and clears the row afterwards.
-func (q *Queries) DeleteWorkspaceLeafData(ctx context.Context, arg DeleteWorkspaceLeafDataParams) error {
-	_, err := q.db.Exec(ctx, deleteWorkspaceLeafData, arg.WorkspaceID, arg.TaskIds)
+func (q *Queries) DeleteWorkspaceLeafData(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteWorkspaceLeafData, workspaceID)
 	return err
 }
 
@@ -461,33 +493,69 @@ func (q *Queries) DeleteWorkspaceSquadsAndSkills(ctx context.Context, workspaceI
 	return err
 }
 
-const deleteWorkspaceTasks = `-- name: DeleteWorkspaceTasks :exec
-DELETE FROM agent_task_queue
-WHERE id = ANY($1::uuid[])
+const detachTaskBatchReferences = `-- name: DetachTaskBatchReferences :exec
+WITH detached_runs AS (
+    UPDATE autopilot_run
+    SET task_id = NULL
+    WHERE task_id = ANY($1::uuid[])
+)
+UPDATE agent_task_queue
+SET parent_task_id = NULL
+WHERE parent_task_id = ANY($1::uuid[])
 `
 
-// Deletes by primary key from the id snapshot the caller collected, so the plan
-// is a pkey lookup instead of the three-way OR's Seq Scan (MUL-5999).
-func (q *Queries) DeleteWorkspaceTasks(ctx context.Context, taskIds []pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, deleteWorkspaceTasks, taskIds)
+// Break inbound references to a task batch before deleting it, in the
+// application layer rather than through the FKs' ON DELETE SET NULL. Both
+// referencing columns are indexed (idx_agent_task_queue_parent from migration
+// 055, idx_autopilot_run_task_id from migration 277) so this stays a per-batch
+// index scan instead of the per-row full scan the FK action would do.
+//
+// Kept separate from DeleteTaskBatch: a task can be both a member of the batch
+// and the parent of another member, and updating plus deleting the same row
+// inside one statement is not well defined.
+func (q *Queries) DetachTaskBatchReferences(ctx context.Context, taskIds []pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, detachTaskBatchReferences, taskIds)
 	return err
 }
 
-const listTaskIDsByAgent = `-- name: ListTaskIDsByAgent :many
-SELECT id FROM agent_task_queue WHERE agent_id = $1
+const listTaskIDsByAgentBatch = `-- name: ListTaskIDsByAgentBatch :many
+SELECT id FROM agent_task_queue
+WHERE agent_id = $1
+ORDER BY id
+LIMIT $2
+FOR UPDATE
 `
 
-// One owner key per call, on purpose. All three ownership paths must stay
+type ListTaskIDsByAgentBatchParams struct {
+	AgentID pgtype.UUID `json:"agent_id"`
+	Limit   int32       `json:"limit"`
+}
+
+// One owner key per call, one bounded page per call.
+//
+// Single-key equality is deliberate. All three ownership paths must stay
 // (nothing enforces that a task's agent/runtime/issue share a workspace), but
-// expressing them as `OR agent_id IN (subquery) OR ...` — or as a UNION of
-// joins, or as `= ANY($1::uuid[])` over a whole workspace's agents — makes the
-// planner estimate a proportional share of the global table and fall back to a
-// Seq Scan on agent_task_queue. A single-key equality is the only form whose
-// row estimate stays small enough to be index-driven regardless of how the
-// workspace's tasks are distributed, so the loop lives in the caller
-// (MUL-5999). Uses idx_agent_task_queue_agent.
-func (q *Queries) ListTaskIDsByAgent(ctx context.Context, agentID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listTaskIDsByAgent, agentID)
+// expressing them as `OR agent_id IN (subquery) OR …` — or as a UNION of joins,
+// or as `= ANY($1::uuid[])` over a whole workspace's agents — makes the planner
+// estimate a proportional share of the global table and fall back to a Seq Scan
+// on agent_task_queue. A single-key equality is the only form whose row estimate
+// stays small enough to be index-driven regardless of how the workspace's tasks
+// are distributed (MUL-5999). Uses idx_agent_task_queue_agent.
+//
+// LIMIT keeps the caller's memory and the DELETE's parameter size bounded by the
+// batch size rather than by the workspace's lifetime task count. The caller
+// re-runs this query until it returns nothing; each iteration deletes the rows it
+// returned, so the same query yields the next page without a cursor.
+//
+// FOR UPDATE is load-bearing for correctness, not throughput. It locks the rows
+// this iteration is about to delete, and under READ COMMITTED PostgreSQL
+// re-checks the WHERE clause after acquiring each lock: a task a concurrent
+// committed UPDATE has already moved to another owner no longer matches and is
+// skipped, and one we did lock cannot be moved away before we delete it. Without
+// it, a task reassigned between the read and the delete would be deleted on the
+// strength of a stale ownership claim.
+func (q *Queries) ListTaskIDsByAgentBatch(ctx context.Context, arg ListTaskIDsByAgentBatchParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByAgentBatch, arg.AgentID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -506,14 +574,23 @@ func (q *Queries) ListTaskIDsByAgent(ctx context.Context, agentID pgtype.UUID) (
 	return items, nil
 }
 
-const listTaskIDsByIssue = `-- name: ListTaskIDsByIssue :many
-SELECT id FROM agent_task_queue WHERE issue_id = $1
+const listTaskIDsByIssueBatch = `-- name: ListTaskIDsByIssueBatch :many
+SELECT id FROM agent_task_queue
+WHERE issue_id = $1
+ORDER BY id
+LIMIT $2
+FOR UPDATE
 `
 
-// Uses idx_agent_task_queue_issue_id. See ListTaskIDsByAgent for why this is
-// one key per call.
-func (q *Queries) ListTaskIDsByIssue(ctx context.Context, issueID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listTaskIDsByIssue, issueID)
+type ListTaskIDsByIssueBatchParams struct {
+	IssueID pgtype.UUID `json:"issue_id"`
+	Limit   int32       `json:"limit"`
+}
+
+// Uses idx_agent_task_queue_issue_id. See ListTaskIDsByAgentBatch for the
+// single-key / LIMIT / FOR UPDATE rationale.
+func (q *Queries) ListTaskIDsByIssueBatch(ctx context.Context, arg ListTaskIDsByIssueBatchParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByIssueBatch, arg.IssueID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -532,87 +609,24 @@ func (q *Queries) ListTaskIDsByIssue(ctx context.Context, issueID pgtype.UUID) (
 	return items, nil
 }
 
-const listTaskIDsByRuntime = `-- name: ListTaskIDsByRuntime :many
-SELECT id FROM agent_task_queue WHERE runtime_id = $1
+const listTaskIDsByRuntimeBatch = `-- name: ListTaskIDsByRuntimeBatch :many
+SELECT id FROM agent_task_queue
+WHERE runtime_id = $1
+ORDER BY id
+LIMIT $2
+FOR UPDATE
 `
 
-// Uses idx_agent_task_queue_runtime_id (migration 273). Before that index the
-// only runtime_id indexes were partial, so this path had no index at all. See
-// ListTaskIDsByAgent for why this is one key per call.
-func (q *Queries) ListTaskIDsByRuntime(ctx context.Context, runtimeID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listTaskIDsByRuntime, runtimeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []pgtype.UUID{}
-	for rows.Next() {
-		var id pgtype.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+type ListTaskIDsByRuntimeBatchParams struct {
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	Limit     int32       `json:"limit"`
 }
 
-const listWorkspaceTaskOwnerAgents = `-- name: ListWorkspaceTaskOwnerAgents :many
-SELECT id FROM agent WHERE agent.workspace_id = $1
-`
-
-func (q *Queries) ListWorkspaceTaskOwnerAgents(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listWorkspaceTaskOwnerAgents, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []pgtype.UUID{}
-	for rows.Next() {
-		var id pgtype.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listWorkspaceTaskOwnerIssues = `-- name: ListWorkspaceTaskOwnerIssues :many
-SELECT id FROM issue WHERE issue.workspace_id = $1
-`
-
-func (q *Queries) ListWorkspaceTaskOwnerIssues(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listWorkspaceTaskOwnerIssues, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []pgtype.UUID{}
-	for rows.Next() {
-		var id pgtype.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listWorkspaceTaskOwnerRuntimes = `-- name: ListWorkspaceTaskOwnerRuntimes :many
-SELECT id FROM agent_runtime WHERE agent_runtime.workspace_id = $1
-`
-
-func (q *Queries) ListWorkspaceTaskOwnerRuntimes(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listWorkspaceTaskOwnerRuntimes, workspaceID)
+// Uses idx_agent_task_queue_runtime_id (migration 273); before that index every
+// runtime_id index was partial, so this path had none. See
+// ListTaskIDsByAgentBatch for the single-key / LIMIT / FOR UPDATE rationale.
+func (q *Queries) ListTaskIDsByRuntimeBatch(ctx context.Context, arg ListTaskIDsByRuntimeBatchParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByRuntimeBatch, arg.RuntimeID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -646,18 +660,89 @@ func (q *Queries) LockTaskUsageRollupForWorkspaceDelete(ctx context.Context) err
 	return err
 }
 
+const lockWorkspaceTaskOwnerAgents = `-- name: LockWorkspaceTaskOwnerAgents :many
+SELECT id FROM agent WHERE agent.workspace_id = $1 FOR UPDATE
+`
+
+// The three LockWorkspaceTaskOwner* queries are a write fence, not a lookup.
+// agent_task_queue has no workspace_id, so a task becomes this workspace's
+// problem through agent_id, issue_id or runtime_id — and inserting such a task
+// requires FOR KEY SHARE on the referenced owner row, which conflicts with
+// FOR UPDATE. Holding these locks for the rest of the teardown transaction
+// therefore blocks any enqueue (or reassignment) that would add a task to this
+// workspace after we have swept it, which row locks on the tasks alone cannot
+// do. Same technique the handler already uses on the workspace row to keep
+// CreateChatSession out of the delete window.
+func (q *Queries) LockWorkspaceTaskOwnerAgents(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, lockWorkspaceTaskOwnerAgents, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockWorkspaceTaskOwnerIssues = `-- name: LockWorkspaceTaskOwnerIssues :many
+SELECT id FROM issue WHERE issue.workspace_id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockWorkspaceTaskOwnerIssues(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, lockWorkspaceTaskOwnerIssues, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockWorkspaceTaskOwnerRuntimes = `-- name: LockWorkspaceTaskOwnerRuntimes :many
+SELECT id FROM agent_runtime WHERE agent_runtime.workspace_id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockWorkspaceTaskOwnerRuntimes(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, lockWorkspaceTaskOwnerRuntimes, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const prepareWorkspaceDeletionLinks = `-- name: PrepareWorkspaceDeletionLinks :exec
 WITH
-ws_tasks AS MATERIALIZED (
-    SELECT id FROM unnest($2::uuid[]) AS t(id)
-),
-detached_tasks AS (
-    UPDATE agent_task_queue
-    SET parent_task_id = NULL,
-        autopilot_run_id = NULL
-    WHERE id IN (SELECT id FROM ws_tasks)
-      AND (parent_task_id IS NOT NULL OR autopilot_run_id IS NOT NULL)
-),
 detached_comments AS (
     UPDATE comment
     SET parent_id = NULL
@@ -676,20 +761,14 @@ WHERE webhook_delivery.workspace_id = $1
   AND replayed_from_delivery_id IS NOT NULL
 `
 
-type PrepareWorkspaceDeletionLinksParams struct {
-	WorkspaceID pgtype.UUID   `json:"workspace_id"`
-	TaskIds     []pgtype.UUID `json:"task_ids"`
-}
-
 // Break self-references and the task/run cycle explicitly before deleting
 // either side. This keeps their ordering in the application-owned graph
 // instead of relying on ON DELETE SET NULL actions.
 //
-// $2 is the workspace's task id set, collected by the caller through the
-// ListTaskIDsBy* queries above and reused by DeleteWorkspaceLeafData and
-// DeleteWorkspaceTasks so all three steps act on one consistent snapshot.
-func (q *Queries) PrepareWorkspaceDeletionLinks(ctx context.Context, arg PrepareWorkspaceDeletionLinksParams) error {
-	_, err := q.db.Exec(ctx, prepareWorkspaceDeletionLinks, arg.WorkspaceID, arg.TaskIds)
+// The task half of this step now lives in DetachTaskBatchReferences, which runs
+// once per bounded batch instead of once for a whole workspace's task set.
+func (q *Queries) PrepareWorkspaceDeletionLinks(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, prepareWorkspaceDeletionLinks, workspaceID)
 	return err
 }
 

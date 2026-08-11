@@ -767,28 +767,31 @@ func effectiveWorkspaceDeleteLockTimeout() time.Duration {
 	return workspaceDeleteLockTimeout
 }
 
-// isLockTimeout reports whether err is Postgres' lock_not_available
-// (SQLSTATE 55P03), which is what `SET LOCAL lock_timeout` raises when a lock
-// wait exceeds its budget. It says nothing about the workspace itself: the row
-// is untouched and the caller can retry once the other holder is done.
-func isLockTimeout(err error) bool {
+// isRetryableLockFailure reports whether err is one of the two transient lock
+// outcomes a teardown can hit: lock_not_available (55P03), which is what
+// `SET LOCAL lock_timeout` raises when a wait exceeds its budget, and
+// deadlock_detected (40P01), which the owner-row locks can hit against a
+// concurrent task update that takes the same locks in the opposite order (task
+// row first, then its owner). Neither says anything about the workspace itself:
+// the transaction rolled back untouched and the caller can retry.
+func isRetryableLockFailure(err error) bool {
 	if err == nil {
 		return false
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		return pgErr.Code == "55P03"
+		return pgErr.Code == "55P03" || pgErr.Code == "40P01"
 	}
 	return false
 }
 
 // failWorkspaceDelete logs a failed teardown step and writes the response for
-// it. A lock timeout is transient and retryable, so it answers 503 with a
-// message the delete dialog can show; every other failure stays a 500.
+// it. A lock timeout or deadlock is transient and retryable, so it answers 503
+// with a message the delete dialog can show; every other failure stays a 500.
 func failWorkspaceDelete(w http.ResponseWriter, r *http.Request, workspaceID, step string, err error) {
 	attrs := append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID, "step", step)
-	if isLockTimeout(err) {
-		slog.Warn("workspace delete blocked by lock timeout", attrs...)
+	if isRetryableLockFailure(err) {
+		slog.Warn("workspace delete blocked by lock contention", attrs...)
 		writeError(w, http.StatusServiceUnavailable, "workspace deletion is temporarily blocked by another operation, please try again")
 		return
 	}
@@ -796,76 +799,130 @@ func failWorkspaceDelete(w http.ResponseWriter, r *http.Request, workspaceID, st
 	writeError(w, http.StatusInternalServerError, "failed to delete workspace")
 }
 
-// collectWorkspaceTaskIDs resolves every agent_task_queue row a workspace owns,
-// one owner key at a time.
+// workspaceDeleteTaskBatchSize bounds one iteration of the task teardown loop:
+// the ids held in this process, the array parameter sent back to Postgres, and
+// the row count of a single DELETE. A whole workspace's task set is not bounded
+// by anything — one busy agent can own millions of historical rows — so it must
+// never be materialized at once (MUL-5999 review).
+const workspaceDeleteTaskBatchSize = 1000
+
+// deleteWorkspaceTasks removes every agent_task_queue row a workspace owns,
+// together with the rows that hang off those tasks, in bounded batches.
 //
-// agent_task_queue has no workspace_id, and all three ownership paths have to
-// stay: nothing in the schema or the application enforces that a task's agent,
-// runtime and issue belong to the same workspace, so dropping a path would turn
-// a performance fix into a tenant-cleanup bug. What changed is HOW the set is
-// resolved. Expressing the three paths inside one statement — as the previous
-// `OR agent_id IN (subquery) OR …`, as a UNION of joins, or as
-// `agent_id = ANY($1)` over the whole workspace's agents — leaves the planner
-// estimating that the workspace owns a proportional share of the global table,
-// which it costs as a Seq Scan over every row in agent_task_queue. Measured on a
-// 1.2M-row synthetic copy of the prod shape (937 agents / 109 issues / 12
-// runtimes): OR form and 937-element array form both Seq Scan (~25k buffers);
-// single-key equality is a Bitmap Index Scan (~8 buffers per key).
+// Shape, and why:
 //
-// The returned ids are deduplicated because a task can be reachable through more
-// than one path, and the same snapshot feeds
-// PrepareWorkspaceDeletionLinks / DeleteWorkspaceLeafData / DeleteWorkspaceTasks
-// so every step acts on one consistent set inside the teardown transaction.
-func collectWorkspaceTaskIDs(ctx context.Context, qtx *db.Queries, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
-	seen := make(map[[16]byte]struct{})
-	taskIDs := make([]pgtype.UUID, 0)
-	appendTasks := func(ids []pgtype.UUID) {
-		for _, id := range ids {
-			if _, dup := seen[id.Bytes]; dup {
-				continue
+//   - One owner key per query. agent_task_queue has no workspace_id and all
+//     three ownership paths must stay (nothing enforces that a task's agent,
+//     runtime and issue share a workspace), but combining them in one statement —
+//     as the previous three-way OR, as a UNION of joins, or as `= ANY(array)`
+//     over a whole workspace's agents — leaves the planner estimating a
+//     proportional share of the global table and choosing a Seq Scan. Measured on
+//     a 1.2M-row synthetic copy of the prod shape: OR and 937-element array forms
+//     both Seq Scan (~25k blocks); single-key equality is a Bitmap Index Scan
+//     (~8 blocks).
+//   - Bounded pages. Each iteration reads at most workspaceDeleteTaskBatchSize
+//     ids and deletes exactly those, so the same query returns the next page and
+//     the loop ends when it comes back empty. No cursor, no whole-workspace
+//     snapshot.
+//   - Row locks, not a read snapshot. The batch query takes FOR UPDATE, so under
+//     READ COMMITTED Postgres re-checks ownership after acquiring each lock: a
+//     task a concurrent commit already moved to another owner is skipped rather
+//     than deleted on a stale claim, and a task we locked cannot move before we
+//     delete it.
+//   - Children first, in the application layer. DetachTaskBatchReferences breaks
+//     inbound references and DeleteTaskBatch removes task_usage, task_message,
+//     task_token, the two outbound card tables and chat_draft_restore before the
+//     task rows themselves. The legacy FK cascades stay a safety net only.
+//
+// The caller must already hold the owner-row locks (lockWorkspaceTaskOwners), or
+// a concurrent enqueue can add a task after its owner has been swept.
+func deleteWorkspaceTasks(ctx context.Context, qtx *db.Queries, owners workspaceTaskOwners) error {
+	type ownerKind struct {
+		label string
+		ids   []pgtype.UUID
+		page  func(context.Context, pgtype.UUID, int32) ([]pgtype.UUID, error)
+	}
+	kinds := []ownerKind{
+		{"agent", owners.Agents, func(ctx context.Context, id pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
+			return qtx.ListTaskIDsByAgentBatch(ctx, db.ListTaskIDsByAgentBatchParams{AgentID: id, Limit: limit})
+		}},
+		{"issue", owners.Issues, func(ctx context.Context, id pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
+			return qtx.ListTaskIDsByIssueBatch(ctx, db.ListTaskIDsByIssueBatchParams{IssueID: id, Limit: limit})
+		}},
+		{"runtime", owners.Runtimes, func(ctx context.Context, id pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
+			return qtx.ListTaskIDsByRuntimeBatch(ctx, db.ListTaskIDsByRuntimeBatchParams{RuntimeID: id, Limit: limit})
+		}},
+	}
+
+	for _, kind := range kinds {
+		for _, ownerID := range kind.ids {
+			for {
+				taskIDs, err := kind.page(ctx, ownerID, workspaceDeleteTaskBatchSize)
+				if err != nil {
+					return fmt.Errorf("list tasks by %s: %w", kind.label, err)
+				}
+				if len(taskIDs) == 0 {
+					break
+				}
+				if err := qtx.DetachTaskBatchReferences(ctx, taskIDs); err != nil {
+					return fmt.Errorf("detach task batch references: %w", err)
+				}
+				if err := qtx.DeleteTaskBatch(ctx, taskIDs); err != nil {
+					return fmt.Errorf("delete task batch: %w", err)
+				}
 			}
-			seen[id.Bytes] = struct{}{}
-			taskIDs = append(taskIDs, id)
 		}
 	}
 
-	agentIDs, err := qtx.ListWorkspaceTaskOwnerAgents(ctx, workspaceID)
-	if err != nil {
-		return nil, fmt.Errorf("list workspace agents: %w", err)
-	}
-	for _, agentID := range agentIDs {
-		ids, err := qtx.ListTaskIDsByAgent(ctx, agentID)
-		if err != nil {
-			return nil, fmt.Errorf("list tasks by agent: %w", err)
+	// Third explicit task_token path. workspace_id (leaf data) and task_id
+	// (DeleteTaskBatch) leave one shape uncovered: a token whose own
+	// workspace_id points at a neighbour while its agent lives here.
+	for _, agentID := range owners.Agents {
+		if err := qtx.DeleteTaskTokensByAgent(ctx, agentID); err != nil {
+			return fmt.Errorf("delete task tokens by agent: %w", err)
 		}
-		appendTasks(ids)
 	}
 
-	issueIDs, err := qtx.ListWorkspaceTaskOwnerIssues(ctx, workspaceID)
-	if err != nil {
-		return nil, fmt.Errorf("list workspace issues: %w", err)
-	}
-	for _, issueID := range issueIDs {
-		ids, err := qtx.ListTaskIDsByIssue(ctx, issueID)
-		if err != nil {
-			return nil, fmt.Errorf("list tasks by issue: %w", err)
-		}
-		appendTasks(ids)
-	}
+	return nil
+}
 
-	runtimeIDs, err := qtx.ListWorkspaceTaskOwnerRuntimes(ctx, workspaceID)
-	if err != nil {
-		return nil, fmt.Errorf("list workspace runtimes: %w", err)
-	}
-	for _, runtimeID := range runtimeIDs {
-		ids, err := qtx.ListTaskIDsByRuntime(ctx, runtimeID)
-		if err != nil {
-			return nil, fmt.Errorf("list tasks by runtime: %w", err)
-		}
-		appendTasks(ids)
-	}
+// workspaceTaskOwners holds the workspace's task owner ids, locked FOR UPDATE.
+type workspaceTaskOwners struct {
+	Agents   []pgtype.UUID
+	Issues   []pgtype.UUID
+	Runtimes []pgtype.UUID
+}
 
-	return taskIDs, nil
+// lockWorkspaceTaskOwners locks every row through which a task can belong to
+// this workspace, and returns their ids.
+//
+// This is the write fence for the task sweep. Locking the tasks themselves is
+// not enough: a task that does not exist yet cannot be locked, so a concurrent
+// enqueue could add one after its owner had been swept and leave it behind with
+// its own leaf rows. Inserting an agent_task_queue row takes FOR KEY SHARE on
+// the agent, issue and runtime it references, and FOR KEY SHARE conflicts with
+// FOR UPDATE — so holding these locks for the rest of the transaction blocks
+// exactly the inserts (and reassignments into this workspace) that could do
+// that. It is the same technique the workspace-row lock below uses to keep
+// CreateChatSession out of the delete window.
+//
+// The wait is bounded by SET LOCAL lock_timeout, and taking these locks can
+// deadlock against a concurrent task update that locks in the opposite order
+// (task row, then owner); both outcomes surface as a retryable 503.
+func lockWorkspaceTaskOwners(ctx context.Context, qtx *db.Queries, workspaceID pgtype.UUID) (workspaceTaskOwners, error) {
+	var owners workspaceTaskOwners
+	var err error
+
+	if owners.Agents, err = qtx.LockWorkspaceTaskOwnerAgents(ctx, workspaceID); err != nil {
+		return owners, fmt.Errorf("lock workspace agents: %w", err)
+	}
+	if owners.Issues, err = qtx.LockWorkspaceTaskOwnerIssues(ctx, workspaceID); err != nil {
+		return owners, fmt.Errorf("lock workspace issues: %w", err)
+	}
+	if owners.Runtimes, err = qtx.LockWorkspaceTaskOwnerRuntimes(ctx, workspaceID); err != nil {
+		return owners, fmt.Errorf("lock workspace runtimes: %w", err)
+	}
+	return owners, nil
 }
 
 func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
@@ -945,7 +1002,7 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 	// set-based delete scoped by workspace_id; the legacy cascades remain only
 	// as an expand-phase safety net until a later schema contract.
 	ctx := r.Context()
-	var workspaceTaskIDs []pgtype.UUID
+	var taskOwners workspaceTaskOwners
 	deleteSteps := []struct {
 		name string
 		run  func() error
@@ -955,27 +1012,22 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.SetWorkspaceTeardownMode(ctx) },
 		},
 		{
-			// Resolve the workspace's task set once, index-driven, and reuse
-			// it for every task-keyed step below. See collectWorkspaceTaskIDs
-			// for why this is a per-owner-key loop instead of one statement.
-			name: "collect workspace tasks",
+			// Fences task enqueue / reassignment for the rest of the
+			// transaction. Must run before anything sweeps tasks — see
+			// lockWorkspaceTaskOwners.
+			name: "lock task owners",
 			run: func() error {
-				ids, err := collectWorkspaceTaskIDs(ctx, qtx, requester.WorkspaceID)
+				owners, err := lockWorkspaceTaskOwners(ctx, qtx, requester.WorkspaceID)
 				if err != nil {
 					return err
 				}
-				workspaceTaskIDs = ids
+				taskOwners = owners
 				return nil
 			},
 		},
 		{
 			name: "prepare relationship graph",
-			run: func() error {
-				return qtx.PrepareWorkspaceDeletionLinks(ctx, db.PrepareWorkspaceDeletionLinksParams{
-					WorkspaceID: requester.WorkspaceID,
-					TaskIds:     workspaceTaskIDs,
-				})
-			},
+			run:  func() error { return qtx.PrepareWorkspaceDeletionLinks(ctx, requester.WorkspaceID) },
 		},
 		{
 			name: "delete chat pins",
@@ -991,21 +1043,19 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.LockTaskUsageRollupForWorkspaceDelete(ctx) },
 		},
 		{
+			// Bounded batches, after the rollup lock because it deletes
+			// task_usage. Replaces both the task-keyed arms of the old leaf
+			// data statement and the separate whole-workspace task delete.
+			name: "delete tasks",
+			run:  func() error { return deleteWorkspaceTasks(ctx, qtx, taskOwners) },
+		},
+		{
 			name: "delete leaf data",
-			run: func() error {
-				return qtx.DeleteWorkspaceLeafData(ctx, db.DeleteWorkspaceLeafDataParams{
-					WorkspaceID: requester.WorkspaceID,
-					TaskIds:     workspaceTaskIDs,
-				})
-			},
+			run:  func() error { return qtx.DeleteWorkspaceLeafData(ctx, requester.WorkspaceID) },
 		},
 		{
 			name: "delete autopilot runs",
 			run:  func() error { return qtx.DeleteWorkspaceAutopilotRuns(ctx, requester.WorkspaceID) },
-		},
-		{
-			name: "delete tasks",
-			run:  func() error { return qtx.DeleteWorkspaceTasks(ctx, workspaceTaskIDs) },
 		},
 		{
 			name: "delete chat messages",
