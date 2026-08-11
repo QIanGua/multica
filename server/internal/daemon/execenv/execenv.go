@@ -404,6 +404,15 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		env.QwenpawWorkspace = qwenpawWorkspace
 	}
 
+	// For Reasonix, deny the `ask` tool for this task through a project-scoped
+	// reasonix.toml. Degraded, not fatal: without it the task still runs under
+	// the backend's fail-closed question handling.
+	if params.Provider == "reasonix" {
+		if err := writeReasonixProjectConfig(workDir, manifest, logger); err != nil {
+			logger.Warn("execenv: write reasonix project config failed", "error", err)
+		}
+	}
+
 	// For Cursor, materialize managed MCP into project-local config and use
 	// an isolated CURSOR_DATA_DIR for the per-workdir approval sidecar. Cursor
 	// still reads ~/.cursor/mcp.json, but only servers with approval entries in
@@ -618,6 +627,15 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 			logger.Warn("execenv: refresh claude skill settings failed", "error", err)
 		} else {
 			env.ClaudeSettingsPath = settingsPath
+		}
+	}
+
+	// Re-deny Reasonix's `ask` tool on reuse: CleanupSidecars above removed the
+	// prior run's reasonix.toml, so without this the next turn would run with
+	// the tool available again.
+	if params.Provider == "reasonix" {
+		if err := writeReasonixProjectConfig(params.WorkDir, manifest, logger); err != nil {
+			logger.Warn("execenv: refresh reasonix project config failed", "error", err)
 		}
 	}
 
