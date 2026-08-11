@@ -197,6 +197,11 @@ func annotateACPThinkingForSessionModel(models []Model, sessionResult json.RawMe
 // a given backend spawned.
 type acpRequestFn func(ctx context.Context, method string, params any) (json.RawMessage, error)
 
+// acpProbeCompletionReserve is the tail of the discovery window that per-model
+// probing must leave alone, so the catalog it built has time to be returned and
+// reported instead of dying with the context that was still probing.
+const acpProbeCompletionReserve = 3 * time.Second
+
 // probeACPPerModelEffort reads the real effort catalog of every model the
 // discovery session did NOT open on, by driving the session's own `model`
 // config option and consuming each refreshed response.
@@ -231,11 +236,18 @@ type acpRequestFn func(ctx context.Context, method string, params any) (json.Raw
 // sibling — the "picker offers `low` on pro, task silently runs at default"
 // failure this whole path exists to prevent (MUL-5991).
 //
-// budget bounds the whole sweep. It is checked between models rather than
-// enforced per request: the ACP transport is a single shared stdout scanner, so
-// one hung switch can only be cut short by the discovery context that owns the
-// child process. Overshoot is bounded by that context, and the models parsed
-// before it still return.
+// budget bounds the whole sweep, and ctx's own deadline bounds it again: the
+// effective stop is the earlier of the two, minus acpProbeCompletionReserve.
+// That second clamp is what keeps the sweep from eating the discovery window it
+// runs inside — a cold model-list request has a client waiting on it
+// (modelDiscoveryClientPollTimeout), so a probe that ran to the context deadline
+// would leave nothing for reporting the catalog it just built.
+//
+// Both are checked between models rather than enforced per request: the ACP
+// transport is a single shared stdout scanner, so one hung switch can only be
+// cut short by the discovery context that owns the child process. Worst-case
+// overshoot is therefore one switch past the stop, hard-bounded by ctx, and the
+// models parsed before it still return.
 func probeACPPerModelEffort(
 	ctx context.Context,
 	request acpRequestFn,
@@ -266,6 +278,11 @@ func probeACPPerModelEffort(
 	}
 
 	deadline := time.Now().Add(budget)
+	if ctxDeadline, ok := ctx.Deadline(); ok {
+		if reserved := ctxDeadline.Add(-acpProbeCompletionReserve); reserved.Before(deadline) {
+			deadline = reserved
+		}
+	}
 	probed, unavailable, skipped := 0, 0, 0
 	for i := range models {
 		// The session's current model already carries the catalog the handshake

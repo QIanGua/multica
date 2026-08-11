@@ -150,11 +150,14 @@ func ListModels(ctx context.Context, providerType, executablePath string) (Catal
 	case "claude":
 		// Claude has no CLI-side discovery to fall back from, so the static
 		// catalog is authoritative rather than a stand-in — never Fallback:true.
-		// Where the host carries an Anthropic credential the Models API refines
-		// it (new models, real per-model effort); where it does not, this is the
-		// static catalog it has always been. See claude_catalog.go.
+		//
+		// The model LIST stays static on purpose: it is discovered per runtime
+		// while tasks execute per agent with the agent's own credentials, so a
+		// discovered id is not evidence the agent that picks it can run it. Only
+		// the per-model effort catalog is refined from the Models API, which is a
+		// property of the model rather than of the account. See claude_catalog.go.
+		models := claudeStaticModels()
 		discovered, discoveredOK := claudeAPICatalog(ctx)
-		models := mergeClaudeModels(claudeStaticModels(), discovered, discoveredOK)
 		annotateClaudeThinking(ctx, models, executablePath, discovered, discoveredOK)
 		return Catalog{Models: models}, nil
 	case "codex":
@@ -1529,24 +1532,43 @@ func acpConfigOptionCurrentValue(raw json.RawMessage, configID string) (string, 
 	return value, value != ""
 }
 
+// modelDiscoveryClientPollTimeout mirrors POLL_TIMEOUT_MS in
+// packages/core/runtimes/models.ts. It is the ceiling every discovery path has
+// to live under, and it is easy to miss from here: a runtime whose catalog is
+// NOT cached is discovered on the request path — InitiateListModels only
+// answers from cache when it has one, otherwise the browser polls until the
+// daemon reports (server/internal/handler/runtime_models.go). Overrun does not
+// degrade gracefully; the picker shows "model discovery timed out" while the
+// daemon is still working, and only the *next* open benefits.
+//
+// Keep this in sync with the TypeScript constant, and keep every
+// acpDiscoveryProvider.timeout meaningfully under it.
+const modelDiscoveryClientPollTimeout = 30 * time.Second
+
 // reasonixDiscoveryTimeout and reasonixEffortProbeBudget bound the per-model
 // effort sweep described in discoverReasonixModels.
 //
 // The sweep costs one `session/set_config_option{model}` per model, and each
 // one makes reasonix rebuild the session controller. That per-switch cost has
 // not been measured against a real binary, so these are sized to be safe
-// without it rather than tuned to it: the budget is what the sweep may spend,
-// and the timeout leaves the handshake its original allowance on top. A switch
-// slow enough to blow the budget simply ends the sweep early — the remaining
-// models keep the nil Thinking they have today.
+// without it rather than tuned to it.
 //
-// Keep timeout > budget. The budget is checked between models, so the last
-// switch can start just under it; the difference is the headroom that lets a
-// slow one finish instead of dying with the process (and the reason
-// codebuddy's discovery-timeout incident, #6180, does not repeat here).
+// Sizing is driven by modelDiscoveryClientPollTimeout above, not by how many
+// models we would like to cover: the first open of an uncached runtime is a
+// user waiting, so the whole handshake-plus-sweep has to finish inside that
+// window with room for the daemon to report. Hence a total that stays well
+// under it, a sweep budget that is a fraction of the total, and
+// acpProbeCompletionReserve holding back the tail. A slower binary covers fewer
+// models per discovery rather than overrunning — the uncovered ones keep the
+// nil Thinking they have today, which is the pre-existing behaviour.
+//
+// Keep timeout > budget: the budget is checked between models, so the last
+// switch can start just under it and the difference is what lets it finish
+// instead of dying with the process (#6180 is the same failure in another
+// runtime).
 const (
-	reasonixDiscoveryTimeout  = 45 * time.Second
-	reasonixEffortProbeBudget = 25 * time.Second
+	reasonixDiscoveryTimeout  = 20 * time.Second
+	reasonixEffortProbeBudget = 10 * time.Second
 )
 
 // discoverReasonixModels drives a short Reasonix ACP session and parses the

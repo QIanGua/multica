@@ -324,8 +324,58 @@ func TestReasonixProbeBudgetFitsDiscoveryTimeout(t *testing.T) {
 		t.Fatalf("probe budget %s must stay below the discovery timeout %s",
 			reasonixEffortProbeBudget, reasonixDiscoveryTimeout)
 	}
-	if reasonixDiscoveryTimeout-reasonixEffortProbeBudget < acpDiscoveryTimeout {
-		t.Fatalf("discovery timeout %s leaves only %s for the handshake; want at least %s",
-			reasonixDiscoveryTimeout, reasonixDiscoveryTimeout-reasonixEffortProbeBudget, acpDiscoveryTimeout)
+}
+
+// TestACPDiscoveryTimeoutsFitClientPollWindow is the regression test for the
+// cold-catalog case: a runtime with no cached catalog is discovered while a
+// browser polls for the answer, and that poll gives up at
+// modelDiscoveryClientPollTimeout. A discovery budget at or past it means the
+// picker reports "model discovery timed out" while the daemon is still working
+// — the user sees a failure and only the NEXT open benefits.
+//
+// Every provider timeout therefore has to leave room for the daemon to report
+// on top of its own work. Raising one without checking this is the easy mistake
+// (an earlier cut of the reasonix sweep used 45s against a 30s client cap).
+func TestACPDiscoveryTimeoutsFitClientPollWindow(t *testing.T) {
+	t.Parallel()
+
+	// Room for the heartbeat pickup, the report round trip, and the client's
+	// own 500ms poll interval.
+	const reportingHeadroom = 5 * time.Second
+
+	for name, timeout := range map[string]time.Duration{
+		"default ACP handshake": acpDiscoveryTimeout,
+		"reasonix":              reasonixDiscoveryTimeout,
+	} {
+		if timeout+reportingHeadroom > modelDiscoveryClientPollTimeout {
+			t.Errorf("%s discovery timeout %s leaves under %s of headroom against the client's %s poll window",
+				name, timeout, reportingHeadroom, modelDiscoveryClientPollTimeout)
+		}
+	}
+}
+
+// TestProbeACPPerModelEffortReservesTailOfDiscoveryWindow: the sweep must stop
+// before the discovery context expires, so the catalog it built has time to be
+// returned rather than dying with the context that was still probing. This
+// holds even when the caller's budget is larger than the window that remains.
+func TestProbeACPPerModelEffortReservesTailOfDiscoveryWindow(t *testing.T) {
+	t.Parallel()
+
+	// Less remaining than the reserve: nothing may be probed.
+	ctx, cancel := context.WithTimeout(context.Background(), acpProbeCompletionReserve/2)
+	defer cancel()
+
+	calls := 0
+	request := func(_ context.Context, _ string, params any) (json.RawMessage, error) {
+		calls++
+		return switchResult(params.(map[string]any)["value"].(string), "auto", "high"), nil
+	}
+
+	models := modelsFromSelector(t)
+	probeACPPerModelEffort(ctx, request, "reasonix", discardLogger(),
+		"ses-reasonix", json.RawMessage(reasonixModelSelectorSessionResult), models, time.Hour)
+
+	if calls != 0 {
+		t.Fatalf("made %d requests inside the completion reserve; want 0 even with a generous budget", calls)
 	}
 }

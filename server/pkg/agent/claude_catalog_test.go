@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
-	"strings"
 	"testing"
 )
 
@@ -372,91 +370,152 @@ func TestParseClaudeAPIModelsPageRejectsNonCatalog(t *testing.T) {
 	}
 }
 
-// ── Merge ────────────────────────────────────────────────────────────
+// ── Redirect handling ────────────────────────────────────────────────
 
-// TestMergeClaudeModelsWithoutDiscoveryIsUnchanged is the no-regression
-// guarantee for every host without a credential.
-func TestMergeClaudeModelsWithoutDiscoveryIsUnchanged(t *testing.T) {
+// TestFetchClaudeAPIModelsNeverFollowsRedirectWithCredential is a security
+// regression test.
+//
+// net/http strips only Authorization / Www-Authenticate / Cookie / Cookie2 /
+// Proxy-* when a redirect crosses domains — `x-api-key` is not on that list, so
+// with the default redirect policy a 302 hands the user's Anthropic key to
+// whatever host it names. ANTHROPIC_BASE_URL makes that reachable: it points at
+// gateways and proxies we do not control.
+func TestFetchClaudeAPIModelsNeverFollowsRedirectWithCredential(t *testing.T) {
 	t.Parallel()
 
-	static := claudeStaticModels()
 	for _, tc := range []struct {
-		name       string
-		discovered []claudeAPIModel
-		ok         bool
+		name    string
+		env     map[string]string
+		leaked  func(*http.Request) string
+		expects string
 	}{
-		{name: "no credential", ok: false},
-		{name: "empty discovery", discovered: []claudeAPIModel{}, ok: true},
-		{name: "failed discovery with stale data", discovered: []claudeAPIModel{{ID: "x"}}, ok: false},
+		{
+			name:    "api key",
+			env:     map[string]string{"ANTHROPIC_API_KEY": "sk-ant-secret"},
+			leaked:  func(r *http.Request) string { return r.Header.Get("x-api-key") },
+			expects: "sk-ant-secret",
+		},
+		{
+			name:    "oauth token",
+			env:     map[string]string{"ANTHROPIC_AUTH_TOKEN": "oat-secret"},
+			leaked:  func(r *http.Request) string { return r.Header.Get("Authorization") },
+			expects: "Bearer oat-secret",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := mergeClaudeModels(static, tc.discovered, tc.ok)
-			if len(got) != len(static) {
-				t.Fatalf("merged %d models, want the %d static ones", len(got), len(static))
+
+			var attackerSaw string
+			var attackerHits int
+			attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attackerHits++
+				attackerSaw = tc.leaked(r)
+				fmt.Fprint(w, `{"data":[{"id":"evil"}],"has_more":false}`)
+			}))
+			defer attacker.Close()
+
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, attacker.URL+"/v1/models", http.StatusFound)
+			}))
+			defer origin.Close()
+
+			env := map[string]string{"ANTHROPIC_BASE_URL": origin.URL}
+			for k, v := range tc.env {
+				env[k] = v
 			}
-			for i := range static {
-				if !reflect.DeepEqual(got[i], static[i]) {
-					t.Fatalf("entry %d = %+v, want %+v", i, got[i], static[i])
-				}
+			models, ok := fetchClaudeAPIModels(context.Background(), envFrom(env), origin.Client())
+
+			if attackerHits != 0 {
+				t.Fatalf("redirect target was contacted %d time(s); the credential request must not follow redirects", attackerHits)
+			}
+			if attackerSaw != "" {
+				t.Fatalf("credential %q reached the redirect target", attackerSaw)
+			}
+			// An unfollowed 3xx is "no answer": keep the static catalog.
+			if ok || models != nil {
+				t.Fatalf("got (%v, %v) from a redirecting host, want (nil, false)", models, ok)
 			}
 		})
 	}
 }
 
-// TestMergeClaudeModelsUnionsBothSources: a model released after the last
-// Multica release must appear, and a model the API organisation cannot see must
-// not disappear — the two halves of why this is a union and not a replacement.
-func TestMergeClaudeModelsUnionsBothSources(t *testing.T) {
+// TestFetchClaudeAPIModelsDoesNotMutateCallerClient: the no-redirect policy is
+// applied to a copy, so a client the caller owns keeps its own behaviour.
+func TestFetchClaudeAPIModelsDoesNotMutateCallerClient(t *testing.T) {
 	t.Parallel()
 
-	static := []Model{
-		{ID: "claude-sonnet-4-6", Label: "Claude Sonnet 4.6", Provider: "anthropic", Default: true},
-		{ID: "claude-opus-5", Label: "Claude Opus 5", Provider: "anthropic"},
-		{ID: "claude-subscription-only", Label: "Subscription Only", Provider: "anthropic"},
-	}
-	discovered := []claudeAPIModel{
-		{ID: "claude-opus-9", DisplayName: "Claude Opus 9"},
-		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6"},
-		{ID: "claude-opus-5", DisplayName: "Claude Opus 5"},
-	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"data":[{"id":"a"}],"has_more":false}`)
+	}))
+	defer server.Close()
 
-	got := mergeClaudeModels(static, discovered, true)
-	wantOrder := []string{"claude-opus-9", "claude-sonnet-4-6", "claude-opus-5", "claude-subscription-only"}
-	if len(got) != len(wantOrder) {
-		t.Fatalf("merged %d models, want %d", len(got), len(wantOrder))
+	client := server.Client()
+	if _, ok := fetchClaudeAPIModels(context.Background(), envFrom(map[string]string{
+		"ANTHROPIC_API_KEY":  "k",
+		"ANTHROPIC_BASE_URL": server.URL,
+	}), client); !ok {
+		t.Fatal("fetch failed")
 	}
-	for i, id := range wantOrder {
-		if got[i].ID != id {
-			t.Fatalf("entry %d = %q, want %q (discovered order first, static-only after)", i, got[i].ID, id)
-		}
-		if got[i].Provider != "anthropic" {
-			t.Fatalf("%s: provider = %q, want anthropic", id, got[i].Provider)
-		}
-	}
-	// The static table owns the default; discovery has no opinion about it.
-	for _, m := range got {
-		if (m.ID == "claude-sonnet-4-6") != m.Default {
-			t.Fatalf("%s: default = %v, want it only on claude-sonnet-4-6", m.ID, m.Default)
-		}
+	if client.CheckRedirect != nil {
+		t.Fatal("fetch installed its redirect policy on the caller's client")
 	}
 }
 
-func TestMergeClaudeModelsFallsBackToCuratedLabel(t *testing.T) {
-	t.Parallel()
+// ── Model list stays static ──────────────────────────────────────────
 
-	static := []Model{{ID: "claude-opus-5", Label: "Claude Opus 5", Provider: "anthropic"}}
-	got := mergeClaudeModels(static, []claudeAPIModel{
-		{ID: "claude-opus-5"},
-		{ID: "claude-opus-9"},
-	}, true)
+// TestListModelsClaudeNeverAddsDiscoveredModelIDs pins the decision taken after
+// review of #6761: the model LIST is discovered per runtime while tasks execute
+// per agent with the agent's own ANTHROPIC_API_KEY, so a discovered id is not
+// evidence that the agent picking it can run it. Publishing one would be the
+// "advertised but doesn't work" outcome this issue exists to prevent.
+//
+// Effort capabilities are not account-scoped and are still applied — that is
+// the half this discovery is allowed to influence.
+func TestListModelsClaudeNeverAddsDiscoveredModelIDs(t *testing.T) {
+	// Mutates package-global caches and the fetch hook; must stay serial.
+	resetClaudeAPICatalogForTests()
+	resetThinkingCacheForTests()
+	defer resetClaudeAPICatalogForTests()
+	defer resetThinkingCacheForTests()
 
-	if got[0].Label != "Claude Opus 5" {
-		t.Fatalf("label = %q, want the curated label when display_name is absent", got[0].Label)
+	original := claudeAPICatalogFetch
+	claudeAPICatalogFetch = func(context.Context) ([]claudeAPIModel, bool) {
+		return []claudeAPIModel{
+			// A model only this credential's organisation can see.
+			{ID: "claude-org-a-only", DisplayName: "Org A Only",
+				EffortLevels: map[string]bool{"low": true}},
+			// A model that IS in the static catalog, with narrower effort than
+			// the hand table grants it.
+			{ID: "claude-opus-5", DisplayName: "Claude Opus 5",
+				EffortLevels: map[string]bool{"low": true, "medium": true, "high": true}},
+		}, true
 	}
-	// A model with no curated label at all still renders something usable.
-	if got[1].Label != "claude-opus-9" {
-		t.Fatalf("label = %q, want the model id as a last resort", got[1].Label)
+	defer func() { claudeAPICatalogFetch = original }()
+
+	catalog, err := ListModels(context.Background(), "claude", writeFakeClaudeHelpBinary(t))
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+
+	static := claudeStaticModels()
+	if len(catalog.Models) != len(static) {
+		t.Fatalf("catalog has %d models, want the %d static ones — discovery must not add ids",
+			len(catalog.Models), len(static))
+	}
+	byID := map[string]Model{}
+	for i, m := range catalog.Models {
+		byID[m.ID] = m
+		if m.ID != static[i].ID {
+			t.Fatalf("entry %d = %q, want %q", i, m.ID, static[i].ID)
+		}
+	}
+	if _, leaked := byID["claude-org-a-only"]; leaked {
+		t.Fatal("a discovered-only model reached the picker")
+	}
+	// The effort half still applies: the API narrowed opus-5 below the hand
+	// table's five levels, and that is the answer we keep.
+	if got := thinkingValues(byID["claude-opus-5"].Thinking); len(got) != 3 {
+		t.Fatalf("claude-opus-5 levels = %v, want the API's three", got)
 	}
 }
 
@@ -560,64 +619,6 @@ func TestClaudeCatalogFingerprintTracksCapabilities(t *testing.T) {
 
 // ── End-to-end through ListModels ────────────────────────────────────
 
-// TestListModelsClaudeSurfacesDiscoveredModel is the completion criterion for
-// the Claude half of MUL-6020: a model Anthropic ships after this build must
-// reach the picker with its real effort levels, without a Multica release.
-func TestListModelsClaudeSurfacesDiscoveredModel(t *testing.T) {
-	// Mutates package-global caches and the fetch hook; must stay serial.
-	resetClaudeAPICatalogForTests()
-	resetThinkingCacheForTests()
-	defer resetClaudeAPICatalogForTests()
-	defer resetThinkingCacheForTests()
-
-	original := claudeAPICatalogFetch
-	claudeAPICatalogFetch = func(context.Context) ([]claudeAPIModel, bool) {
-		return []claudeAPIModel{
-			{ID: "claude-opus-9", DisplayName: "Claude Opus 9",
-				EffortLevels: map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}},
-			{ID: "claude-haiku-9", DisplayName: "Claude Haiku 9",
-				EffortLevels: map[string]bool{"low": true, "medium": true, "high": true}},
-		}, true
-	}
-	defer func() { claudeAPICatalogFetch = original }()
-
-	// A stub `claude` whose --help advertises the full effort superset, so the
-	// projection is driven by the discovered capabilities rather than the CLI.
-	stub := writeFakeClaudeHelpBinary(t)
-
-	catalog, err := ListModels(context.Background(), "claude", stub)
-	if err != nil {
-		t.Fatalf("ListModels: %v", err)
-	}
-	if catalog.Fallback {
-		t.Fatal("claude's catalog is authoritative; Fallback must stay false")
-	}
-
-	byID := map[string]Model{}
-	for _, m := range catalog.Models {
-		byID[m.ID] = m
-	}
-	opus, ok := byID["claude-opus-9"]
-	if !ok {
-		t.Fatalf("discovered model missing from the catalog: %v", byID)
-	}
-	if got := thinkingValues(opus.Thinking); len(got) != 5 {
-		t.Fatalf("claude-opus-9 levels = %v, want all five", got)
-	}
-	// The API says haiku has no xhigh/max, and no hand-maintained table knows
-	// this model at all — the exact gap that used to need a Multica release.
-	haiku := byID["claude-haiku-9"]
-	if got := thinkingValues(haiku.Thinking); len(got) != 3 || strings.Contains(strings.Join(got, ","), "xhigh") {
-		t.Fatalf("claude-haiku-9 levels = %v, want low/medium/high", got)
-	}
-	// Static entries the API did not return must survive the merge.
-	if _, ok := byID["claude-sonnet-4-6"]; !ok {
-		t.Fatal("static model dropped by the merge")
-	}
-}
-
-// TestListModelsClaudeWithoutCredentialIsStatic pins the other half: with no
-// credential the catalog is byte-for-byte the pre-existing static one.
 func TestListModelsClaudeWithoutCredentialIsStatic(t *testing.T) {
 	// Mutates package-global caches and the fetch hook; must stay serial.
 	resetClaudeAPICatalogForTests()

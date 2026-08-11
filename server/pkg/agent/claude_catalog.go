@@ -37,10 +37,13 @@ import (
 //
 // So discovery here is CREDENTIAL-GATED, and its absence is not a failure:
 //
-//   - Credential present  → the API is authoritative for per-model effort and
-//     additive for the model list.
+//   - Credential present  → the API supplies each model's real effort catalog.
 //   - Credential absent   → behaviour is byte-for-byte what it was before this
 //     file existed. No request is made.
+//
+// It refines the effort catalog ONLY. The model LIST stays static, because that
+// one cannot be made sound at this layer — see "Why the model LIST stays static"
+// below.
 //
 // Three rules keep the gate honest:
 //
@@ -136,6 +139,24 @@ func fetchClaudeAPIModels(ctx context.Context, env func(string) string, client *
 	if client == nil {
 		client = &http.Client{Timeout: claudeAPITimeout}
 	}
+	// Never follow a redirect on a request that carries a credential.
+	//
+	// net/http strips only Authorization / Www-Authenticate / Cookie / Cookie2 /
+	// Proxy-* when a redirect crosses domains — `X-Api-Key` is not on that list,
+	// so a 302 from the configured host would hand the user's Anthropic key to
+	// whatever origin it names. ANTHROPIC_BASE_URL makes that reachable in
+	// practice: it points at gateways and proxies we do not control. Even the
+	// headers Go does strip are kept across a same-host HTTPS→HTTP downgrade.
+	//
+	// ErrUseLastResponse hands the 3xx back unfollowed, which the status check
+	// below already treats as "no answer" → keep the static catalog. Copy the
+	// client rather than mutating one the caller owns; the shallow copy shares
+	// the transport, which is what we want.
+	noRedirect := *client
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	client = &noRedirect
 	baseURL := claudeAPIBaseURL(env)
 
 	reqCtx, cancel := context.WithTimeout(ctx, claudeAPITimeout)
@@ -293,8 +314,15 @@ type claudeAPICatalogEntry struct {
 }
 
 var (
-	claudeAPICatalogMu    sync.Mutex
-	claudeAPICatalogCache claudeAPICatalogEntry
+	claudeAPICatalogMu sync.Mutex
+	// claudeAPICatalogFetchMu serialises the fetch itself. Without it, every
+	// concurrent cache miss issues its own request to an external API, and
+	// whichever finishes LAST wins the cache — so a failed request could
+	// overwrite a fresh successful snapshot. Held across the network call, with
+	// a second cache check underneath, so the losers of the race read the
+	// winner's result instead of repeating it.
+	claudeAPICatalogFetchMu sync.Mutex
+	claudeAPICatalogCache   claudeAPICatalogEntry
 )
 
 // resetClaudeAPICatalogForTests is exposed for tests only; production code
@@ -320,13 +348,17 @@ var claudeAPICatalogFetch = func(ctx context.Context) ([]claudeAPIModel, bool) {
 // retrying it on every discovery would put a doomed network call in front of a
 // picker that already has a correct static answer.
 func claudeAPICatalog(ctx context.Context) ([]claudeAPIModel, bool) {
-	claudeAPICatalogMu.Lock()
-	if time.Now().Before(claudeAPICatalogCache.expiresAt) {
-		models, ok := claudeAPICatalogCache.models, claudeAPICatalogCache.ok
-		claudeAPICatalogMu.Unlock()
+	if models, ok, fresh := claudeAPICatalogCached(); fresh {
 		return models, ok
 	}
-	claudeAPICatalogMu.Unlock()
+
+	// One fetch at a time. Re-check underneath: a caller that queued behind the
+	// winner must read its result rather than issue a second request.
+	claudeAPICatalogFetchMu.Lock()
+	defer claudeAPICatalogFetchMu.Unlock()
+	if models, ok, fresh := claudeAPICatalogCached(); fresh {
+		return models, ok
+	}
 
 	models, ok := claudeAPICatalogFetch(ctx)
 
@@ -340,67 +372,41 @@ func claudeAPICatalog(ctx context.Context) ([]claudeAPIModel, bool) {
 	return models, ok
 }
 
-// ── Merging ──────────────────────────────────────────────────────────
-
-// mergeClaudeModels combines the discovered catalog with the static one.
-//
-// The merge is a UNION, not a replacement, and that asymmetry is the point.
-// Codex and Kimi replace their static list on a successful discovery because
-// discovery runs through the same binary and the same account that will execute
-// the task — what it reports is what the CLI will accept. Here the two are
-// different auth contexts: the credential in the environment belongs to an API
-// organisation, while Claude Code may be running on a subscription login that
-// can reach models that organisation cannot. Replacing would then delete
-// working models from the picker to fix a staleness problem.
-//
-// So: every discovered model appears (this is what makes a new release show up
-// without a Multica release), and every static model survives (this is what
-// makes the change safe). Discovered order leads because it is the fresher
-// signal; static-only entries keep their relative order after it.
-func mergeClaudeModels(static []Model, discovered []claudeAPIModel, discoveredOK bool) []Model {
-	if !discoveredOK || len(discovered) == 0 {
-		return static
+func claudeAPICatalogCached() (models []claudeAPIModel, ok, fresh bool) {
+	claudeAPICatalogMu.Lock()
+	defer claudeAPICatalogMu.Unlock()
+	if time.Now().Before(claudeAPICatalogCache.expiresAt) {
+		return claudeAPICatalogCache.models, claudeAPICatalogCache.ok, true
 	}
-
-	staticByID := make(map[string]Model, len(static))
-	for _, m := range static {
-		staticByID[m.ID] = m
-	}
-	// The static table owns which model is the everyday default; discovery has
-	// no opinion about it. Carry the flag over only if that model still exists.
-	defaultID := ""
-	for _, m := range static {
-		if m.Default {
-			defaultID = m.ID
-			break
-		}
-	}
-
-	out := make([]Model, 0, len(discovered)+len(static))
-	seen := make(map[string]bool, len(discovered)+len(static))
-	for _, d := range discovered {
-		entry := Model{ID: d.ID, Label: d.DisplayName, Provider: "anthropic"}
-		if prior, ok := staticByID[d.ID]; ok && entry.Label == "" {
-			// display_name is normally present; fall back to the curated label
-			// rather than rendering a bare model id.
-			entry.Label = prior.Label
-		}
-		if entry.Label == "" {
-			entry.Label = d.ID
-		}
-		entry.Default = d.ID == defaultID
-		out = append(out, entry)
-		seen[d.ID] = true
-	}
-	for _, m := range static {
-		if seen[m.ID] {
-			continue
-		}
-		out = append(out, m)
-		seen[m.ID] = true
-	}
-	return out
+	return nil, false, false
 }
+
+// ── Why the model LIST stays static ──────────────────────────────────
+//
+// An earlier cut of this file merged the discovered model ids into the picker,
+// so a model Anthropic shipped after the last Multica release would appear on
+// its own. That is removed, and the reason is a credential-scope mismatch this
+// layer cannot resolve (review of #6761):
+//
+//   - The catalog is discovered per RUNTIME. handleModelList is given a runtime
+//     and an executable path, nothing else, and the answer is cached per runtime.
+//   - Tasks execute per AGENT, and an agent's own ANTHROPIC_API_KEY is layered
+//     into the child environment at launch (layerCustomEnvAndHermesHome —
+//     ANTHROPIC_API_KEY is named in its doc comment as a typical value).
+//
+// So the key that answers "which models exist" is not necessarily the key that
+// runs the task. A daemon-env key for organisation A would publish A's models
+// into a picker used by an agent that executes with organisation B's key, or on
+// a subscription login. The union direction protected against *removing* a model
+// B can run; it did nothing about *adding* one only A can — which is the
+// "advertised but doesn't work" outcome this whole issue exists to avoid, and
+// the model list is exactly where we have no per-agent signal to fix it.
+//
+// `capabilities.effort` has no such problem: which levels a model accepts is a
+// property of the model, not of the account asking. That half is kept below.
+// Restoring dynamic model ids needs an agent-scoped catalog (the discovery
+// request would have to carry the agent's resolved credentials) — a protocol
+// change, tracked separately, not something a comment can make safe.
 
 // claudeEffortAllowForModel decides which effort levels a model may offer,
 // before the local CLI's own superset narrows them further.
