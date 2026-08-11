@@ -147,20 +147,30 @@ func parseACPEffortOption(raw json.RawMessage) (acpEffortOption, bool) {
 	return acpEffortOption{}, false
 }
 
-// annotateACPThinkingFromSession fills in each model's effort catalog from the
-// selector carried by the SAME session/new response the models came from, so
-// the catalog costs no extra process.
+// annotateACPThinkingForSessionModel fills in the effort catalog for the model
+// the session is currently on, from the SAME session/new response the models
+// came from, so the catalog costs no extra process.
 //
-// Every model shares one catalog because ACP scopes configOptions to the
-// session, not the model: a backend's effort selector is independent of which
-// model the session is on. Per-model catalogs need a separate structured
-// interface from the CLI — `codex debug models --bundled`, `kimi provider list`
-// — which ACP does not offer. ModelThinking is still per model, so a runtime
-// that later exposes per-model efforts can diverge without touching the UI.
+// ONLY that model is annotated, and this is the load-bearing part. A session's
+// configOptions describe the session's *current* configuration, and the ACP
+// session-config RFD lets options depend on each other: change the model and
+// the effort option can change vocabulary or disappear. reasonix v1.21.5 does
+// exactly that — `SessionConfigState` resolves the provider entry for the
+// current model and derives the catalog with `EffortCapabilityForEntry`, so
+// `deepseek-v4-flash` advertises `low` while `deepseek-v4-pro` does not, GLM /
+// OpenAI / MiniMax / Ollama Cloud each carry their own vocabulary, and a model
+// whose protocol resolves to none gets no effort option at all.
 //
-// Models keep a nil Thinking when nothing is advertised: no picker beats a
-// picker that does nothing.
-func annotateACPThinkingFromSession(models []Model, sessionResult json.RawMessage) {
+// Copying one model's catalog onto its siblings therefore invents levels the
+// runtime will refuse: the picker would offer `low` on pro, ValidateThinkingLevel
+// would wave it through, and the task would silently run at the default — the
+// exact fake switch this whole path exists to prevent.
+//
+// Models other than the current one keep a nil Thinking, which hides the picker
+// for them. Reading a real per-model catalog means driving the session's own
+// `model` config option once per model and consuming each refreshed response;
+// that is a follow-up, not something to fake here.
+func annotateACPThinkingForSessionModel(models []Model, sessionResult json.RawMessage) {
 	option, ok := parseACPEffortOption(sessionResult)
 	if !ok || len(option.Choices) == 0 {
 		return
@@ -170,7 +180,12 @@ func annotateACPThinkingFromSession(models []Model, sessionResult json.RawMessag
 		DefaultLevel:    option.CurrentValue,
 	}
 	for i := range models {
-		models[i].Thinking = thinking
+		// Default is set from the session's advertised currentModelId, so it
+		// marks the one model this catalog actually describes. If nothing is
+		// marked, annotate nothing rather than guessing.
+		if models[i].Default {
+			models[i].Thinking = thinking
+		}
 	}
 }
 
@@ -189,19 +204,25 @@ type acpRequestFn func(ctx context.Context, method string, params any) (json.Raw
 // fresh session, the previous turn's level on a resumed one); on an
 // unconfirmed reply it sits at whatever the backend reports.
 //
-// The read-back is the load-bearing part. `set_config_option` answering
-// success does not mean the agent applied anything: Kimi ≤0.28.1 confirms "on"
-// after being set to "max", and Hermes records the value without wiring it
-// into the agent. Re-reading currentValue is the only signal available at
-// runtime that separates a runtime that honours the level from one that just
-// accepts the call.
+// The read-back is worth doing but it is NOT proof the level took effect. It
+// confirms one thing only: that the session's own configOptions now report the
+// value we asked for. It catches a runtime that accepts the call and leaves the
+// setting where it was — Kimi ≤0.28.1 confirms "on" after being set to "max" —
+// but a runtime could equally echo the new value and still not thread it into
+// the provider request. Nothing observable on this wire distinguishes that.
+// Knowing a runtime actually honours the setting comes from checking its source
+// or a real run, which is what admission to acpCatalogThinkingProviders means;
+// the read-back is runtime confirmation and diagnostics on top of that.
 //
-// resumed says whether sessionResult came from session/resume rather than
-// session/new. It only changes how loudly a missing option is reported: ACP
-// does not require resume to re-advertise configOptions, and a resumed session
-// already carries the previous turn's level, so silence there is expected
-// rather than a fault. The cost is that changing an agent's level mid-session
-// takes effect on the next fresh session — see the reasonix call site.
+// stateIsCurrent says whether sessionResult still describes the session as it
+// is right now. It does not after a model switch: ACP options may depend on
+// each other, so the effort vocabulary advertised for the model the session
+// opened on can differ from the one it is on after session/set_model — and
+// reasonix returns an empty result from set_model, publishing the refreshed
+// options only through a config_option_update notification that the shared
+// client drops. When the state is stale we skip the local vocabulary check
+// rather than test the level against the wrong model's list, send the request,
+// and let the runtime's own answer decide.
 func applyACPEffortOption(
 	ctx context.Context,
 	request acpRequestFn,
@@ -210,7 +231,7 @@ func applyACPEffortOption(
 	sessionID string,
 	sessionResult json.RawMessage,
 	level string,
-	resumed bool,
+	stateIsCurrent bool,
 ) {
 	if level == "" {
 		return
@@ -221,29 +242,23 @@ func applyACPEffortOption(
 
 	option, ok := parseACPEffortOption(sessionResult)
 	if !ok || len(option.Choices) == 0 {
-		if resumed {
-			// Expected: the session keeps whatever level it was created with.
-			// Warning here would fire on every turn of every resumed task.
-			logger.Debug("resumed session re-advertises no reasoning-effort option; keeping the level it already has",
-				"backend", backend,
-				"requested_level", level,
-			)
-			return
-		}
-		// A fresh session that advertises nothing is a real gap: the agent
-		// carries a level the server accepted against a previously discovered
-		// catalog. A CLI downgrade, a different account, or a model without
-		// the dial all land here.
+		// The agent carries a level the server accepted against a previously
+		// discovered catalog, but this session advertises none. A CLI
+		// downgrade, a different account, or a model without the dial all land
+		// here. Without an option id there is nothing to address, so there is
+		// no request to send even speculatively.
 		logger.Warn("session advertises no reasoning-effort option; sending the prompt without it",
 			"backend", backend,
 			"requested_level", level,
 		)
 		return
 	}
-	if !option.supports(level) {
+	if stateIsCurrent && !option.supports(level) {
 		// Sending an unadvertised token invites a hard error from the backend
 		// on a call whose failure we deliberately swallow. Skipping keeps the
-		// session on a level it actually understands.
+		// session on a level it actually understands. Only trustworthy while
+		// the advertised list still describes the live session — see
+		// stateIsCurrent.
 		logger.Warn("session does not advertise the requested reasoning effort; sending the prompt without it",
 			"backend", backend,
 			"config_id", option.ConfigID,

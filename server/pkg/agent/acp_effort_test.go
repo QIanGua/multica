@@ -127,37 +127,56 @@ func TestParseACPEffortOptionLabelFallback(t *testing.T) {
 	}
 }
 
-// ── annotateACPThinkingFromSession ───────────────────────────────────
+// ── annotateACPThinkingForSessionModel ───────────────────────────────
 
-// TestAnnotateACPThinkingFromSession: ACP scopes configOptions to the session,
-// not the model, so every model shares one catalog.
-func TestAnnotateACPThinkingFromSession(t *testing.T) {
+// TestAnnotateACPThinkingForSessionModel: the advertised catalog describes the
+// model the session is on and nothing else, so only that model is annotated.
+//
+// reasonix v1.21.5 derives the effort levels from the current model's provider
+// entry (`EffortCapabilityForEntry`), and the vocabularies genuinely differ —
+// `deepseek-v4-flash` has `low`, `deepseek-v4-pro` does not. Copying one
+// model's catalog onto its siblings would offer `low` on pro, and the runtime
+// would refuse it at apply time while the task ran on at the default.
+func TestAnnotateACPThinkingForSessionModel(t *testing.T) {
 	t.Parallel()
-	models := []Model{{ID: "deepseek-v4-flash"}, {ID: "deepseek-v4"}}
-	annotateACPThinkingFromSession(models, json.RawMessage(reasonixEffortSessionResult))
-
-	for _, m := range models {
-		if m.Thinking == nil {
-			t.Fatalf("model %q was not annotated", m.ID)
-		}
-		if len(m.Thinking.SupportedLevels) != 5 {
-			t.Errorf("model %q: %d levels, want 5", m.ID, len(m.Thinking.SupportedLevels))
-		}
-		if m.Thinking.DefaultLevel != "max" {
-			t.Errorf("model %q: DefaultLevel = %q, want max", m.ID, m.Thinking.DefaultLevel)
-		}
+	models := []Model{
+		{ID: "deepseek-v4-flash", Default: true},
+		{ID: "deepseek-v4-pro"},
 	}
-	if models[0].Thinking != models[1].Thinking {
-		t.Error("session-scoped catalogs should be shared, not copied per model")
+	annotateACPThinkingForSessionModel(models, json.RawMessage(reasonixEffortSessionResult))
+
+	if models[0].Thinking == nil {
+		t.Fatal("the session's current model must carry the advertised catalog")
+	}
+	if len(models[0].Thinking.SupportedLevels) != 5 || models[0].Thinking.DefaultLevel != "max" {
+		t.Errorf("current model thinking = %+v", models[0].Thinking)
+	}
+	if models[1].Thinking != nil {
+		t.Errorf("non-current model got %+v; its real catalog is unknown and must stay nil",
+			models[1].Thinking)
 	}
 }
 
-// TestAnnotateACPThinkingFromSessionNoOption: no advertised dial means no
+// TestAnnotateACPThinkingForSessionModelNoDefault: if nothing is marked as the
+// session's current model there is no model the catalog is known to describe,
+// so annotate nothing rather than guessing at the first entry.
+func TestAnnotateACPThinkingForSessionModelNoDefault(t *testing.T) {
+	t.Parallel()
+	models := []Model{{ID: "a"}, {ID: "b"}}
+	annotateACPThinkingForSessionModel(models, json.RawMessage(reasonixEffortSessionResult))
+	for _, m := range models {
+		if m.Thinking != nil {
+			t.Errorf("model %q was annotated with no current model to anchor the catalog", m.ID)
+		}
+	}
+}
+
+// TestAnnotateACPThinkingForSessionModelNoOption: no advertised dial means no
 // picker. A picker that cannot change anything is worse than none.
-func TestAnnotateACPThinkingFromSessionNoOption(t *testing.T) {
+func TestAnnotateACPThinkingForSessionModelNoOption(t *testing.T) {
 	t.Parallel()
 	models := []Model{{ID: "m"}}
-	annotateACPThinkingFromSession(models, json.RawMessage(`{"sessionId":"s","modes":{}}`))
+	annotateACPThinkingForSessionModel(models, json.RawMessage(`{"sessionId":"s","modes":{}}`))
 	if models[0].Thinking != nil {
 		t.Errorf("Thinking = %+v, want nil when the session advertises no effort option", models[0].Thinking)
 	}
@@ -192,7 +211,7 @@ func TestApplyACPEffortOptionSendsAdvertisedID(t *testing.T) {
 	request, calls := recordingACPRequest(echo, nil)
 
 	applyACPEffortOption(context.Background(), request, "reasonix", discardLogger(),
-		"ses-1", json.RawMessage(reasonixEffortSessionResult), "low", false)
+		"ses-1", json.RawMessage(reasonixEffortSessionResult), "low", true)
 
 	if len(*calls) != 1 {
 		t.Fatalf("calls = %+v, want exactly one set_config_option", *calls)
@@ -240,7 +259,7 @@ func TestApplyACPEffortOptionSkips(t *testing.T) {
 			t.Parallel()
 			request, calls := recordingACPRequest(`{}`, nil)
 			applyACPEffortOption(context.Background(), request, "reasonix", discardLogger(),
-				"ses-1", json.RawMessage(tc.sessionResult), tc.level, false)
+				"ses-1", json.RawMessage(tc.sessionResult), tc.level, true)
 			if len(*calls) != 0 {
 				t.Errorf("sent %+v, want no request at all", *calls)
 			}
@@ -279,6 +298,35 @@ func TestApplyACPEffortOptionResumedWithoutOption(t *testing.T) {
 	}
 }
 
+// TestApplyACPEffortOptionStaleStateDefersToRuntime: after a model switch the
+// advertised list describes the model the session opened on, not the one it is
+// now running. Testing the level against that list would be testing it against
+// the wrong model, so the check is skipped and the runtime's own answer decides.
+func TestApplyACPEffortOptionStaleStateDefersToRuntime(t *testing.T) {
+	t.Parallel()
+	// `ultra` is absent from the session/new list. With current state that is a
+	// skip; with stale state it must go out and let the runtime rule on it.
+	echo := `{"configOptions":[{"id":"effort","currentValue":"ultra","options":[{"value":"ultra"}]}]}`
+
+	request, calls := recordingACPRequest(echo, nil)
+	applyACPEffortOption(context.Background(), request, "reasonix", discardLogger(),
+		"ses-1", json.RawMessage(reasonixEffortSessionResult), "ultra", false)
+	if len(*calls) != 1 {
+		t.Fatalf("calls = %+v, want the request sent when the advertised list is stale", *calls)
+	}
+	if (*calls)[0].params["value"] != "ultra" {
+		t.Errorf("params = %+v", (*calls)[0].params)
+	}
+
+	// Same input, state known current: the local check short-circuits it.
+	request, calls = recordingACPRequest(echo, nil)
+	applyACPEffortOption(context.Background(), request, "reasonix", discardLogger(),
+		"ses-1", json.RawMessage(reasonixEffortSessionResult), "ultra", true)
+	if len(*calls) != 0 {
+		t.Errorf("sent %+v, want the unadvertised level skipped against fresh state", *calls)
+	}
+}
+
 // TestApplyACPEffortOptionSurvivesUnconfirmedApply pins the Kimi ≤0.28.1 /
 // Hermes shape: set_config_option answers success but the session reports a
 // different level. The task must continue — the read-back exists to log the
@@ -307,7 +355,7 @@ func TestApplyACPEffortOptionSurvivesUnconfirmedApply(t *testing.T) {
 			t.Parallel()
 			request, calls := recordingACPRequest(tc.reply, tc.err)
 			applyACPEffortOption(context.Background(), request, "reasonix", discardLogger(),
-				"ses-1", json.RawMessage(reasonixEffortSessionResult), "max", false)
+				"ses-1", json.RawMessage(reasonixEffortSessionResult), "max", true)
 			if len(*calls) != 1 {
 				t.Fatalf("calls = %+v, want the attempt to still have been made", *calls)
 			}

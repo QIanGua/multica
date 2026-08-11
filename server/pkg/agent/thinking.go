@@ -773,15 +773,19 @@ var thinkingDynamicCatalogProviders = map[string]bool{
 //     — its discovery runs over ACP but it executes through its own CLI
 //     surface (`--acp` is blocked in copilot.go), so a catalog here would
 //     render a picker with nothing behind it.
-//   - Setting the option demonstrably changes the session. Advertising is not
-//     evidence: Hermes accepts set_config_option and ignores it, and Kimi
-//     ≤0.28.1 confirms "on" after being set to "max". applyACPEffortOption's
-//     read-back catches this at runtime, but keeping the list opt-in means a
-//     runtime nobody has verified never gets a picker in the first place.
+//   - Someone has confirmed the runtime actually threads the setting into its
+//     provider request, from its source or a real run. Advertising is not
+//     evidence — Hermes accepts set_config_option and ignores it, Kimi ≤0.28.1
+//     confirms "on" after being set to "max" — and neither is the read-back in
+//     applyACPEffortOption, which only proves the session reports the new
+//     value. This list is where that offline verification is recorded; the
+//     read-back is runtime diagnostics on top of it.
 var acpCatalogThinkingProviders = map[string]bool{
-	// Verified against reasonix v1.21.x: session/new advertises option id
-	// `effort` (category `thought_level`) with auto|disabled|low|high|max, and
-	// set_config_option echoes the refreshed currentValue.
+	// reasonix v1.21.5: session/new advertises option id `effort` (category
+	// `thought_level`), set_config_option returns the refreshed options, and
+	// the effort reaches the session controller rather than stopping at the
+	// config surface. Its catalog is per model — see
+	// annotateACPThinkingForSessionModel.
 	"reasonix": true,
 }
 

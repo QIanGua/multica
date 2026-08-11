@@ -385,12 +385,12 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		// the runtime's own default, which is a degraded result rather than a
 		// wrong one. The helper logs what actually took effect.
 		//
-		// On a resumed session this only re-applies when session/resume echoes
-		// the option back. When it does not, the session keeps the level it was
-		// created with, so a level changed mid-session lands on the next fresh
-		// one rather than immediately.
+		// sessionResult stops describing the live session once set_model runs
+		// above, because reasonix derives the effort catalog from the current
+		// model and returns nothing from set_model. Say so, so the helper
+		// trusts the runtime's answer over a stale advertised list.
 		applyACPEffortOption(runCtx, c.request, "reasonix", b.cfg.Logger,
-			sessionID, sessionResult, opts.ThinkingLevel, opts.ResumeSessionID != "")
+			sessionID, sessionResult, opts.ThinkingLevel, opts.Model == "")
 
 		// 4. Send the prompt and wait for PromptResponse. Reasonix loads
 		// AGENTS.md from cwd, so the daemon deliberately does not duplicate the
