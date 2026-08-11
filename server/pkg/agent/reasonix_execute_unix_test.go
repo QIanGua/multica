@@ -150,41 +150,6 @@ done
 	}
 }
 
-func TestReasonixPromptCarriesUnattendedNotice(t *testing.T) {
-	t.Parallel()
-	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
-	fakePath := filepath.Join(t.TempDir(), "reasonix")
-	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScript(recordPath, "notice-session", "{}")))
-	backend, err := New("reasonix", Config{ExecutablePath: fakePath, Logger: slog.Default()})
-	if err != nil {
-		t.Fatalf("New(reasonix): %v", err)
-	}
-	session, err := backend.Execute(context.Background(), "Reply to the comment.", ExecOptions{Timeout: 5 * time.Second})
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	go func() {
-		for range session.Messages {
-		}
-	}()
-	if result := <-session.Result; result.Status != "completed" {
-		t.Fatalf("result = %+v", result)
-	}
-
-	frame := findRecordedFrame(t, recordPath, "session/prompt")
-	blocks := frame["params"].(map[string]any)["prompt"].([]any)
-	if len(blocks) != 1 {
-		t.Fatalf("prompt blocks = %+v, want one text block", blocks)
-	}
-	text := blocks[0].(map[string]any)["text"].(string)
-	if !strings.HasPrefix(text, "Reply to the comment.") {
-		t.Fatalf("prompt dropped the task text: %q", text)
-	}
-	if !strings.Contains(text, reasonixUnattendedNotice) {
-		t.Fatalf("prompt = %q, want the unattended notice appended", text)
-	}
-}
-
 func TestReasonixResumeFiltersUnsupportedSSEMCP(t *testing.T) {
 	t.Parallel()
 	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")

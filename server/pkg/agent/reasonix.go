@@ -43,34 +43,6 @@ func reasonixACPLaunchArgs() []string {
 	}
 }
 
-// reasonixUnattendedNotice tells Reasonix that this turn has no interactive
-// user, so it must not reach for the `ask` tool.
-//
-// Reasonix registers `ask` unconditionally and its ACP server wires an asker
-// for every session, so the runtime's own "no interactive user" fallback —
-// which answers the question with "decide for yourself" — is unreachable over
-// ACP. A question that does arrive can only be refused, and Reasonix reads an
-// unanswered question as a dismissal and cancels the whole turn.
-//
-// This rides the per-turn user message rather than the AGENTS.md runtime brief
-// because two agents can call `ask` in one turn: the executor, which reads
-// AGENTS.md, and the planner, which runs on its own system prompt and never
-// sees the workdir brief. The user message is the only surface both read.
-const reasonixUnattendedNotice = "Unattended Multica task: there is no interactive user in this session. " +
-	"Do NOT call the `ask` tool — nobody can answer it, and an unanswered question cancels the whole turn. " +
-	"When a decision is genuinely open, take the most conservative reversible option, keep going, " +
-	"and state the assumption you made in your final issue comment."
-
-// withReasonixUnattendedNotice appends the unattended notice to the per-turn
-// prompt. It lands last so it sits after any quoted issue or comment body the
-// daemon injected, and an empty prompt still carries the constraint.
-func withReasonixUnattendedNotice(prompt string) string {
-	if strings.TrimSpace(prompt) == "" {
-		return reasonixUnattendedNotice
-	}
-	return prompt + "\n\n" + reasonixUnattendedNotice
-}
-
 // reasonixReaderDrainGrace bounds how long the turn waits for trailing ACP
 // notifications after the session/prompt response. A var, not a const, so
 // tests can shorten it. Mirrors qoderReaderDrainGrace / traecliReaderDrainGrace.
@@ -402,13 +374,12 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 		// 4. Send the prompt and wait for PromptResponse. Reasonix loads
 		// AGENTS.md from cwd, so the daemon deliberately does not duplicate the
-		// runtime brief in this user message — only the unattended notice, which
-		// AGENTS.md cannot deliver to both agents in the turn.
+		// runtime brief in this user message.
 		streamingCurrentTurn.Store(true)
 		_, err = c.request(runCtx, "session/prompt", map[string]any{
 			"sessionId": sessionID,
 			"prompt": []map[string]any{
-				{"type": "text", "text": withReasonixUnattendedNotice(prompt)},
+				{"type": "text", "text": prompt},
 			},
 		})
 		if err != nil {
