@@ -72,6 +72,38 @@ func TestReasonixPermissionPolicy(t *testing.T) {
 	}
 }
 
+func TestReasonixUnattendedNoticeRidesEveryPrompt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		prompt string
+		want   string
+	}{
+		{name: "appended after the task prompt", prompt: "Reply to the comment.", want: "Reply to the comment.\n\n" + reasonixUnattendedNotice},
+		{name: "empty prompt still carries the constraint", prompt: "   ", want: reasonixUnattendedNotice},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := withReasonixUnattendedNotice(tt.prompt); got != tt.want {
+				t.Fatalf("prompt = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	// The notice exists to keep BOTH Reasonix agents off the ask tool — the
+	// executor and the planner, which never sees AGENTS.md. Naming the tool and
+	// the fallback behaviour is the whole payload; a reword that drops either
+	// leaves the planner with no instruction at all.
+	if !strings.Contains(reasonixUnattendedNotice, "`ask`") {
+		t.Fatalf("notice must name the ask tool: %q", reasonixUnattendedNotice)
+	}
+	if !strings.Contains(reasonixUnattendedNotice, "no interactive user") {
+		t.Fatalf("notice must state that no user can answer: %q", reasonixUnattendedNotice)
+	}
+}
+
 func TestReasonixPermissionMetadataWarningDetection(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
