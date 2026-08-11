@@ -58,6 +58,9 @@ const (
 	skipMaxDepth             = "max_depth"
 	skipConditionFalse       = "condition_false"
 	skipConditionAlreadyTrue = "condition_already_true"
+	// skipExecutionDisabled marks a match observed while execution was off for the
+	// workspace. Terminal on purpose — see the shadow note in decideOne.
+	skipExecutionDisabled = "execution_disabled"
 
 	// errCodeInvalidConfig marks the isolation row written for a candidate whose
 	// stored revision cannot be evaluated.
@@ -224,7 +227,23 @@ func (s *HookService) tryClaimAndDecide(ctx context.Context, candidate db.PeekCl
 		}
 		event := claimedEvent(rows[0])
 		took, eventID = true, event.ID
-		ok, err := s.decideAndFinalize(ctx, tx, qtx, event, pinnedCandidates(rows), lease)
+
+		// PER-WORKSPACE gate (MUL-4332 review: workspace rollout). The loop used to
+		// ask the flag once with the process root context, which carries no
+		// workspace — so a workspace-targeted rule matched nothing and only a global
+		// override could turn the engine on, for everyone at once.
+		//
+		// A disabled workspace's event is still CLAIMED and dispatched, with an empty
+		// candidate set. Leaving it pending would be worse in both directions: the
+		// oldest events of disabled workspaces would fill the ordered candidate
+		// window and starve the one workspace under canary, and turning the flag on
+		// later would replay the entire accumulated backlog at once. Dispatching it
+		// undecided means the engine starts from "now" for whoever is enabled next.
+		candidates := pinnedCandidates(rows)
+		if !s.hooksEnabledFor(ctx, event.WorkspaceID) {
+			candidates = nil
+		}
+		ok, err := s.decideAndFinalize(ctx, tx, qtx, event, candidates, lease)
 		dispatched = ok
 		return err
 	})
@@ -409,12 +428,20 @@ func (s *HookService) MatchEvent(ctx context.Context, event db.DomainEvent) erro
 // recorded as a terminal `failed` row and the loop continues, while a transient
 // (database) failure aborts the whole event so it retries intact.
 func (s *HookService) decideCandidates(ctx context.Context, tx pgx.Tx, qtx *db.Queries, event db.DomainEvent, view automation.EventView, candidates []pinnedCandidate) error {
+	// SHADOW (MUL-4332 review: retroactive execution). Decided ONCE per event, for
+	// this event's workspace. When execution is off, a match must NOT be recorded as
+	// `queued`: the executor's claim query selects every queued row regardless of age,
+	// so an entire observation period would fire the moment execution is switched on —
+	// the opposite of "observe first, then enable safely". A shadow decision is
+	// written in a TERMINAL status the claim can never select, while still recording
+	// the full match/condition snapshot so the observation itself is preserved.
+	shadow := !s.executionEnabledFor(ctx, event.WorkspaceID)
 	for _, candidate := range candidates {
 		sp, err := tx.Begin(ctx) // SAVEPOINT
 		if err != nil {
 			return err
 		}
-		err = processHookForEvent(ctx, s.Queries.WithTx(sp), event, view, candidate)
+		err = processHookForEvent(ctx, s.Queries.WithTx(sp), event, view, candidate, shadow)
 		if err == nil {
 			if err := sp.Commit(ctx); err != nil { // RELEASE SAVEPOINT
 				return err
@@ -440,7 +467,7 @@ func (s *HookService) decideCandidates(ctx context.Context, tx pgx.Tx, qtx *db.Q
 
 // processHookForEvent makes and persists the fire/skip decision for one (hook,
 // event) pair against the revision pinned when the event was claimed.
-func processHookForEvent(ctx context.Context, qtx *db.Queries, event db.DomainEvent, view automation.EventView, candidate pinnedCandidate) error {
+func processHookForEvent(ctx context.Context, qtx *db.Queries, event db.DomainEvent, view automation.EventView, candidate pinnedCandidate, shadow bool) error {
 	// Serialize this hook's latch read-modify-write against other matchers. The
 	// revision is NOT re-read here — the pinned one below is authoritative.
 	if _, err := qtx.LockHookForDecision(ctx, db.LockHookForDecisionParams{
@@ -493,6 +520,8 @@ func processHookForEvent(ctx context.Context, qtx *db.Queries, event db.DomainEv
 			status, reason = hookExecSkipped, skipMaxDepth
 		case !ev.ConditionsMet:
 			status, reason = hookExecSkipped, skipConditionFalse
+		case shadow:
+			status, reason = hookExecSkipped, skipExecutionDisabled
 		}
 		_, err := writeHookExecution(ctx, qtx, event, candidate, status, reason, matchSnap, condSnap)
 		return err
@@ -513,17 +542,23 @@ func processHookForEvent(ctx context.Context, qtx *db.Queries, event db.DomainEv
 		status, reason = hookExecSkipped, skipConditionFalse
 	case prev:
 		status, reason = hookExecSkipped, skipConditionAlreadyTrue
+	case shadow:
+		status, reason = hookExecSkipped, skipExecutionDisabled
 	}
 
 	inserted, err := writeHookExecution(ctx, qtx, event, candidate, status, reason, matchSnap, condSnap)
 	if err != nil {
 		return err
 	}
-	// Record the condition state this matched event observed, exactly once per
-	// (hook, event) — INCLUDING when the depth guard rejected the fire. Skipping the
-	// advance there would strand the latch and swallow the next legitimate false→true
-	// edge. Gating on `inserted` keeps a re-leased retry from double-advancing it.
-	if inserted {
+	// SHADOW DOES NOT LATCH (MUL-4332 review: shadow→live latch semantics). The latch
+	// is durable state that decides future firing, so advancing it while nothing can
+	// execute would consume the rising edge in shadow: after execution is enabled the
+	// condition is already recorded as true, `prev` is true, and the hook would sit
+	// skipped as `condition_already_true` until the condition happens to fall and rise
+	// again — a silent never-fires. Leaving the latch untouched means shadow
+	// over-reports "would fire" in the observation log (harmless, and arguably what
+	// you want to see) and the first qualifying event AFTER enabling fires for real.
+	if inserted && !shadow {
 		return upsertLatch(ctx, qtx, event.WorkspaceID, candidate.HookID, candidate.RevisionID, nowSatisfied)
 	}
 	return nil

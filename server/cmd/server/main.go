@@ -433,8 +433,8 @@ func main() {
 
 	// Start background sweeper to mark stale runtimes as offline.
 	go runRuntimeSweeper(sweepCtx, queries, liveness, taskSvc, bus)
-	// Domain event retention (MUL-4332) — explicit no-op in PR1, wired for
-	// visibility; the real sweep lands in PR3 with hook_execution.
+	// Domain event retention (MUL-4332) — still an explicit no-op, wired for
+	// visibility; the real sweep needs the terminal-execution predicate (TTL=90d).
 	go runDomainEventRetention(sweepCtx)
 	// Event Hooks matcher (MUL-4332 PR3) — consumes the domain_event outbox and
 	// records queued/skipped hook_execution decisions. Gated on the

@@ -12,9 +12,10 @@
 //   - A caller whose write is a bare autocommit statement uses WriteInTx, which
 //     wraps the write + event in one transaction.
 //
-// PR1 has NO consumer: rows land dispatch_status='pending' and nothing reads
-// them, so wiring Write into a domain path is a zero-behavior-change addition.
-// The matcher/executor that claims pending rows arrives in PR3.
+// The write itself is unconditional — a fact must never commit without its event,
+// or the trigger is lost for good. What the event then causes is gated: the
+// matcher/executor consume these rows only for a workspace whose Event Hooks flags
+// are on, and both default to off.
 //
 // This package is intentionally separate from internal/events (the in-memory
 // events.Bus). The Bus stays best-effort, post-commit, and serves realtime UI;
@@ -54,8 +55,8 @@ const (
 	ActorHook   = "hook"
 )
 
-// Dispatch statuses (the `dispatch_status` column). Only DispatchPending is
-// produced in PR1; the rest are advanced by the PR3 matcher/executor.
+// Dispatch statuses (the `dispatch_status` column). Writers only ever produce
+// DispatchPending; the rest are advanced by the matcher.
 const (
 	DispatchPending     = "pending"
 	DispatchDispatching = "dispatching"

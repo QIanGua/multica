@@ -119,6 +119,21 @@ func (s *HookService) ClaimAndRun(ctx context.Context, batchSize int32) (int, er
 	return finished, nil
 }
 
+// notEnabledBackoffSeconds paces re-claims of an execution whose workspace is not
+// enabled for execution, so it is not re-leased on every 2s tick.
+const notEnabledBackoffSeconds = 60
+
+// releaseExecutionClaim returns an unrun claim to the queue. A lost lease is not an
+// error here: the row was never touched, so whoever holds it now owns it.
+func (s *HookService) releaseExecutionClaim(ctx context.Context, exec db.HookExecution, lease pgtype.UUID) error {
+	_, err := s.Queries.ReleaseHookExecutionClaim(ctx, db.ReleaseHookExecutionClaimParams{
+		ID:             exec.ID,
+		LeaseToken:     lease,
+		BackoffSeconds: notEnabledBackoffSeconds,
+	})
+	return err
+}
+
 // claimAndRunOne leases one execution and runs its remaining actions. It reports
 // whether an execution was claimed and whether it reached a terminal state.
 func (s *HookService) claimAndRunOne(ctx context.Context) (claimed bool, finished bool, err error) {
@@ -132,6 +147,20 @@ func (s *HookService) claimAndRunOne(ctx context.Context) (claimed bool, finishe
 			return false, false, nil
 		}
 		return false, false, err
+	}
+
+	// PER-WORKSPACE gate (MUL-4332 review: workspace rollout). The claim queue is
+	// global, so a row can only be authorised against ITS OWN workspace — the loop
+	// cannot decide this once for every workspace at the same time. A row whose
+	// workspace is not enabled is released back to `queued` and left for a future
+	// tick, never run here. Belt-and-braces with the matcher's shadow gate: the
+	// matcher already refuses to write `queued` while execution is off, and this
+	// catches anything queued before the flag was narrowed.
+	if !s.executionEnabledFor(ctx, exec.WorkspaceID) {
+		if err := s.releaseExecutionClaim(ctx, exec, lease); err != nil {
+			return true, false, err
+		}
+		return true, false, nil
 	}
 
 	actions, err := s.executionActions(ctx, exec)

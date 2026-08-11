@@ -1,4 +1,4 @@
--- Event Hooks MVP — PR1: the transactional-outbox domain event log (MUL-4332 §4.1).
+-- Event Hooks MVP: the transactional-outbox domain event log (MUL-4332 §4.1).
 --
 -- `domain_event` is the persisted source of truth for the future hooks engine.
 -- Every domain command that commits a fact (issue created / status changed /
@@ -7,10 +7,10 @@
 -- the classic transactional outbox. A crash after the domain write but before
 -- any downstream reaction can therefore never lose the event.
 --
--- PR1 ships the table + the write-path convergence only. There is NO consumer
--- yet: rows land with dispatch_status='pending' and nothing reads them, so this
--- is a zero-behavior-change, additive migration. The matcher/executor that
--- claims pending rows via the lease columns arrives in PR3.
+-- This migration adds the table and is additive on its own; the matcher/executor
+-- that claims these rows via the lease columns ship in the same change set, both
+-- behind default-off feature flags evaluated per workspace. With the flags off an
+-- event is claimed and dispatched with no decisions, so nothing reacts to it.
 --
 -- The in-memory `events.Bus` (internal/events) is SEPARATE and unchanged — it
 -- keeps serving realtime UI fanout. This table is the durable, transactional
@@ -20,7 +20,7 @@
 -- Workspace DB rules (CLAUDE.md + MUL-4332 §4): NO foreign key, NO cascade —
 -- every UUID association is validated in the application layer. Secondary and
 -- unique indexes are added in their own single-statement CONCURRENTLY
--- migrations (254–258), never inline, so index builds never take an ACCESS
+-- migrations (274–278), never inline, so index builds never take an ACCESS
 -- EXCLUSIVE lock during deploy.
 
 -- Monotonic dispatch / drain boundary. `seq` orders events for stable scanning
@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS domain_event (
     causation_action_index INT,
     hop_count              INT NOT NULL DEFAULT 0,
 
-    -- Single-consumer outbox lease. Unused in PR1 (no matcher); rows stay
+    -- Single-consumer outbox lease. Claimed by the matcher; with the engine off
+    -- for a workspace its rows are claimed and dispatched undecided, so they stay
     -- 'pending'. PR3's matcher claims via lease_token/lease_expires_at and
     -- advances dispatch_status.
     dispatch_status        TEXT NOT NULL DEFAULT 'pending'

@@ -10,8 +10,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/featureflag"
 )
 
 // A real end-to-end regression for the activity-actor contract of an automated status
@@ -76,7 +78,7 @@ func TestHookExecutorStatusChangeWritesActivityUnderSystemActor(t *testing.T) {
 		cleanupTestIssue(t, issueID)
 	})
 
-	svc := service.NewHookService(queries, testPool, bus)
+	svc := service.NewHookService(queries, testPool, bus, hookTestFlags())
 
 	// The executor claims the OLDEST queued execution on a shared DB, so drain until
 	// ours reaches a terminal state.
@@ -134,4 +136,14 @@ func TestHookExecutorStatusChangeWritesActivityUnderSystemActor(t *testing.T) {
 	if details["automation_id"] != hookID {
 		t.Errorf("details automation_id = %q, want the firing hook %q", details["automation_id"], hookID)
 	}
+}
+
+// hookTestFlags enables both Event Hooks switches for this integration test. They
+// are evaluated per workspace in production, so a test that wants the engine to run
+// has to opt in — the compiled default is off.
+func hookTestFlags() *featureflag.Service {
+	p := featureflag.NewStaticProvider()
+	p.Set(featureflags.EventHooks, featureflag.Rule{Default: true})
+	p.Set(featureflags.EventHookExecution, featureflag.Rule{Default: true})
+	return featureflag.NewService(p)
 }

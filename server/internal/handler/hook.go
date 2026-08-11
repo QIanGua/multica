@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/featureflag"
 )
 
 // hookExecutionListLimit bounds the execution-trace read for the debug endpoint.
@@ -108,11 +110,25 @@ func hookExecutionToResponse(e db.HookExecution) HookExecutionResponse {
 // Store-only PR2 already writes rows, but the whole surface stays invisible until
 // the flag is deliberately turned on, so nothing changes for existing workspaces.
 func (h *Handler) hookEnabled(w http.ResponseWriter, r *http.Request) bool {
-	if !featureflags.EventHooksEnabled(r.Context(), h.FeatureFlags) {
+	if !featureflags.EventHooksEnabled(h.hookFlagContext(r), h.FeatureFlags) {
 		writeError(w, http.StatusNotFound, "event hooks are not enabled")
 		return false
 	}
 	return true
+}
+
+// hookFlagContext attaches the REQUEST'S workspace to the flag evaluation context so
+// the API gate answers the same question the matcher and executor answer about a
+// candidate row (MUL-4332 review: workspace rollout). Without it a
+// workspace-targeted rule never matched here either, and the whole surface was
+// all-or-nothing across every workspace.
+func (h *Handler) hookFlagContext(r *http.Request) context.Context {
+	ec := featureflag.EvalContextFrom(r.Context())
+	ec.WorkspaceID = h.resolveWorkspaceID(r)
+	if ec.UserID == "" {
+		ec.UserID = requestUserID(r)
+	}
+	return featureflag.WithEvalContext(r.Context(), ec)
 }
 
 // CreateHook validates and persists a new hook + revision #1.

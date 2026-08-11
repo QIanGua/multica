@@ -78,7 +78,7 @@ func newTeardownFixture(t *testing.T) teardownFixture {
 	})
 
 	return teardownFixture{
-		pool: pool, svc: NewHookService(db.New(pool), pool, nil),
+		pool: pool, svc: NewHookService(db.New(pool), pool, nil, hookFlags(true, true)),
 		ws: ws, userID: userID, issueID: issueID, neighbor: neighbor,
 		trackedRevisions: map[string][]string{},
 		trackedEffects:   map[string][]string{},

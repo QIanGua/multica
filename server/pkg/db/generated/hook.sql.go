@@ -1056,6 +1056,41 @@ func (q *Queries) MarkHookExecutionSucceeded(ctx context.Context, arg MarkHookEx
 	return result.RowsAffected(), nil
 }
 
+const releaseHookExecutionClaim = `-- name: ReleaseHookExecutionClaim :execrows
+UPDATE hook_execution
+SET status = 'queued',
+    next_attempt_at = now() + make_interval(secs => $3::int),
+    attempts = GREATEST(attempts - 1, 0),
+    lease_token = NULL, lease_expires_at = NULL
+WHERE id = $1
+  AND status = 'running'
+  AND lease_token = $2
+  AND lease_expires_at > clock_timestamp()
+`
+
+type ReleaseHookExecutionClaimParams struct {
+	ID             pgtype.UUID `json:"id"`
+	LeaseToken     pgtype.UUID `json:"lease_token"`
+	BackoffSeconds int32       `json:"backoff_seconds"`
+}
+
+// Hand a claimed execution straight back, unrun, because its workspace is not
+// enabled for execution (MUL-4332 review: workspace rollout). The claim queue is
+// global, so a worker can only discover that after it has already leased the row.
+//
+// `attempts` is rolled back because ClaimOneHookExecution incremented it before we
+// learned the row was not ours to run: this claim performed no work, so charging it
+// against the retry ladder would eventually fail a perfectly healthy execution just
+// for belonging to a workspace outside the canary. The short backoff keeps a
+// not-enabled row from being re-claimed on every 2s tick.
+func (q *Queries) ReleaseHookExecutionClaim(ctx context.Context, arg ReleaseHookExecutionClaimParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseHookExecutionClaim, arg.ID, arg.LeaseToken, arg.BackoffSeconds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const rescheduleHookExecution = `-- name: RescheduleHookExecution :execrows
 UPDATE hook_execution
 SET status = 'queued',

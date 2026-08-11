@@ -514,12 +514,11 @@ type PeekClaimableDomainEventsRow struct {
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 }
 
-// NOTE: the retention/TTL delete is intentionally NOT defined in PR1. The
-// correct predicate is "dispatched AND older than TTL AND every related
-// hook_execution is terminal" (MUL-4332 §4.1/§9), and hook_execution does not
-// exist until PR3. Shipping a weaker "dispatched + TTL" delete now would risk
-// reclaiming still-executing audit sources the moment PR3 enables dispatching
-// (review point 5). The query lands in PR3 with the full terminal predicate.
+// NOTE: the retention/TTL delete (TTL = 90 days) is still intentionally NOT defined
+// here. The correct predicate is "dispatched AND older than TTL AND every related
+// hook_execution is terminal" (MUL-4332 §4.1/§9); a weaker "dispatched + TTL" delete
+// would reclaim the audit source of an execution that is still retrying. It lands
+// with the remaining action slices, together with its concurrent-sweep tests.
 // A bounded WINDOW of the next claimable events, taking NO lock (MUL-4332 review:
 // production lock order + cross-workspace progress). The matcher walks this window,
 // and for each candidate locks the workspace FIRST and then reserves the event, so

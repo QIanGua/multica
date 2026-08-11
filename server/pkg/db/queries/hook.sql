@@ -255,6 +255,26 @@ WHERE id = $1
   AND lease_token = $2
   AND lease_expires_at > clock_timestamp();
 
+-- name: ReleaseHookExecutionClaim :execrows
+-- Hand a claimed execution straight back, unrun, because its workspace is not
+-- enabled for execution (MUL-4332 review: workspace rollout). The claim queue is
+-- global, so a worker can only discover that after it has already leased the row.
+--
+-- `attempts` is rolled back because ClaimOneHookExecution incremented it before we
+-- learned the row was not ours to run: this claim performed no work, so charging it
+-- against the retry ladder would eventually fail a perfectly healthy execution just
+-- for belonging to a workspace outside the canary. The short backoff keeps a
+-- not-enabled row from being re-claimed on every 2s tick.
+UPDATE hook_execution
+SET status = 'queued',
+    next_attempt_at = now() + make_interval(secs => @backoff_seconds::int),
+    attempts = GREATEST(attempts - 1, 0),
+    lease_token = NULL, lease_expires_at = NULL
+WHERE id = $1
+  AND status = 'running'
+  AND lease_token = $2
+  AND lease_expires_at > clock_timestamp();
+
 -- name: GetHookActionEffect :one
 SELECT * FROM hook_action_effect WHERE effect_key = $1;
 

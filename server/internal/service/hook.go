@@ -12,8 +12,10 @@ import (
 	"github.com/multica-ai/multica/server/internal/admission"
 	"github.com/multica-ai/multica/server/internal/automation"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/featureflag"
 )
 
 // Hook CRUD errors surfaced to the handler for status mapping. Validation
@@ -60,10 +62,38 @@ type HookService struct {
 	// inbox / subscriber / autopilot listeners, best-effort, after the action
 	// commits (MUL-4332 review a′). Nil in tests that only assert database state.
 	Bus *events.Bus
+	// Flags evaluates the two Event Hooks switches PER WORKSPACE (MUL-4332 review:
+	// workspace rollout). The worker loops have no request context, so every gate
+	// below rebuilds an EvalContext from the candidate row's own workspace instead
+	// of asking once with the process root context — which is what made
+	// `allow_by: workspace_id` silently match nothing. Nil means "no provider",
+	// and every gate then falls back to the compiled default (off).
+	Flags *featureflag.Service
 }
 
-func NewHookService(q *db.Queries, tx TxStarter, bus *events.Bus) *HookService {
-	return &HookService{Queries: q, TxStarter: tx, Bus: bus}
+func NewHookService(q *db.Queries, tx TxStarter, bus *events.Bus, flags *featureflag.Service) *HookService {
+	return &HookService{Queries: q, TxStarter: tx, Bus: bus, Flags: flags}
+}
+
+// hooksEnabledFor reports whether the Event Hooks engine may run for ONE workspace.
+// The workspace is injected into the flag EvalContext so a workspace-targeted rule
+// (allow_by: workspace_id) resolves against the row being processed.
+func (s *HookService) hooksEnabledFor(ctx context.Context, workspaceID pgtype.UUID) bool {
+	return featureflags.EventHooksEnabled(s.workspaceEvalContext(ctx, workspaceID), s.Flags)
+}
+
+// executionEnabledFor reports whether the executor may perform real side effects for
+// ONE workspace. Requires both switches, same as the process-wide helper.
+func (s *HookService) executionEnabledFor(ctx context.Context, workspaceID pgtype.UUID) bool {
+	return featureflags.EventHookExecutionEnabled(s.workspaceEvalContext(ctx, workspaceID), s.Flags)
+}
+
+// workspaceEvalContext attaches the workspace to the flag evaluation context,
+// preserving any user/attributes an inbound HTTP request already put there.
+func (s *HookService) workspaceEvalContext(ctx context.Context, workspaceID pgtype.UUID) context.Context {
+	ec := featureflag.EvalContextFrom(ctx)
+	ec.WorkspaceID = util.UUIDToString(workspaceID)
+	return featureflag.WithEvalContext(ctx, ec)
 }
 
 // CreateHook validates the spec (shape + workspace-scoped, principal-gated

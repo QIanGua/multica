@@ -35,7 +35,7 @@ func newMatcherFixture(t *testing.T) matcherFixture {
 	ws, userID, _, issueID := seedAttributionFixture(t, pool)
 	bus := events.New()
 	return matcherFixture{
-		svc:     NewHookService(db.New(pool), pool, bus),
+		svc:     NewHookService(db.New(pool), pool, bus, hookFlags(true, true)),
 		pool:    pool,
 		bus:     bus,
 		ws:      ws,
