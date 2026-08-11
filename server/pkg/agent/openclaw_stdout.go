@@ -79,19 +79,26 @@ func readOpenclawStdout(r io.Reader, idleGrace time.Duration) (buf []byte, cutSh
 		chunk := make([]byte, 32*1024)
 		for {
 			n, rerr := r.Read(chunk)
+			// One Read is one observation: a reader is allowed to return the
+			// final bytes and io.EOF together, and publishing those under two
+			// separate locks would let the ticker see "bytes arrived, stream
+			// still open" in between. On a loaded machine that gap can outlast
+			// idleGrace, and since the trailing bytes are exactly what makes
+			// the buffer parseable, the poll loop would report cutShort for a
+			// stream that had already ended cleanly.
+			mu.Lock()
 			if n > 0 {
-				mu.Lock()
 				acc = append(acc, chunk[:n]...)
 				lastByte = time.Now()
-				mu.Unlock()
 			}
 			if rerr != nil {
-				mu.Lock()
 				if rerr != io.EOF {
 					readErr = rerr
 				}
 				atEOF = true
-				mu.Unlock()
+			}
+			mu.Unlock()
+			if rerr != nil {
 				return
 			}
 		}
@@ -111,27 +118,30 @@ func readOpenclawStdout(r io.Reader, idleGrace time.Duration) (buf []byte, cutSh
 			return out, false, rerr
 
 		case <-ticker.C:
-			// Check the cheap conditions under the lock first and only copy the
-			// buffer once the silence threshold is actually met. Copying on every
-			// tick would allocate the whole accumulated result ~20 times per wait
-			// window, which for a large result is pure waste.
+			// Decide and snapshot under ONE lock. Re-reading acc after
+			// releasing it would mix a stale verdict with a fresh buffer: the
+			// terminal write can land in between, so the "still open, gone
+			// quiet" check would be answered from before it while the bytes
+			// being parsed came from after it. That is precisely the buffer
+			// that parses, so a cleanly-ended stream got reported as cut
+			// short, spuriously warning and cancelling a process that had
+			// already exited.
+			//
+			// The threshold is still evaluated before copying, so the common
+			// tick allocates nothing: copying the whole accumulated result on
+			// every tick would repeat ~20 times per wait window for no reason.
 			mu.Lock()
-			size := len(acc)
-			last := lastByte
-			done := atEOF
+			var out []byte
+			if !atEOF && len(acc) > 0 && time.Since(lastByte) >= idleGrace {
+				out = append([]byte(nil), acc...)
+			}
 			mu.Unlock()
 
-			if done {
-				continue // let the <-finished branch report the final state
-			}
-			if size == 0 || time.Since(last) < idleGrace {
+			// Either the stream has ended — let the <-finished branch report
+			// the final state — or it has not been quiet long enough yet.
+			if out == nil {
 				continue
 			}
-
-			mu.Lock()
-			out := append([]byte(nil), acc...)
-			mu.Unlock()
-
 			if _, ok := parseWholeBufferOpenclawResult(out); !ok {
 				continue
 			}
