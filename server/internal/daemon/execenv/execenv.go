@@ -80,7 +80,7 @@ type PrepareParams struct {
 	// HermesMemoryStore is the agent's persistent Hermes memory store
 	// (HermesMemoryStorePath) the overlay links memories/ to, so memory outlives
 	// the task. Empty keeps memories/ task-local — no agent to key on, or the
-	// MULTICA_HERMES_TASK_MEMORY rollback switch is engaged.
+	// Multica profile dir could not be resolved.
 	HermesMemoryStore string
 	// HermesEnv is the sanitized effective env (agent custom_env minus the daemon
 	// blocklisted keys) used to expand ${VAR} in Hermes external_dirs so it
