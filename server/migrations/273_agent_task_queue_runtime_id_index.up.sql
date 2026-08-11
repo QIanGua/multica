@@ -19,5 +19,10 @@
 -- Cheap to carry: runtime_id is set on essentially every row, so this is a
 -- one-entry-per-row btree with no maintenance beyond what the FK column
 -- already implies.
+--
+-- The trailing id column is what makes teardown's keyset paging free: the sweep
+-- pages with `runtime_id = $1 AND id > $cursor ORDER BY id`, and without id in
+-- the index every page would have to read the runtime's whole task set and sort
+-- it before applying LIMIT.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_agent_task_queue_runtime_id
-    ON agent_task_queue (runtime_id);
+    ON agent_task_queue (runtime_id, id);

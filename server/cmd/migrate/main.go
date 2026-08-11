@@ -82,6 +82,11 @@ var concurrentIndexCleanups = map[string]string{
 	"275_task_token_agent_id_index":                        "idx_task_token_agent_id",
 	"276_chat_draft_restore_task_id_index":                 "idx_chat_draft_restore_task_id",
 	"277_autopilot_run_task_id_index":                      "idx_autopilot_run_task_id",
+	"278_agent_task_queue_agent_id_keyset_index":           "idx_agent_task_queue_agent_id_keyset",
+	"279_agent_task_queue_issue_id_keyset_index":           "idx_agent_task_queue_issue_id_keyset",
+	"281_agent_workspace_id_keyset_index":                  "idx_agent_workspace_id_keyset",
+	"282_issue_workspace_id_keyset_index":                  "idx_issue_workspace_id_keyset",
+	"283_agent_runtime_workspace_id_keyset_index":          "idx_agent_runtime_workspace_id_keyset",
 }
 
 var preMigrationHooks = func() map[string]preMigrationHook {

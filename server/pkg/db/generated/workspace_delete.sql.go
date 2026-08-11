@@ -518,44 +518,45 @@ func (q *Queries) DetachTaskBatchReferences(ctx context.Context, taskIds []pgtyp
 	return err
 }
 
-const listTaskIDsByAgentBatch = `-- name: ListTaskIDsByAgentBatch :many
+const listTaskIDsByAgentPage = `-- name: ListTaskIDsByAgentPage :many
 SELECT id FROM agent_task_queue
-WHERE agent_id = $1
+WHERE agent_id = $1 AND id > $2
 ORDER BY id
-LIMIT $2
+LIMIT $3
 FOR UPDATE
 `
 
-type ListTaskIDsByAgentBatchParams struct {
+type ListTaskIDsByAgentPageParams struct {
 	AgentID pgtype.UUID `json:"agent_id"`
+	ID      pgtype.UUID `json:"id"`
 	Limit   int32       `json:"limit"`
 }
 
-// One owner key per call, one bounded page per call.
+// One owner key per call, one keyset-paged chunk per call.
 //
-// Single-key equality is deliberate. All three ownership paths must stay
-// (nothing enforces that a task's agent/runtime/issue share a workspace), but
-// expressing them as `OR agent_id IN (subquery) OR …` — or as a UNION of joins,
-// or as `= ANY($1::uuid[])` over a whole workspace's agents — makes the planner
+// Single-key equality is deliberate. All three ownership paths must stay (nothing
+// enforces that a task's agent/runtime/issue share a workspace), but expressing
+// them as `OR agent_id IN (subquery) OR …` — or as a UNION of joins, or as
+// `= ANY($1::uuid[])` over a whole workspace's agents — makes the planner
 // estimate a proportional share of the global table and fall back to a Seq Scan
 // on agent_task_queue. A single-key equality is the only form whose row estimate
 // stays small enough to be index-driven regardless of how the workspace's tasks
-// are distributed (MUL-5999). Uses idx_agent_task_queue_agent.
+// are distributed (MUL-5999).
 //
-// LIMIT keeps the caller's memory and the DELETE's parameter size bounded by the
-// batch size rather than by the workspace's lifetime task count. The caller
-// re-runs this query until it returns nothing; each iteration deletes the rows it
-// returned, so the same query yields the next page without a cursor.
+// `id > $2 ORDER BY id LIMIT $3` against idx_agent_task_queue_agent_id_keyset
+// (migration 278) bounds the SCAN, not just the result: each page is an index
+// range scan that starts where the previous one stopped. Bounding only the result
+// — `ORDER BY id LIMIT n` against the (agent_id, status) index — puts a Sort over
+// the agent's entire task set in front of every page, so a busy agent costs
+// roughly O(N² / page) for the sweep.
 //
 // FOR UPDATE is load-bearing for correctness, not throughput. It locks the rows
-// this iteration is about to delete, and under READ COMMITTED PostgreSQL
-// re-checks the WHERE clause after acquiring each lock: a task a concurrent
-// committed UPDATE has already moved to another owner no longer matches and is
-// skipped, and one we did lock cannot be moved away before we delete it. Without
-// it, a task reassigned between the read and the delete would be deleted on the
-// strength of a stale ownership claim.
-func (q *Queries) ListTaskIDsByAgentBatch(ctx context.Context, arg ListTaskIDsByAgentBatchParams) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listTaskIDsByAgentBatch, arg.AgentID, arg.Limit)
+// this page is about to delete, and under READ COMMITTED PostgreSQL re-checks the
+// WHERE clause after acquiring each lock: a task a concurrent committed UPDATE
+// has already moved to another owner no longer matches and is skipped, and one we
+// did lock cannot be moved away before we delete it.
+func (q *Queries) ListTaskIDsByAgentPage(ctx context.Context, arg ListTaskIDsByAgentPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByAgentPage, arg.AgentID, arg.ID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -574,23 +575,24 @@ func (q *Queries) ListTaskIDsByAgentBatch(ctx context.Context, arg ListTaskIDsBy
 	return items, nil
 }
 
-const listTaskIDsByIssueBatch = `-- name: ListTaskIDsByIssueBatch :many
+const listTaskIDsByIssuePage = `-- name: ListTaskIDsByIssuePage :many
 SELECT id FROM agent_task_queue
-WHERE issue_id = $1
+WHERE issue_id = $1 AND id > $2
 ORDER BY id
-LIMIT $2
+LIMIT $3
 FOR UPDATE
 `
 
-type ListTaskIDsByIssueBatchParams struct {
+type ListTaskIDsByIssuePageParams struct {
 	IssueID pgtype.UUID `json:"issue_id"`
+	ID      pgtype.UUID `json:"id"`
 	Limit   int32       `json:"limit"`
 }
 
-// Uses idx_agent_task_queue_issue_id. See ListTaskIDsByAgentBatch for the
-// single-key / LIMIT / FOR UPDATE rationale.
-func (q *Queries) ListTaskIDsByIssueBatch(ctx context.Context, arg ListTaskIDsByIssueBatchParams) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listTaskIDsByIssueBatch, arg.IssueID, arg.Limit)
+// Uses idx_agent_task_queue_issue_id_keyset (migration 279). See
+// ListTaskIDsByAgentPage for the single-key / keyset / FOR UPDATE rationale.
+func (q *Queries) ListTaskIDsByIssuePage(ctx context.Context, arg ListTaskIDsByIssuePageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByIssuePage, arg.IssueID, arg.ID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -609,24 +611,133 @@ func (q *Queries) ListTaskIDsByIssueBatch(ctx context.Context, arg ListTaskIDsBy
 	return items, nil
 }
 
-const listTaskIDsByRuntimeBatch = `-- name: ListTaskIDsByRuntimeBatch :many
+const listTaskIDsByRuntimePage = `-- name: ListTaskIDsByRuntimePage :many
 SELECT id FROM agent_task_queue
-WHERE runtime_id = $1
+WHERE runtime_id = $1 AND id > $2
 ORDER BY id
-LIMIT $2
+LIMIT $3
 FOR UPDATE
 `
 
-type ListTaskIDsByRuntimeBatchParams struct {
+type ListTaskIDsByRuntimePageParams struct {
 	RuntimeID pgtype.UUID `json:"runtime_id"`
+	ID        pgtype.UUID `json:"id"`
 	Limit     int32       `json:"limit"`
 }
 
-// Uses idx_agent_task_queue_runtime_id (migration 273); before that index every
-// runtime_id index was partial, so this path had none. See
-// ListTaskIDsByAgentBatch for the single-key / LIMIT / FOR UPDATE rationale.
-func (q *Queries) ListTaskIDsByRuntimeBatch(ctx context.Context, arg ListTaskIDsByRuntimeBatchParams) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listTaskIDsByRuntimeBatch, arg.RuntimeID, arg.Limit)
+// Uses idx_agent_task_queue_runtime_id (migration 273, (runtime_id, id)); before
+// it every runtime_id index was partial, so this path had none at all. See
+// ListTaskIDsByAgentPage for the single-key / keyset / FOR UPDATE rationale.
+func (q *Queries) ListTaskIDsByRuntimePage(ctx context.Context, arg ListTaskIDsByRuntimePageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByRuntimePage, arg.RuntimeID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkspaceAgentIDPage = `-- name: ListWorkspaceAgentIDPage :many
+SELECT id FROM agent
+WHERE agent.workspace_id = $1 AND id > $2
+ORDER BY id
+LIMIT $3
+`
+
+type ListWorkspaceAgentIDPageParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ID          pgtype.UUID `json:"id"`
+	Limit       int32       `json:"limit"`
+}
+
+// Owner enumeration in bounded, keyset-paged chunks. The rows are already locked
+// by LockWorkspaceTaskOwnerAgents above; this only walks them.
+//
+// Keyset on id, not on a natural key: the cursor column must be immutable, and
+// renaming an agent mid-teardown would otherwise let it sort behind the cursor
+// and escape the sweep. Uses idx_agent_workspace_id_keyset (migration 281), which
+// exists so this page does not sort the whole owner set.
+func (q *Queries) ListWorkspaceAgentIDPage(ctx context.Context, arg ListWorkspaceAgentIDPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceAgentIDPage, arg.WorkspaceID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkspaceIssueIDPage = `-- name: ListWorkspaceIssueIDPage :many
+SELECT id FROM issue
+WHERE issue.workspace_id = $1 AND id > $2
+ORDER BY id
+LIMIT $3
+`
+
+type ListWorkspaceIssueIDPageParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ID          pgtype.UUID `json:"id"`
+	Limit       int32       `json:"limit"`
+}
+
+// Uses idx_issue_workspace_id_keyset (migration 282).
+func (q *Queries) ListWorkspaceIssueIDPage(ctx context.Context, arg ListWorkspaceIssueIDPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceIssueIDPage, arg.WorkspaceID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkspaceRuntimeIDPage = `-- name: ListWorkspaceRuntimeIDPage :many
+SELECT id FROM agent_runtime
+WHERE agent_runtime.workspace_id = $1 AND id > $2
+ORDER BY id
+LIMIT $3
+`
+
+type ListWorkspaceRuntimeIDPageParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ID          pgtype.UUID `json:"id"`
+	Limit       int32       `json:"limit"`
+}
+
+// Uses idx_agent_runtime_workspace_id_keyset (migration 283).
+func (q *Queries) ListWorkspaceRuntimeIDPage(ctx context.Context, arg ListWorkspaceRuntimeIDPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceRuntimeIDPage, arg.WorkspaceID, arg.ID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -660,11 +771,14 @@ func (q *Queries) LockTaskUsageRollupForWorkspaceDelete(ctx context.Context) err
 	return err
 }
 
-const lockWorkspaceTaskOwnerAgents = `-- name: LockWorkspaceTaskOwnerAgents :many
-SELECT id FROM agent WHERE agent.workspace_id = $1 FOR UPDATE
+const lockWorkspaceTaskOwnerAgents = `-- name: LockWorkspaceTaskOwnerAgents :exec
+SELECT 1 FROM agent WHERE agent.workspace_id = $1 FOR UPDATE
 `
 
-// The three LockWorkspaceTaskOwner* queries are a write fence, not a lookup.
+// The three LockWorkspaceTaskOwner* statements are a write fence, not a lookup —
+// they deliberately return nothing, so a workspace with a huge owner set costs
+// the API process no memory at all.
+//
 // agent_task_queue has no workspace_id, so a task becomes this workspace's
 // problem through agent_id, issue_id or runtime_id — and inserting such a task
 // requires FOR KEY SHARE on the referenced owner row, which conflicts with
@@ -673,72 +787,32 @@ SELECT id FROM agent WHERE agent.workspace_id = $1 FOR UPDATE
 // workspace after we have swept it, which row locks on the tasks alone cannot
 // do. Same technique the handler already uses on the workspace row to keep
 // CreateChatSession out of the delete window.
-func (q *Queries) LockWorkspaceTaskOwnerAgents(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, lockWorkspaceTaskOwnerAgents, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []pgtype.UUID{}
-	for rows.Next() {
-		var id pgtype.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+//
+// This fence is defence in depth, not the only guarantee: deleteWorkspaceTasks
+// re-verifies every owner after sweeping it and fails closed if tasks keep
+// appearing, so teardown does not silently leak rows even if the fence is ever
+// weakened (for example by removing the legacy FKs this one leans on).
+func (q *Queries) LockWorkspaceTaskOwnerAgents(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockWorkspaceTaskOwnerAgents, workspaceID)
+	return err
 }
 
-const lockWorkspaceTaskOwnerIssues = `-- name: LockWorkspaceTaskOwnerIssues :many
-SELECT id FROM issue WHERE issue.workspace_id = $1 FOR UPDATE
+const lockWorkspaceTaskOwnerIssues = `-- name: LockWorkspaceTaskOwnerIssues :exec
+SELECT 1 FROM issue WHERE issue.workspace_id = $1 FOR UPDATE
 `
 
-func (q *Queries) LockWorkspaceTaskOwnerIssues(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, lockWorkspaceTaskOwnerIssues, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []pgtype.UUID{}
-	for rows.Next() {
-		var id pgtype.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+func (q *Queries) LockWorkspaceTaskOwnerIssues(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockWorkspaceTaskOwnerIssues, workspaceID)
+	return err
 }
 
-const lockWorkspaceTaskOwnerRuntimes = `-- name: LockWorkspaceTaskOwnerRuntimes :many
-SELECT id FROM agent_runtime WHERE agent_runtime.workspace_id = $1 FOR UPDATE
+const lockWorkspaceTaskOwnerRuntimes = `-- name: LockWorkspaceTaskOwnerRuntimes :exec
+SELECT 1 FROM agent_runtime WHERE agent_runtime.workspace_id = $1 FOR UPDATE
 `
 
-func (q *Queries) LockWorkspaceTaskOwnerRuntimes(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, lockWorkspaceTaskOwnerRuntimes, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []pgtype.UUID{}
-	for rows.Next() {
-		var id pgtype.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+func (q *Queries) LockWorkspaceTaskOwnerRuntimes(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockWorkspaceTaskOwnerRuntimes, workspaceID)
+	return err
 }
 
 const prepareWorkspaceDeletionLinks = `-- name: PrepareWorkspaceDeletionLinks :exec

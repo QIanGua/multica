@@ -16,8 +16,11 @@ SELECT set_config('multica.workspace_teardown', 'on', true);
 -- minutes, and an unbounded wait here hangs the delete request (MUL-5983).
 SELECT pg_advisory_xact_lock(4246);
 
--- name: LockWorkspaceTaskOwnerAgents :many
--- The three LockWorkspaceTaskOwner* queries are a write fence, not a lookup.
+-- name: LockWorkspaceTaskOwnerAgents :exec
+-- The three LockWorkspaceTaskOwner* statements are a write fence, not a lookup —
+-- they deliberately return nothing, so a workspace with a huge owner set costs
+-- the API process no memory at all.
+--
 -- agent_task_queue has no workspace_id, so a task becomes this workspace's
 -- problem through agent_id, issue_id or runtime_id — and inserting such a task
 -- requires FOR KEY SHARE on the referenced owner row, which conflicts with
@@ -26,61 +29,93 @@ SELECT pg_advisory_xact_lock(4246);
 -- workspace after we have swept it, which row locks on the tasks alone cannot
 -- do. Same technique the handler already uses on the workspace row to keep
 -- CreateChatSession out of the delete window.
-SELECT id FROM agent WHERE agent.workspace_id = $1 FOR UPDATE;
-
--- name: LockWorkspaceTaskOwnerIssues :many
-SELECT id FROM issue WHERE issue.workspace_id = $1 FOR UPDATE;
-
--- name: LockWorkspaceTaskOwnerRuntimes :many
-SELECT id FROM agent_runtime WHERE agent_runtime.workspace_id = $1 FOR UPDATE;
-
--- name: ListTaskIDsByAgentBatch :many
--- One owner key per call, one bounded page per call.
 --
--- Single-key equality is deliberate. All three ownership paths must stay
--- (nothing enforces that a task's agent/runtime/issue share a workspace), but
--- expressing them as `OR agent_id IN (subquery) OR …` — or as a UNION of joins,
--- or as `= ANY($1::uuid[])` over a whole workspace's agents — makes the planner
+-- This fence is defence in depth, not the only guarantee: deleteWorkspaceTasks
+-- re-verifies every owner after sweeping it and fails closed if tasks keep
+-- appearing, so teardown does not silently leak rows even if the fence is ever
+-- weakened (for example by removing the legacy FKs this one leans on).
+SELECT 1 FROM agent WHERE agent.workspace_id = $1 FOR UPDATE;
+
+-- name: LockWorkspaceTaskOwnerIssues :exec
+SELECT 1 FROM issue WHERE issue.workspace_id = $1 FOR UPDATE;
+
+-- name: LockWorkspaceTaskOwnerRuntimes :exec
+SELECT 1 FROM agent_runtime WHERE agent_runtime.workspace_id = $1 FOR UPDATE;
+
+-- name: ListWorkspaceAgentIDPage :many
+-- Owner enumeration in bounded, keyset-paged chunks. The rows are already locked
+-- by LockWorkspaceTaskOwnerAgents above; this only walks them.
+--
+-- Keyset on id, not on a natural key: the cursor column must be immutable, and
+-- renaming an agent mid-teardown would otherwise let it sort behind the cursor
+-- and escape the sweep. Uses idx_agent_workspace_id_keyset (migration 281), which
+-- exists so this page does not sort the whole owner set.
+SELECT id FROM agent
+WHERE agent.workspace_id = $1 AND id > $2
+ORDER BY id
+LIMIT $3;
+
+-- name: ListWorkspaceIssueIDPage :many
+-- Uses idx_issue_workspace_id_keyset (migration 282).
+SELECT id FROM issue
+WHERE issue.workspace_id = $1 AND id > $2
+ORDER BY id
+LIMIT $3;
+
+-- name: ListWorkspaceRuntimeIDPage :many
+-- Uses idx_agent_runtime_workspace_id_keyset (migration 283).
+SELECT id FROM agent_runtime
+WHERE agent_runtime.workspace_id = $1 AND id > $2
+ORDER BY id
+LIMIT $3;
+
+-- name: ListTaskIDsByAgentPage :many
+-- One owner key per call, one keyset-paged chunk per call.
+--
+-- Single-key equality is deliberate. All three ownership paths must stay (nothing
+-- enforces that a task's agent/runtime/issue share a workspace), but expressing
+-- them as `OR agent_id IN (subquery) OR …` — or as a UNION of joins, or as
+-- `= ANY($1::uuid[])` over a whole workspace's agents — makes the planner
 -- estimate a proportional share of the global table and fall back to a Seq Scan
 -- on agent_task_queue. A single-key equality is the only form whose row estimate
 -- stays small enough to be index-driven regardless of how the workspace's tasks
--- are distributed (MUL-5999). Uses idx_agent_task_queue_agent.
+-- are distributed (MUL-5999).
 --
--- LIMIT keeps the caller's memory and the DELETE's parameter size bounded by the
--- batch size rather than by the workspace's lifetime task count. The caller
--- re-runs this query until it returns nothing; each iteration deletes the rows it
--- returned, so the same query yields the next page without a cursor.
+-- `id > $2 ORDER BY id LIMIT $3` against idx_agent_task_queue_agent_id_keyset
+-- (migration 278) bounds the SCAN, not just the result: each page is an index
+-- range scan that starts where the previous one stopped. Bounding only the result
+-- — `ORDER BY id LIMIT n` against the (agent_id, status) index — puts a Sort over
+-- the agent's entire task set in front of every page, so a busy agent costs
+-- roughly O(N² / page) for the sweep.
 --
 -- FOR UPDATE is load-bearing for correctness, not throughput. It locks the rows
--- this iteration is about to delete, and under READ COMMITTED PostgreSQL
--- re-checks the WHERE clause after acquiring each lock: a task a concurrent
--- committed UPDATE has already moved to another owner no longer matches and is
--- skipped, and one we did lock cannot be moved away before we delete it. Without
--- it, a task reassigned between the read and the delete would be deleted on the
--- strength of a stale ownership claim.
+-- this page is about to delete, and under READ COMMITTED PostgreSQL re-checks the
+-- WHERE clause after acquiring each lock: a task a concurrent committed UPDATE
+-- has already moved to another owner no longer matches and is skipped, and one we
+-- did lock cannot be moved away before we delete it.
 SELECT id FROM agent_task_queue
-WHERE agent_id = $1
+WHERE agent_id = $1 AND id > $2
 ORDER BY id
-LIMIT $2
+LIMIT $3
 FOR UPDATE;
 
--- name: ListTaskIDsByIssueBatch :many
--- Uses idx_agent_task_queue_issue_id. See ListTaskIDsByAgentBatch for the
--- single-key / LIMIT / FOR UPDATE rationale.
+-- name: ListTaskIDsByIssuePage :many
+-- Uses idx_agent_task_queue_issue_id_keyset (migration 279). See
+-- ListTaskIDsByAgentPage for the single-key / keyset / FOR UPDATE rationale.
 SELECT id FROM agent_task_queue
-WHERE issue_id = $1
+WHERE issue_id = $1 AND id > $2
 ORDER BY id
-LIMIT $2
+LIMIT $3
 FOR UPDATE;
 
--- name: ListTaskIDsByRuntimeBatch :many
--- Uses idx_agent_task_queue_runtime_id (migration 273); before that index every
--- runtime_id index was partial, so this path had none. See
--- ListTaskIDsByAgentBatch for the single-key / LIMIT / FOR UPDATE rationale.
+-- name: ListTaskIDsByRuntimePage :many
+-- Uses idx_agent_task_queue_runtime_id (migration 273, (runtime_id, id)); before
+-- it every runtime_id index was partial, so this path had none at all. See
+-- ListTaskIDsByAgentPage for the single-key / keyset / FOR UPDATE rationale.
 SELECT id FROM agent_task_queue
-WHERE runtime_id = $1
+WHERE runtime_id = $1 AND id > $2
 ORDER BY id
-LIMIT $2
+LIMIT $3
 FOR UPDATE;
 
 -- name: DetachTaskBatchReferences :exec

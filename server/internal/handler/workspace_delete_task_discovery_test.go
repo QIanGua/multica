@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -196,15 +197,10 @@ func TestDeleteWorkspaceTasks_IsSelfSufficientWithoutCascades(t *testing.T) {
 	if err := qtx.SetWorkspaceTeardownMode(ctx); err != nil {
 		t.Fatalf("set teardown mode: %v", err)
 	}
-	owners, err := lockWorkspaceTaskOwners(ctx, qtx, parseUUID(f.victimID))
-	if err != nil {
+	if err := lockWorkspaceTaskOwners(ctx, qtx, parseUUID(f.victimID)); err != nil {
 		t.Fatalf("lock task owners: %v", err)
 	}
-	if len(owners.Agents) != 1 || len(owners.Issues) != 1 || len(owners.Runtimes) != 1 {
-		t.Fatalf("locked owners = %d agents / %d issues / %d runtimes, want 1 each",
-			len(owners.Agents), len(owners.Issues), len(owners.Runtimes))
-	}
-	if err := deleteWorkspaceTasks(ctx, qtx, owners); err != nil {
+	if err := deleteWorkspaceTasks(ctx, qtx, parseUUID(f.victimID)); err != nil {
 		t.Fatalf("deleteWorkspaceTasks: %v", err)
 	}
 
@@ -301,7 +297,7 @@ func TestDeleteWorkspaceTasks_PagesPastTheBatchSize(t *testing.T) {
 
 	// Two and a half batches on one agent, so the loop has to page and then
 	// see an empty page.
-	const extraTasks = workspaceDeleteTaskBatchSize*2 + workspaceDeleteTaskBatchSize/2
+	const extraTasks = workspaceDeleteTaskPageSize*2 + workspaceDeleteTaskPageSize/2
 	if _, err := testPool.Exec(ctx, `
 INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, completed_at)
 SELECT $1, $2, $3, 'completed', now() FROM generate_series(1, $4::int)
@@ -319,40 +315,49 @@ SELECT $1, $2, $3, 'completed', now() FROM generate_series(1, $4::int)
 	if err := qtx.SetWorkspaceTeardownMode(ctx); err != nil {
 		t.Fatalf("set teardown mode: %v", err)
 	}
-	owners, err := lockWorkspaceTaskOwners(ctx, qtx, parseUUID(f.victimID))
-	if err != nil {
+	if err := lockWorkspaceTaskOwners(ctx, qtx, parseUUID(f.victimID)); err != nil {
 		t.Fatalf("lock task owners: %v", err)
 	}
 
-	// The bound is the LIMIT on the page query. Without it the sweep would pull
-	// a whole owner's task history into this process in one go, which is the
-	// unbounded-memory failure mode this loop exists to avoid.
-	for _, tc := range []struct {
-		name string
-		page func(int32) ([]pgtype.UUID, error)
-	}{
-		{"by agent", func(limit int32) ([]pgtype.UUID, error) {
-			return qtx.ListTaskIDsByAgentBatch(ctx, db.ListTaskIDsByAgentBatchParams{AgentID: owners.Agents[0], Limit: limit})
-		}},
-		{"by issue", func(limit int32) ([]pgtype.UUID, error) {
-			return qtx.ListTaskIDsByIssueBatch(ctx, db.ListTaskIDsByIssueBatchParams{IssueID: owners.Issues[0], Limit: limit})
-		}},
-		{"by runtime", func(limit int32) ([]pgtype.UUID, error) {
-			return qtx.ListTaskIDsByRuntimeBatch(ctx, db.ListTaskIDsByRuntimeBatchParams{RuntimeID: owners.Runtimes[0], Limit: limit})
-		}},
-	} {
-		const probeLimit = 10
-		ids, err := tc.page(probeLimit)
-		if err != nil {
-			t.Fatalf("page %s: %v", tc.name, err)
-		}
-		if len(ids) != probeLimit {
-			t.Errorf("page %s returned %d ids for LIMIT %d; the page query is not bounded",
-				tc.name, len(ids), probeLimit)
+	// The bound is a keyset page, not just a LIMIT: each page must return at
+	// most the requested rows AND resume strictly after the previous page, so
+	// the scan never re-walks what it already deleted. A LIMIT alone would still
+	// read (and sort) the owner's whole task set per page.
+	const probeLimit = 10
+	firstPage, err := qtx.ListTaskIDsByAgentPage(ctx, db.ListTaskIDsByAgentPageParams{
+		AgentID: parseUUID(f.victimAgent), ID: uuidCursorStart, Limit: probeLimit,
+	})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(firstPage) != probeLimit {
+		t.Fatalf("first page returned %d ids for LIMIT %d; the page query is not bounded",
+			len(firstPage), probeLimit)
+	}
+	secondPage, err := qtx.ListTaskIDsByAgentPage(ctx, db.ListTaskIDsByAgentPageParams{
+		AgentID: parseUUID(f.victimAgent), ID: firstPage[len(firstPage)-1], Limit: probeLimit,
+	})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(secondPage) != probeLimit {
+		t.Fatalf("second page returned %d ids, want %d", len(secondPage), probeLimit)
+	}
+	seen := make(map[string]struct{}, len(firstPage))
+	for _, id := range firstPage {
+		seen[uuidToString(id)] = struct{}{}
+	}
+	for _, id := range secondPage {
+		if _, dup := seen[uuidToString(id)]; dup {
+			t.Fatalf("page 2 re-returned id %s; the cursor is not advancing", uuidToString(id))
 		}
 	}
+	if uuidToString(secondPage[0]) <= uuidToString(firstPage[len(firstPage)-1]) {
+		t.Errorf("page 2 starts at %s, which is not after page 1's last id %s",
+			uuidToString(secondPage[0]), uuidToString(firstPage[len(firstPage)-1]))
+	}
 
-	if err := deleteWorkspaceTasks(ctx, qtx, owners); err != nil {
+	if err := deleteWorkspaceTasks(ctx, qtx, parseUUID(f.victimID)); err != nil {
 		t.Fatalf("deleteWorkspaceTasks: %v", err)
 	}
 
@@ -365,6 +370,165 @@ WHERE agent_id = $1 OR issue_id = $2 OR runtime_id = $3
 	}
 	if remaining != 0 {
 		t.Errorf("%d tasks survived a multi-batch sweep", remaining)
+	}
+}
+
+// TestDeleteWorkspaceTasks_PagesOwnersBeyondOnePage covers the other unbounded
+// dimension: owner enumeration. A workspace with more agents than one owner page
+// must still be swept completely, and the owner ids must never all be held here at
+// once (MUL-5999 review).
+func TestDeleteWorkspaceTasks_PagesOwnersBeyondOnePage(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "ownerpages")
+
+	// One more agent than a single owner page, each with a task, so the sweep has
+	// to fetch a second owner page and then see an empty one.
+	extraAgents := workspaceDeleteOwnerPageSize + 1
+	if _, err := testPool.Exec(ctx, `
+WITH new_agents AS (
+    INSERT INTO agent (workspace_id, name, runtime_mode, runtime_config, runtime_id, owner_id)
+    SELECT $1, 'owner-page-agent-' || g, 'cloud', '{}'::jsonb, $2, $3
+    FROM generate_series(1, $4::int) g
+    RETURNING id
+)
+INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, completed_at)
+SELECT id, $5, $2, 'completed', now() FROM new_agents
+`, f.victimID, f.victimRuntime, testUserID, extraAgents, f.neighbourIssue); err != nil {
+		t.Fatalf("seed %d agents: %v", extraAgents, err)
+	}
+
+	tx, err := testHandler.TxStarter.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := testHandler.Queries.WithTx(tx)
+
+	if err := qtx.SetWorkspaceTeardownMode(ctx); err != nil {
+		t.Fatalf("set teardown mode: %v", err)
+	}
+	if err := lockWorkspaceTaskOwners(ctx, qtx, parseUUID(f.victimID)); err != nil {
+		t.Fatalf("lock task owners: %v", err)
+	}
+
+	// The owner page is bounded and advances the same way the task page does.
+	firstOwners, err := qtx.ListWorkspaceAgentIDPage(ctx, db.ListWorkspaceAgentIDPageParams{
+		WorkspaceID: parseUUID(f.victimID), ID: uuidCursorStart, Limit: workspaceDeleteOwnerPageSize,
+	})
+	if err != nil {
+		t.Fatalf("first owner page: %v", err)
+	}
+	if len(firstOwners) != workspaceDeleteOwnerPageSize {
+		t.Fatalf("first owner page returned %d ids, want %d", len(firstOwners), workspaceDeleteOwnerPageSize)
+	}
+	nextOwners, err := qtx.ListWorkspaceAgentIDPage(ctx, db.ListWorkspaceAgentIDPageParams{
+		WorkspaceID: parseUUID(f.victimID), ID: firstOwners[len(firstOwners)-1], Limit: workspaceDeleteOwnerPageSize,
+	})
+	if err != nil {
+		t.Fatalf("second owner page: %v", err)
+	}
+	if len(nextOwners) == 0 {
+		t.Fatal("second owner page is empty; owner enumeration stopped after one page")
+	}
+
+	if err := deleteWorkspaceTasks(ctx, qtx, parseUUID(f.victimID)); err != nil {
+		t.Fatalf("deleteWorkspaceTasks: %v", err)
+	}
+
+	var remaining int
+	if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM agent_task_queue q
+JOIN agent a ON a.id = q.agent_id
+WHERE a.workspace_id = $1
+`, f.victimID).Scan(&remaining); err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("%d tasks survived; owners past the first page were not swept", remaining)
+	}
+}
+
+// TestSweepTasksForOwner_FailsClosedWhenTasksKeepArriving pins the behaviour that
+// makes the sweep safe without an application-wide enqueue protocol: if tasks keep
+// appearing for an owner that has already been swept, teardown refuses to commit
+// instead of leaving a half-cleaned tenant behind.
+//
+// The page function stands in for a broken fence — it keeps producing a task the
+// sweep cannot get rid of.
+func TestSweepTasksForOwner_FailsClosedWhenTasksKeepArriving(t *testing.T) {
+	ctx := context.Background()
+	owner := parseUUID("11111111-2222-3333-4444-555555555555")
+	stubTask := parseUUID("66666666-7777-8888-9999-aaaaaaaaaaaa")
+
+	// Faithful model of a broken fence: each pass finds one page of tasks and
+	// then reports the owner clean, so the next pass starts from the beginning
+	// and finds another one. Honours the page query's `id > cursor` contract, so
+	// the only thing that can stop this is the pass cap.
+	pages := 0
+	oneTaskPerPass := func(_ context.Context, _ pgtype.UUID, cursor pgtype.UUID, _ int32) ([]pgtype.UUID, error) {
+		pages++
+		if pages > 100 {
+			t.Fatal("sweep did not stop; the pass cap is not working")
+		}
+		if cursor != uuidCursorStart {
+			return nil, nil
+		}
+		return []pgtype.UUID{stubTask}, nil
+	}
+	noop := func(context.Context, []pgtype.UUID) error { return nil }
+
+	err := sweepTasksForOwner(ctx, "agent", owner, oneTaskPerPass, noop, noop)
+	if err == nil {
+		t.Fatal("sweep succeeded while tasks kept arriving; teardown would commit a partial cleanup")
+	}
+	if !strings.Contains(err.Error(), "refusing to commit a partial teardown") {
+		t.Errorf("error = %v, want a fail-closed partial-teardown error", err)
+	}
+}
+
+// TestAgentTaskQueueOwnerFKsStillExist guards the precondition the write fence
+// leans on. Blocking a concurrent enqueue depends on an INSERT taking FOR KEY
+// SHARE on the agent / issue / runtime it references, which is a property of these
+// foreign keys. The file header calls the legacy FKs an expand-phase safety net,
+// so if a later migration removes them this test is what turns a silently missing
+// fence into a red build — the replacement has to be an explicit protocol shared
+// with every enqueue path.
+func TestAgentTaskQueueOwnerFKsStillExist(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	for column, referenced := range map[string]string{
+		"agent_id":   "agent",
+		"issue_id":   "issue",
+		"runtime_id": "agent_runtime",
+	} {
+		var exists bool
+		if err := testPool.QueryRow(ctx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class child ON child.oid = c.conrelid
+    JOIN pg_class parent ON parent.oid = c.confrelid
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+    WHERE c.contype = 'f'
+      AND child.relname = 'agent_task_queue'
+      AND parent.relname = $1
+      AND a.attname = $2
+      AND array_length(c.conkey, 1) = 1
+)
+`, referenced, column).Scan(&exists); err != nil {
+			t.Fatalf("look up FK on %s: %v", column, err)
+		}
+		if !exists {
+			t.Errorf("agent_task_queue.%s no longer has an FK to %s: the workspace-delete write fence "+
+				"relied on that FK's implicit FOR KEY SHARE to block concurrent enqueues, so it needs an "+
+				"explicit application-layer replacement before this FK goes away", column, referenced)
+		}
 	}
 }
 
@@ -391,7 +555,7 @@ func TestDeleteWorkspaceTasks_FencesConcurrentEnqueueAndReassignment(t *testing.
 	}
 	defer tearDownTx.Rollback(ctx)
 	qtx := testHandler.Queries.WithTx(tearDownTx)
-	if _, err := lockWorkspaceTaskOwners(ctx, qtx, parseUUID(f.victimID)); err != nil {
+	if err := lockWorkspaceTaskOwners(ctx, qtx, parseUUID(f.victimID)); err != nil {
 		t.Fatalf("lock task owners: %v", err)
 	}
 
