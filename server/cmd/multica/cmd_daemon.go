@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -292,7 +293,9 @@ type unknownProfileError struct {
 
 func (e *unknownProfileError) Error() string {
 	if len(e.Known) == 0 {
-		return fmt.Sprintf("unknown profile %q: no named profiles exist yet.\nCreate one with 'multica login --profile %s'", e.Profile, e.Profile)
+		// The command is left unquoted so the shell-quoted profile name below
+		// stays the only quoting in the line and the hint pastes cleanly.
+		return fmt.Sprintf("unknown profile %q: no named profiles exist yet.\nCreate one with: multica login --profile %s", e.Profile, shellQuoteArg(e.Profile))
 	}
 	return fmt.Sprintf("unknown profile %q\nKnown profiles: %s", e.Profile, strings.Join(e.Known, ", "))
 }
@@ -311,26 +314,71 @@ func (e *unknownProfileError) jsonPayload() map[string]any {
 	}
 }
 
-// knownProfiles lists the named profiles that exist on disk, sorted by name.
+// profileConfigFileName is the file whose presence marks a directory under the
+// profiles root as an actual profile rather than just a parent of one. Kept in
+// step with cli.CLIConfigPathForProfile.
+const profileConfigFileName = "config.json"
+
+// profileExists reports whether an explicitly named profile has state on disk.
+//
+// The name is resolved through the same path logic the config layer uses
+// rather than matched against a flat directory listing, because a profile name
+// may contain separators: `multica --profile team/dev config set ...` creates
+// ~/.multica/profiles/team/dev. Matching against top-level entries would
+// reject that profile while offering its parent "team" as a suggestion.
+func profileExists(profile string) (bool, error) {
+	dir, err := cli.ProfileDir(profile)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return info.IsDir(), nil
+}
+
+// knownProfiles lists the profiles that exist on disk, sorted by name, for use
+// as suggestions after a name misses. A profile is a directory under the
+// profiles root holding a config.json, at any depth — requiring that file is
+// what keeps a bare parent directory such as "team" out of a list where every
+// entry is meant to be directly usable as --profile.
+//
 // A missing profiles root is not an error: it just means no named profile has
-// been created yet, which is the common case for a default-profile-only user.
+// been created yet, the common case for a default-profile-only user.
 func knownProfiles() ([]string, error) {
 	root, err := profilesRootDir()
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
+	names := make([]string, 0)
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// An unreadable subtree costs us suggestions, not correctness:
+			// skip it so the rest of the list still reaches the user.
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() || d.Name() != profileConfigFileName {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, filepath.Dir(path))
+		if relErr != nil || rel == "." {
+			return nil
+		}
+		names = append(names, filepath.ToSlash(rel))
+		return nil
+	})
+	if walkErr != nil {
+		if os.IsNotExist(walkErr) {
 			return nil, nil
 		}
-		return nil, err
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			names = append(names, entry.Name())
-		}
+		return nil, walkErr
 	}
 	sort.Strings(names)
 	return names, nil
@@ -356,14 +404,18 @@ func requireKnownProfile(profile string) error {
 	if profile == "" {
 		return nil
 	}
+	exists, err := profileExists(profile)
+	if err != nil {
+		return fmt.Errorf("resolve profile %q: %w", profile, err)
+	}
+	if exists {
+		return nil
+	}
+	// Only now is the listing worth its disk walk, and only now can it be
+	// wrong in a way the user sees.
 	names, err := knownProfiles()
 	if err != nil {
 		return fmt.Errorf("list profiles: %w", err)
-	}
-	for _, name := range names {
-		if name == profile {
-			return nil
-		}
 	}
 	return &unknownProfileError{Profile: profile, Known: names}
 }

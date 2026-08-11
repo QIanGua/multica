@@ -24,8 +24,14 @@ func mkProfiles(t *testing.T, names ...string) string {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	for _, name := range names {
-		if err := os.MkdirAll(filepath.Join(home, ".multica", "profiles", name), 0o755); err != nil {
+		dir := filepath.Join(home, ".multica", "profiles", filepath.FromSlash(name))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("create profile %q: %v", name, err)
+		}
+		// A profile is a directory holding a config.json; the file is what
+		// separates a real profile from a bare parent directory.
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{}"), 0o600); err != nil {
+			t.Fatalf("write config for profile %q: %v", name, err)
 		}
 	}
 	return home
@@ -85,6 +91,46 @@ func TestRequireKnownProfile(t *testing.T) {
 		// real profile, so the fix is visible without further digging.
 		if !strings.Contains(msg, `"desktop-api.multica"`) || !strings.Contains(msg, "desktop-api.multica.ai") {
 			t.Fatalf("error message %q must name both the bad profile and the known ones", msg)
+		}
+	})
+
+	// Regression: profile names may contain separators. `multica --profile
+	// team/dev config set ...` creates ~/.multica/profiles/team/dev, so
+	// validating against a flat top-level listing would reject a profile the
+	// same CLI had just created, and suggest its parent "team" instead.
+	t.Run("nested profile created by the CLI is accepted", func(t *testing.T) {
+		mkProfiles(t, "team/dev", "dev")
+		if err := requireKnownProfile("team/dev"); err != nil {
+			t.Fatalf("requireKnownProfile(\"team/dev\") = %v, want nil", err)
+		}
+	})
+
+	t.Run("a bare parent directory is not offered as a profile", func(t *testing.T) {
+		mkProfiles(t, "team/dev")
+
+		// "team" exists on disk but holds no config.json, so it is a parent,
+		// not something the user could pass to --profile.
+		err := requireKnownProfile("nope")
+		var unknown *unknownProfileError
+		if !errors.As(err, &unknown) {
+			t.Fatalf("requireKnownProfile = %v, want *unknownProfileError", err)
+		}
+		want := []string{"team/dev"}
+		if strings.Join(unknown.Known, ",") != strings.Join(want, ",") {
+			t.Fatalf("Known = %v, want %v", unknown.Known, want)
+		}
+	})
+
+	t.Run("login hint quotes an awkward profile name", func(t *testing.T) {
+		mkProfiles(t)
+
+		err := requireKnownProfile("my profile")
+		var unknown *unknownProfileError
+		if !errors.As(err, &unknown) {
+			t.Fatalf("requireKnownProfile = %v, want *unknownProfileError", err)
+		}
+		if !strings.Contains(unknown.Error(), "--profile 'my profile'") {
+			t.Fatalf("error message %q should shell-quote the name so the hint is copy-pasteable", unknown.Error())
 		}
 	})
 
@@ -184,6 +230,24 @@ func TestDaemonStatusKnownProfileStillReportsStopped(t *testing.T) {
 	}
 	if !strings.Contains(out, "stopped") {
 		t.Fatalf("stdout = %q, want a stopped report", out)
+	}
+}
+
+// End-to-end counterpart of the nested-profile regression: `daemon status` on
+// a profile the CLI created as "team/dev" must fall through to the normal
+// health probe rather than stopping at validation.
+func TestDaemonStatusNestedProfileStillProbes(t *testing.T) {
+	clearDaemonTaskEnv(t)
+	mkProfiles(t, "team/dev")
+
+	out, err := captureStdout(t, func() error {
+		return runDaemonStatus(daemonStatusCmdFor(t, "team/dev", ""), nil)
+	})
+	if err != nil {
+		t.Fatalf("runDaemonStatus = %v, want nil", err)
+	}
+	if !strings.Contains(out, "stopped") {
+		t.Fatalf("stdout = %q, want the probe result for a valid nested profile", out)
 	}
 }
 
