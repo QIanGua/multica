@@ -34,6 +34,34 @@ func enqueueViaRealQuery(ctx context.Context, q *db.Queries, agentID, runtimeID,
 	return err
 }
 
+// waitForBlockedWriter blocks until some other backend is waiting on a lock while
+// running a statement that mentions querySnippet, so a race test can be sure the
+// writer really is queued before the other side commits. Fails the test on timeout
+// rather than proceeding, so a missed race shows up as a failure instead of a
+// vacuous pass.
+func waitForBlockedWriter(t *testing.T, ctx context.Context, querySnippet string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting int
+		if err := testPool.QueryRow(ctx, `
+SELECT count(*)
+FROM pg_stat_activity
+WHERE pid <> pg_backend_pid()
+  AND wait_event_type = 'Lock'
+  AND state = 'active'
+  AND query LIKE '%' || $1 || '%'
+`, querySnippet).Scan(&waiting); err != nil {
+			t.Fatalf("poll pg_stat_activity: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no backend blocked on a lock while running a statement mentioning %q; the race was not set up", querySnippet)
+}
+
 // TestTaskOwnershipWritesCallTheFence is the guard that keeps the fence from being
 // a convention. Every statement that inserts an agent_task_queue row, or assigns
 // one of its ownership columns, has to call lock_task_owner_workspaces — a new
@@ -254,8 +282,10 @@ func TestTaskWriteFence_QueuedWriterCannotLandAfterTeardownCommits(t *testing.T)
 			f.victimAgent, f.victimRuntime, f.victimIssue)
 	}()
 
-	// Give the writer time to reach the lock and block on it.
-	time.Sleep(300 * time.Millisecond)
+	// Wait until the writer is genuinely parked on a lock rather than trusting a
+	// fixed sleep: on a loaded machine a sleep can elapse before the writer even
+	// reaches the fence, and the test would then pass without exercising the race.
+	waitForBlockedWriter(t, ctx, "agent_task_queue")
 
 	if _, err := teardown.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, f.victimID); err != nil {
 		t.Fatalf("delete workspace: %v", err)
@@ -361,6 +391,67 @@ DELETE FROM agent_task_queue
 WHERE (agent_id = $1 AND runtime_id = $2) OR (agent_id = $3 AND runtime_id = $4)
 `, f.victimAgent, f.neighbourRuntime, f.neighbourAgent, f.victimRuntime); err != nil {
 		t.Fatalf("clean up: %v", err)
+	}
+}
+
+// TestMergeLegacyRuntime_KeepsOldRuntimeWhenFenceRefuses is the regression test
+// for the failure mode the review found: the fence refusing looked exactly like
+// "the old runtime had no tasks", so the merge went on to delete the old runtime
+// and agent_task_queue's ON DELETE CASCADE quietly took its history with it.
+//
+// Here the merge target has vanished before the reassignment runs, so the fence
+// returns false. The old runtime and its task must both survive, and nothing may
+// be recorded on the target.
+func TestMergeLegacyRuntime_KeepsOldRuntimeWhenFenceRefuses(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "mergefence")
+
+	// A target runtime id that does not resolve — the same state a merge sees when
+	// the target's workspace was torn down a moment ago.
+	vanishedTarget := parseUUID("00000000-0000-0000-0000-0000000000fe")
+
+	err := testHandler.mergeLegacyRuntime(ctx, vanishedTarget, parseUUID(f.victimRuntime), "legacy-daemon", "delete-test")
+	if !errors.Is(err, errRuntimeMergeFenced) {
+		t.Fatalf("mergeLegacyRuntime = %v, want errRuntimeMergeFenced", err)
+	}
+
+	if !rowExists(t, "agent_runtime", f.victimRuntime) {
+		t.Error("the old runtime was deleted even though the reassignment was fenced")
+	}
+	if !rowExists(t, "agent_task_queue", f.taskViaRuntime) {
+		t.Error("the old runtime's task was deleted by the cascade behind a fenced merge")
+	}
+	var stillOnOldRuntime bool
+	if err := testPool.QueryRow(ctx,
+		`SELECT runtime_id = $1 FROM agent_task_queue WHERE id = $2`,
+		f.victimRuntime, f.taskViaRuntime).Scan(&stillOnOldRuntime); err != nil {
+		t.Fatalf("read task runtime: %v", err)
+	}
+	if !stillOnOldRuntime {
+		t.Error("the task was re-pointed at the vanished runtime")
+	}
+
+	// And the happy path still merges, so the abort is not unconditional.
+	var freshRuntime string
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO agent_runtime (workspace_id, name, runtime_mode, provider, status, device_info, metadata, owner_id)
+VALUES ($1, 'merge target', 'cloud', 'delete-test', 'offline', '', '{}'::jsonb, $2)
+RETURNING id
+`, f.victimID, testUserID).Scan(&freshRuntime); err != nil {
+		t.Fatalf("create merge target: %v", err)
+	}
+	if err := testHandler.mergeLegacyRuntime(ctx, parseUUID(freshRuntime), parseUUID(f.victimRuntime),
+		"legacy-daemon", "delete-test"); err != nil {
+		t.Fatalf("merge onto a live runtime: %v", err)
+	}
+	if rowExists(t, "agent_runtime", f.victimRuntime) {
+		t.Error("the old runtime survived a merge that should have completed")
+	}
+	if !rowExists(t, "agent_task_queue", f.taskViaRuntime) {
+		t.Error("a completed merge lost the old runtime's task")
 	}
 }
 

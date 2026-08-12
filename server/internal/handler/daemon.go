@@ -751,43 +751,70 @@ func (h *Handler) mergeLegacyRuntimes(r *http.Request, registered db.AgentRuntim
 			}
 			merged[oldID] = struct{}{}
 
-			agents, err := h.Queries.ReassignAgentsToRuntime(r.Context(), db.ReassignAgentsToRuntimeParams{
-				NewRuntimeID: registered.ID,
-				OldRuntimeID: old.ID,
-			})
-			if err != nil {
-				slog.Warn("legacy runtime merge: reassign agents failed", "legacy_daemon_id", legacyID, "old_runtime_id", oldID, "new_runtime_id", newID, "error", err)
-				continue
+			if err := h.mergeLegacyRuntime(r.Context(), registered.ID, old.ID, legacyID, provider); err != nil {
+				slog.Warn("legacy runtime merge failed",
+					"legacy_daemon_id", legacyID, "old_runtime_id", oldID, "new_runtime_id", newID, "error", err)
 			}
-			tasks, err := h.Queries.ReassignTasksToRuntime(r.Context(), db.ReassignTasksToRuntimeParams{
-				NewRuntimeID: registered.ID,
-				OldRuntimeID: old.ID,
-			})
-			if err != nil {
-				slog.Warn("legacy runtime merge: reassign tasks failed", "legacy_daemon_id", legacyID, "old_runtime_id", oldID, "new_runtime_id", newID, "error", err)
-				continue
-			}
-			if err := h.Queries.RecordRuntimeLegacyDaemonID(r.Context(), db.RecordRuntimeLegacyDaemonIDParams{
-				ID:             registered.ID,
-				LegacyDaemonID: strToText(legacyID),
-			}); err != nil {
-				slog.Warn("legacy runtime merge: record legacy daemon_id failed", "legacy_daemon_id", legacyID, "error", err)
-			}
-			if err := h.Queries.DeleteAgentRuntime(r.Context(), old.ID); err != nil {
-				slog.Warn("legacy runtime merge: delete old runtime failed", "old_runtime_id", oldID, "error", err)
-				continue
-			}
-
-			slog.Info("legacy runtime merged",
-				"legacy_daemon_id", legacyID,
-				"old_runtime_id", oldID,
-				"new_runtime_id", newID,
-				"provider", provider,
-				"agents_reassigned", agents,
-				"tasks_reassigned", tasks,
-			)
 		}
 	}
+}
+
+// errRuntimeMergeFenced reports that the task-write fence refused the
+// reassignment because the target runtime's workspace is being deleted or is
+// already gone. The merge is abandoned, not retried in place: the next daemon
+// registration re-runs it, and by then either the workspace is gone entirely or
+// the teardown rolled back.
+var errRuntimeMergeFenced = errors.New("runtime merge refused by the task-write fence")
+
+// mergeLegacyRuntime folds one legacy runtime row into the freshly registered one.
+//
+// Order is load-bearing. Tasks move first, because that statement carries the
+// workspace fence (lock_task_owner_workspaces) and is the only step that can tell
+// us the target workspace is being torn down. Its verdict is separate from its row
+// count for exactly this reason: "0 tasks reassigned" is also what a legacy runtime
+// with no history looks like, and treating a fenced refusal as success would take
+// us straight to DeleteAgentRuntime below — where agent_task_queue's
+// ON DELETE CASCADE would delete the history this merge is supposed to carry
+// forward (MUL-5999 review). Nothing after this point runs unless the fence agreed.
+func (h *Handler) mergeLegacyRuntime(ctx context.Context, newRuntimeID, oldRuntimeID pgtype.UUID, legacyID, provider string) error {
+	reassignment, err := h.Queries.ReassignTasksToRuntime(ctx, db.ReassignTasksToRuntimeParams{
+		NewRuntimeID: newRuntimeID,
+		OldRuntimeID: oldRuntimeID,
+	})
+	if err != nil {
+		return fmt.Errorf("reassign tasks: %w", err)
+	}
+	if !reassignment.FenceOk {
+		return errRuntimeMergeFenced
+	}
+
+	agents, err := h.Queries.ReassignAgentsToRuntime(ctx, db.ReassignAgentsToRuntimeParams{
+		NewRuntimeID: newRuntimeID,
+		OldRuntimeID: oldRuntimeID,
+	})
+	if err != nil {
+		return fmt.Errorf("reassign agents: %w", err)
+	}
+
+	if err := h.Queries.RecordRuntimeLegacyDaemonID(ctx, db.RecordRuntimeLegacyDaemonIDParams{
+		ID:             newRuntimeID,
+		LegacyDaemonID: strToText(legacyID),
+	}); err != nil {
+		slog.Warn("legacy runtime merge: record legacy daemon_id failed", "legacy_daemon_id", legacyID, "error", err)
+	}
+	if err := h.Queries.DeleteAgentRuntime(ctx, oldRuntimeID); err != nil {
+		return fmt.Errorf("delete old runtime: %w", err)
+	}
+
+	slog.Info("legacy runtime merged",
+		"legacy_daemon_id", legacyID,
+		"old_runtime_id", uuidToString(oldRuntimeID),
+		"new_runtime_id", uuidToString(newRuntimeID),
+		"provider", provider,
+		"agents_reassigned", agents,
+		"tasks_reassigned", reassignment.ReassignedTasks,
+	)
+	return nil
 }
 
 func (h *Handler) GetDaemonWorkspaceRepos(w http.ResponseWriter, r *http.Request) {

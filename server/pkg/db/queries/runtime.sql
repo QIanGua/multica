@@ -366,7 +366,7 @@ UPDATE agent
 SET runtime_id = @new_runtime_id
 WHERE runtime_id = @old_runtime_id;
 
--- name: ReassignTasksToRuntime :execrows
+-- name: ReassignTasksToRuntime :one
 -- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
@@ -374,16 +374,28 @@ WHERE runtime_id = @old_runtime_id;
 -- Re-points every queued/running/completed task referencing old_runtime_id.
 -- Required before deleting the old runtime row because agent_task_queue has
 -- an ON DELETE CASCADE FK that would otherwise drop historical tasks.
+--
+-- Returns the fence verdict separately from the row count on purpose. "0 rows"
+-- is ambiguous — it means either "the old runtime had no tasks" or "the fence
+-- refused" — and a caller that cannot tell them apart would go on to delete the
+-- old runtime, letting that same ON DELETE CASCADE drop the very history this
+-- statement exists to preserve. FenceOk = false must abort the merge.
 WITH fence AS MATERIALIZED (
     -- Once per statement rather than once per row: the predicate is VOLATILE, so
     -- calling it from the WHERE clause of a bulk UPDATE would re-run it for every
     -- candidate row.
     SELECT lock_task_owner_workspaces(NULL, NULL, @new_runtime_id) AS ok
+),
+reassigned AS (
+    UPDATE agent_task_queue
+    SET runtime_id = @new_runtime_id
+    WHERE runtime_id = @old_runtime_id
+      AND (SELECT ok FROM fence)
+    RETURNING id
 )
-UPDATE agent_task_queue
-SET runtime_id = @new_runtime_id
-WHERE runtime_id = @old_runtime_id
-  AND (SELECT ok FROM fence);
+SELECT
+    (SELECT ok FROM fence) AS fence_ok,
+    (SELECT count(*) FROM reassigned) AS reassigned_tasks;
 
 -- name: RecordRuntimeLegacyDaemonID :exec
 -- Remembers the most recent hostname-derived daemon_id that was merged into
