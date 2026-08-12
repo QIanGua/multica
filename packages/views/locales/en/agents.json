@@ -467,6 +467,7 @@
       "row_edit_action": "Edit as rows",
       "bulk_placeholder": "API_KEY=value\nBASE_URL=https://example.com",
       "bulk_plaintext_notice": "Values are shown in plain text while bulk editing.",
+      "bulk_unsupported_toast": "\"{{key}}\" can't be shown as text — edit it as a row",
       "parse_error_malformed": "Line {{line}} isn't a KEY=value assignment",
       "parse_error_duplicate": "Duplicate key \"{{key}}\" on line {{line}}",
       "paste_invalid_toast": "Couldn't parse pasted environment variables",

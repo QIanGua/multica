@@ -58,7 +58,7 @@ function envMapToEntries(env: Record<string, string>): EnvEntry[] {
 
 // Bulk mode round-trips through the same parser the paste path uses, so the
 // two entry points can never disagree about what a line means.
-function entriesToBulkText(entries: EnvEntry[]): string {
+function entriesToBulkText(entries: EnvEntry[]) {
   return formatEnvFile(
     entries
       .filter((entry) => entry.key.trim() !== "")
@@ -120,9 +120,14 @@ export function EnvTab({
     revealed !== null &&
     JSON.stringify(currentEnvMap) !== JSON.stringify(originalMap);
 
+  // Bulk text that does not parse never reaches `revealed`, so `dirty` alone
+  // would report a clean tab while the textarea still holds the user's work —
+  // and the parent's discard guard would let a tab switch drop it silently.
+  const hasUnsavedWork = dirty || (bulkEditing && bulkError !== null);
+
   useEffect(() => {
-    onDirtyChange?.(dirty);
-  }, [dirty, onDirtyChange]);
+    onDirtyChange?.(hasUnsavedWork);
+  }, [hasUnsavedWork, onDirtyChange]);
 
   const handleReveal = useCallback(async () => {
     setRevealing(true);
@@ -217,7 +222,17 @@ export function EnvTab({
   };
 
   const enterBulkEditing = () => {
-    setBulkText(entriesToBulkText(revealed ?? []));
+    const formatted = entriesToBulkText(revealed ?? []);
+    if (!formatted.ok) {
+      // Refuse rather than hand back text that cannot be read again — the
+      // user would edit an unrelated line and silently truncate this one.
+      toast.error(
+        t(($) => $.tab_body.env.bulk_unsupported_toast, { key: formatted.key }),
+      );
+      return;
+    }
+
+    setBulkText(formatted.text);
     setBulkError(null);
     setBulkEditing(true);
   };
@@ -276,8 +291,17 @@ export function EnvTab({
       setOriginalMap(env);
       setRevealed(savedEntries);
       // Keep the textarea in step with what the server accepted rather than
-      // dropping the user out of bulk mode on every save.
-      if (bulkEditing) setBulkText(entriesToBulkText(savedEntries));
+      // dropping the user out of bulk mode on every save. If the server hands
+      // back something bulk text cannot express, fall back to rows — the data
+      // is already saved, so the only wrong move would be showing lossy text.
+      if (bulkEditing) {
+        const formatted = entriesToBulkText(savedEntries);
+        if (formatted.ok) {
+          setBulkText(formatted.text);
+        } else {
+          leaveBulkEditing();
+        }
+      }
       toast.success(t(($) => $.tab_body.env.saved_toast));
       onSaved?.();
     } catch (err) {
@@ -420,10 +444,9 @@ export function EnvTab({
                   onChange={(e) =>
                     updateEnvEntry(index, "value", e.target.value)
                   }
-                  // Same handler as the key field: pasting a whole file into
-                  // the value box used to do nothing at all, which read as the
-                  // feature being broken rather than aimed elsewhere.
-                  onPaste={(event) => handleEnvPaste(index, event)}
+                  // Deliberately no paste interception here: a value is
+                  // arbitrary text, and `foo=bar` pasted as a value is a value,
+                  // not an assignment. Bulk edit is the entry point for files.
                   placeholder={t(($) => $.tab_body.env.value_placeholder)}
                   className="pr-8 font-mono text-caption"
                 />
@@ -463,7 +486,7 @@ export function EnvTab({
       )}
 
       <div className="flex items-center justify-end gap-3">
-        {dirty && (
+        {hasUnsavedWork && (
           <span className="text-caption text-muted-foreground">
             {t(($) => $.tab_body.common.unsaved_changes)}
           </span>

@@ -94,21 +94,71 @@ describe("parseEnvFileResult", () => {
 });
 
 describe("formatEnvFile", () => {
-  it("round-trips values that would otherwise change meaning", () => {
-    const assignments = [
-      { key: "PLAIN", value: "value" },
-      { key: "EMPTY", value: "" },
-      { key: "WIN_DIR", value: String.raw`C:\Users\me\.ssh` },
-      { key: "PASSWORD", value: "p$ss`word" },
-      { key: "JSON", value: '{"a":1}' },
-      { key: "PADDED", value: "  spaced  " },
-      { key: "HASH", value: "value # kept" },
-      { key: "LEADING_QUOTE", value: '"quoted"' },
-      { key: "APOSTROPHE", value: "it's" },
-    ];
+  // The invariant that matters: anything the API accepts and this serializer
+  // agrees to render must read back byte-identical. Reasoning about "which
+  // characters are dangerous" is what previously truncated `foo" #bar`.
+  const ROUND_TRIP_VALUES = [
+    ["plain", "value"],
+    ["empty", ""],
+    ["windows path", String.raw`C:\Users\me\.ssh`],
+    ["dollar and backtick", "p$ss`word"],
+    ["json", '{"a":1}'],
+    ["padded", "  spaced  "],
+    ["inline hash", "value # kept"],
+    ["leading hash", "#not-a-comment"],
+    ["wrapped in quotes", '"quoted"'],
+    ["apostrophe", "it's"],
+    ["double quote then hash", 'foo" #bar'],
+    ["single quote then hash", "foo' #bar"],
+    ["both quote styles", `a"b'c`],
+    ["only whitespace", "   "],
+    ["equals signs", "a=b=c"],
+    ["trailing backslash", "C:\\path\\"],
+  ] as const;
 
-    const result = parseEnvFileResult(formatEnvFile(assignments));
-    expect(result).toEqual({ ok: true, assignments });
+  it.each(ROUND_TRIP_VALUES)("round-trips %s", (_label, value) => {
+    const assignments = [{ key: "K", value }];
+    const formatted = formatEnvFile(assignments);
+    expect(formatted.ok).toBe(true);
+    if (!formatted.ok) return;
+    expect(parseEnvFileResult(formatted.text)).toEqual({
+      ok: true,
+      assignments,
+    });
+  });
+
+  it("round-trips a whole file at once", () => {
+    const assignments = ROUND_TRIP_VALUES.map(([label, value], index) => ({
+      key: `K${index}_${label.replace(/[^a-z]/gi, "")}`,
+      value,
+    }));
+    const formatted = formatEnvFile(assignments);
+    expect(formatted.ok).toBe(true);
+    if (!formatted.ok) return;
+    expect(parseEnvFileResult(formatted.text)).toEqual({
+      ok: true,
+      assignments,
+    });
+  });
+
+  it("refuses values it cannot represent instead of mangling them", () => {
+    // A real newline: the parser splits on those before it ever sees a value,
+    // so there is no encoding. The server does accept these (PEM keys).
+    expect(formatEnvFile([{ key: "PEM", value: "line1\nline2" }])).toEqual({
+      ok: false,
+      key: "PEM",
+    });
+    // Closes early under both quote styles.
+    expect(
+      formatEnvFile([{ key: "TRICKY", value: `a" #b' #c` }]),
+    ).toEqual({ ok: false, key: "TRICKY" });
+  });
+
+  it("refuses keys the parser could not read back", () => {
+    expect(formatEnvFile([{ key: "foo-bar", value: "x" }])).toEqual({
+      ok: false,
+      key: "foo-bar",
+    });
   });
 
   it("leaves values bare unless quoting is required", () => {
@@ -118,6 +168,6 @@ describe("formatEnvFile", () => {
         { key: "B", value: "" },
         { key: "C", value: "  padded" },
       ]),
-    ).toBe('A=plain\nB=\nC="  padded"');
+    ).toEqual({ ok: true, text: 'A=plain\nB=\nC="  padded"' });
   });
 });

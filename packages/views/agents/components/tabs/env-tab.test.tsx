@@ -278,18 +278,38 @@ describe("EnvTab value-field paste", () => {
     updateAgentEnv.mockResolvedValue({ custom_env: {} });
   });
 
-  it("expands an env file pasted into the value field too", async () => {
+  it("leaves the value field alone — a pasted value is a value", async () => {
     const user = userEvent.setup();
     renderTab();
 
     await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
-    fireEvent.paste(screen.getByPlaceholderText("value"), {
+    await user.type(screen.getByPlaceholderText("KEY"), "CONFIG");
+
+    // `foo=bar` looks like an assignment but was pasted as a value. Hijacking
+    // it would save { foo: "bar" } instead of { CONFIG: "foo=bar" }.
+    const valueInput = screen.getByPlaceholderText("value");
+    const nativeAllowed = fireEvent.paste(valueInput, {
+      clipboardData: { getData: () => "foo=bar" },
+    });
+
+    expect(nativeAllowed).toBe(true);
+    expect(toastError).not.toHaveBeenCalled();
+    expect(
+      screen.getAllByPlaceholderText("KEY").map((i) => (i as HTMLInputElement).value),
+    ).toEqual(["CONFIG"]);
+  });
+
+  it("does not intercept a whole file pasted into the value field either", async () => {
+    const user = userEvent.setup();
+    renderTab();
+
+    await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    const nativeAllowed = fireEvent.paste(screen.getByPlaceholderText("value"), {
       clipboardData: { getData: () => "FIRST=one\nSECOND=two" },
     });
 
-    expect(
-      screen.getAllByPlaceholderText("KEY").map((i) => (i as HTMLInputElement).value),
-    ).toEqual(["FIRST", "SECOND"]);
+    expect(nativeAllowed).toBe(true);
+    expect(screen.getAllByPlaceholderText("KEY")).toHaveLength(1);
   });
 
   it("reports the offending line when a paste cannot be parsed", async () => {
@@ -304,5 +324,87 @@ describe("EnvTab value-field paste", () => {
     expect(toastError).toHaveBeenCalledWith(
       "Line 2 isn't a KEY=value assignment",
     );
+  });
+});
+
+describe("EnvTab unsaved-work reporting", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getAgentEnv.mockResolvedValue({ custom_env: { API_KEY: "secret" } });
+    updateAgentEnv.mockResolvedValue({ custom_env: {} });
+  });
+
+  it("reports bulk text that does not parse as unsaved work", async () => {
+    const onDirtyChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <EnvTab agent={agent} onDirtyChange={onDirtyChange} />
+      </I18nProvider>,
+    );
+
+    await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    await user.click(screen.getByRole("button", { name: /bulk edit/i }));
+    onDirtyChange.mockClear();
+
+    const textarea = screen.getByRole("textbox", { name: /bulk edit/i });
+    await user.clear(textarea);
+    await user.type(textarea, "not-an-assignment");
+
+    // Without this the parent's discard guard sees a clean tab and lets a tab
+    // switch drop the text with no prompt.
+    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+    expect(screen.getByText(/unsaved changes/i)).toBeInTheDocument();
+
+    // Clearing the error settles back to genuinely clean.
+    await user.clear(textarea);
+    await user.type(textarea, "API_KEY=secret");
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  });
+});
+
+describe("EnvTab values that bulk text cannot represent", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    updateAgentEnv.mockResolvedValue({ custom_env: {} });
+  });
+
+  it("refuses to enter bulk mode rather than serialize lossily", async () => {
+    getAgentEnv.mockResolvedValue({
+      custom_env: { PEM: "line1\nline2", SAFE: "ok" },
+    });
+    const user = userEvent.setup();
+    renderTab();
+
+    await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    await user.click(screen.getByRole("button", { name: /bulk edit/i }));
+
+    expect(toastError).toHaveBeenCalledWith(
+      '"PEM" can\'t be shown as text — edit it as a row',
+    );
+    // Still in the row editor, data untouched.
+    expect(
+      screen.queryByRole("textbox", { name: /bulk edit/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getAllByPlaceholderText("KEY").map((i) => (i as HTMLInputElement).value),
+    ).toEqual(["PEM", "SAFE"]);
+  });
+
+  it("keeps a quote-then-hash value intact through a bulk round trip", async () => {
+    getAgentEnv.mockResolvedValue({ custom_env: { TRICKY: 'foo" #bar' } });
+    const user = userEvent.setup();
+    renderTab();
+
+    await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    await user.click(screen.getByRole("button", { name: /bulk edit/i }));
+    await user.click(screen.getByRole("button", { name: /edit as rows/i }));
+    await user.click(screen.getByRole("button", { name: /^add$/i }));
+    await user.type(screen.getAllByPlaceholderText("KEY")[1]!, "NEW");
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(updateAgentEnv.mock.calls[0]?.[1]).toEqual({
+      custom_env: { TRICKY: 'foo" #bar', NEW: "" },
+    });
   });
 });

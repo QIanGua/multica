@@ -126,24 +126,49 @@ export function parseEnvFile(text: string): EnvAssignment[] | null {
   return result.assignments;
 }
 
+export type EnvFormatResult =
+  | { ok: true; text: string }
+  | { ok: false; key: string };
+
+const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
- * Quote only when a bare value would not survive a round trip: the parser
- * trims surrounding whitespace, treats a leading quote as an opening quote,
- * and cuts an inline ` #` comment. Everything else — `$`, backslashes,
- * backticks, embedded quotes — is literal on both sides and stays bare.
+ * Pick an encoding by round-tripping each candidate through the very parser
+ * that will read it back, instead of reasoning about which characters are
+ * dangerous — that reasoning is what previously turned `foo" #bar` into `foo`.
+ *
+ * Some values have no representation at all: an embedded newline (the parser
+ * splits on those first) or a value that closes early under both quote styles,
+ * such as `a" #b' #c`. The server accepts those, so they must be reported
+ * rather than mangled into something that merely looks editable.
  */
-function needsQuotes(value: string): boolean {
-  if (value === "") return false;
-  if (value !== value.trim()) return true;
-  if (value.startsWith('"') || value.startsWith("'")) return true;
-  return /\s#/.test(value);
+function encodeValue(key: string, value: string): string | null {
+  if (/[\r\n]/.test(value)) return null;
+
+  for (const candidate of [value, `"${value}"`, `'${value}'`]) {
+    const result = parseEnvFileResult(`${key}=${candidate}`);
+    if (result.ok && result.assignments[0]?.value === value) return candidate;
+  }
+
+  return null;
 }
 
-/** Serialize entries back into the dotenv text `parseEnvFileResult` accepts. */
-export function formatEnvFile(assignments: EnvAssignment[]): string {
-  return assignments
-    .map(({ key, value }) =>
-      needsQuotes(value) ? `${key}="${value}"` : `${key}=${value}`,
-    )
-    .join("\n");
+/**
+ * Serialize entries back into text `parseEnvFileResult` reads identically, or
+ * name the first entry that cannot be represented so the caller can refuse to
+ * enter bulk editing without touching any data.
+ */
+export function formatEnvFile(assignments: EnvAssignment[]): EnvFormatResult {
+  const lines: string[] = [];
+
+  for (const { key, value } of assignments) {
+    if (!KEY_PATTERN.test(key)) return { ok: false, key };
+
+    const encoded = encodeValue(key, value);
+    if (encoded === null) return { ok: false, key };
+
+    lines.push(`${key}=${encoded}`);
+  }
+
+  return { ok: true, text: lines.join("\n") };
 }
