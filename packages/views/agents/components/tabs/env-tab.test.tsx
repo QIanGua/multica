@@ -391,6 +391,24 @@ describe("EnvTab values that bulk text cannot represent", () => {
     ).toEqual(["PEM", "SAFE"]);
   });
 
+  it("refuses bulk mode when two rows share a key", async () => {
+    getAgentEnv.mockResolvedValue({ custom_env: { A: "1" } });
+    const user = userEvent.setup();
+    renderTab();
+
+    await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    await user.click(screen.getByRole("button", { name: /^add$/i }));
+    await user.type(screen.getAllByPlaceholderText("KEY")[1]!, "A");
+    await user.click(screen.getByRole("button", { name: /bulk edit/i }));
+
+    // No text could round-trip two entries sharing a key, so entering bulk
+    // mode would show a duplicate error the user could not trace to a row.
+    expect(toastError).toHaveBeenCalledWith("Duplicate environment variable keys");
+    expect(
+      screen.queryByRole("textbox", { name: /bulk edit/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("keeps a quote-then-hash value intact through a bulk round trip", async () => {
     getAgentEnv.mockResolvedValue({ custom_env: { TRICKY: 'foo" #bar' } });
     const user = userEvent.setup();

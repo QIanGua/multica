@@ -227,7 +227,11 @@ export function EnvTab({
       // Refuse rather than hand back text that cannot be read again — the
       // user would edit an unrelated line and silently truncate this one.
       toast.error(
-        t(($) => $.tab_body.env.bulk_unsupported_toast, { key: formatted.key }),
+        formatted.reason === "duplicate"
+          ? t(($) => $.tab_body.env.duplicate_keys_toast)
+          : t(($) => $.tab_body.env.bulk_unsupported_toast, {
+              key: formatted.key,
+            }),
       );
       return;
     }

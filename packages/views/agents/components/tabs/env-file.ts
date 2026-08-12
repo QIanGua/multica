@@ -128,7 +128,7 @@ export function parseEnvFile(text: string): EnvAssignment[] | null {
 
 export type EnvFormatResult =
   | { ok: true; text: string }
-  | { ok: false; key: string };
+  | { ok: false; reason: "unrepresentable" | "duplicate"; key: string };
 
 const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -157,16 +157,27 @@ function encodeValue(key: string, value: string): string | null {
  * Serialize entries back into text `parseEnvFileResult` reads identically, or
  * name the first entry that cannot be represented so the caller can refuse to
  * enter bulk editing without touching any data.
+ *
+ * Success means the whole text round-trips, which is why duplicate keys are a
+ * refusal rather than a formatting detail: two entries sharing a key can only
+ * ever read back as one, so no text could satisfy the contract.
  */
 export function formatEnvFile(assignments: EnvAssignment[]): EnvFormatResult {
   const lines: string[] = [];
+  const keys = new Set<string>();
 
   for (const { key, value } of assignments) {
-    if (!KEY_PATTERN.test(key)) return { ok: false, key };
+    if (!KEY_PATTERN.test(key)) {
+      return { ok: false, reason: "unrepresentable", key };
+    }
+    if (keys.has(key)) return { ok: false, reason: "duplicate", key };
 
     const encoded = encodeValue(key, value);
-    if (encoded === null) return { ok: false, key };
+    if (encoded === null) {
+      return { ok: false, reason: "unrepresentable", key };
+    }
 
+    keys.add(key);
     lines.push(`${key}=${encoded}`);
   }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { EnvAssignment } from "./env-file";
 import {
   formatEnvFile,
   isEnvFilePaste,
@@ -146,19 +147,63 @@ describe("formatEnvFile", () => {
     // so there is no encoding. The server does accept these (PEM keys).
     expect(formatEnvFile([{ key: "PEM", value: "line1\nline2" }])).toEqual({
       ok: false,
+      reason: "unrepresentable",
       key: "PEM",
     });
     // Closes early under both quote styles.
-    expect(
-      formatEnvFile([{ key: "TRICKY", value: `a" #b' #c` }]),
-    ).toEqual({ ok: false, key: "TRICKY" });
+    expect(formatEnvFile([{ key: "TRICKY", value: `a" #b' #c` }])).toEqual({
+      ok: false,
+      reason: "unrepresentable",
+      key: "TRICKY",
+    });
   });
 
   it("refuses keys the parser could not read back", () => {
     expect(formatEnvFile([{ key: "foo-bar", value: "x" }])).toEqual({
       ok: false,
+      reason: "unrepresentable",
       key: "foo-bar",
     });
+  });
+
+  it("refuses duplicate keys, which no text could round-trip", () => {
+    expect(
+      formatEnvFile([
+        { key: "A", value: "1" },
+        { key: "B", value: "2" },
+        { key: "A", value: "3" },
+      ]),
+    ).toEqual({ ok: false, reason: "duplicate", key: "A" });
+  });
+
+  it("guarantees that success means the whole text round-trips", () => {
+    // The contract in one assertion: whatever formatEnvFile agrees to render
+    // must parse back to exactly what went in — including the inputs it is
+    // allowed to reject, which must reject rather than render something lossy.
+    const inputs: EnvAssignment[][] = [
+      [{ key: "A", value: "1" }],
+      [{ key: "PEM", value: "line1\nline2" }],
+      [{ key: "TRICKY", value: `a" #b' #c` }],
+      [{ key: "QUOTED", value: 'foo" #bar' }],
+      [{ key: "foo-bar", value: "x" }],
+      [
+        { key: "A", value: "1" },
+        { key: "A", value: "2" },
+      ],
+      ROUND_TRIP_VALUES.map(([label, value], index) => ({
+        key: `R${index}_${label.replace(/[^a-z]/gi, "")}`,
+        value,
+      })),
+    ];
+
+    for (const assignments of inputs) {
+      const formatted = formatEnvFile(assignments);
+      if (!formatted.ok) continue;
+      expect(parseEnvFileResult(formatted.text)).toEqual({
+        ok: true,
+        assignments,
+      });
+    }
   });
 
   it("leaves values bare unless quoting is required", () => {
