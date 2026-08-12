@@ -39,6 +39,7 @@ import {
 } from "@multica/ui/components/ui/dropdown-menu";
 import { ActorAvatar } from "../actor-avatar";
 import { AttributionBadge } from "../../issues/components/attribution-badge";
+import { cancelReasonLabel } from "../../agents/components/tabs/task-failure";
 import { RichContent } from "../../rich-content";
 import { api } from "@multica/core/api";
 import {
@@ -566,13 +567,21 @@ export function AgentTranscriptDialog({
             {t(($) => $.transcript.status_failed)}
           </span>
         );
-      case "cancelled":
+      case "cancelled": {
+        // A server-cancelled run (worktree claim gate, preserved-work
+        // delivery) carries a persisted reason the user must act on; surface
+        // it on the badge instead of a bare "Cancelled". User-initiated
+        // cancels have no reason and keep the plain label.
+        const cancelReason = cancelReasonLabel(task);
         return (
-          <span className={cn(base, "bg-muted text-muted-foreground")}>
+          <span className={cn(base, "bg-muted text-muted-foreground")} title={task.error ?? undefined}>
             <XCircle className="h-3 w-3" />
-            {t(($) => $.transcript.status_cancelled)}
+            {cancelReason
+              ? `${t(($) => $.transcript.status_cancelled)} · ${cancelReason}`
+              : t(($) => $.transcript.status_cancelled)}
           </span>
         );
+      }
       case "queued":
         return (
           <span className={cn(base, "bg-muted text-muted-foreground")}>
@@ -646,6 +655,7 @@ export function AgentTranscriptDialog({
     !!runtimeInfo ||
     !!task.relative_work_dir ||
     !!task.branch_name ||
+    !!task.error ||
     !!createdLabel ||
     !!startedLabel ||
     !!completedLabel ||
@@ -766,6 +776,16 @@ export function AgentTranscriptDialog({
                           onCopy={handleCopyBranch}
                           copied={copiedBranch}
                           copyTitle={t(($) => $.transcript.copy_branch)}
+                        />
+                      )}
+                      {/* The full persisted error, for failed AND
+                          server-cancelled runs — this is where "which
+                          worktree holds my preserved work" and "which
+                          machine needs upgrading" are actually readable. */}
+                      {task.error && (
+                        <RunDetailRow
+                          label={t(($) => $.transcript.details_reason)}
+                          value={task.error}
                         />
                       )}
                       {createdLabel && (

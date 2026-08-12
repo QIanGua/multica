@@ -825,6 +825,7 @@
     "details_cost": "费用",
     "usage_chip_title": "这次运行消耗的 token 与估算费用",
     "details_branch": "分支",
+    "details_reason": "原因",
     "copy_branch": "复制分支名"
   },
   "task_failure": {

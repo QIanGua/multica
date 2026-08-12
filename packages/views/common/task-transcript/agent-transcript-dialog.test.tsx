@@ -636,3 +636,36 @@ describe("AgentTranscriptDialog — delivered branch", () => {
     expect(screen.queryByTitle("Copy branch name")).not.toBeInTheDocument();
   });
 });
+
+// A server-cancelled run (worktree claim gate, preserved-work delivery) must
+// explain itself: the reason rides the status badge and the full persisted
+// error is readable in Run details. A user's own cancel stays a plain
+// "Cancelled" — they know why they clicked.
+describe("AgentTranscriptDialog — cancel reason", () => {
+  const gateError = "worktree mode needs daemon version 0.4.24 or newer on that machine";
+
+  it("labels a server-cancelled run and surfaces the persisted reason", async () => {
+    renderDialog(items, {
+      task: {
+        ...baseTask,
+        status: "cancelled",
+        error: gateError,
+        failure_reason: "local_directory_error",
+      },
+    });
+
+    expect(screen.getByText(/Local directory error/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Run details" }));
+    expect(screen.getByText(gateError)).toBeInTheDocument();
+  });
+
+  it("keeps a user-initiated cancel a plain Cancelled", () => {
+    renderDialog(items, {
+      task: { ...baseTask, status: "cancelled", error: null },
+    });
+
+    expect(screen.getByText("Cancelled")).toBeInTheDocument();
+    expect(screen.queryByText(/Local directory error/)).not.toBeInTheDocument();
+  });
+});

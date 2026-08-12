@@ -4904,14 +4904,24 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	select {
 	case <-cancelledByPoll:
 		taskLog.Info("task cancelled during execution, discarding result",
-			"branch_name", result.BranchName)
+			"branch_name", result.BranchName, "error", err)
 		// runner.run has returned, so the transcript flush is complete —
 		// tell the server it can settle its deferred chat finalization
-		// (#5219). Best-effort: the sweeper grace period covers a lost ack.
-		// The branch rides along because the worktree was already finalized
-		// before this check: the partial work is committed either way, and the
-		// only question is whether the user can find it.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, result.BranchName); ackErr != nil {
+		// (#5219). The sweeper grace period covers a lost ack's chat settle,
+		// but NOT the payload: the branch rides along because the worktree was
+		// already finalized before this check, and when Finalize instead
+		// ABORTED, the preserved-worktree error is the only pointer left to
+		// the agent's work — everything else on this path is discarded. Other
+		// run errors stay discarded: on a cancelled run they are expected
+		// noise (context canceled, killed process), and persisting them would
+		// stamp a bogus reason on every ordinary mid-run cancel.
+		ack := TaskCancelAck{BranchName: result.BranchName}
+		var preserved *worktreePreservedError
+		if errors.As(err, &preserved) {
+			ack.ErrorMessage = preserved.Error()
+			ack.FailureReason = "local_directory_error"
+		}
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, ack); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
@@ -4949,8 +4959,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			"status", status, "error", err, "branch_name", result.BranchName)
 		// Same contract as the poll-cancelled path above: the transcript is
 		// flushed, so let the server settle its deferred chat finalization, and
-		// carry the finalized branch so cancelled work stays discoverable.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, result.BranchName); ackErr != nil {
+		// carry the finalized branch so cancelled work stays discoverable. No
+		// error to carry here — this branch is only reached with err == nil.
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, TaskCancelAck{BranchName: result.BranchName}); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
@@ -4987,6 +4998,16 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		}
 	}
 }
+
+// worktreePreservedError marks a task error that must survive the cancel path:
+// its message names the preserved worktree holding the agent's uncommitted
+// work. Every other error on a cancelled run is expected noise (context
+// canceled, killed process) and stays discarded; this one is the only pointer
+// to real work and rides the cancel ack to the server.
+type worktreePreservedError struct{ err error }
+
+func (e *worktreePreservedError) Error() string { return e.err.Error() }
+func (e *worktreePreservedError) Unwrap() error { return e.err }
 
 func taskRunFailureReason(err error) string {
 	if errors.Is(err, errTaskPrepareTimeout) {
@@ -5240,8 +5261,8 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			// The agent succeeded here — only the server's complete callback was
 			// rejected. Its branch is real and already committed, so it must
 			// survive the downgrade to a failure report.
-			branchName: result.BranchName,
-			sessionID:  result.SessionID,
+			branchName:            result.BranchName,
+			sessionID:             result.SessionID,
 			workDir:               result.WorkDir,
 			failureReason:         taskfailure.Classify(fallbackErrMsg).String(),
 			sessionRolloutMissing: result.SessionRolloutMissing,
@@ -6329,12 +6350,22 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// worktree instead of deleting them. Fail the task: a "completed"
 			// task whose branch is missing the work reads as success, and the
 			// user would never learn the changes are sitting in an env root the
-			// GC reclaims on a timer. Only overwrite a nil error — an earlier
-			// failure is the more useful one to report.
+			// GC reclaims on a timer.
+			//
+			// Wrapped in worktreePreservedError so the cancel path can
+			// recognise it: a cancelled task discards its result and error, but
+			// THIS error names the preserved worktree holding the agent's work
+			// and must ride the cancel ack instead of vanishing into a log.
+			// Joined rather than replacing an earlier failure — that one is
+			// usually the more useful primary cause, but the preserved path
+			// must not be displaced by it.
 			taskLog.Error("local_directory: worktree finalize could not persist the agent's changes",
 				"error", finalizeErr, "preserved_path", outcome.PreservedPath)
+			wrapped := &worktreePreservedError{err: fmt.Errorf("local_directory worktree: %w", finalizeErr)}
 			if returnErr == nil {
-				returnErr = fmt.Errorf("local_directory worktree: %w", finalizeErr)
+				returnErr = wrapped
+			} else {
+				returnErr = errors.Join(returnErr, wrapped)
 			}
 		}()
 	}

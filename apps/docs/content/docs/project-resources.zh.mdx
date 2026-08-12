@@ -80,6 +80,10 @@ import { Callout } from "fumadocs-ui/components/callout";
 
 由于 worktree 位于运行时的工作区目录内，它会按正常的清理周期回收；只有分支会留在你的仓库里。
 
+<Callout type="warn">
+**自托管运维注意：** 该模式的隔离由服务端强制（保存资源时检查一次，运行时领取每条任务时再检查一次），所以无论何时降级运行时都会被拦住。唯一拦不住的组合是：把服务端回滚到本功能之前的版本，同时还连着低于最低版本的运行时 —— 旧服务端没有这道门禁，而旧运行时会忽略 `execution_mode`、直接在原目录里跑任务。只要还存在 `worktree` 资源，就不要把服务端回滚到本版本之前，除非那些机器上的运行时全部升级到位。
+</Callout>
+
 <Callout type="info">
 worktree 模式面向 git 仓库。普通的非 git 目录仍然串行执行 —— 这正是 `in_place` 的用途。
 </Callout>

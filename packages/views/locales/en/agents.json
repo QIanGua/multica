@@ -840,6 +840,7 @@
     "details_cost": "Cost",
     "usage_chip_title": "Tokens and estimated cost for this run",
     "details_branch": "Branch",
+    "details_reason": "Reason",
     "copy_branch": "Copy branch name"
   },
   "task_failure": {

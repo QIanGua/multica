@@ -297,7 +297,14 @@ export interface AgentTask {
   error: string | null;
   // Empty string when the task is not in a failed state (the backend uses
   // `omitempty`, so the field may also be missing on non-failed tasks).
-  failure_reason?: TaskFailureReason | "";
+  // Open string on the wire, not a closed enum: the backend's classifier
+  // taxonomy has grown far past TaskFailureReason (21+ refined
+  // `agent_error.*` reasons since MUL-1949, `local_directory_error`, …) and
+  // keeps growing — an installed client will meet reasons its build
+  // predates. TaskFailureReason stays in the union for autocomplete on the
+  // coarse values; `string & {}` admits the rest without collapsing the
+  // hints.
+  failure_reason?: TaskFailureReason | (string & {}) | "";
   created_at: string;
   /** Non-empty when the task was spawned from a chat session. */
   chat_session_id?: string;

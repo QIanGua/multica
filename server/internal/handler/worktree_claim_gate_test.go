@@ -337,6 +337,74 @@ func TestBranchNameSurvivesEveryTerminalPath(t *testing.T) {
 			t.Errorf("branch_name = %q, want the original preserved", got)
 		}
 	})
+
+	readError := func(t *testing.T, taskID string) (string, string) {
+		t.Helper()
+		var errText, failureReason pgtype.Text
+		if err := testPool.QueryRow(ctx,
+			`SELECT error, failure_reason FROM agent_task_queue WHERE id = $1`, taskID).Scan(&errText, &failureReason); err != nil {
+			t.Fatalf("read error columns: %v", err)
+		}
+		return errText.String, failureReason.String
+	}
+
+	// Cancel + Finalize-abort: no branch exists, and the error naming the
+	// preserved worktree is the only pointer left to the agent's work. The ack
+	// must land it on the row for the UI to show.
+	t.Run("cancel ack records a preserved-worktree error", func(t *testing.T) {
+		taskID := newTask(t, "cancelled")
+		const preserved = "local_directory worktree: could not commit; the work is preserved in the worktree at /env/worktree"
+		post(t, taskID, "cancel-ack", map[string]any{
+			"error_message":  preserved,
+			"failure_reason": "local_directory_error",
+		}, testHandler.AckTaskCancelled)
+		gotErr, gotReason := readError(t, taskID)
+		if gotErr != preserved {
+			t.Errorf("error = %q, want the preserved-worktree message", gotErr)
+		}
+		if gotReason != "local_directory_error" {
+			t.Errorf("failure_reason = %q, want local_directory_error", gotReason)
+		}
+	})
+
+	// A reason already recorded (fail callback, claim gate) is authoritative;
+	// a replayed or late ack must not clobber it.
+	t.Run("cancel ack does not overwrite an existing error", func(t *testing.T) {
+		taskID := newTask(t, "cancelled")
+		if _, err := testPool.Exec(ctx,
+			`UPDATE agent_task_queue SET error = 'original reason', failure_reason = 'timeout' WHERE id = $1`,
+			taskID); err != nil {
+			t.Fatalf("seed existing error: %v", err)
+		}
+		post(t, taskID, "cancel-ack", map[string]any{
+			"error_message":  "latecomer",
+			"failure_reason": "local_directory_error",
+		}, testHandler.AckTaskCancelled)
+		gotErr, gotReason := readError(t, taskID)
+		if gotErr != "original reason" || gotReason != "timeout" {
+			t.Errorf("error/failure_reason = %q/%q, want the original pair preserved", gotErr, gotReason)
+		}
+	})
+
+	// Replaying the same ack (the daemon retries on transient errors) must be
+	// idempotent: same row state, still a 200.
+	t.Run("cancel ack replay is idempotent", func(t *testing.T) {
+		taskID := newTask(t, "cancelled")
+		body := map[string]any{
+			"branch_name":    "agent/j/replay11",
+			"error_message":  "preserved at /env/worktree",
+			"failure_reason": "local_directory_error",
+		}
+		post(t, taskID, "cancel-ack", body, testHandler.AckTaskCancelled)
+		post(t, taskID, "cancel-ack", body, testHandler.AckTaskCancelled)
+		if got := readBranch(t, taskID); got != "agent/j/replay11" {
+			t.Errorf("branch_name = %q after replay, want agent/j/replay11", got)
+		}
+		gotErr, _ := readError(t, taskID)
+		if gotErr != "preserved at /env/worktree" {
+			t.Errorf("error = %q after replay, want unchanged", gotErr)
+		}
+	})
 }
 
 // The claim gate cancels the task; the reason has to land on the row. The 4xx
@@ -389,5 +457,199 @@ func TestWorktreeClaimGateCancelPersistsReason(t *testing.T) {
 	}
 	if failureReason.String != "local_directory_error" {
 		t.Errorf("failure_reason = %q, want local_directory_error", failureReason.String)
+	}
+}
+
+// seedWorktreeGateClaimFixture builds the full claim-path scenario the gate
+// exists for: a runtime whose machine reports cliVersion, an agent bound to
+// it, and a queued issue task whose project carries a worktree-mode
+// local_directory resource pinned to that same machine.
+func seedWorktreeGateClaimFixture(t *testing.T, ctx context.Context, label, daemonID, cliVersion string) (runtimeID, taskID string) {
+	t.Helper()
+
+	metadata := "{}"
+	if cliVersion != "" {
+		metadata = `{"cli_version":"` + cliVersion + `"}`
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider,
+			status, device_info, metadata, last_seen_at, visibility, owner_id
+		)
+		VALUES ($1, $2, $3, 'local', 'handler_test_runtime', 'online', 'worktree gate fixture', $4::jsonb, now(), 'private', $5)
+		RETURNING id
+	`, testWorkspaceID, daemonID, label+" runtime", metadata, testUserID).Scan(&runtimeID); err != nil {
+		t.Fatalf("setup: create runtime: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID) })
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, $2, '', 'local', '{}'::jsonb, $3, 'private', 1, $4)
+		RETURNING id
+	`, testWorkspaceID, label+" agent", runtimeID, testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("setup: create agent: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1`, agentID) })
+
+	var projectID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO project (workspace_id, title) VALUES ($1, $2) RETURNING id
+	`, testWorkspaceID, label+" project").Scan(&projectID); err != nil {
+		t.Fatalf("setup: create project: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM project WHERE id = $1`, projectID) })
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO project_resource (project_id, workspace_id, resource_type, resource_ref, position)
+		VALUES ($1, $2, 'local_directory', $3::jsonb, 0)
+	`, projectID, testWorkspaceID,
+		`{"local_path":"/Users/dev/wtgate","daemon_id":"`+daemonID+`","execution_mode":"worktree"}`); err != nil {
+		t.Fatalf("setup: create project_resource: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM project_resource WHERE project_id = $1`, projectID)
+	})
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, project_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES (
+			$1, $2, $3, 'in_progress', 'none', $4, 'member',
+			(SELECT COALESCE(MAX(number), 82649) + 1 FROM issue WHERE workspace_id = $1),
+			0
+		)
+		RETURNING id
+	`, testWorkspaceID, projectID, label+" issue", testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("setup: create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, 'queued', 0)
+		RETURNING id
+	`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	return runtimeID, taskID
+}
+
+// assertWorktreeGateCancelled reads the task row and asserts the gate left it
+// in the state the user can act on: cancelled, with the reason persisted.
+func assertWorktreeGateCancelled(t *testing.T, ctx context.Context, taskID string) {
+	t.Helper()
+	var status string
+	var errText, failureReason pgtype.Text
+	if err := testPool.QueryRow(ctx,
+		`SELECT status, error, failure_reason FROM agent_task_queue WHERE id = $1`,
+		taskID).Scan(&status, &errText, &failureReason); err != nil {
+		t.Fatalf("read task: %v", err)
+	}
+	if status != "cancelled" {
+		t.Errorf("status = %q, want cancelled", status)
+	}
+	if !strings.Contains(errText.String, "/Users/dev/wtgate") {
+		t.Errorf("error = %q, want the persisted reason naming the directory", errText.String)
+	}
+	if failureReason.String != "local_directory_error" {
+		t.Errorf("failure_reason = %q, want local_directory_error", failureReason.String)
+	}
+}
+
+// TestClaimTask_WorktreeGateSingular drives the REAL singular claim endpoint
+// against a too-old runtime: the daemon must get the reason as a 422, and the
+// row must land cancelled-with-reason via the full TaskService path — not a
+// bare status flip that leaves agent status and live cards stale.
+func TestClaimTask_WorktreeGateSingular(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	const daemonID = "wtgate-singular-daemon"
+	runtimeID, taskID := seedWorktreeGateClaimFixture(t, ctx, "WT gate singular", daemonID, "0.4.10")
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, daemonID)
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for a too-old runtime, got %d: %s", w.Code, w.Body.String())
+	}
+	if body := w.Body.String(); !strings.Contains(body, "/Users/dev/wtgate") || !strings.Contains(body, "0.4.10") {
+		t.Errorf("422 body should carry the actionable reason, got: %s", body)
+	}
+	assertWorktreeGateCancelled(t, ctx, taskID)
+}
+
+// TestClaimTask_WorktreeGateBatch drives the REAL batch claim endpoint: the
+// blocked task is omitted from the response (the daemon never sees it), so the
+// persisted row reason is the ONLY explanation the user gets — assert both.
+func TestClaimTask_WorktreeGateBatch(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	// The batch token and body share batchClaimTestDaemonID; the runtime row
+	// and resource ref must use the same machine for the gate to key on it.
+	runtimeID, taskID := seedWorktreeGateClaimFixture(t, ctx, "WT gate batch", batchClaimTestDaemonID, "0.4.10")
+
+	w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 5)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch claim: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Tasks []AgentTaskResponse `json:"tasks"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tasks) != 0 {
+		t.Fatalf("blocked worktree task leaked into the batch response: %+v", resp.Tasks)
+	}
+	assertWorktreeGateCancelled(t, ctx, taskID)
+}
+
+// TestClaimTask_WorktreeGateAllowsCurrentRuntime is the control: the same
+// fixture with a new-enough runtime claims normally, proving the gate blocks
+// on version — not on worktree resources in general.
+func TestClaimTask_WorktreeGateAllowsCurrentRuntime(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	const daemonID = "wtgate-ok-daemon"
+	runtimeID, taskID := seedWorktreeGateClaimFixture(t, ctx, "WT gate ok", daemonID, "9.9.9")
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, daemonID)
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a current runtime, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Task *AgentTaskResponse `json:"task"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Task == nil {
+		t.Fatal("expected the task to be claimed by a new-enough runtime")
+	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task: %v", err)
+	}
+	if status != "dispatched" {
+		t.Errorf("status = %q, want dispatched", status)
 	}
 }

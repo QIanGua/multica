@@ -718,6 +718,7 @@
     "details_cost": "費用",
     "usage_chip_title": "この実行のトークンと推定費用",
     "details_branch": "ブランチ",
+    "details_reason": "理由",
     "copy_branch": "ブランチ名をコピー"
   },
   "task_failure": {

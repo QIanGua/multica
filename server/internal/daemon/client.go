@@ -339,21 +339,44 @@ func (c *Client) MarkTaskWaitingLocalDirectory(ctx context.Context, taskID, reas
 	}, nil)
 }
 
+// TaskCancelAck is the payload of the daemon's cancel acknowledgement.
+type TaskCancelAck struct {
+	// BranchName: a cancelled worktree task has already finalized — its
+	// partial work is committed to a branch in the user's repo. The cancel
+	// path discards the rest of the result, so this ack is the only channel
+	// left to report where that work went.
+	BranchName string
+	// ErrorMessage / FailureReason: set when the cancelled run additionally
+	// FAILED to persist its work (worktree Finalize abort). There is no branch
+	// then; the error text carrying the preserved-worktree path is the only
+	// pointer to the agent's work, and without this the cancel path would
+	// swallow it entirely.
+	ErrorMessage  string
+	FailureReason string
+}
+
 // AckTaskCancelled tells the server this daemon observed the task's
 // cancellation and has finished flushing the transcript (runner.run only
 // returns after executeAndDrain's drain wait), so the server can settle its
 // deferred chat finalization now instead of waiting out the sweeper grace
 // period (#5219). Idempotent server-side.
-func (c *Client) AckTaskCancelled(ctx context.Context, taskID, branchName string) error {
+//
+// Retried on transient errors like the complete/fail callbacks: when the ack
+// carries a branch or an error it is a terminal delivery — the only pointer to
+// the cancelled task's work — and a single lost POST would lose it forever.
+// The server never overwrites already-recorded values, so replays are safe.
+func (c *Client) AckTaskCancelled(ctx context.Context, taskID string, ack TaskCancelAck) error {
 	body := map[string]any{}
-	// A cancelled worktree task has already finalized: its partial work is
-	// committed to a branch in the user's repo. The cancel path discards the
-	// rest of the result, so this ack is the only channel left to report where
-	// that work went — otherwise the branch exists and nothing points at it.
-	if branchName != "" {
-		body["branch_name"] = branchName
+	if ack.BranchName != "" {
+		body["branch_name"] = ack.BranchName
 	}
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), body, nil)
+	if ack.ErrorMessage != "" {
+		body["error_message"] = ack.ErrorMessage
+	}
+	if ack.FailureReason != "" {
+		body["failure_reason"] = ack.FailureReason
+	}
+	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), body, nil, defaultTerminalRetrySchedule)
 }
 
 func (c *Client) ReportProgress(ctx context.Context, taskID, summary string, step, total int) error {
