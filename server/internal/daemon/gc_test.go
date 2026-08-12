@@ -1595,6 +1595,13 @@ func TestShouldCleanTaskDir_ChatHardDeletedFreshMtime(t *testing.T) {
 // criterion #2: an active chat session whose workdir is older than
 // GCOrphanTTL must NOT be reclaimed. The only path to clean an active
 // session's workdir is for the user to archive or hard-delete the session.
+//
+// #6782 narrowed this from "the GC does nothing" to "the GC never removes the
+// directory": a session idle past GCArtifactTTL now gives back the regenerable
+// codex-home/.sandbox-bin cache, which the next message re-provisions. The
+// acceptance criterion is unchanged — the session's own data survives — so
+// this asserts the surviving contents rather than the bare action value.
+// TestManagedArtifact_IdleActiveChatReclaimsSandboxBin covers the carve-out.
 func TestShouldCleanTaskDir_ChatActiveResistsOldMtime(t *testing.T) {
 	t.Parallel()
 	chatID := "ffffffff-ffff-ffff-ffff-ffffffffff01"
@@ -1617,12 +1624,22 @@ func TestShouldCleanTaskDir_ChatActiveResistsOldMtime(t *testing.T) {
 		CompletedAt:   time.Now().Add(-200 * 24 * time.Hour),
 	}
 	taskDir := createTaskDir(t, d.cfg.WorkspacesRoot, "ws", "active-chat", meta)
+	writeFile(t, filepath.Join(taskDir, "logs/run.log"), 32)
+	writeFile(t, filepath.Join(taskDir, "output/result.md"), 32)
 	if err := os.Chtimes(taskDir, time.Now().Add(-200*24*time.Hour), time.Now().Add(-200*24*time.Hour)); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	if got := d.shouldCleanTaskDir(context.Background(), taskDir); got != gcActionSkip {
-		t.Fatalf("active chat session must not be reclaimed even with stale mtime, got %d", got)
+	action := d.shouldCleanTaskDir(context.Background(), taskDir)
+	if action == gcActionClean || action == gcActionOrphan {
+		t.Fatalf("active chat session's directory must never be removed, got action %d", action)
+	}
+	d.applyGCAction(taskDir, action, &gcStats{byPattern: map[string]int{}})
+
+	for _, rel := range []string{".", "logs/run.log", "output/result.md", ".gc_meta.json"} {
+		if _, err := os.Stat(filepath.Join(taskDir, rel)); err != nil {
+			t.Fatalf("active chat session must keep %s: %v", rel, err)
+		}
 	}
 }
 

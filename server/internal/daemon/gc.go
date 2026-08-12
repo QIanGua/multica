@@ -235,11 +235,16 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 		issueID := strings.TrimSpace(candidate.meta.IssueID)
 		result, ok := results[issueID]
 		if !ok || result.Err != nil {
-			stats.skipped++
+			// No usable answer about the parent issue this cycle, so the task
+			// data stays. The regenerable Codex cache is still fair game —
+			// see applyManagedArtifactFallback.
+			action := d.applyManagedArtifactFallback(candidate.taskDir, candidate.meta, gcActionSkip)
+			cleaned += d.applyGCAction(candidate.taskDir, action, stats)
 			continue
 		}
 		action := d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
 		action = d.applyLocalDirectoryGCOverride(candidate.meta, action)
+		action = d.applyManagedArtifactFallback(candidate.taskDir, candidate.meta, action)
 		cleaned += d.applyGCAction(candidate.taskDir, action, stats)
 	}
 	return cleaned
@@ -329,7 +334,49 @@ func (d *Daemon) shouldCleanTaskDir(ctx context.Context, taskDir string) gcActio
 	}
 
 	action := d.shouldCleanTaskDirForKind(ctx, taskDir, meta)
-	return d.applyLocalDirectoryGCOverride(meta, action)
+	action = d.applyLocalDirectoryGCOverride(meta, action)
+	return d.applyManagedArtifactFallback(taskDir, meta, action)
+}
+
+// applyManagedArtifactFallback upgrades a skip into managed-artifact cleanup
+// once the task's own regenerable Codex cache is past GCArtifactTTL.
+//
+// Whether a task's *data* may be removed is a per-kind question: it depends on
+// the parent record, and shouldCleanTaskDirForKind is what answers it. Whether
+// the daemon's *own regenerable cache* may be reclaimed is not a per-kind
+// question at all — codex-home/.sandbox-bin is a ~285 MiB copy of the Codex
+// binary that the next run re-provisions on demand, whoever the parent is.
+// Wiring that reclaim into the issue path alone (#5654) left every other kind
+// holding the cache indefinitely; for chat that is genuinely unbounded, since a
+// session stays "active" with no time limit and Desktop's chat is the main
+// interactive surface (#6782).
+//
+// Deliberately a one-way upgrade from gcActionSkip. Clean and Orphan already
+// remove strictly more than this, and applyLocalDirectoryGCOverride owns the
+// demotions in the other direction — so this can only ever widen what a cycle
+// reclaims, never narrow it.
+//
+// Note this also fires when the GC check API call itself failed (a transient
+// network error resolves to gcActionSkip). That is intended: the cache is
+// regenerable, so it does not need a confirmed parent record the way deleting
+// task data does. The isActiveEnvRoot short-circuit above and the env-root
+// reservation in applyGCAction still keep a running task's cache intact.
+func (d *Daemon) applyManagedArtifactFallback(taskDir string, meta *execenv.GCMeta, action gcAction) gcAction {
+	if action != gcActionSkip || d.cfg.GCArtifactTTL <= 0 {
+		return action
+	}
+	// A zero CompletedAt means the task never reported completion through
+	// WriteGCMeta. Leave those to the per-kind legacy handling rather than
+	// guessing from an unrelated clock.
+	if meta.CompletedAt.IsZero() || time.Since(meta.CompletedAt) <= d.cfg.GCArtifactTTL {
+		return action
+	}
+	d.logger.Info("gc: eligible for managed artifact cleanup",
+		"dir", filepath.Base(taskDir),
+		"kind", string(meta.Kind),
+		"completed_at", meta.CompletedAt.Format(time.RFC3339),
+	)
+	return gcActionCleanManagedArtifacts
 }
 
 func (d *Daemon) applyLocalDirectoryGCOverride(meta *execenv.GCMeta, action gcAction) gcAction {
@@ -521,10 +568,18 @@ func (d *Daemon) gcDecisionChat(ctx context.Context, taskDir string, meta *exece
 
 	switch status.Status {
 	case "active":
-		// An active chat session must never be reclaimed by mtime — that
-		// would silently kill a user's idle session and break "PriorWorkDir"
-		// resume on their next message. This is the explicit short-circuit
-		// the issue body called out as verifyable behavior #2.
+		// An active chat session's directory must never be reclaimed by mtime
+		// — that would silently kill a user's idle session and break
+		// "PriorWorkDir" resume on their next message.
+		//
+		// This protects the session's own data, not the daemon's regenerable
+		// caches. shouldCleanTaskDir layers applyManagedArtifactFallback on top
+		// of this skip, so a session idle past GCArtifactTTL gives back
+		// codex-home/.sandbox-bin and the next message re-provisions it. That
+		// costs a ~285 MiB Codex bootstrap on resume and is the same trade-off
+		// gcDecisionIssueResult already makes for a completed task whose issue
+		// is still open — without it an active session pins the cache forever
+		// (#6782).
 		return gcActionSkip
 	case "archived":
 		if time.Since(status.UpdatedAt) > d.cfg.GCTTL {
