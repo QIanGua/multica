@@ -36,8 +36,10 @@ vi.mock("@multica/core/config", () => ({
     mockUseConfigStore(selector),
 }));
 
+const mockCreateMutate = vi.hoisted(() => vi.fn());
+
 vi.mock("@multica/core/workspace/mutations", () => ({
-  useCreateWorkspace: () => ({ mutate: vi.fn(), isPending: false }),
+  useCreateWorkspace: () => ({ mutate: mockCreateMutate, isPending: false }),
 }));
 
 vi.mock("@multica/core/api", () => ({
@@ -180,5 +182,103 @@ describe("StepWorkspace — random workspace identity", () => {
     expect(slug.value).toMatch(
       new RegExp(`^${expectedSlugPrefix}-[a-z0-9]{4}$`),
     );
+  });
+});
+
+// MUL-6050: the issue prefix used to be a read-only preview derived
+// server-side from the workspace NAME, so every workspace named in Chinese
+// (or Japanese, Korean, emoji…) was created as "WS" with no way to change it
+// in the create flow. It now derives from the slug — which the same form
+// already forces the user to pick in ASCII — and is editable here.
+describe("StepWorkspace — issue prefix", () => {
+  const prefixInput = () =>
+    screen.getByLabelText("Issue prefix") as HTMLInputElement;
+
+  it("derives the prefix from the slug, not the name", () => {
+    renderStep({ existing: null, disabled: false });
+
+    fireEvent.change(screen.getByLabelText("Workspace name"), {
+      target: { value: "Acme Inc" },
+    });
+
+    // Slug auto-filled to "acme-inc" → first 4 alphanumerics, uppercased.
+    expect(prefixInput().value).toBe("ACME");
+    expect(screen.getByText("ACME-123")).toBeInTheDocument();
+  });
+
+  it("gives a Chinese-named workspace a slug-derived prefix instead of WS", () => {
+    renderStep({ existing: null, disabled: false });
+
+    // A CJK-only name produces no slug, so the user types one — that ASCII
+    // choice is what the prefix now follows.
+    fireEvent.change(screen.getByLabelText("Workspace name"), {
+      target: { value: "前端团队" },
+    });
+    fireEvent.change(screen.getByLabelText("URL"), {
+      target: { value: "frontend" },
+    });
+
+    expect(prefixInput().value).toBe("FRON");
+    expect(prefixInput().value).not.toBe("WS");
+  });
+
+  it("stops following the slug once the user edits it, and normalizes input", () => {
+    renderStep({ existing: null, disabled: false });
+
+    fireEvent.change(screen.getByLabelText("Workspace name"), {
+      target: { value: "Acme Inc" },
+    });
+    fireEvent.change(prefixInput(), { target: { value: "fe-team!" } });
+
+    // Uppercased, non-alphanumerics dropped — matching the server's
+    // `^[A-Z0-9]{1,10}$` rule and the settings tab's guardrail.
+    expect(prefixInput().value).toBe("FETEAM");
+
+    // A later slug edit must not clobber the user's choice.
+    fireEvent.change(screen.getByLabelText("URL"), {
+      target: { value: "acme-corp" },
+    });
+    expect(prefixInput().value).toBe("FETEAM");
+    expect(screen.getByText("FETEAM-123")).toBeInTheDocument();
+  });
+
+  it("submits the prefix the user was shown", () => {
+    mockCreateMutate.mockClear();
+    renderStep({ existing: null, disabled: false });
+
+    fireEvent.change(screen.getByLabelText("Workspace name"), {
+      target: { value: "前端团队" },
+    });
+    fireEvent.change(screen.getByLabelText("URL"), {
+      target: { value: "frontend" },
+    });
+    fireEvent.change(prefixInput(), { target: { value: "fe" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Create 前端团队$/ }));
+
+    expect(mockCreateMutate).toHaveBeenCalledTimes(1);
+    expect(mockCreateMutate.mock.calls[0]![0]).toEqual({
+      name: "前端团队",
+      slug: "frontend",
+      issue_prefix: "FE",
+    });
+  });
+
+  it("falls back to the slug-derived default when the field is cleared", () => {
+    mockCreateMutate.mockClear();
+    renderStep({ existing: null, disabled: false });
+
+    fireEvent.change(screen.getByLabelText("Workspace name"), {
+      target: { value: "Acme Inc" },
+    });
+    fireEvent.change(prefixInput(), { target: { value: "" } });
+
+    // Empty input doesn't block the CTA: the placeholder already shows the
+    // default that will be used, so submitting an empty field can't surprise.
+    expect(prefixInput().placeholder).toBe("ACME");
+    fireEvent.click(screen.getByRole("button", { name: /^Create Acme Inc$/ }));
+
+    expect(mockCreateMutate.mock.calls[0]![0]).toMatchObject({
+      issue_prefix: "ACME",
+    });
   });
 });
