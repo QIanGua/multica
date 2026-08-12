@@ -12,9 +12,47 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
+
+// blockingChildEnv marks a re-executed copy of this test binary as the
+// stand-in daemon process rather than a normal test run.
+const blockingChildEnv = "MULTICA_TEST_BLOCKING_CHILD"
+
+// TestBlockingChildProcess is not a test. It is the entry point the child from
+// startBlockingChild runs, and it returns immediately unless that child's env
+// var is set, so an ordinary `go test` sees a no-op.
+//
+// Re-executing the test binary rather than spawning `sleep` keeps this working
+// on Windows, which ships no sleep.exe for exec.Command to resolve. This file
+// carries no platform build tag, so `go test ./cmd/multica` has to pass there
+// even though CI currently only builds the package on Windows.
+func TestBlockingChildProcess(t *testing.T) {
+	if os.Getenv(blockingChildEnv) != "1" {
+		return
+	}
+	// Bounded rather than blocking forever: if the parent ever fails to clean
+	// up, the stray process still exits instead of outliving the test run.
+	time.Sleep(60 * time.Second)
+}
+
+// startBlockingChild returns the PID of a live process this test owns, for
+// cases where the code under test may signal the PID it is handed.
+func startBlockingChild(t *testing.T) int {
+	t.Helper()
+	child := exec.Command(os.Args[0], "-test.run=^TestBlockingChildProcess$")
+	child.Env = append(os.Environ(), blockingChildEnv+"=1")
+	if err := child.Start(); err != nil {
+		t.Fatalf("start stand-in daemon process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	})
+	return child.Process.Pid
+}
 
 // stubDaemon is a fake daemon on a real health port. It serves /shutdown as
 // well as /health so `daemon stop` can complete through its graceful path:
@@ -177,16 +215,7 @@ func TestDaemonStopAcceptsDaemonWithoutProfileField(t *testing.T) {
 	clearDaemonTaskEnv(t)
 	mkProfiles(t, "legacy")
 
-	victim := exec.Command("sleep", "30")
-	if err := victim.Start(); err != nil {
-		t.Fatalf("start stand-in daemon process: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = victim.Process.Kill()
-		_ = victim.Wait()
-	})
-
-	stub := serveHealthAsPID(t, "legacy", nil, victim.Process.Pid)
+	stub := serveHealthAsPID(t, "legacy", nil, startBlockingChild(t))
 
 	err := runDaemonStop(daemonStatusCmdFor(t, "legacy", ""), nil)
 	if err != nil {
