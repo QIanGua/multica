@@ -518,6 +518,42 @@ func (q *Queries) DetachTaskBatchReferences(ctx context.Context, taskIds []pgtyp
 	return err
 }
 
+const listTaskIDsByAgentFirstPage = `-- name: ListTaskIDsByAgentFirstPage :many
+SELECT id FROM agent_task_queue
+WHERE agent_id = $1
+ORDER BY id
+LIMIT $2
+FOR UPDATE
+`
+
+type ListTaskIDsByAgentFirstPageParams struct {
+	AgentID pgtype.UUID `json:"agent_id"`
+	Limit   int32       `json:"limit"`
+}
+
+// First page of the same walk; see ListWorkspaceAgentIDFirstPage for why this is
+// a separate query rather than a zero-uuid cursor, and ListTaskIDsByAgentPage for
+// the single-key / keyset / FOR UPDATE rationale.
+func (q *Queries) ListTaskIDsByAgentFirstPage(ctx context.Context, arg ListTaskIDsByAgentFirstPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByAgentFirstPage, arg.AgentID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTaskIDsByAgentPage = `-- name: ListTaskIDsByAgentPage :many
 SELECT id FROM agent_task_queue
 WHERE agent_id = $1 AND id > $2
@@ -575,6 +611,42 @@ func (q *Queries) ListTaskIDsByAgentPage(ctx context.Context, arg ListTaskIDsByA
 	return items, nil
 }
 
+const listTaskIDsByIssueFirstPage = `-- name: ListTaskIDsByIssueFirstPage :many
+SELECT id FROM agent_task_queue
+WHERE issue_id = $1
+ORDER BY id
+LIMIT $2
+FOR UPDATE
+`
+
+type ListTaskIDsByIssueFirstPageParams struct {
+	IssueID pgtype.UUID `json:"issue_id"`
+	Limit   int32       `json:"limit"`
+}
+
+// First page of the same walk; see ListWorkspaceAgentIDFirstPage for why this is
+// a separate query rather than a zero-uuid cursor, and ListTaskIDsByAgentPage for
+// the single-key / keyset / FOR UPDATE rationale.
+func (q *Queries) ListTaskIDsByIssueFirstPage(ctx context.Context, arg ListTaskIDsByIssueFirstPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByIssueFirstPage, arg.IssueID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTaskIDsByIssuePage = `-- name: ListTaskIDsByIssuePage :many
 SELECT id FROM agent_task_queue
 WHERE issue_id = $1 AND id > $2
@@ -593,6 +665,42 @@ type ListTaskIDsByIssuePageParams struct {
 // ListTaskIDsByAgentPage for the single-key / keyset / FOR UPDATE rationale.
 func (q *Queries) ListTaskIDsByIssuePage(ctx context.Context, arg ListTaskIDsByIssuePageParams) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, listTaskIDsByIssuePage, arg.IssueID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTaskIDsByRuntimeFirstPage = `-- name: ListTaskIDsByRuntimeFirstPage :many
+SELECT id FROM agent_task_queue
+WHERE runtime_id = $1
+ORDER BY id
+LIMIT $2
+FOR UPDATE
+`
+
+type ListTaskIDsByRuntimeFirstPageParams struct {
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	Limit     int32       `json:"limit"`
+}
+
+// First page of the same walk; see ListWorkspaceAgentIDFirstPage for why this is
+// a separate query rather than a zero-uuid cursor, and ListTaskIDsByAgentPage for
+// the single-key / keyset / FOR UPDATE rationale.
+func (q *Queries) ListTaskIDsByRuntimeFirstPage(ctx context.Context, arg ListTaskIDsByRuntimeFirstPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTaskIDsByRuntimeFirstPage, arg.RuntimeID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -630,6 +738,41 @@ type ListTaskIDsByRuntimePageParams struct {
 // ListTaskIDsByAgentPage for the single-key / keyset / FOR UPDATE rationale.
 func (q *Queries) ListTaskIDsByRuntimePage(ctx context.Context, arg ListTaskIDsByRuntimePageParams) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, listTaskIDsByRuntimePage, arg.RuntimeID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkspaceAgentIDFirstPage = `-- name: ListWorkspaceAgentIDFirstPage :many
+SELECT id FROM agent
+WHERE agent.workspace_id = $1
+ORDER BY id
+LIMIT $2
+`
+
+type ListWorkspaceAgentIDFirstPageParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Limit       int32       `json:"limit"`
+}
+
+// First page of the same walk. Split from the keyset query rather than seeded
+// with the all-zero uuid, because that value is itself a valid uuid: a row whose
+// id happened to be all zeros would be skipped forever by `id > $2`.
+func (q *Queries) ListWorkspaceAgentIDFirstPage(ctx context.Context, arg ListWorkspaceAgentIDFirstPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceAgentIDFirstPage, arg.WorkspaceID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -688,6 +831,41 @@ func (q *Queries) ListWorkspaceAgentIDPage(ctx context.Context, arg ListWorkspac
 	return items, nil
 }
 
+const listWorkspaceIssueIDFirstPage = `-- name: ListWorkspaceIssueIDFirstPage :many
+SELECT id FROM issue
+WHERE issue.workspace_id = $1
+ORDER BY id
+LIMIT $2
+`
+
+type ListWorkspaceIssueIDFirstPageParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Limit       int32       `json:"limit"`
+}
+
+// First page of the same walk. Split from the keyset query rather than seeded
+// with the all-zero uuid, because that value is itself a valid uuid: a row whose
+// id happened to be all zeros would be skipped forever by `id > $2`.
+func (q *Queries) ListWorkspaceIssueIDFirstPage(ctx context.Context, arg ListWorkspaceIssueIDFirstPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceIssueIDFirstPage, arg.WorkspaceID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkspaceIssueIDPage = `-- name: ListWorkspaceIssueIDPage :many
 SELECT id FROM issue
 WHERE issue.workspace_id = $1 AND id > $2
@@ -704,6 +882,41 @@ type ListWorkspaceIssueIDPageParams struct {
 // Uses idx_issue_workspace_id_keyset (migration 282).
 func (q *Queries) ListWorkspaceIssueIDPage(ctx context.Context, arg ListWorkspaceIssueIDPageParams) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, listWorkspaceIssueIDPage, arg.WorkspaceID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkspaceRuntimeIDFirstPage = `-- name: ListWorkspaceRuntimeIDFirstPage :many
+SELECT id FROM agent_runtime
+WHERE agent_runtime.workspace_id = $1
+ORDER BY id
+LIMIT $2
+`
+
+type ListWorkspaceRuntimeIDFirstPageParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Limit       int32       `json:"limit"`
+}
+
+// First page of the same walk. Split from the keyset query rather than seeded
+// with the all-zero uuid, because that value is itself a valid uuid: a row whose
+// id happened to be all zeros would be skipped forever by `id > $2`.
+func (q *Queries) ListWorkspaceRuntimeIDFirstPage(ctx context.Context, arg ListWorkspaceRuntimeIDFirstPageParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceRuntimeIDFirstPage, arg.WorkspaceID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}

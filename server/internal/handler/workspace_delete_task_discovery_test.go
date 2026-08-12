@@ -324,8 +324,8 @@ SELECT $1, $2, $3, 'completed', now() FROM generate_series(1, $4::int)
 	// the scan never re-walks what it already deleted. A LIMIT alone would still
 	// read (and sort) the owner's whole task set per page.
 	const probeLimit = 10
-	firstPage, err := qtx.ListTaskIDsByAgentPage(ctx, db.ListTaskIDsByAgentPageParams{
-		AgentID: parseUUID(f.victimAgent), ID: uuidCursorStart, Limit: probeLimit,
+	firstPage, err := qtx.ListTaskIDsByAgentFirstPage(ctx, db.ListTaskIDsByAgentFirstPageParams{
+		AgentID: parseUUID(f.victimAgent), Limit: probeLimit,
 	})
 	if err != nil {
 		t.Fatalf("first page: %v", err)
@@ -415,8 +415,8 @@ SELECT id, $5, $2, 'completed', now() FROM new_agents
 	}
 
 	// The owner page is bounded and advances the same way the task page does.
-	firstOwners, err := qtx.ListWorkspaceAgentIDPage(ctx, db.ListWorkspaceAgentIDPageParams{
-		WorkspaceID: parseUUID(f.victimID), ID: uuidCursorStart, Limit: workspaceDeleteOwnerPageSize,
+	firstOwners, err := qtx.ListWorkspaceAgentIDFirstPage(ctx, db.ListWorkspaceAgentIDFirstPageParams{
+		WorkspaceID: parseUUID(f.victimID), Limit: workspaceDeleteOwnerPageSize,
 	})
 	if err != nil {
 		t.Fatalf("first owner page: %v", err)
@@ -468,19 +468,19 @@ func TestSweepTasksForOwner_FailsClosedWhenTasksKeepArriving(t *testing.T) {
 	// and finds another one. Honours the page query's `id > cursor` contract, so
 	// the only thing that can stop this is the pass cap.
 	pages := 0
-	oneTaskPerPass := func(_ context.Context, _ pgtype.UUID, cursor pgtype.UUID, _ int32) ([]pgtype.UUID, error) {
+	firstPage := func(_ context.Context, _ pgtype.UUID, _ int32) ([]pgtype.UUID, error) {
 		pages++
 		if pages > 100 {
 			t.Fatal("sweep did not stop; the pass cap is not working")
 		}
-		if cursor != uuidCursorStart {
-			return nil, nil
-		}
 		return []pgtype.UUID{stubTask}, nil
+	}
+	nextPage := func(context.Context, pgtype.UUID, pgtype.UUID, int32) ([]pgtype.UUID, error) {
+		return nil, nil
 	}
 	noop := func(context.Context, []pgtype.UUID) error { return nil }
 
-	err := sweepTasksForOwner(ctx, "agent", owner, oneTaskPerPass, noop, noop)
+	err := sweepTasksForOwner(ctx, "agent", owner, firstPage, nextPage, noop, noop)
 	if err == nil {
 		t.Fatal("sweep succeeded while tasks kept arriving; teardown would commit a partial cleanup")
 	}
@@ -529,6 +529,134 @@ SELECT EXISTS (
 				"relied on that FK's implicit FOR KEY SHARE to block concurrent enqueues, so it needs an "+
 				"explicit application-layer replacement before this FK goes away", column, referenced)
 		}
+	}
+}
+
+// TestTaskWriteFence_BlocksOnWorkspaceLockAlone is the regression test for the
+// window that a re-scan cannot close: a task inserted after teardown's final empty
+// scan but before COMMIT.
+//
+// It also isolates the fence from the foreign keys. The holder locks ONLY the
+// workspace row — no agent, issue or runtime row — so the FKs on
+// agent_task_queue have nothing to block on: none of them references workspace.
+// Anything that blocks here is migration 284's BEFORE trigger taking FOR KEY SHARE
+// on the owners' workspace row, which is exactly the guarantee that has to survive
+// the legacy FKs being removed.
+func TestTaskWriteFence_BlocksOnWorkspaceLockAlone(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "fenceonly")
+
+	holder, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin holder: %v", err)
+	}
+	defer holder.Rollback(ctx)
+	// Exactly what LockWorkspaceForDelete does, and nothing else.
+	if _, err := holder.Exec(ctx, `SELECT id FROM workspace WHERE id = $1 FOR UPDATE`, f.victimID); err != nil {
+		t.Fatalf("lock workspace row: %v", err)
+	}
+
+	expectBlocked := func(name, sql string, args ...any) {
+		t.Helper()
+		writer, err := testPool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("%s: begin: %v", name, err)
+		}
+		defer writer.Rollback(ctx)
+		if _, err := writer.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+			t.Fatalf("%s: set lock_timeout: %v", name, err)
+		}
+		_, err = writer.Exec(ctx, sql, args...)
+		if err == nil {
+			t.Errorf("%s: committed while only the workspace row was locked; the fence is not in the write path", name)
+			return
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Errorf("%s: got %v, want lock_not_available (55P03)", name, err)
+		}
+	}
+
+	expectBlocked("insert via the victim's agent", `
+INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, completed_at)
+VALUES ($1, $2, $3, 'completed', now())
+`, f.victimAgent, f.neighbourIssue, f.neighbourRuntime)
+
+	expectBlocked("insert via the victim's issue", `
+INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, completed_at)
+VALUES ($1, $2, $3, 'completed', now())
+`, f.neighbourAgent, f.victimIssue, f.neighbourRuntime)
+
+	expectBlocked("insert via the victim's runtime", `
+INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, completed_at)
+VALUES ($1, $2, $3, 'completed', now())
+`, f.neighbourAgent, f.neighbourIssue, f.victimRuntime)
+
+	expectBlocked("reassignment onto the victim's runtime", `
+UPDATE agent_task_queue SET runtime_id = $1 WHERE id = $2
+`, f.victimRuntime, f.neighbourTask)
+
+	// A write that touches none of the locked workspace's owners must still pass,
+	// so the fence is not a global stop-the-world.
+	unrelated, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin unrelated: %v", err)
+	}
+	defer unrelated.Rollback(ctx)
+	if _, err := unrelated.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+		t.Fatalf("unrelated: set lock_timeout: %v", err)
+	}
+	if _, err := unrelated.Exec(ctx, `
+INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, completed_at)
+VALUES ($1, $2, $3, 'completed', now())
+`, f.neighbourAgent, f.neighbourIssue, f.neighbourRuntime); err != nil {
+		t.Errorf("neighbour-only insert was blocked by the victim's workspace lock: %v", err)
+	}
+
+	// Status-only updates are the hot path and must not pay the fence at all:
+	// they still work while the workspace row is locked.
+	statusUpdate, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin status update: %v", err)
+	}
+	defer statusUpdate.Rollback(ctx)
+	if _, err := statusUpdate.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+		t.Fatalf("status update: set lock_timeout: %v", err)
+	}
+	if _, err := statusUpdate.Exec(ctx,
+		`UPDATE agent_task_queue SET status = 'failed' WHERE id = $1`, f.taskViaAgent); err != nil {
+		t.Errorf("status-only update was blocked by the fence: %v", err)
+	}
+}
+
+// TestTaskWriteFence_FailsClosedAfterWorkspaceIsGone covers the other side of the
+// fence: once teardown has committed, a task write that was queued up behind it
+// must fail rather than resurrect rows into a deleted tenant.
+func TestTaskWriteFence_FailsClosedAfterWorkspaceIsGone(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "failclosed")
+
+	// Keep an agent row alive whose workspace is gone, which is the state a
+	// late writer would see if it only had the FKs to go on. Deleting the
+	// workspace row directly (not via the handler) is the point: the FK from
+	// agent.workspace_id is ON DELETE CASCADE, so this also removes the agent —
+	// so the fence is exercised through the issue path, whose row we keep.
+	if _, err := testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, f.victimID); err != nil {
+		t.Fatalf("delete workspace: %v", err)
+	}
+
+	_, err := testPool.Exec(ctx, `
+INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, completed_at)
+VALUES ($1, $2, $3, 'completed', now())
+`, f.neighbourAgent, f.neighbourIssue, f.neighbourRuntime)
+	if err != nil {
+		t.Fatalf("neighbour insert should still work after an unrelated workspace is deleted: %v", err)
 	}
 }
 

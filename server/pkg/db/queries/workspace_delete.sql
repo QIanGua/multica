@@ -42,6 +42,15 @@ SELECT 1 FROM issue WHERE issue.workspace_id = $1 FOR UPDATE;
 -- name: LockWorkspaceTaskOwnerRuntimes :exec
 SELECT 1 FROM agent_runtime WHERE agent_runtime.workspace_id = $1 FOR UPDATE;
 
+-- name: ListWorkspaceAgentIDFirstPage :many
+-- First page of the same walk. Split from the keyset query rather than seeded
+-- with the all-zero uuid, because that value is itself a valid uuid: a row whose
+-- id happened to be all zeros would be skipped forever by `id > $2`.
+SELECT id FROM agent
+WHERE agent.workspace_id = $1
+ORDER BY id
+LIMIT $2;
+
 -- name: ListWorkspaceAgentIDPage :many
 -- Owner enumeration in bounded, keyset-paged chunks. The rows are already locked
 -- by LockWorkspaceTaskOwnerAgents above; this only walks them.
@@ -55,6 +64,15 @@ WHERE agent.workspace_id = $1 AND id > $2
 ORDER BY id
 LIMIT $3;
 
+-- name: ListWorkspaceIssueIDFirstPage :many
+-- First page of the same walk. Split from the keyset query rather than seeded
+-- with the all-zero uuid, because that value is itself a valid uuid: a row whose
+-- id happened to be all zeros would be skipped forever by `id > $2`.
+SELECT id FROM issue
+WHERE issue.workspace_id = $1
+ORDER BY id
+LIMIT $2;
+
 -- name: ListWorkspaceIssueIDPage :many
 -- Uses idx_issue_workspace_id_keyset (migration 282).
 SELECT id FROM issue
@@ -62,12 +80,31 @@ WHERE issue.workspace_id = $1 AND id > $2
 ORDER BY id
 LIMIT $3;
 
+-- name: ListWorkspaceRuntimeIDFirstPage :many
+-- First page of the same walk. Split from the keyset query rather than seeded
+-- with the all-zero uuid, because that value is itself a valid uuid: a row whose
+-- id happened to be all zeros would be skipped forever by `id > $2`.
+SELECT id FROM agent_runtime
+WHERE agent_runtime.workspace_id = $1
+ORDER BY id
+LIMIT $2;
+
 -- name: ListWorkspaceRuntimeIDPage :many
 -- Uses idx_agent_runtime_workspace_id_keyset (migration 283).
 SELECT id FROM agent_runtime
 WHERE agent_runtime.workspace_id = $1 AND id > $2
 ORDER BY id
 LIMIT $3;
+
+-- name: ListTaskIDsByAgentFirstPage :many
+-- First page of the same walk; see ListWorkspaceAgentIDFirstPage for why this is
+-- a separate query rather than a zero-uuid cursor, and ListTaskIDsByAgentPage for
+-- the single-key / keyset / FOR UPDATE rationale.
+SELECT id FROM agent_task_queue
+WHERE agent_id = $1
+ORDER BY id
+LIMIT $2
+FOR UPDATE;
 
 -- name: ListTaskIDsByAgentPage :many
 -- One owner key per call, one keyset-paged chunk per call.
@@ -99,6 +136,16 @@ ORDER BY id
 LIMIT $3
 FOR UPDATE;
 
+-- name: ListTaskIDsByIssueFirstPage :many
+-- First page of the same walk; see ListWorkspaceAgentIDFirstPage for why this is
+-- a separate query rather than a zero-uuid cursor, and ListTaskIDsByAgentPage for
+-- the single-key / keyset / FOR UPDATE rationale.
+SELECT id FROM agent_task_queue
+WHERE issue_id = $1
+ORDER BY id
+LIMIT $2
+FOR UPDATE;
+
 -- name: ListTaskIDsByIssuePage :many
 -- Uses idx_agent_task_queue_issue_id_keyset (migration 279). See
 -- ListTaskIDsByAgentPage for the single-key / keyset / FOR UPDATE rationale.
@@ -106,6 +153,16 @@ SELECT id FROM agent_task_queue
 WHERE issue_id = $1 AND id > $2
 ORDER BY id
 LIMIT $3
+FOR UPDATE;
+
+-- name: ListTaskIDsByRuntimeFirstPage :many
+-- First page of the same walk; see ListWorkspaceAgentIDFirstPage for why this is
+-- a separate query rather than a zero-uuid cursor, and ListTaskIDsByAgentPage for
+-- the single-key / keyset / FOR UPDATE rationale.
+SELECT id FROM agent_task_queue
+WHERE runtime_id = $1
+ORDER BY id
+LIMIT $2
 FOR UPDATE;
 
 -- name: ListTaskIDsByRuntimePage :many

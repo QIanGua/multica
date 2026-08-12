@@ -813,18 +813,15 @@ const workspaceDeleteOwnerPageSize = 500
 
 // workspaceDeleteVerifyPasses caps how many times a single owner may be swept.
 //
-// Pass 1 removes what is there. Pass 2 exists because the write fence is a
-// property of the current schema rather than an application-layer protocol shared
-// with every enqueue path: if it is ever weakened, a task could arrive after its
-// owner was swept. A second pass that comes back empty proves nothing was left
-// behind; one that finds rows deletes them and warns. If tasks are still arriving
-// after this many passes, teardown fails closed and rolls back rather than
-// committing a partially cleaned tenant.
+// Pass 1 removes what is there; pass 2 confirms the owner came back empty. This is
+// a cheap self-check, NOT the concurrency guarantee: a task inserted after the
+// final empty scan and before COMMIT would not be caught by any number of passes.
+// What closes that window is the in-transaction fence on task writes
+// (migration 284) plus the workspace row lock teardown already holds. The passes
+// exist so that anything unexpected — a path that somehow bypassed the fence — is
+// either cleaned up or turns into a failed, rolled-back teardown rather than a
+// tenant with rows left behind.
 const workspaceDeleteVerifyPasses = 3
-
-// uuidCursorStart is the keyset cursor's zero value: every valid uuid sorts after
-// it, so `id > uuidCursorStart` means "from the beginning".
-var uuidCursorStart = pgtype.UUID{Valid: true}
 
 // deleteWorkspaceTasks removes every agent_task_queue row a workspace owns,
 // together with the rows that hang off those tasks, in bounded keyset pages.
@@ -850,23 +847,34 @@ var uuidCursorStart = pgtype.UUID{Valid: true}
 //     inbound references and DeleteTaskBatch removes task_usage, task_message,
 //     task_token, the two outbound card tables and chat_draft_restore before the
 //     task rows themselves. The legacy FK cascades stay a safety net only.
-//   - Verify, then fail closed. Every owner is re-swept until a pass finds
-//     nothing, bounded by workspaceDeleteVerifyPasses, so a task that slips in
-//     behind the fence is still removed — or the whole teardown rolls back.
 //
-// The caller must already hold the owner-row locks (lockWorkspaceTaskOwners).
+// Late arrivals are handled by the fence, not here: migration 284 makes every task
+// write take FOR KEY SHARE on its owners' workspace rows, which conflicts with the
+// FOR UPDATE that LockWorkspaceForDelete holds for this whole transaction.
 func deleteWorkspaceTasks(ctx context.Context, qtx *db.Queries, workspaceID pgtype.UUID) error {
 	ownerKinds := []struct {
-		label      string
-		ownerPage  func(context.Context, pgtype.UUID, int32) ([]pgtype.UUID, error)
-		taskPage   func(context.Context, pgtype.UUID, pgtype.UUID, int32) ([]pgtype.UUID, error)
-		sweepAgent bool
+		label          string
+		ownerFirstPage func(context.Context, int32) ([]pgtype.UUID, error)
+		ownerPage      func(context.Context, pgtype.UUID, int32) ([]pgtype.UUID, error)
+		taskFirstPage  func(context.Context, pgtype.UUID, int32) ([]pgtype.UUID, error)
+		taskPage       func(context.Context, pgtype.UUID, pgtype.UUID, int32) ([]pgtype.UUID, error)
+		sweepAgent     bool
 	}{
 		{
 			label: "agent",
+			ownerFirstPage: func(ctx context.Context, limit int32) ([]pgtype.UUID, error) {
+				return qtx.ListWorkspaceAgentIDFirstPage(ctx, db.ListWorkspaceAgentIDFirstPageParams{
+					WorkspaceID: workspaceID, Limit: limit,
+				})
+			},
 			ownerPage: func(ctx context.Context, cursor pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
 				return qtx.ListWorkspaceAgentIDPage(ctx, db.ListWorkspaceAgentIDPageParams{
 					WorkspaceID: workspaceID, ID: cursor, Limit: limit,
+				})
+			},
+			taskFirstPage: func(ctx context.Context, owner pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
+				return qtx.ListTaskIDsByAgentFirstPage(ctx, db.ListTaskIDsByAgentFirstPageParams{
+					AgentID: owner, Limit: limit,
 				})
 			},
 			taskPage: func(ctx context.Context, owner, cursor pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
@@ -881,9 +889,19 @@ func deleteWorkspaceTasks(ctx context.Context, qtx *db.Queries, workspaceID pgty
 		},
 		{
 			label: "issue",
+			ownerFirstPage: func(ctx context.Context, limit int32) ([]pgtype.UUID, error) {
+				return qtx.ListWorkspaceIssueIDFirstPage(ctx, db.ListWorkspaceIssueIDFirstPageParams{
+					WorkspaceID: workspaceID, Limit: limit,
+				})
+			},
 			ownerPage: func(ctx context.Context, cursor pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
 				return qtx.ListWorkspaceIssueIDPage(ctx, db.ListWorkspaceIssueIDPageParams{
 					WorkspaceID: workspaceID, ID: cursor, Limit: limit,
+				})
+			},
+			taskFirstPage: func(ctx context.Context, owner pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
+				return qtx.ListTaskIDsByIssueFirstPage(ctx, db.ListTaskIDsByIssueFirstPageParams{
+					IssueID: owner, Limit: limit,
 				})
 			},
 			taskPage: func(ctx context.Context, owner, cursor pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
@@ -894,9 +912,19 @@ func deleteWorkspaceTasks(ctx context.Context, qtx *db.Queries, workspaceID pgty
 		},
 		{
 			label: "runtime",
+			ownerFirstPage: func(ctx context.Context, limit int32) ([]pgtype.UUID, error) {
+				return qtx.ListWorkspaceRuntimeIDFirstPage(ctx, db.ListWorkspaceRuntimeIDFirstPageParams{
+					WorkspaceID: workspaceID, Limit: limit,
+				})
+			},
 			ownerPage: func(ctx context.Context, cursor pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
 				return qtx.ListWorkspaceRuntimeIDPage(ctx, db.ListWorkspaceRuntimeIDPageParams{
 					WorkspaceID: workspaceID, ID: cursor, Limit: limit,
+				})
+			},
+			taskFirstPage: func(ctx context.Context, owner pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
+				return qtx.ListTaskIDsByRuntimeFirstPage(ctx, db.ListTaskIDsByRuntimeFirstPageParams{
+					RuntimeID: owner, Limit: limit,
 				})
 			},
 			taskPage: func(ctx context.Context, owner, cursor pgtype.UUID, limit int32) ([]pgtype.UUID, error) {
@@ -908,19 +936,14 @@ func deleteWorkspaceTasks(ctx context.Context, qtx *db.Queries, workspaceID pgty
 	}
 
 	for _, kind := range ownerKinds {
-		ownerCursor := uuidCursorStart
-		for {
-			owners, err := kind.ownerPage(ctx, ownerCursor, workspaceDeleteOwnerPageSize)
-			if err != nil {
-				return fmt.Errorf("list workspace %ss: %w", kind.label, err)
-			}
-			if len(owners) == 0 {
-				break
-			}
-			ownerCursor = owners[len(owners)-1]
-
+		owners, err := kind.ownerFirstPage(ctx, workspaceDeleteOwnerPageSize)
+		if err != nil {
+			return fmt.Errorf("list workspace %ss: %w", kind.label, err)
+		}
+		for len(owners) > 0 {
 			for _, ownerID := range owners {
-				if err := sweepTasksForOwner(ctx, kind.label, ownerID, kind.taskPage,
+				if err := sweepTasksForOwner(ctx, kind.label, ownerID,
+					kind.taskFirstPage, kind.taskPage,
 					qtx.DetachTaskBatchReferences, qtx.DeleteTaskBatch); err != nil {
 					return err
 				}
@@ -929,6 +952,9 @@ func deleteWorkspaceTasks(ctx context.Context, qtx *db.Queries, workspaceID pgty
 						return fmt.Errorf("delete task tokens by agent: %w", err)
 					}
 				}
+			}
+			if owners, err = kind.ownerPage(ctx, owners[len(owners)-1], workspaceDeleteOwnerPageSize); err != nil {
+				return fmt.Errorf("list workspace %ss: %w", kind.label, err)
 			}
 		}
 	}
@@ -940,29 +966,25 @@ func deleteWorkspaceTasks(ctx context.Context, qtx *db.Queries, workspaceID pgty
 //
 // Each pass walks the owner's tasks by keyset and deletes each page. A pass that
 // deletes nothing means the owner is clean. A later pass that still finds tasks
-// means something inserted them after the fence should have blocked it, which is
-// logged and retried; exhausting the passes fails the whole teardown rather than
-// committing a workspace with tasks left behind.
+// means something reached agent_task_queue without going through the fence, which
+// is logged and retried; exhausting the passes fails the whole teardown rather
+// than committing a workspace with tasks left behind.
 func sweepTasksForOwner(
 	ctx context.Context,
 	label string,
 	ownerID pgtype.UUID,
+	taskFirstPage func(context.Context, pgtype.UUID, int32) ([]pgtype.UUID, error),
 	taskPage func(context.Context, pgtype.UUID, pgtype.UUID, int32) ([]pgtype.UUID, error),
 	detach func(context.Context, []pgtype.UUID) error,
 	deletePage func(context.Context, []pgtype.UUID) error,
 ) error {
 	for pass := 1; pass <= workspaceDeleteVerifyPasses; pass++ {
 		deleted := 0
-		cursor := uuidCursorStart
-		for {
-			taskIDs, err := taskPage(ctx, ownerID, cursor, workspaceDeleteTaskPageSize)
-			if err != nil {
-				return fmt.Errorf("list tasks by %s: %w", label, err)
-			}
-			if len(taskIDs) == 0 {
-				break
-			}
-			cursor = taskIDs[len(taskIDs)-1]
+		taskIDs, err := taskFirstPage(ctx, ownerID, workspaceDeleteTaskPageSize)
+		if err != nil {
+			return fmt.Errorf("list tasks by %s: %w", label, err)
+		}
+		for len(taskIDs) > 0 {
 			if err := detach(ctx, taskIDs); err != nil {
 				return fmt.Errorf("detach task page references: %w", err)
 			}
@@ -970,6 +992,9 @@ func sweepTasksForOwner(
 				return fmt.Errorf("delete task page: %w", err)
 			}
 			deleted += len(taskIDs)
+			if taskIDs, err = taskPage(ctx, ownerID, taskIDs[len(taskIDs)-1], workspaceDeleteTaskPageSize); err != nil {
+				return fmt.Errorf("list tasks by %s: %w", label, err)
+			}
 		}
 		if deleted == 0 {
 			return nil
@@ -986,21 +1011,18 @@ func sweepTasksForOwner(
 // lockWorkspaceTaskOwners locks every row through which a task can belong to this
 // workspace.
 //
-// This is the write fence for the task sweep. Locking the tasks themselves is not
-// enough: a task that does not exist yet cannot be locked, so a concurrent enqueue
-// could add one after its owner had been swept and leave it behind with its own
-// leaf rows. Inserting an agent_task_queue row takes FOR KEY SHARE on the agent,
-// issue and runtime it references, and FOR KEY SHARE conflicts with FOR UPDATE —
-// so holding these locks for the rest of the transaction blocks exactly the
-// inserts (and reassignments into this workspace) that could do that. It is the
-// same technique the workspace-row lock below uses to keep CreateChatSession out
-// of the delete window.
+// Defence in depth on top of the real fence. The fence that closes the
+// insert-after-sweep window is migration 284's BEFORE trigger on
+// agent_task_queue: every task write takes FOR KEY SHARE on its owners' workspace
+// rows, which conflicts with the FOR UPDATE that LockWorkspaceForDelete holds for
+// this whole transaction. That fence is explicit, in-transaction by construction,
+// and independent of the legacy foreign keys.
 //
-// The locks are taken set-based and return no ids, so this costs no memory here.
-//
-// Being a schema property rather than a protocol every enqueue path opts into,
-// this fence is treated as defence in depth: sweepTasksForOwner re-verifies each
-// owner and fails the teardown closed if tasks keep arriving.
+// These owner-row locks add a second, narrower barrier — they also block
+// ownership-changing UPDATEs of tasks that already exist — and cost nothing to
+// hold, since teardown deletes these very rows a few steps later. They are taken
+// set-based and return no ids, so a workspace with a huge owner set costs no
+// memory here.
 //
 // The wait is bounded by SET LOCAL lock_timeout, and taking these locks can
 // deadlock against a concurrent task update that locks in the opposite order
