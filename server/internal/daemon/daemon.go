@@ -5528,10 +5528,14 @@ func (d *Daemon) resolveSkillBundle(ctx context.Context, task *Task, ref SkillRe
 		return SkillData{}, fmt.Errorf("resolve skill bundle returned wrong skill: requested source=%s id=%s, got source=%s id=%s", ref.Source, ref.ID, bundle.Source, bundle.ID)
 	}
 	bundleRef := skillRefFromBundle(bundle)
-	if !validateSkillBundle(bundleRef, bundle) {
+	validationRef := bundleRef
+	if ref.Source == skillbundle.SourcePlugin {
+		validationRef = ref
+	}
+	if !validateSkillBundle(validationRef, bundle) {
 		return SkillData{}, fmt.Errorf("resolve skill bundle returned invalid bundle: skill_id=%s source=%s hash=%s", bundle.ID, bundle.Source, bundle.Hash)
 	}
-	if err := d.skillCache.WithRefLock(task.WorkspaceID, bundleRef, func() error {
+	if err := d.skillCache.WithRefLock(task.WorkspaceID, validationRef, func() error {
 		return d.skillCache.Store(task.WorkspaceID, bundle)
 	}); err != nil {
 		return SkillData{}, fmt.Errorf("store skill bundle cache: %w", err)

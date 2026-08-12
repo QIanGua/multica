@@ -574,6 +574,22 @@ WITH installations AS MATERIALIZED (
     FROM plugin_installation
     WHERE plugin_installation.workspace_id = $1
 ),
+deleted_health AS (
+    DELETE FROM plugin_health
+    WHERE workspace_id = $1
+),
+deleted_execution_manifests AS (
+    DELETE FROM plugin_execution_manifest
+    WHERE workspace_id = $1
+),
+deleted_snapshots AS (
+    DELETE FROM plugin_capability_snapshot
+    WHERE workspace_id = $1
+),
+deleted_workspace_state AS (
+    DELETE FROM plugin_workspace_capability_state
+    WHERE workspace_id = $1
+),
 deleted_bindings AS (
     DELETE FROM plugin_binding
     WHERE installation_id IN (SELECT id FROM installations)
