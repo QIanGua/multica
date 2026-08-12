@@ -88,6 +88,27 @@ describe("ActorAvatar profile link", () => {
     expect(open).not.toHaveBeenCalled();
   });
 
+  it("can own the click when nested inside a host control", () => {
+    const push = vi.fn();
+    const hostClick = vi.fn();
+
+    render(
+      <NavigationProvider value={makeAdapter({ push })}>
+        <button type="button" onClick={hostClick}>
+          <ActorAvatar
+            actorType="member"
+            actorId={MEMBER_ID}
+            profileLinkInControls
+          />
+        </button>
+      </NavigationProvider>,
+    );
+    fireEvent.click(screen.getByRole("link"));
+
+    expect(push).toHaveBeenCalledWith(HREF);
+    expect(hostClick).not.toHaveBeenCalled();
+  });
+
   it("uses openInNewTab for cmd/ctrl click when available (desktop)", () => {
     const push = vi.fn();
     const openInNewTab = vi.fn();

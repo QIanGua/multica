@@ -66,6 +66,12 @@ interface ActorAvatarProps {
    * and agents, while picker/menu controls keep their own click behavior.
    */
   profileLink?: boolean;
+  /**
+   * Keep the profile link active when the avatar is nested inside a host
+   * control. Use only when clicking the avatar should navigate instead of
+   * activating the surrounding picker/menu trigger.
+   */
+  profileLinkInControls?: boolean;
 }
 
 const FOCUSABLE_ANCESTOR_SELECTOR =
@@ -82,6 +88,7 @@ export function ActorAvatar({
   showStatusDot,
   hoverCardVariant = "profile",
   profileLink,
+  profileLinkInControls,
 }: ActorAvatarProps) {
   const { getActorName, getActorInitials, getActorAvatarUrl } = useActorName();
   const paths = useWorkspacePaths();
@@ -124,7 +131,12 @@ export function ActorAvatar({
           : null
     : null;
   const content = profileHref ? (
-    <ActorAvatarProfileLink href={profileHref}>{dotted}</ActorAvatarProfileLink>
+    <ActorAvatarProfileLink
+      href={profileHref}
+      profileLinkInControls={profileLinkInControls}
+    >
+      {dotted}
+    </ActorAvatarProfileLink>
   ) : (
     dotted
   );
@@ -159,9 +171,11 @@ export function ActorAvatar({
  */
 function ActorAvatarProfileLink({
   href,
+  profileLinkInControls,
   children,
 }: {
   href: string;
+  profileLinkInControls?: boolean;
   children: React.ReactNode;
 }) {
   // Web note: the trigger is a `<span role="link">`, not an anchor, so there
@@ -171,6 +185,7 @@ function ActorAvatarProfileLink({
   const intentNavigate = useIntentNavigate();
 
   const insideControl = (event: React.SyntheticEvent) =>
+    !profileLinkInControls &&
     !!event.currentTarget.parentElement?.closest(PROFILE_LINK_CONTROL_SELECTOR);
 
   const open = (intent: LinkClickIntent) => intentNavigate(href, intent);
