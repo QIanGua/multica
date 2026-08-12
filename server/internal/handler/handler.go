@@ -989,15 +989,23 @@ func splitIdentifier(id string) *identifierParts {
 // getIssuePrefix fetches the issue_prefix for a workspace.
 // Falls back to generating a prefix from the workspace name if the stored
 // prefix is empty (e.g. workspaces created before the prefix was introduced).
+// issuePrefixForWorkspace resolves a workspace row's effective issue prefix:
+// the configured value, or the name-derived default when it was never set.
+// Split out from getIssuePrefix so callers that already hold the row — such as
+// the GitHub close-intent scan, which must not re-read it — can reuse the rule.
+func issuePrefixForWorkspace(ws db.Workspace) string {
+	if ws.IssuePrefix != "" {
+		return ws.IssuePrefix
+	}
+	return generateIssuePrefix(ws.Name)
+}
+
 func (h *Handler) getIssuePrefix(ctx context.Context, workspaceID pgtype.UUID) string {
 	ws, err := h.Queries.GetWorkspace(ctx, workspaceID)
 	if err != nil {
 		return ""
 	}
-	if ws.IssuePrefix != "" {
-		return ws.IssuePrefix
-	}
-	return generateIssuePrefix(ws.Name)
+	return issuePrefixForWorkspace(ws)
 }
 
 func (h *Handler) loadAgentForUser(w http.ResponseWriter, r *http.Request, agentID string) (db.Agent, bool) {
