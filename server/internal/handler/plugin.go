@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -9,11 +10,24 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/pluginbundled"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+func (h *Handler) pluginsV1Enabled(ctx context.Context) bool {
+	return featureflags.PluginsV1Enabled(ctx, h.FeatureFlags)
+}
+
+func (h *Handler) requirePluginsV1(w http.ResponseWriter, r *http.Request) bool {
+	if h.pluginsV1Enabled(r.Context()) {
+		return true
+	}
+	writeError(w, http.StatusServiceUnavailable, "Plugin management is not enabled")
+	return false
+}
 
 type pluginBindingResponse struct {
 	ScopeType string `json:"scope_type"`
@@ -87,6 +101,9 @@ func (h *Handler) pluginInstallationResponse(r *http.Request, installation db.Pl
 }
 
 func (h *Handler) ListPlugins(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
 	if !ok {
 		return
@@ -214,6 +231,9 @@ func (h *Handler) catalogReleaseResponse(r *http.Request, workspaceID pgtype.UUI
 }
 
 func (h *Handler) ListPluginCatalog(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
 	if !ok {
 		return
@@ -239,6 +259,9 @@ func (h *Handler) ListPluginCatalog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetPluginCatalogRelease(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
 	if !ok {
 		return
@@ -262,6 +285,9 @@ type pluginReleaseRequest struct {
 }
 
 func (h *Handler) InstallPlugin(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	workspaceID, actorID, ok := pluginRequestIDs(w, r)
 	if !ok {
 		return
@@ -285,6 +311,9 @@ func (h *Handler) InstallPlugin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpgradePlugin(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	workspaceID, actorID, ok := pluginRequestIDs(w, r)
 	if !ok {
 		return
@@ -317,10 +346,16 @@ type pluginBindingRequest struct {
 }
 
 func (h *Handler) EnablePlugin(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	h.setPluginEnabled(w, r, true)
 }
 
 func (h *Handler) DisablePlugin(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	h.setPluginEnabled(w, r, false)
 }
 
@@ -367,6 +402,9 @@ func (h *Handler) setPluginEnabled(w http.ResponseWriter, r *http.Request, enabl
 }
 
 func (h *Handler) RollbackPlugin(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	workspaceID, actorID, ok := pluginRequestIDs(w, r)
 	if !ok {
 		return

@@ -24,6 +24,7 @@ func pluginHandlerRequest(method, path string, body []byte, params map[string]st
 }
 
 func TestPluginHTTPLifecycleForInstalledReferenceRelease(t *testing.T) {
+	withPluginsV1Flag(t, testHandler, true)
 	cleanup := func() {
 		ctx := context.Background()
 		testPool.Exec(ctx, `DELETE FROM plugin_health WHERE workspace_id = $1`, testWorkspaceID)
@@ -131,5 +132,38 @@ func TestPluginHTTPLifecycleForInstalledReferenceRelease(t *testing.T) {
 	testHandler.RollbackPlugin(recorder, pluginHandlerRequest(http.MethodPost, "/plugins/rollback", []byte(`{"version":"9.9.9"}`), params))
 	if recorder.Code != http.StatusNotFound || bytes.Contains(recorder.Body.Bytes(), []byte("no rows")) {
 		t.Fatalf("safe missing rollback status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPluginManagementUnavailableWhenFlagDisabled(t *testing.T) {
+	h := &Handler{}
+	request := func() *http.Request {
+		return pluginHandlerRequest(http.MethodGet, "/plugins", nil, map[string]string{
+			"id":             testWorkspaceID,
+			"installationId": "00000000-0000-0000-0000-000000000001",
+			"pluginKey":      plugintest.ReviewReadinessPluginKey,
+		})
+	}
+
+	for name, handler := range map[string]http.HandlerFunc{
+		"list installed": h.ListPlugins,
+		"list catalog":   h.ListPluginCatalog,
+		"catalog detail": h.GetPluginCatalogRelease,
+		"install":        h.InstallPlugin,
+		"upgrade":        h.UpgradePlugin,
+		"enable":         h.EnablePlugin,
+		"disable":        h.DisablePlugin,
+		"rollback":       h.RollbackPlugin,
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler(recorder, request())
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if bytes.Contains(recorder.Body.Bytes(), []byte(plugintest.ReviewReadinessPluginKey)) {
+				t.Fatalf("disabled response leaked catalog data: %s", recorder.Body.String())
+			}
+		})
 	}
 }

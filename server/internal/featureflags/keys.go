@@ -13,6 +13,11 @@ const (
 	// The access model exists to gate Composio sharing, so the two ship on the
 	// same switch.
 	ComposioMCPApps = "composio_mcp_apps"
+	// PluginsV1 gates the user-facing Plugin catalog and lifecycle management
+	// APIs while the first product slice is dogfooded. It deliberately does not
+	// gate pinned Task/Run execution: disabling discovery and management must not
+	// mutate an immutable execution manifest that is already in flight.
+	PluginsV1 = "plugins_v1"
 	// agentBuilderCompat is no longer a release flag. Keep publishing the key
 	// as enabled so installed desktop clients that still gate the AI creation
 	// entry on this config decision receive the permanently enabled behavior.
@@ -32,10 +37,15 @@ const (
 
 var frontendPublicFlags = []string{
 	ComposioMCPApps,
+	PluginsV1,
 }
 
 func ComposioMCPAppsEnabled(ctx context.Context, flags *featureflag.Service) bool {
 	return flags.IsEnabled(ctx, ComposioMCPApps, false)
+}
+
+func PluginsV1Enabled(ctx context.Context, flags *featureflag.Service) bool {
+	return flags.IsEnabled(ctx, PluginsV1, false)
 }
 
 func EvaluateFrontendPublicFlags(ctx context.Context, flags *featureflag.Service) map[string]bool {
