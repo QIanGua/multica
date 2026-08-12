@@ -99,6 +99,9 @@ const (
 	EvidenceAutopilotRun    EvidenceKind = "autopilot_run"
 	EvidenceRuleVersion     EvidenceKind = "rule_version"
 	EvidenceRerun           EvidenceKind = "rerun"
+	// EvidenceDelegatedFailure points at the terminal worker task that handed
+	// control back to its source coordinator.
+	EvidenceDelegatedFailure EvidenceKind = "delegated_failure"
 	// EvidenceChat points the uniform evidence pair at the chat session that
 	// triggered the run — the chat analogue of autopilot_run/issue_assignment.
 	// The dedicated chat_session_id column still exists for its own consumers;
@@ -128,6 +131,7 @@ const (
 	KindRetry             TriggerKind = "retry"
 	KindRerun             TriggerKind = "rerun"
 	KindDeferredFallback  TriggerKind = "deferred_fallback"
+	KindDelegatedFailure  TriggerKind = "delegated_failure"
 )
 
 // Result is the attribution stamped onto a queued run.

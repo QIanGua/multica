@@ -609,6 +609,22 @@ RETURNING *;
 SELECT * FROM agent_task_queue
 WHERE id = $1;
 
+-- name: GetAgentTaskForDelegatedFailureUpdate :one
+-- Serializes the idempotent delegated-failure recovery signal for one failed
+-- task. FailTask and the stale-task sweepers can converge on the same row; the
+-- lock ensures they cannot create two recovery comments/tasks for it.
+SELECT * FROM agent_task_queue
+WHERE id = $1
+FOR UPDATE;
+
+-- name: HasRetryTaskForParent :one
+-- Defense-in-depth for the recovery path: a delegated failure with any retry
+-- child is still intermediate and must not wake its coordinator.
+SELECT count(*) > 0
+FROM agent_task_queue
+WHERE parent_task_id = $1
+  AND status <> 'cancelled';
+
 -- name: GetAgentTaskInWorkspace :one
 -- Loads a task only when its owning agent lives in the given workspace.
 -- agent_id is NOT NULL on every task row (and ON DELETE CASCADE, so the agent
@@ -1462,6 +1478,52 @@ WHERE id = (
     LIMIT 1
 )
 RETURNING id, coalesced_comment_ids;
+
+-- name: MergeDelegatedFailureCommentIntoPendingTask :one
+-- A delegated failure is a platform-owned input, not a new human instruction:
+-- fold it into the coordinator's pre-claim task without replacing that task's
+-- attribution snapshot. The recovery comment is the newest input, so it becomes
+-- the trigger and the prior trigger joins the coalesced plan. This preserves the
+-- claim/prompt invariant that trigger_comment_id names the newest comment while
+-- retaining the pending task's original human authority and connected apps.
+UPDATE agent_task_queue
+SET coalesced_comment_ids = (
+        SELECT COALESCE(array_agg(DISTINCT e), '{}')
+        FROM unnest(array_append(coalesced_comment_ids, trigger_comment_id)) AS e
+        WHERE e IS NOT NULL AND e <> @comment_id::uuid
+    ),
+    trigger_comment_id = @comment_id::uuid,
+    trigger_summary = sqlc.narg('trigger_summary')
+WHERE id = (
+    SELECT t.id FROM agent_task_queue t
+    WHERE t.issue_id = @issue_id
+      AND t.agent_id = @agent_id
+      AND (
+          t.status = 'queued'
+          OR (t.status = 'deferred' AND t.context->>'channel_issue_media_pending' = 'true')
+      )
+      AND t.trigger_comment_id IS DISTINCT FROM @comment_id::uuid
+      AND NOT (@comment_id::uuid = ANY(t.coalesced_comment_ids))
+    ORDER BY t.created_at DESC
+    LIMIT 1
+)
+RETURNING *;
+
+-- name: HasTaskCoveringDelegatedFailureComment :one
+-- Durable idempotency check for a recovery comment. The completion reconciler
+-- excludes its own just-completed task when replaying a planned-but-undelivered
+-- signal; every other task that already carries the comment is a durable
+-- coverage record, including cancelled/failed tasks. A terminal recovery task
+-- must not be silently recreated and turn one source failure into a loop.
+SELECT count(*) > 0 AS covered
+FROM agent_task_queue
+WHERE issue_id = @issue_id
+  AND agent_id = @agent_id
+  AND (trigger_comment_id = @comment_id::uuid OR @comment_id::uuid = ANY(coalesced_comment_ids))
+  AND (
+      id IS DISTINCT FROM sqlc.narg('exclude_task_id')::uuid
+      OR @comment_id::uuid = ANY(delivered_comment_ids)
+  );
 
 -- name: HasActiveTaskForIssueAndAgent :one
 -- MUL-4195: true when the (issue, agent) pair has any non-terminal task in a

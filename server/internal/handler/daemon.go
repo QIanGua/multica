@@ -3327,6 +3327,24 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		if isNoteComment(c.Content) {
 			continue
 		}
+		// A delegated failure recovery signal is platform-authored and targets
+		// the exact source coordinator recorded by the failed task. It bypasses
+		// generic comment routing (which deliberately treats system authors as
+		// unattributed) and excludes this just-completed task from the coverage
+		// check because the signal was planned after claim, not delivered to it.
+		if service.IsDelegatedFailureRecoveryComment(c) {
+			if err := h.TaskService.DispatchDelegatedFailureRecoveryComment(ctx, c, task.ID); err != nil {
+				slog.Warn("reconcile comments on completion: delegated failure recovery replay failed",
+					"issue_id", uuidToString(task.IssueID),
+					"task_id", uuidToString(task.ID),
+					"comment_id", uuidToString(c.ID),
+					"error", err,
+				)
+			} else {
+				scheduled++
+			}
+			continue
+		}
 		var parentComment *db.Comment
 		if c.ParentID.Valid {
 			// Scope to the issue's workspace; a comment's parent is always in the
