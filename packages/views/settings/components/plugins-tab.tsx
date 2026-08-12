@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { agentListOptions } from "@multica/core/workspace/queries";
 import { useCurrentMember } from "@multica/core/permissions";
 import {
+  comparePluginVersions,
   pluginCatalogOptions,
   pluginInstallationsOptions,
   useInstallPlugin,
@@ -31,17 +32,6 @@ import { useT } from "../../i18n";
 import { SettingsCard, SettingsSection, SettingsTab } from "./settings-layout";
 
 type BindingScope = "workspace" | "agent";
-
-function compareVersions(left: string, right: string): number {
-  const parse = (value: string) => value.split("-")[0]?.split(".").map((part) => Number(part)) ?? [];
-  const leftParts = parse(left);
-  const rightParts = parse(right);
-  for (let index = 0; index < 3; index += 1) {
-    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
-    if (difference !== 0) return difference;
-  }
-  return left.localeCompare(right);
-}
 
 function installationState(installation: PluginInstallation): "disabled" | "activating" | "healthy" | "degraded" | "failed" {
   if (installation.enabled !== true) return "disabled";
@@ -76,7 +66,7 @@ export function PluginsTab() {
       grouped.set(release.plugin_key, versions);
     }
     for (const versions of grouped.values()) {
-      versions.sort((left, right) => compareVersions(right.version, left.version));
+      versions.sort((left, right) => comparePluginVersions(right.version, left.version));
     }
     return [...grouped.entries()];
   }, [catalogQuery.data?.releases]);
@@ -162,9 +152,9 @@ export function PluginsTab() {
         const installation = installations.get(pluginKey) ?? latest.installation;
         const selectedVersion = selectedVersions[pluginKey] ?? latest.version;
         const selectedRelease = versions.find((release) => release.version === selectedVersion) ?? latest;
-        const upgrade = installation && compareVersions(latest.version, installation.desired_version) > 0 ? latest : null;
+        const upgrade = installation && comparePluginVersions(latest.version, installation.desired_version) > 0 ? latest : null;
         const rollback = installation
-          ? versions.find((release) => compareVersions(release.version, installation.desired_version) < 0)
+          ? versions.find((release) => comparePluginVersions(release.version, installation.desired_version) < 0)
           : null;
         const scope = installation ? selectedScopes[installation.id] ?? "workspace" : "workspace";
         const selectedAgent = installation ? selectedAgents[installation.id] ?? agents[0]?.id ?? "" : "";

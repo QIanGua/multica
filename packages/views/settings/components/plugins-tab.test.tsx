@@ -59,6 +59,7 @@ vi.mock("@tanstack/react-query", () => ({
 }));
 
 vi.mock("@multica/core/plugins", () => ({
+  comparePluginVersions: (left: string, right: string) => left.localeCompare(right),
   pluginCatalogOptions: () => ({ queryKey: ["plugins", "catalog"] }),
   pluginInstallationsOptions: () => ({ queryKey: ["plugins", "installed"] }),
   useInstallPlugin: () => ({ mutateAsync: mockInstall, isPending: false }),

@@ -4,13 +4,48 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/testutil/plugintest"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+type failPluginDetailQueryDB struct {
+	db.DBTX
+	queryFragment       string
+	queryRowFragment    string
+	failQueryRowAtMatch int
+	queryRowMatches     int
+}
+
+func (database *failPluginDetailQueryDB) Query(ctx context.Context, query string, args ...any) (pgx.Rows, error) {
+	if database.queryFragment != "" && strings.Contains(query, database.queryFragment) {
+		return nil, errors.New("forced Plugin detail query failure")
+	}
+	return database.DBTX.Query(ctx, query, args...)
+}
+
+type pluginDetailErrorRow struct{}
+
+func (pluginDetailErrorRow) Scan(...any) error {
+	return errors.New("forced Plugin detail query failure")
+}
+
+func (database *failPluginDetailQueryDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
+	if database.queryRowFragment != "" && strings.Contains(query, database.queryRowFragment) {
+		database.queryRowMatches++
+		if database.queryRowMatches == database.failQueryRowAtMatch {
+			return pluginDetailErrorRow{}
+		}
+	}
+	return database.DBTX.QueryRow(ctx, query, args...)
+}
 
 func pluginHandlerRequest(method, path string, body []byte, params map[string]string) *http.Request {
 	request := httptest.NewRequest(method, path, bytes.NewReader(body))
@@ -92,6 +127,31 @@ func TestPluginHTTPLifecycleForInstalledReferenceRelease(t *testing.T) {
 	testHandler.ListPlugins(recorder, pluginHandlerRequest(http.MethodGet, "/plugins", nil, map[string]string{"id": testWorkspaceID}))
 	if recorder.Code != http.StatusOK || !bytes.Contains(recorder.Body.Bytes(), []byte(plugintest.ReviewReadinessPluginKey)) {
 		t.Fatalf("list status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	for _, test := range []struct {
+		name                string
+		queryFragment       string
+		queryRowFragment    string
+		failQueryRowAtMatch int
+	}{
+		{name: "contributions", queryFragment: "FROM plugin_contribution"},
+		{name: "bindings", queryFragment: "FROM plugin_binding"},
+		{name: "active release", queryRowFragment: "FROM plugin_release\nWHERE id = $1", failQueryRowAtMatch: 2},
+	} {
+		t.Run("list fails closed when "+test.name+" cannot be read", func(t *testing.T) {
+			failingHandler := *testHandler
+			failingHandler.Queries = db.New(&failPluginDetailQueryDB{
+				DBTX:                testPool,
+				queryFragment:       test.queryFragment,
+				queryRowFragment:    test.queryRowFragment,
+				failQueryRowAtMatch: test.failQueryRowAtMatch,
+			})
+			recorder := httptest.NewRecorder()
+			failingHandler.ListPlugins(recorder, pluginHandlerRequest(http.MethodGet, "/plugins", nil, map[string]string{"id": testWorkspaceID}))
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 
 	recorder = httptest.NewRecorder()

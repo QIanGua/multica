@@ -14,7 +14,6 @@ import (
 	"io/fs"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -346,35 +345,80 @@ func IsNewerVersion(candidate, current string) bool {
 }
 
 func compareSemver(left, right string) int {
-	parse := func(value string) ([3]int, string) {
-		var numeric [3]int
-		main, suffix, _ := strings.Cut(value, "-")
-		parts := strings.Split(main, ".")
-		for index := 0; index < len(parts) && index < len(numeric); index++ {
-			numeric[index], _ = strconv.Atoi(parts[index])
+	parse := func(value string) ([3]string, []string) {
+		var numeric [3]string
+		withoutBuild, _, _ := strings.Cut(value, "+")
+		main, prerelease, _ := strings.Cut(withoutBuild, "-")
+		copy(numeric[:], strings.Split(main, "."))
+		if prerelease == "" {
+			return numeric, nil
 		}
-		return numeric, suffix
+		return numeric, strings.Split(prerelease, ".")
 	}
-	leftNumeric, leftSuffix := parse(left)
-	rightNumeric, rightSuffix := parse(right)
+	leftNumeric, leftPrerelease := parse(left)
+	rightNumeric, rightPrerelease := parse(right)
 	for index := range leftNumeric {
-		if leftNumeric[index] < rightNumeric[index] {
-			return -1
-		}
-		if leftNumeric[index] > rightNumeric[index] {
-			return 1
+		if comparison := compareNumericIdentifier(leftNumeric[index], rightNumeric[index]); comparison != 0 {
+			return comparison
 		}
 	}
-	if leftSuffix == rightSuffix {
+	if len(leftPrerelease) == 0 && len(rightPrerelease) == 0 {
 		return 0
 	}
-	if leftSuffix == "" {
+	if len(leftPrerelease) == 0 {
 		return 1
 	}
-	if rightSuffix == "" {
+	if len(rightPrerelease) == 0 {
 		return -1
 	}
-	return strings.Compare(leftSuffix, rightSuffix)
+	for index := 0; index < len(leftPrerelease) && index < len(rightPrerelease); index++ {
+		leftIdentifier := leftPrerelease[index]
+		rightIdentifier := rightPrerelease[index]
+		leftNumber := isNumericIdentifier(leftIdentifier)
+		rightNumber := isNumericIdentifier(rightIdentifier)
+		switch {
+		case leftNumber && rightNumber:
+			if comparison := compareNumericIdentifier(leftIdentifier, rightIdentifier); comparison != 0 {
+				return comparison
+			}
+		case leftNumber:
+			return -1
+		case rightNumber:
+			return 1
+		default:
+			if comparison := strings.Compare(leftIdentifier, rightIdentifier); comparison != 0 {
+				return comparison
+			}
+		}
+	}
+	return len(leftPrerelease) - len(rightPrerelease)
+}
+
+func compareNumericIdentifier(left, right string) int {
+	left = strings.TrimLeft(left, "0")
+	right = strings.TrimLeft(right, "0")
+	if left == "" {
+		left = "0"
+	}
+	if right == "" {
+		right = "0"
+	}
+	if len(left) != len(right) {
+		return len(left) - len(right)
+	}
+	return strings.Compare(left, right)
+}
+
+func isNumericIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // VerifyReproducibleRelease rebuilds a source release and returns the exact

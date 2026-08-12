@@ -71,6 +71,12 @@ func TestIsNewerVersion(t *testing.T) {
 		{candidate: "1.0.0", current: "1.0.0", want: false},
 		{candidate: "1.0.0", current: "1.1.0", want: false},
 		{candidate: "1.0.0", current: "1.0.0-rc.1", want: true},
+		{candidate: "1.0.0-rc.10", current: "1.0.0-rc.9", want: true},
+		{candidate: "1.0.0-beta.1", current: "1.0.0-1", want: true},
+		{candidate: "1.0.0-rc.1", current: "1.0.0-rc.1.1", want: false},
+		{candidate: "1.2.1+r1", current: "1.2.0", want: true},
+		{candidate: "1.2.1+r2", current: "1.2.1+r1", want: false},
+		{candidate: "100000000000000000000.0.0", current: "99999999999999999999.0.0", want: true},
 	}
 	for _, test := range tests {
 		if got := IsNewerVersion(test.candidate, test.current); got != test.want {

@@ -73,25 +73,31 @@ func (h *Handler) pluginInstallationResponse(r *http.Request, installation db.Pl
 		Contributions:     []string{},
 		Bindings:          []pluginBindingResponse{},
 	}
-	if contributions, err := h.Queries.ListPluginContributionsByRelease(r.Context(), desired.ID); err == nil {
-		for _, contribution := range contributions {
-			response.Contributions = append(response.Contributions, contribution.ContributionKey)
-		}
+	contributions, err := h.Queries.ListPluginContributionsByRelease(r.Context(), desired.ID)
+	if err != nil {
+		return pluginInstallationResponse{}, err
 	}
-	if bindings, err := h.Queries.ListLatestPluginBindings(r.Context(), installation.ID); err == nil {
-		for _, binding := range bindings {
-			response.Bindings = append(response.Bindings, pluginBindingResponse{
-				ScopeType: binding.ScopeType,
-				ScopeID:   uuidToString(binding.ScopeID),
-				Enabled:   binding.Enabled,
-				Revision:  binding.BindingRevision,
-			})
-		}
+	for _, contribution := range contributions {
+		response.Contributions = append(response.Contributions, contribution.ContributionKey)
+	}
+	bindings, err := h.Queries.ListLatestPluginBindings(r.Context(), installation.ID)
+	if err != nil {
+		return pluginInstallationResponse{}, err
+	}
+	for _, binding := range bindings {
+		response.Bindings = append(response.Bindings, pluginBindingResponse{
+			ScopeType: binding.ScopeType,
+			ScopeID:   uuidToString(binding.ScopeID),
+			Enabled:   binding.Enabled,
+			Revision:  binding.BindingRevision,
+		})
 	}
 	if installation.ActiveReleaseID.Valid {
-		if active, err := h.Queries.GetPluginRelease(r.Context(), installation.ActiveReleaseID); err == nil {
-			response.ActiveVersion = active.Version
+		active, err := h.Queries.GetPluginRelease(r.Context(), installation.ActiveReleaseID)
+		if err != nil {
+			return pluginInstallationResponse{}, err
 		}
+		response.ActiveVersion = active.Version
 	}
 	if health != nil {
 		response.HealthState = health.State
