@@ -3794,6 +3794,26 @@ func TestEnsureRepoReadyConcurrentMissRefreshesOnce(t *testing.T) {
 	}
 }
 
+func TestContextLockCancelsWaitWithoutConsumingToken(t *testing.T) {
+	t.Parallel()
+
+	var lock contextLock
+	if err := lock.Lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := lock.Lock(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Lock error = %v, want deadline exceeded", err)
+	}
+	lock.Unlock()
+
+	if err := lock.Lock(context.Background()); err != nil {
+		t.Fatalf("Lock after cancelled waiter: %v", err)
+	}
+	lock.Unlock()
+}
+
 func TestShellArgsFromEnv(t *testing.T) {
 	t.Setenv("MULTICA_CLAUDE_ARGS", `--max-turns 60 --append-system-prompt "multi word"`)
 	got, err := shellArgsFromEnv("MULTICA_CLAUDE_ARGS")

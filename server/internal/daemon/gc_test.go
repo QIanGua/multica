@@ -26,13 +26,14 @@ func newGCTestDaemon(t *testing.T, handler http.Handler) *Daemon {
 
 	root := t.TempDir()
 	cfg := Config{
-		WorkspacesRoot:     root,
-		GCEnabled:          true,
-		GCInterval:         1 * time.Hour,
-		GCTTL:              5 * 24 * time.Hour,
-		GCOrphanTTL:        30 * 24 * time.Hour,
-		GCArtifactTTL:      12 * time.Hour,
-		GCArtifactPatterns: []string{"node_modules", ".next", ".turbo"},
+		WorkspacesRoot:           root,
+		GCEnabled:                true,
+		GCInterval:               1 * time.Hour,
+		GCTTL:                    5 * 24 * time.Hour,
+		GCOrphanTTL:              30 * 24 * time.Hour,
+		GCArtifactTTL:            12 * time.Hour,
+		GCArtifactPatterns:       []string{"node_modules", ".next", ".turbo"},
+		GCRepoMaintenanceEnabled: true,
 	}
 	d := New(cfg, slog.Default())
 	d.client = NewClient(srv.URL)
@@ -1111,6 +1112,29 @@ func TestPruneWorktree_SkipsMaintenanceWhenNothingDeleted(t *testing.T) {
 	}
 }
 
+func TestPruneWorktree_RetriesPendingMaintenanceWithoutAnotherBranchDeletion(t *testing.T) {
+	t.Parallel()
+
+	d := newGCTestDaemon(t, http.NewServeMux())
+	sourceRepo := createGCGitRepo(t)
+	barePath := filepath.Join(t.TempDir(), "cache.git")
+	runGitForGC(t, "", "clone", "--bare", sourceRepo, barePath)
+
+	sentinelPath := writeOldLooseBlob(t, barePath, "pending-maintenance", 60*24*time.Hour)
+	markerPath := filepath.Join(barePath, repoMaintenanceMarker)
+	if err := os.WriteFile(markerPath, []byte("pending\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d.pruneWorktree(barePath)
+	if _, err := os.Stat(sentinelPath); !os.IsNotExist(err) {
+		t.Fatalf("expected pending maintenance to prune sentinel, stat err=%v", err)
+	}
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("expected completed maintenance to clear pending marker, stat err=%v", err)
+	}
+}
+
 // writeOldLooseBlob writes a dangling loose-object blob to the bare repo and
 // backdates its mtime so `git gc --prune=30.days` will consider it prunable.
 // Returns the absolute path to the loose object on disk.
@@ -1137,7 +1161,7 @@ func writeOldLooseBlob(t *testing.T, barePath, content string, age time.Duration
 	return loose
 }
 
-func TestPruneWorktree_SerializesWithCreateWorktree(t *testing.T) {
+func TestPruneWorktree_LegacyCacheFallbackSerializesWithCreateWorktree(t *testing.T) {
 	t.Parallel()
 
 	d := newGCTestDaemon(t, http.NewServeMux())
@@ -1206,6 +1230,55 @@ func TestPruneWorktree_SerializesWithCreateWorktree(t *testing.T) {
 	case <-pruneDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for pruneWorktree to finish")
+	}
+}
+
+func TestCleanupNewRepoMaintenanceLocksPreservesPreexistingFiles(t *testing.T) {
+	t.Parallel()
+
+	d := newGCTestDaemon(t, http.NewServeMux())
+	barePath := t.TempDir()
+	preexisting := filepath.Join(barePath, "logs", "refs", "heads", "main.lock")
+	if err := os.MkdirAll(filepath.Dir(preexisting), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(preexisting, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotRepoMaintenanceLocks(barePath)
+
+	created := []string{
+		filepath.Join(barePath, "refs", "remotes", "origin", "main.lock"),
+		filepath.Join(barePath, "objects", "pack", "multi-pack-index.lock"),
+		filepath.Join(barePath, "packed-refs.lock"),
+		filepath.Join(barePath, "gc.pid"),
+	}
+	for _, path := range created {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outsideWhitelist := filepath.Join(barePath, "hooks", "user.lock")
+	if err := os.MkdirAll(filepath.Dir(outsideWhitelist), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsideWhitelist, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d.cleanupNewRepoMaintenanceLocks(barePath, before)
+	for _, path := range created {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("new maintenance lock %s survived, stat error = %v", path, err)
+		}
+	}
+	for _, path := range []string{preexisting, outsideWhitelist} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("unowned lock %s was removed: %v", path, err)
+		}
 	}
 }
 
