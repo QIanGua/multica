@@ -1,0 +1,333 @@
+package execenv
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/multica-ai/multica/server/internal/cli"
+)
+
+// Background
+//
+// Hermes persists every ACP session — the actual conversation transcript — in
+// the SQLite database at `<HERMES_HOME>/state.db` (acp_adapter/session.py).
+// Because Multica has to take over HERMES_HOME to inject bound skills, that
+// database landed inside the per-task overlay, which made a Hermes agent's
+// conversation last exactly one task.
+//
+// The failure was silent, which is what made it expensive. `session/resume`
+// against a database that does not hold the session does not fail: Hermes
+// creates a fresh session and answers with an ordinary success frame
+// (acp_adapter/server.py resume_session), so the daemon believed it had
+// resumed, re-sent the same dead id on every later turn, and the user saw a
+// conversation that restarted from zero with nothing in the logs (GH #6806).
+// The backend now detects that rebind (resolveHermesResumedSessionID), and
+// this file removes the cause.
+//
+// The store is keyed by (agent, hermes profile, conversation):
+//
+//	<multica profile dir>/hermes-sessions/<agent>/<hermes profile>/<conversation>/state.db
+//
+// Keying to the conversation — the issue, or `chat_<id>` for a chat session —
+// is what makes this safe to share where #6693 could not. Its stated reason
+// for leaving state.db task-local was concurrency: one agent's parallel tasks
+// would write one live SQLite database, which needs lock and consistency work
+// (plus Windows byte-range locks on `-shm`) that plain memory files do not.
+// Tasks of the SAME conversation are serial by construction — a follow-up is
+// dispatched after its predecessor reports — so the shard has one writer at a
+// time, while two different issues get two different databases and never meet.
+//
+// The (agent, profile) prefix matches the memory store's scoping exactly, so
+// pointing an agent at another Hermes profile gives it a fresh conversation
+// line just as it gives it a fresh memory line. It is a sibling root rather
+// than a subdirectory of `hermes-state/<agent>/<profile>` because that
+// directory IS the agent's memories dir (the overlay links `memories/`
+// straight at it), so nesting sessions inside it would surface them to Hermes
+// as a memory entry.
+//
+// The overlay mounts the shard by symlinking `<overlay>/state.db` at
+// `<store>/state.db`. SQLite resolves the link when it derives the `-wal` and
+// `-shm` paths, so the journal sidecars are created in the store next to the
+// database rather than in the task directory, and a task teardown can never
+// take the write-ahead log with it.
+
+// hermesSessionStoreRoot is the directory under the daemon's Multica profile
+// dir that holds every agent's persistent Hermes conversation shards.
+const hermesSessionStoreRoot = "hermes-sessions"
+
+// hermesSessionDBEntry is the database file name inside both the store and the
+// overlay home — Hermes resolves it relative to HERMES_HOME.
+const hermesSessionDBEntry = "state.db"
+
+// HermesSessionStorePath returns the persistent session store for
+// (daemonProfile, agentID, sourceHome, conversation), or "" when the session
+// database must stay task-local — no agent to key on, no conversation to key
+// on (neither an issue nor a chat session), or an unresolvable Multica profile
+// dir. The daemon marks the returned path in-use for the task's duration so
+// PruneHermesSessionStores never reclaims it mid-mount.
+func HermesSessionStorePath(daemonProfile, agentID, sourceHome string, task TaskContextForEnv) string {
+	agent := sanitizePathSegment(agentID)
+	if agent == "" {
+		return ""
+	}
+	conversation := hermesConversationSegment(task)
+	if conversation == "" {
+		return ""
+	}
+	profileDir, err := cli.ProfileDir(daemonProfile)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(profileDir, hermesSessionStoreRoot, agent,
+		hermesMemoryProfileSegment(sourceHome), conversation)
+}
+
+// hermesConversationSegment maps a task to the conversation its transcript
+// belongs to: the issue it runs on, or the chat session when there is no
+// issue. Same derivation as the per-issue Codex session store
+// (codexSessionStoreKey), so both providers agree on what "one conversation"
+// means. Returns "" for a task that belongs to neither, which keeps its
+// session database task-local rather than inventing a shard nothing will
+// resume.
+func hermesConversationSegment(task TaskContextForEnv) string {
+	if issue := sanitizePathSegment(task.IssueID); issue != "" {
+		return issue
+	}
+	if chat := sanitizePathSegment(task.ChatSessionID); chat != "" {
+		return "chat_" + chat
+	}
+	return ""
+}
+
+// mountHermesSessionDB points the overlay's state.db at the conversation's
+// store, so the transcript outlives the task. It reports whether the mount is
+// in place: a false with a nil error means this platform could not create the
+// link and the caller must keep the database task-local (the previous
+// behaviour) rather than run against a half-mounted store.
+//
+// Idempotent across Reuse: a link already pointing at the store is left alone.
+// A real state.db left by an older daemon — or by a task that ran before this
+// conversation had a store — is migrated into an empty store rather than
+// dropped, so upgrading mid-conversation does not discard the transcript the
+// user is in the middle of.
+func mountHermesSessionDB(hermesHome, storeDir string, logger *slog.Logger) (bool, error) {
+	dst := filepath.Join(hermesHome, hermesSessionDBEntry)
+	target := filepath.Join(storeDir, hermesSessionDBEntry)
+
+	if err := os.MkdirAll(storeDir, 0o700); err != nil {
+		return false, fmt.Errorf("create hermes session store %s: %w", storeDir, err)
+	}
+
+	if fi, err := os.Lstat(dst); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if current, rlErr := os.Readlink(dst); rlErr == nil && filepath.Clean(current) == filepath.Clean(target) {
+				touchHermesSessionStore(storeDir, logger)
+				return true, nil
+			}
+		} else if fi.Mode().IsRegular() {
+			if err := migrateHermesTaskSessionDB(hermesHome, storeDir, logger); err != nil {
+				return false, err
+			}
+		}
+		if err := removeHermesTaskSessionDB(hermesHome); err != nil {
+			return false, err
+		}
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat hermes session db %s: %w", dst, err)
+	}
+
+	// A real symlink, never a copy. createFileLink falls back to copying on a
+	// Windows host that cannot symlink, and a copied SQLite database would
+	// take every write of this turn to a file the next task throws away —
+	// worse than the task-local behaviour it replaces, because it would look
+	// like it worked. Report "not mounted" instead and let the caller keep the
+	// database task-local.
+	if err := os.Symlink(target, dst); err != nil {
+		logger.Warn("execenv: hermes session store not mounted; conversation history stays task-local",
+			"store", storeDir,
+			"error", err,
+		)
+		return false, nil
+	}
+	// Stamp the store as just-used: mounting it does not touch its mtime, so
+	// without this the GC's idle check could reclaim a long-idle conversation
+	// right as a task picks it back up.
+	touchHermesSessionStore(storeDir, logger)
+	return true, nil
+}
+
+// migrateHermesTaskSessionDB carries a task-local state.db into an empty store
+// so a daemon upgrade does not restart the conversation that is already in
+// flight. The journal sidecars come with it: a database whose task was killed
+// mid-write holds its most recent commits in `-wal`, and copying the database
+// alone would silently truncate the transcript to the last checkpoint.
+//
+// Only an empty store is migrated into — a store that already holds a
+// database is this conversation's real history and must never be overwritten.
+func migrateHermesTaskSessionDB(hermesHome, storeDir string, logger *slog.Logger) error {
+	if _, err := os.Stat(filepath.Join(storeDir, hermesSessionDBEntry)); err == nil {
+		return nil // store already holds this conversation — never overwrite it
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat hermes session store db %s: %w", storeDir, err)
+	}
+
+	entries, err := os.ReadDir(hermesHome)
+	if err != nil {
+		return fmt.Errorf("read overlay home %s: %w", hermesHome, err)
+	}
+	migrated := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if !isHermesTaskLocalStateEntry(name) || !entry.Type().IsRegular() {
+			continue
+		}
+		if err := copyFile(filepath.Join(hermesHome, name), filepath.Join(storeDir, name)); err != nil {
+			return fmt.Errorf("migrate task-local hermes session db %s into %s: %w", name, storeDir, err)
+		}
+		migrated++
+	}
+	if migrated > 0 {
+		logger.Info("execenv: migrated task-local hermes session db into conversation store",
+			"store", storeDir,
+			"files", migrated,
+		)
+	}
+	return nil
+}
+
+// removeHermesTaskSessionDB clears the overlay's own state.db family. Called
+// once the database is either safely in the store or deliberately being
+// replaced by the link; leaving a stale `-wal` next to the link would be
+// dead weight SQLite never reads (it derives the sidecar paths from the
+// resolved store path) and a confusing thing to find in a task directory.
+func removeHermesTaskSessionDB(hermesHome string) error {
+	entries, err := os.ReadDir(hermesHome)
+	if err != nil {
+		return fmt.Errorf("read overlay home %s: %w", hermesHome, err)
+	}
+	for _, entry := range entries {
+		if !isHermesTaskLocalStateEntry(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(hermesHome, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove task-local hermes session state %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// touchHermesSessionStore refreshes storeDir's mtime — the signal the GC reads
+// as last activity. Best-effort: a failed touch only risks an over-eager
+// prune, which the daemon's active-store guard still prevents.
+func touchHermesSessionStore(storeDir string, logger *slog.Logger) {
+	now := time.Now()
+	if err := os.Chtimes(storeDir, now, now); err != nil {
+		logger.Warn("execenv: refresh hermes session store activity failed", "store", storeDir, "error", err)
+	}
+}
+
+// PruneHermesSessionStores reclaims per-conversation Hermes session stores
+// untouched within retention. They live outside the task-scoped envRoot the
+// task GC reclaims — that is the point, the transcript has to outlive the
+// task — so without this a finished issue's conversation would sit on disk
+// forever and deleting the issue or the agent would not remove it.
+// retention <= 0 disables pruning entirely.
+//
+// Retention is shorter than the memory store's by design: this holds full
+// transcripts rather than a handful of markdown notes, and losing an idle
+// conversation's replay is a resume that starts fresh (with a continuity
+// notice), not the agent forgetting what it learned.
+//
+// reserve (may be nil) atomically claims a store for deletion exactly as
+// PruneCodexSessionStores uses it: ok=false means a live task holds the store,
+// so it is left alone. nil disables the guard (tests).
+func PruneHermesSessionStores(daemonProfile string, retention time.Duration, now time.Time, reserve func(storeDir string) (commit func(), ok bool), logger *slog.Logger) (removed int, bytesFreed int64) {
+	if retention <= 0 {
+		return 0, 0
+	}
+	profileDir, err := cli.ProfileDir(daemonProfile)
+	if err != nil {
+		return 0, 0
+	}
+	root := filepath.Join(profileDir, hermesSessionStoreRoot)
+	agents, err := os.ReadDir(root)
+	if err != nil {
+		return 0, 0 // not created yet, or unreadable — nothing to prune
+	}
+	for _, a := range agents {
+		if !a.IsDir() {
+			continue
+		}
+		agentDir := filepath.Join(root, a.Name())
+		profiles, err := os.ReadDir(agentDir)
+		if err != nil {
+			continue
+		}
+		keptProfiles := 0
+		for _, p := range profiles {
+			if !p.IsDir() {
+				continue
+			}
+			profileStoreDir := filepath.Join(agentDir, p.Name())
+			conversations, err := os.ReadDir(profileStoreDir)
+			if err != nil {
+				keptProfiles++
+				continue
+			}
+			kept := 0
+			for _, conv := range conversations {
+				if !conv.IsDir() {
+					continue
+				}
+				storeDir := filepath.Join(profileStoreDir, conv.Name())
+				// Same "newest mtime is last activity, plus total size" walk the
+				// memory store prunes on; SQLite bumps the database's mtime on
+				// every commit, so an advancing conversation keeps its shard fresh.
+				newest, size := hermesMemoryStoreStat(storeDir)
+				if newest.IsZero() || now.Sub(newest) <= retention {
+					kept++
+					continue
+				}
+				var commit func()
+				if reserve != nil {
+					c, ok := reserve(storeDir)
+					if !ok {
+						kept++
+						continue
+					}
+					commit = c
+				}
+				err := os.RemoveAll(storeDir)
+				if commit != nil {
+					commit()
+				}
+				if err != nil {
+					logger.Warn("execenv: prune hermes session store failed", "store", storeDir, "error", err)
+					kept++
+					continue
+				}
+				removed++
+				bytesFreed += size
+			}
+			// Drop the profile dir once its last conversation is gone, then the
+			// agent dir once its last profile is, so the tree does not leave
+			// empty shells behind. os.Remove only succeeds on an empty
+			// directory, so anything still holding content keeps its parents.
+			if kept > 0 {
+				keptProfiles++
+				continue
+			}
+			if err := os.Remove(profileStoreDir); err != nil {
+				keptProfiles++
+			}
+		}
+		if keptProfiles == 0 {
+			_ = os.Remove(agentDir)
+		}
+	}
+	return removed, bytesFreed
+}

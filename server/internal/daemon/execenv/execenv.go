@@ -82,6 +82,12 @@ type PrepareParams struct {
 	// the task. Empty keeps memories/ task-local — no agent to key on, or the
 	// Multica profile dir could not be resolved.
 	HermesMemoryStore string
+	// HermesSessionStore is the conversation's persistent Hermes session store
+	// (HermesSessionStorePath) the overlay links state.db to, so the transcript
+	// outlives the task and a follow-up turn can actually resume it. Empty keeps
+	// state.db task-local — no agent or conversation to key on, or the Multica
+	// profile dir could not be resolved.
+	HermesSessionStore string
 	// HermesEnv is the sanitized effective env (agent custom_env minus the daemon
 	// blocklisted keys) used to expand ${VAR} in Hermes external_dirs so it
 	// matches what the Hermes child process actually sees. Only used for hermes.
@@ -264,6 +270,12 @@ type Environment struct {
 	// .agent_context/skills/ fallback was never read (issue #5242). See
 	// hermes_home.go.
 	HermesHome string
+	// HermesSessionStore is the conversation's session store this task's
+	// state.db is actually linked to, or "" when the session database stayed
+	// task-local (no store to key on, or a host that could not create the
+	// link). The daemon reads it as the answer to "can a prior session id
+	// still resolve here?" — see gateResumeToReusedWorkdir.
+	HermesSessionStore string
 	// QwenpawWorkspace is the path to the per-task QwenPaw workspace directory
 	// (set only for the qwenpaw provider). It is populated with the bound skills
 	// and their skill.json manifest with enabled: true, so the skills are
@@ -415,10 +427,14 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// Emptying an agent's own skill list is NOT a way to opt out of the overlay.
 	if params.Provider == "hermes" && len(params.Task.AgentSkills) > 0 {
 		hermesHome := filepath.Join(envRoot, "hermes-home")
-		if err := prepareHermesHome(hermesHome, params.HermesSourceHome, params.HermesSourceMustExist, params.Task.AgentSkills, params.HermesEnv, params.HermesMemoryStore, logger); err != nil {
+		sessionsMounted, err := prepareHermesHome(hermesHome, params.HermesSourceHome, params.HermesSourceMustExist, params.Task.AgentSkills, params.HermesEnv, params.HermesMemoryStore, params.HermesSessionStore, logger)
+		if err != nil {
 			return nil, fmt.Errorf("execenv: prepare hermes-home: %w", err)
 		}
 		env.HermesHome = hermesHome
+		if sessionsMounted {
+			env.HermesSessionStore = params.HermesSessionStore
+		}
 	}
 	if params.Provider == "qwenpaw" {
 		qwenpawWorkspace := filepath.Join(envRoot, "qwenpaw-workspace")
@@ -518,13 +534,15 @@ type ReuseParams struct {
 	// loop) keep the "never delete the user's directory" invariant on
 	// reuse paths.
 	LocalDirectory bool
-	// HermesSourceHome, HermesEnv and HermesMemoryStore mirror PrepareParams on
-	// reuse so the Hermes overlay re-derives against the agent's current source
-	// home / profile, external_dirs vars, and memory store.
+	// HermesSourceHome, HermesEnv, HermesMemoryStore and HermesSessionStore
+	// mirror PrepareParams on reuse so the Hermes overlay re-derives against the
+	// agent's current source home / profile, external_dirs vars, memory store and
+	// conversation session store.
 	HermesSourceHome      string
 	HermesSourceMustExist bool
 	HermesEnv             map[string]string
 	HermesMemoryStore     string
+	HermesSessionStore    string
 	// ReasonixEnv mirrors PrepareParams.ReasonixEnv on reuse so the rewritten
 	// reasonix.toml keeps restating the owner's current permissions.
 	ReasonixEnv map[string]string
@@ -686,7 +704,8 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	if params.Provider == "hermes" && env.RootDir != "" {
 		hermesHome := filepath.Join(env.RootDir, "hermes-home")
 		if len(params.Task.AgentSkills) > 0 {
-			if err := prepareHermesHome(hermesHome, params.HermesSourceHome, params.HermesSourceMustExist, params.Task.AgentSkills, params.HermesEnv, params.HermesMemoryStore, logger); err != nil {
+			sessionsMounted, err := prepareHermesHome(hermesHome, params.HermesSourceHome, params.HermesSourceMustExist, params.Task.AgentSkills, params.HermesEnv, params.HermesMemoryStore, params.HermesSessionStore, logger)
+			if err != nil {
 				// Fail closed: a half-built overlay must not run. Returning nil
 				// makes the daemon fall back to a fresh Prepare, whose error
 				// then blocks dispatch rather than silently dropping the bound
@@ -695,8 +714,13 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 				return nil
 			}
 			env.HermesHome = hermesHome
+			env.HermesSessionStore = ""
+			if sessionsMounted {
+				env.HermesSessionStore = params.HermesSessionStore
+			}
 		} else {
 			env.HermesHome = ""
+			env.HermesSessionStore = ""
 			if err := os.RemoveAll(hermesHome); err != nil {
 				logger.Warn("execenv: remove stale hermes-home failed", "error", err)
 			}

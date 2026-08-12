@@ -5243,23 +5243,37 @@ func providerNeedsInlineSystemPrompt(provider string) bool {
 	}
 }
 
-// gateResumeToReusedWorkdir clears the task's prior session unless the task
-// runs in the exact workdir the session was recorded against, and reports
-// whether that workdir was reused. CLI backends key their session stores to
-// the cwd (Claude Code looks sessions up under ~/.claude/projects/<encoded-cwd>/),
-// so a session id from a different workdir can never resolve: the CLI exits
-// within a second and the run fails before doing any work — permanently,
-// because the failed run records no session and the next claim serves the
-// same stale pointer again. This fires whenever the prior workdir no longer
-// exists (GC'd after the issue went done, daemon reinstall, manual cleanup)
-// and execenv.Reuse fell back to a fresh Prepare (GitHub #3854).
-func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, envWorkDir string, taskLog *slog.Logger) bool {
-	reused := task.PriorWorkDir != "" && envWorkDir == task.PriorWorkDir
+// gateResumeToReusedWorkdir clears the task's prior session unless this run
+// can actually reach the store the session lives in, and reports whether that
+// held. CLI backends key their session stores to the cwd (Claude Code looks
+// sessions up under ~/.claude/projects/<encoded-cwd>/), so a session id from a
+// different workdir can never resolve: the CLI exits within a second and the
+// run fails before doing any work — permanently, because the failed run
+// records no session and the next claim serves the same stale pointer again.
+// This fires whenever the prior workdir no longer exists (GC'd after the issue
+// went done, daemon reinstall, manual cleanup) and execenv.Reuse fell back to a
+// fresh Prepare (GitHub #3854).
+//
+// A matching workdir is not sufficient on its own. Hermes keys its sessions to
+// HERMES_HOME — the per-task overlay under envRoot — not to the cwd, and the
+// two keys come apart precisely in the local_directory flow: reuse is disabled
+// there (shouldReusePriorWorkdir), so every task builds a fresh overlay with an
+// empty state.db, while envWorkDir stays the user's own directory and therefore
+// still equals PriorWorkDir. The gate read "reused" and forwarded a session id
+// that could not possibly resolve, and Hermes answers an unresolvable resume by
+// silently starting over (GH #6806). sessionHomeReachable is the provider's own
+// answer to "can a prior session still be found here?" — for Hermes, whether
+// the conversation's session store got mounted (execenv.Environment
+// HermesSessionStore) — and false drops the resume with the same disclosure as
+// a workdir mismatch.
+func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, envWorkDir string, sessionHomeReachable bool, taskLog *slog.Logger) bool {
+	reused := task.PriorWorkDir != "" && envWorkDir == task.PriorWorkDir && sessionHomeReachable
 	if !reused && task.PriorSessionID != "" {
-		taskLog.Info("dropping prior session: workdir not reused, per-cwd session cannot resolve",
+		taskLog.Info("dropping prior session: session store not reachable from this run",
 			"session_id", task.PriorSessionID,
 			"prior_workdir", task.PriorWorkDir,
 			"workdir", envWorkDir,
+			"session_home_reachable", sessionHomeReachable,
 		)
 		task.PriorSessionID = ""
 		taskCtx.PriorSessionResumed = false
@@ -5271,6 +5285,28 @@ func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, e
 		task.PriorSessionResumeUnavailable = true
 	}
 	return reused
+}
+
+// sessionHomeReachable reports whether a session recorded by a prior task on
+// this conversation can still be found from THIS run's environment, for
+// providers that key their sessions somewhere other than the cwd.
+//
+// Only Hermes does today: its transcripts live in `<HERMES_HOME>/state.db`,
+// which is the per-task overlay under envRoot. Two things can make that
+// reachable — the conversation's persistent session store was mounted into the
+// overlay (hermes_sessions.go), or this run reused the prior task's env root
+// and therefore its overlay. Neither means a fresh overlay with an empty
+// database, and forwarding a session id into that is what produced a
+// conversation restarting from zero every turn (GH #6806).
+//
+// Every other provider is keyed by cwd (or resolves its own store), so the
+// workdir comparison in gateResumeToReusedWorkdir remains the whole answer and
+// this returns true.
+func sessionHomeReachable(provider string, env *execenv.Environment, envReused bool) bool {
+	if provider != "hermes" {
+		return true
+	}
+	return env.HermesSessionStore != "" || envReused
 }
 
 // shouldReusePriorWorkdir keeps the local_directory lock invariant without
@@ -5905,6 +5941,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var hermesSourceMustExist bool
 	var hermesEnv map[string]string
 	var hermesMemoryStore string
+	var hermesSessionStore string
 	if provider == "hermes" {
 		sel := agent.ParseHermesProfileArgs(agentCustomArgs)
 		res := execenv.ResolveHermesProfile(agentEnvOverrides["HERMES_HOME"], sel.Name, sel.Found, sel.Inline)
@@ -5925,6 +5962,17 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// model. Guarded from the GC for the whole task, as the Codex store below.
 		if store := execenv.HermesMemoryStorePath(d.cfg.Profile, task.AgentID, res.SourceHome); store != "" {
 			hermesMemoryStore = store
+			d.markActiveStore(store)
+			defer d.unmarkActiveStore(store)
+		}
+		// The overlay links state.db here so the conversation transcript
+		// survives the task and a follow-up turn can actually resume it
+		// (GH #6806). Keyed on (agent, resolved source home, conversation):
+		// tasks of one conversation are serial, so the shard has a single
+		// writer, while two issues never share a database. Guarded from the GC
+		// for the whole task, as the stores above and below.
+		if store := execenv.HermesSessionStorePath(d.cfg.Profile, task.AgentID, res.SourceHome, taskCtx); store != "" {
+			hermesSessionStore = store
 			d.markActiveStore(store)
 			defer d.unmarkActiveStore(store)
 		}
@@ -5949,6 +5997,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			defer d.unmarkActiveStore(store)
 		}
 	}
+	envReused := false
 	if shouldReusePriorWorkdir(task, localAssignment, d.cfg.WorkspacesRoot) {
 		var err error
 		env, err = d.reuseExecutionEnvironment(prepareCtx, execenv.ReuseParams{
@@ -5966,6 +6015,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			HermesSourceMustExist: hermesSourceMustExist,
 			HermesEnv:             hermesEnv,
 			HermesMemoryStore:     hermesMemoryStore,
+			HermesSessionStore:    hermesSessionStore,
 			ReasonixEnv:           reasonixEnv,
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
@@ -5973,6 +6023,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if err != nil {
 			return TaskResult{}, fmt.Errorf("reuse execution environment: %w", err)
 		}
+		// Reuse can decline (nil) and fall through to a fresh Prepare below.
+		// Whether it did decides whether an env-root-scoped session store — the
+		// Hermes overlay's task-local state.db — carried over from the prior task.
+		envReused = env != nil
 	}
 	if env == nil {
 		var err error
@@ -5992,6 +6046,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			HermesSourceMustExist: hermesSourceMustExist,
 			HermesEnv:             hermesEnv,
 			HermesMemoryStore:     hermesMemoryStore,
+			HermesSessionStore:    hermesSessionStore,
 			ReasonixEnv:           reasonixEnv,
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
@@ -6040,7 +6095,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	cancelPrepare()
 	_ = d.client.ReportProgress(ctx, task.ID, fmt.Sprintf("Launching %s", provider), 1, 2)
 
-	reused := gateResumeToReusedWorkdir(&task, &taskCtx, env.WorkDir, taskLog)
+	reused := gateResumeToReusedWorkdir(&task, &taskCtx, env.WorkDir, sessionHomeReachable(provider, env, envReused), taskLog)
 	// A reused workdir is necessary but not sufficient for a Codex resume: the
 	// prior thread's rollout must actually be present in this task's CODEX_HOME
 	// sessions (MUL-4424 isolates them). Drop the resume before the brief is
