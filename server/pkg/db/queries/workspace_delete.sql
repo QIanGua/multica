@@ -564,6 +564,26 @@ WITH deleted_squads AS (
 )
 DELETE FROM skill WHERE skill.workspace_id = $1;
 
+-- name: DeleteWorkspacePluginData :exec
+-- Plugin relationships have no foreign keys or cascades. Delete the append-only
+-- grant/binding history first, then installation rows. Global identity, release,
+-- contribution, and artifact rows survive for other workspaces and historical
+-- execution-manifest attribution.
+WITH installations AS MATERIALIZED (
+    SELECT plugin_installation.id
+    FROM plugin_installation
+    WHERE plugin_installation.workspace_id = $1
+),
+deleted_bindings AS (
+    DELETE FROM plugin_binding
+    WHERE installation_id IN (SELECT id FROM installations)
+),
+deleted_grants AS (
+    DELETE FROM plugin_grant
+    WHERE installation_id IN (SELECT id FROM installations)
+)
+DELETE FROM plugin_installation WHERE id IN (SELECT id FROM installations);
+
 -- name: DeleteWorkspaceAgents :exec
 DELETE FROM agent WHERE agent.workspace_id = $1;
 

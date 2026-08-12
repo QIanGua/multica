@@ -873,6 +873,96 @@ type PinnedItem struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type PluginBinding struct {
+	ID              pgtype.UUID        `json:"id"`
+	InstallationID  pgtype.UUID        `json:"installation_id"`
+	ScopeType       string             `json:"scope_type"`
+	ScopeID         pgtype.UUID        `json:"scope_id"`
+	Enabled         bool               `json:"enabled"`
+	BindingRevision int64              `json:"binding_revision"`
+	CreatedBy       pgtype.UUID        `json:"created_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type PluginContribution struct {
+	ID                     pgtype.UUID        `json:"id"`
+	ReleaseID              pgtype.UUID        `json:"release_id"`
+	ContributionKey        string             `json:"contribution_key"`
+	Type                   string             `json:"type"`
+	SchemaVersion          int32              `json:"schema_version"`
+	DisplayName            string             `json:"display_name"`
+	Description            string             `json:"description"`
+	EntryPath              string             `json:"entry_path"`
+	EntryDigest            string             `json:"entry_digest"`
+	ArtifactDigest         string             `json:"artifact_digest"`
+	RequiredDaemonFeatures []byte             `json:"required_daemon_features"`
+	Ordinal                int32              `json:"ordinal"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+}
+
+type PluginGrant struct {
+	ID             pgtype.UUID        `json:"id"`
+	InstallationID pgtype.UUID        `json:"installation_id"`
+	Capability     string             `json:"capability"`
+	Decision       string             `json:"decision"`
+	Limits         []byte             `json:"limits"`
+	GrantRevision  int64              `json:"grant_revision"`
+	ApprovedBy     pgtype.UUID        `json:"approved_by"`
+	ApprovedAt     pgtype.Timestamptz `json:"approved_at"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type PluginIdentity struct {
+	ID            pgtype.UUID        `json:"id"`
+	PluginKey     string             `json:"plugin_key"`
+	DisplayName   string             `json:"display_name"`
+	PublisherID   string             `json:"publisher_id"`
+	PublisherType string             `json:"publisher_type"`
+	TrustTier     string             `json:"trust_tier"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	RetiredAt     pgtype.Timestamptz `json:"retired_at"`
+}
+
+type PluginInstallation struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	PluginID          pgtype.UUID        `json:"plugin_id"`
+	SourceKind        string             `json:"source_kind"`
+	SourceRef         string             `json:"source_ref"`
+	DesiredReleaseID  pgtype.UUID        `json:"desired_release_id"`
+	ActiveReleaseID   pgtype.UUID        `json:"active_release_id"`
+	Enabled           bool               `json:"enabled"`
+	DesiredGeneration int64              `json:"desired_generation"`
+	ActiveGeneration  int64              `json:"active_generation"`
+	LifecycleStatus   string             `json:"lifecycle_status"`
+	InstalledBy       pgtype.UUID        `json:"installed_by"`
+	InstalledAt       pgtype.Timestamptz `json:"installed_at"`
+	UpdatedBy         pgtype.UUID        `json:"updated_by"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	DisabledAt        pgtype.Timestamptz `json:"disabled_at"`
+	UninstalledAt     pgtype.Timestamptz `json:"uninstalled_at"`
+}
+
+type PluginRelease struct {
+	ID               pgtype.UUID        `json:"id"`
+	PluginID         pgtype.UUID        `json:"plugin_id"`
+	Version          string             `json:"version"`
+	Manifest         []byte             `json:"manifest"`
+	ManifestDigest   string             `json:"manifest_digest"`
+	SourceKind       string             `json:"source_kind"`
+	SourceRef        string             `json:"source_ref"`
+	ArchiveDigest    string             `json:"archive_digest"`
+	ArtifactRef      string             `json:"artifact_ref"`
+	ArtifactDigest   string             `json:"artifact_digest"`
+	ArtifactSize     int64              `json:"artifact_size"`
+	Signature        []byte             `json:"signature"`
+	SignatureKeyID   pgtype.Text        `json:"signature_key_id"`
+	RevocationStatus string             `json:"revocation_status"`
+	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
+	RevocationReason pgtype.Text        `json:"revocation_reason"`
+	PublishedAt      pgtype.Timestamptz `json:"published_at"`
+}
+
 type Project struct {
 	ID          pgtype.UUID        `json:"id"`
 	WorkspaceID pgtype.UUID        `json:"workspace_id"`
