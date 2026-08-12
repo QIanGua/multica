@@ -69,8 +69,10 @@ describe("EnvTab", () => {
     renderTab();
 
     await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    // Bulk editing is the advertised entry point; pasting into a field stays
+    // as an undocumented shortcut for people who reach for it.
     expect(
-      screen.getByText(/paste KEY=value lines into a key field/i),
+      screen.getByRole("button", { name: /bulk edit/i }),
     ).toBeInTheDocument();
     const keyInput = screen.getByPlaceholderText("KEY");
     keyInput.focus();
@@ -156,7 +158,7 @@ describe("EnvTab", () => {
     expect(pasteAllowed).toBe(false);
     expect(keyInput).toHaveValue("");
     expect(toastError).toHaveBeenCalledWith(
-      "Couldn't parse pasted environment variables",
+      "Line 2 isn't a KEY=value assignment",
     );
   });
 
@@ -171,7 +173,136 @@ describe("EnvTab", () => {
 
     expect(pasteAllowed).toBe(false);
     expect(toastError).toHaveBeenCalledWith(
-      "Duplicate environment variable keys",
+      'Duplicate key "API_KEY" on line 2',
+    );
+  });
+});
+
+describe("EnvTab bulk editing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getAgentEnv.mockResolvedValue({
+      custom_env: { API_KEY: "secret value", BASE_URL: "https://example.com" },
+    });
+    updateAgentEnv.mockResolvedValue({ custom_env: {} });
+  });
+
+  async function revealAndBulkEdit() {
+    const user = userEvent.setup();
+    renderTab();
+    await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    await user.click(screen.getByRole("button", { name: /bulk edit/i }));
+    return user;
+  }
+
+  it("seeds the textarea with the current variables", async () => {
+    await revealAndBulkEdit();
+
+    expect(screen.getByRole("textbox", { name: /bulk edit/i })).toHaveValue(
+      "API_KEY=secret value\nBASE_URL=https://example.com",
+    );
+    // The row editor is what the textarea replaces, not something beside it.
+    expect(screen.queryAllByPlaceholderText("KEY")).toHaveLength(0);
+    expect(
+      screen.getByText(/values are shown in plain text/i),
+    ).toBeInTheDocument();
+  });
+
+  it("saves what the textarea holds", async () => {
+    const user = await revealAndBulkEdit();
+
+    const textarea = screen.getByRole("textbox", { name: /bulk edit/i });
+    await user.clear(textarea);
+    await user.type(textarea, "WIN_DIR=C:\\Users\\me{Enter}PG=p$ssw0rd");
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(updateAgentEnv.mock.calls[0]?.[1]).toEqual({
+      custom_env: { WIN_DIR: String.raw`C:\Users\me`, PG: "p$ssw0rd" },
+    });
+  });
+
+  it("blocks saving while the text does not parse and names the line", async () => {
+    const user = await revealAndBulkEdit();
+
+    const textarea = screen.getByRole("textbox", { name: /bulk edit/i });
+    await user.clear(textarea);
+    await user.type(textarea, "FIRST=one{Enter}echo unsafe");
+
+    expect(
+      screen.getByText("Line 2 isn't a KEY=value assignment"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^save$/i })).toBeDisabled();
+    // Leaving via the toggle would silently discard the text, so it waits too.
+    expect(screen.getByRole("button", { name: /edit as rows/i })).toBeDisabled();
+
+    // Fixing the line releases both.
+    await user.clear(textarea);
+    await user.type(textarea, "FIRST=one");
+    expect(screen.getByRole("button", { name: /^save$/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /edit as rows/i })).toBeEnabled();
+  });
+
+  it("names the duplicated key and its line", async () => {
+    const user = await revealAndBulkEdit();
+
+    const textarea = screen.getByRole("textbox", { name: /bulk edit/i });
+    await user.clear(textarea);
+    await user.type(textarea, "A=1{Enter}A=2");
+
+    expect(
+      screen.getByText('Duplicate key "A" on line 2'),
+    ).toBeInTheDocument();
+  });
+
+  it("carries edits back into the row editor, still masked", async () => {
+    const user = await revealAndBulkEdit();
+
+    const textarea = screen.getByRole("textbox", { name: /bulk edit/i });
+    await user.clear(textarea);
+    await user.type(textarea, "ONLY_KEY=only value");
+    await user.click(screen.getByRole("button", { name: /edit as rows/i }));
+
+    expect(
+      screen.getAllByPlaceholderText("KEY").map((i) => (i as HTMLInputElement).value),
+    ).toEqual(["ONLY_KEY"]);
+    expect(
+      screen.getAllByPlaceholderText("value").map((i) => (i as HTMLInputElement).type),
+    ).toEqual(["password"]);
+  });
+});
+
+describe("EnvTab value-field paste", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getAgentEnv.mockResolvedValue({ custom_env: {} });
+    updateAgentEnv.mockResolvedValue({ custom_env: {} });
+  });
+
+  it("expands an env file pasted into the value field too", async () => {
+    const user = userEvent.setup();
+    renderTab();
+
+    await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    fireEvent.paste(screen.getByPlaceholderText("value"), {
+      clipboardData: { getData: () => "FIRST=one\nSECOND=two" },
+    });
+
+    expect(
+      screen.getAllByPlaceholderText("KEY").map((i) => (i as HTMLInputElement).value),
+    ).toEqual(["FIRST", "SECOND"]);
+  });
+
+  it("reports the offending line when a paste cannot be parsed", async () => {
+    const user = userEvent.setup();
+    renderTab();
+
+    await user.click(screen.getByRole("button", { name: /reveal & edit/i }));
+    fireEvent.paste(screen.getByPlaceholderText("KEY"), {
+      clipboardData: { getData: () => "FIRST=one\necho unsafe" },
+    });
+
+    expect(toastError).toHaveBeenCalledWith(
+      "Line 2 isn't a KEY=value assignment",
     );
   });
 });
