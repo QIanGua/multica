@@ -155,8 +155,9 @@ export function StepWorkspace({
   // What the workspace will actually be created with. Clearing the prefix
   // input reverts to the slug-derived default rather than blocking the CTA —
   // the placeholder shows that default, so an empty field is never a
-  // surprise. A valid slug always derives something, so this is only empty
-  // while the form itself can't be submitted.
+  // surprise. Empty only while the slug is (a CJK-only name derives none),
+  // which is also exactly when `canCreate` is false, so submit always carries
+  // a real prefix.
   const derivedPrefix = issuePrefix(slug);
   const effectivePrefix = prefix || derivedPrefix;
 
@@ -339,7 +340,14 @@ export function StepWorkspace({
         {slugError ? <FieldError>{slugError}</FieldError> : null}
       </Field>
       {/* Editable, pre-filled from the slug. Narrow input — the value is
-          capped at 10 chars, so a full-width field would read as a mistake. */}
+          capped at 10 chars, so a full-width field would read as a mistake.
+
+          Nothing is invented while the slug is empty: a CJK-only name derives
+          no slug (see nameToWorkspaceSlug), and the placeholder used to fill
+          that gap with "WS" — telling the user they were getting the exact
+          prefix this whole change exists to eliminate. Empty field plus a
+          hint is the honest state; the user is picking a URL next anyway,
+          and the prefix appears the moment they do. */}
       <Field>
         <FieldLabel htmlFor="ws-issue-prefix">
           {t(($) => $.step_workspace.issue_prefix_label)}
@@ -349,7 +357,7 @@ export function StepWorkspace({
           type="text"
           value={prefix}
           onChange={(e) => handlePrefixChange(e.target.value)}
-          placeholder={derivedPrefix || "WS"}
+          placeholder={derivedPrefix}
           autoComplete="off"
           autoCapitalize="characters"
           spellCheck={false}
@@ -361,11 +369,17 @@ export function StepWorkspace({
           }}
         />
         <FieldDescription>
-          {t(($) => $.step_workspace.issue_prefix_prefix)}
-          <span className="font-mono text-foreground">
-            {effectivePrefix || "WS"}-123
-          </span>
-          {t(($) => $.step_workspace.issue_prefix_suffix)}
+          {effectivePrefix ? (
+            <>
+              {t(($) => $.step_workspace.issue_prefix_prefix)}
+              <span className="font-mono text-foreground">
+                {effectivePrefix}-123
+              </span>
+              {t(($) => $.step_workspace.issue_prefix_suffix)}
+            </>
+          ) : (
+            t(($) => $.step_workspace.issue_prefix_pending)
+          )}
         </FieldDescription>
       </Field>
     </FieldGroup>
