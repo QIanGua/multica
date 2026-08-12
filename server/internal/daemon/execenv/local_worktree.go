@@ -528,8 +528,11 @@ func addLocalWorktree(gitRoot, worktreePath, branch, baseRef string) (string, er
 // is returned so the caller can tell the user instead of quietly under-copying.
 func copyUntrackedFiles(gitRoot, worktreePath string, logger *slog.Logger) (copied, skipped int, err error) {
 	// stdout only: a warning on stderr would otherwise be split apart and
-	// treated as file paths to copy.
-	out, err := runGitTrimmed(gitRoot, "ls-files", "--others", "--exclude-standard", "-z")
+	// treated as file paths to copy. Raw, not trimmed: with -z the entries are
+	// exact filenames, and a file whose name begins or ends with whitespace
+	// would be trim-corrupted into a path that fails to stat and silently
+	// vanishes from the replay.
+	out, err := runGitStdout(gitRoot, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return 0, 0, fmt.Errorf("git ls-files: %w", err)
 	}
@@ -578,24 +581,29 @@ func copyUntrackedFiles(gitRoot, worktreePath string, logger *slog.Logger) (copi
 // copyUntrackedFile copies one untracked file into the worktree, creating
 // parent directories and preserving the executable bit — a script the user just
 // wrote and hasn't committed has to stay runnable for the agent.
-// multicaSidecarPrefixes are the paths Prepare writes into a workdir. A task
-// running in_place on the same directory leaves these present as untracked
-// files for the length of its run, so a concurrent worktree snapshot sees them.
-// CLAUDE.md / AGENTS.md are deliberately absent: those are ordinarily the
-// user's own tracked files, and the runtime only injects a marker block into
-// them, which CleanupRuntimeConfig removes.
-var multicaSidecarPrefixes = []string{
+// multicaSidecarDirNames are the directories Prepare writes into a workdir. A
+// task running in_place on the same directory leaves these present as
+// untracked files for the length of its run, so a concurrent worktree snapshot
+// sees them. CLAUDE.md / AGENTS.md are deliberately absent: those are
+// ordinarily the user's own tracked files, and the runtime only injects a
+// marker block into them, which CleanupRuntimeConfig removes.
+var multicaSidecarDirNames = []string{
 	".agent_context",
 	".multica",
 }
 
 // isMulticaSidecarPath reports whether a repo-relative path is one of the
-// daemon's own sidecars rather than the user's content.
+// daemon's own sidecars rather than the user's content. Matched as a whole
+// path segment at ANY depth, not just the repo root: an in_place resource may
+// point at a subdirectory of this repo, in which case its sidecars sit at
+// <subdir>/.agent_context — replaying those would put another issue's brief
+// inside this task's worktree and commit it to the delivered branch.
 func isMulticaSidecarPath(rel string) bool {
-	normalized := filepath.ToSlash(rel)
-	for _, prefix := range multicaSidecarPrefixes {
-		if normalized == prefix || strings.HasPrefix(normalized, prefix+"/") {
-			return true
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		for _, name := range multicaSidecarDirNames {
+			if seg == name {
+				return true
+			}
 		}
 	}
 	return false
@@ -628,6 +636,17 @@ func runGit(dir string, args ...string) (string, error) {
 // diagnostic line can't be mistaken for the value (`rev-parse` output, a
 // config value, a stash sha).
 func runGitTrimmed(dir string, args ...string) (string, error) {
+	out, err := runGitStdout(dir, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// runGitStdout is runGitTrimmed without the trimming, for output where
+// whitespace is significant — NUL-separated file listings, where a leading or
+// trailing space is part of a filename.
+func runGitStdout(dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
 	defer cancel()
 
@@ -638,5 +657,5 @@ func runGitTrimmed(dir string, args ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return string(out), nil
 }

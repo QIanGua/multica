@@ -6224,10 +6224,52 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// resource (each project may attach it once, so several can).
 			// Snapshotting underneath a running in_place task would capture a
 			// half-written tree plus that task's in-flight sidecars.
-			release, lockErr := d.localPathLocks.Acquire(prepareCtx, localAssignment.RealPath, task.ID, func(holder string) {
-				taskLog.Info("local_directory: worktree snapshot waiting for in-place holder",
+			//
+			// The wait gets the same visibility plumbing as the in-place
+			// acquire in acquireLocalDirectoryLockIfNeeded, because the holder
+			// can be an in-place task that runs for hours: without the status
+			// update the user sees a bare "preparing" with no hint the task is
+			// queued behind the directory, and without the poller a task the
+			// user cancels keeps its daemon slot pinned until the prepare
+			// timeout — the run-phase cancellation watcher only starts after
+			// launch. The prepare-lease extender is already running for this
+			// whole phase, so only status, accounting, and cancellation are
+			// mirrored here.
+			waitCtx, waitCancel := context.WithCancel(prepareCtx)
+			defer waitCancel()
+			pollInterval := d.cancelPollInterval
+			if pollInterval == 0 {
+				pollInterval = 5 * time.Second
+			}
+			// LocalPathLocker invokes onWait synchronously, in this goroutine,
+			// at most once per Acquire — see the in-place call site.
+			waitCounted := false
+			release, lockErr := d.localPathLocks.Acquire(waitCtx, localAssignment.RealPath, task.ID, func(holder string) {
+				d.resourceWaitTasks.Add(1)
+				waitCounted = true
+				reason := fmt.Sprintf("local_directory %s", localAssignment.AbsPath)
+				if holder != "" {
+					reason = fmt.Sprintf("%s (held by task %s)", reason, shortID(holder))
+				}
+				taskLog.Info("local_directory: worktree snapshot waiting for holder",
 					"holder", shortID(holder))
+				if waitErr := d.client.MarkTaskWaitingLocalDirectory(waitCtx, task.ID, reason); waitErr != nil {
+					// Non-fatal: the wait still happens, the UI just won't
+					// show the explicit "waiting" badge.
+					taskLog.Warn("local_directory: mark waiting status failed", "error", waitErr)
+				}
+				cancelled := d.watchTaskCancellation(waitCtx, task.ID, pollInterval, taskLog)
+				go func() {
+					select {
+					case <-cancelled:
+						waitCancel()
+					case <-waitCtx.Done():
+					}
+				}()
 			})
+			if waitCounted {
+				d.resourceWaitTasks.Add(-1)
+			}
 			if lockErr != nil {
 				return TaskResult{}, fmt.Errorf("local_directory worktree: wait for a consistent snapshot of %s: %w",
 					localAssignment.AbsPath, lockErr)
@@ -6281,6 +6323,54 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			}
 		}()
 	}
+	// Workdir is preserved for reuse by future tasks on the same (agent,
+	// issue) pair in cloud mode; the work_dir path is stored in DB on task
+	// completion and passed back via PriorWorkDir on the next claim, so
+	// rewriting the marker block in place is the right behavior.
+	//
+	// In local_directory mode the workdir is the user's own repo, reuse is
+	// already disabled above (see localAssignment == nil), and the brief
+	// would otherwise live on inside the user's repository — a subsequent
+	// manual `claude` / `codex` run in that directory would pick
+	// up stale Multica instructions (issue id, trigger comment id, reply
+	// rules) and start acting on the previous task's context. Excise the
+	// marker block on the way out instead.
+	//
+	// Worktree mode runs the same pass for a different reason: the worktree is
+	// disposable, but its branch is the deliverable, and Finalize commits
+	// whatever is still on disk. Without this the sidecars would land in every
+	// task's diff. The .git/info/exclude trick repocache uses for github_repo
+	// worktrees is not available here — a linked worktree resolves info/exclude
+	// to the user's own common git dir, so using it would silently change what
+	// `git status` hides in the user's checkout. Removing the files we wrote is
+	// both narrower and exact; it also leaves a genuine agent edit to a tracked
+	// CLAUDE.md intact, since CleanupRuntimeConfig only excises our marker block.
+	//
+	// Ordering: registered immediately after the Finalize defer above, so LIFO
+	// runs cleanup first and Finalize commits an already-clean worktree. It must
+	// also precede every early return between here and provider launch
+	// (temp-dir setup, StartTask): those paths still run Finalize, and without
+	// this pass Finalize would auto-commit the sidecars Prepare just wrote and
+	// deliver a branch whose only content is Multica's own runtime files — or,
+	// in place, leave them behind in the user's tree.
+	if env.LocalDirectory || env.LocalWorktree != nil {
+		defer func() {
+			if cerr := execenv.CleanupRuntimeConfig(env.WorkDir, provider); cerr != nil {
+				d.logger.Warn("execenv: cleanup runtime config failed (non-fatal)", "error", cerr)
+			}
+			// Excise the sidecar tree (.agent_context/, .multica/,
+			// provider-specific .claude/skills/ etc.) that Prepare wrote
+			// into the user's repo. Without this pass the user's tree
+			// accumulates one directory layer per task — see MUL-2784.
+			// CleanupRuntimeConfig handles the runtime brief inside
+			// CLAUDE.md / AGENTS.md; CleanupSidecars handles
+			// every other file Prepare placed under WorkDir. Together
+			// they round-trip the workdir to its exact pre-task bytes.
+			if cerr := execenv.CleanupSidecars(env.RootDir); cerr != nil {
+				d.logger.Warn("execenv: cleanup sidecars failed (non-fatal)", "error", cerr)
+			}
+		}()
+	}
 	taskTempDir, err := ensureTaskTempDir(env.RootDir, task.WorkspaceID, task.ID)
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("prepare task temp dir: %w", err)
@@ -6326,50 +6416,6 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err != nil {
 		d.logger.Warn("execenv: inject runtime config failed (non-fatal)", "error", err)
 	}
-	// Workdir is preserved for reuse by future tasks on the same (agent,
-	// issue) pair in cloud mode; the work_dir path is stored in DB on task
-	// completion and passed back via PriorWorkDir on the next claim, so
-	// rewriting the marker block in place is the right behavior.
-	//
-	// In local_directory mode the workdir is the user's own repo, reuse is
-	// already disabled above (see localAssignment == nil), and the brief
-	// would otherwise live on inside the user's repository — a subsequent
-	// manual `claude` / `codex` run in that directory would pick
-	// up stale Multica instructions (issue id, trigger comment id, reply
-	// rules) and start acting on the previous task's context. Excise the
-	// marker block on the way out instead.
-	//
-	// Worktree mode runs the same pass for a different reason: the worktree is
-	// disposable, but its branch is the deliverable, and Finalize commits
-	// whatever is still on disk. Without this the sidecars would land in every
-	// task's diff. The .git/info/exclude trick repocache uses for github_repo
-	// worktrees is not available here — a linked worktree resolves info/exclude
-	// to the user's own common git dir, so using it would silently change what
-	// `git status` hides in the user's checkout. Removing the files we wrote is
-	// both narrower and exact; it also leaves a genuine agent edit to a tracked
-	// CLAUDE.md intact, since CleanupRuntimeConfig only excises our marker block.
-	//
-	// Ordering: this defer is registered after the Finalize defer above, so LIFO
-	// runs cleanup first and Finalize commits an already-clean worktree.
-	if env.LocalDirectory || env.LocalWorktree != nil {
-		defer func() {
-			if cerr := execenv.CleanupRuntimeConfig(env.WorkDir, provider); cerr != nil {
-				d.logger.Warn("execenv: cleanup runtime config failed (non-fatal)", "error", cerr)
-			}
-			// Excise the sidecar tree (.agent_context/, .multica/,
-			// provider-specific .claude/skills/ etc.) that Prepare wrote
-			// into the user's repo. Without this pass the user's tree
-			// accumulates one directory layer per task — see MUL-2784.
-			// CleanupRuntimeConfig handles the runtime brief inside
-			// CLAUDE.md / AGENTS.md; CleanupSidecars handles
-			// every other file Prepare placed under WorkDir. Together
-			// they round-trip the workdir to its exact pre-task bytes.
-			if cerr := execenv.CleanupSidecars(env.RootDir); cerr != nil {
-				d.logger.Warn("execenv: cleanup sidecars failed (non-fatal)", "error", cerr)
-			}
-		}()
-	}
-
 	prompt := BuildPrompt(task, provider)
 
 	// Pass task-scoped auth credentials and context so the spawned agent CLI

@@ -6,6 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func TestProjectResourceLifecycle(t *testing.T) {
@@ -1104,9 +1108,10 @@ func TestCreateProjectBundledLocalDirectoryDaemonConflict(t *testing.T) {
 }
 
 // execution_mode selects between the historical exclusive in-place run and
-// worktree mode. It is validated at the API boundary because the daemon treats
-// an unknown value as in_place — without this check a typo would silently
-// downgrade a user who asked for concurrency back to a queue.
+// worktree mode. It is validated at the API boundary so a typo is caught at
+// save time; a daemon new enough to know the field refuses unknown values
+// rather than falling back to in_place, so the two checks together keep a
+// mistyped mode from ever running.
 func TestValidateLocalDirectoryRefExecutionMode(t *testing.T) {
 	accepted := []struct {
 		name string
@@ -1155,6 +1160,81 @@ func TestValidateLocalDirectoryRefExecutionMode(t *testing.T) {
 			}
 			if _, err := validateLocalDirectoryRef(raw); err == nil {
 				t.Errorf("execution_mode %q was accepted, want a validation error", mode)
+			}
+		})
+	}
+}
+
+// latestDaemonCLIVersion feeds the worktree-mode save gate: an old daemon
+// json-skips execution_mode and would run tasks in place, so the gate has to
+// read the version of the binary actually running on the machine — the
+// freshest version-bearing row for that daemon_id, never a stale sibling row.
+func TestLatestDaemonCLIVersion(t *testing.T) {
+	row := func(daemonID, version string, seen time.Time) db.AgentRuntime {
+		rt := db.AgentRuntime{
+			DaemonID:   pgtype.Text{String: daemonID, Valid: daemonID != ""},
+			LastSeenAt: pgtype.Timestamptz{Time: seen, Valid: !seen.IsZero()},
+		}
+		if version != "" {
+			rt.Metadata = []byte(`{"cli_version":"` + version + `"}`)
+		}
+		return rt
+	}
+	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		runtimes []db.AgentRuntime
+		daemonID string
+		want     string
+	}{
+		{
+			name:     "no rows at all",
+			runtimes: nil,
+			daemonID: "d1",
+			want:     "",
+		},
+		{
+			name:     "only other daemons",
+			runtimes: []db.AgentRuntime{row("d2", "0.9.9", base)},
+			daemonID: "d1",
+			want:     "",
+		},
+		{
+			name:     "single match",
+			runtimes: []db.AgentRuntime{row("d1", "0.4.24", base)},
+			daemonID: "d1",
+			want:     "0.4.24",
+		},
+		{
+			name: "freshest row wins regardless of order",
+			runtimes: []db.AgentRuntime{
+				row("d1", "0.4.30", base.Add(2*time.Hour)),
+				row("d1", "0.4.20", base),
+			},
+			daemonID: "d1",
+			want:     "0.4.30",
+		},
+		{
+			name: "stale-but-fresher row without a version does not mask an older versioned row",
+			runtimes: []db.AgentRuntime{
+				row("d1", "", base.Add(2*time.Hour)),
+				row("d1", "0.4.24", base),
+			},
+			daemonID: "d1",
+			want:     "0.4.24",
+		},
+		{
+			name:     "match with no version anywhere",
+			runtimes: []db.AgentRuntime{row("d1", "", base)},
+			daemonID: "d1",
+			want:     "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := latestDaemonCLIVersion(tc.runtimes, tc.daemonID); got != tc.want {
+				t.Errorf("latestDaemonCLIVersion = %q, want %q", got, tc.want)
 			}
 		})
 	}

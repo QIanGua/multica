@@ -525,7 +525,12 @@ func TestPrepareLocalWorktreeSkipsMulticaSidecars(t *testing.T) {
 	repo := newTestRepo(t)
 	writeFile(t, filepath.Join(repo, ".agent_context", "issue_context.md"), "OTHER issue's brief\n")
 	writeFile(t, filepath.Join(repo, ".multica", "project", "resources.json"), "{}\n")
+	// An in_place resource may point at a SUBDIRECTORY of this repo, in which
+	// case its sidecars sit below that subdirectory, not at the repo root.
+	writeFile(t, filepath.Join(repo, "services", "api", ".agent_context", "issue_context.md"), "yet another issue's brief\n")
+	writeFile(t, filepath.Join(repo, "services", "api", ".multica", "task.json"), "{}\n")
 	writeFile(t, filepath.Join(repo, "real-untracked.txt"), "user's own file\n")
+	writeFile(t, filepath.Join(repo, "services", "api", "notes.txt"), "user's nested file\n")
 
 	wt := prepareForTest(t, repo)
 	t.Cleanup(func() { finalizeOK(t, wt) })
@@ -536,8 +541,17 @@ func TestPrepareLocalWorktreeSkipsMulticaSidecars(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(wt.Path, ".multica")); !os.IsNotExist(err) {
 		t.Error("another task's .multica was copied into this worktree")
 	}
+	if _, err := os.Stat(filepath.Join(wt.Path, "services", "api", ".agent_context")); !os.IsNotExist(err) {
+		t.Error("a subdirectory task's .agent_context was copied into this worktree")
+	}
+	if _, err := os.Stat(filepath.Join(wt.Path, "services", "api", ".multica")); !os.IsNotExist(err) {
+		t.Error("a subdirectory task's .multica was copied into this worktree")
+	}
 	if got := readFile(t, filepath.Join(wt.Path, "real-untracked.txt")); got != "user's own file\n" {
 		t.Errorf("the user's own untracked file was not replayed: %q", got)
+	}
+	if got := readFile(t, filepath.Join(wt.Path, "services", "api", "notes.txt")); got != "user's nested file\n" {
+		t.Errorf("the user's nested untracked file was not replayed: %q", got)
 	}
 }
 
