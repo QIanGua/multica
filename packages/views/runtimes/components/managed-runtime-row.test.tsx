@@ -36,6 +36,7 @@ vi.mock("@multica/core/paths", () => ({
 }));
 vi.mock("../../navigation", () => ({
   useRowLink: () => () => ({}),
+  useIntentNavigate: () => () => {},
 }));
 vi.mock("./provider-logo", () => ({ ProviderLogo: () => null }));
 vi.mock("../../common/actor-avatar", () => ({ ActorAvatar: () => null }));

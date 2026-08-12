@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/managedruntime"
+	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
 // shellResolveTTL bounds how long one login-shell PATH resolution is reused
@@ -183,6 +184,20 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 	}
 	if e, ok := probe("pi", "MULTICA_PI_PATH", "pi", "MULTICA_PI_MODEL"); ok {
 		agents["pi"] = e
+	}
+	// Built-in runtime identities (e.g. omp) are derived from the descriptor
+	// registry in server/pkg/agent/builtin_runtimes.go. Each one probes a
+	// separate CLI independently so a host with both pi and omp installed gets
+	// two runtimes. The env prefix and default command come from the
+	// descriptor, so adding a new fork is a descriptor entry, not a probe edit.
+	// The descriptor ID doubles as the managed-runtime provider key, so a fork
+	// that Multica can install is discovered through the same fallback.
+	for _, desc := range agent.BuiltinRuntimes {
+		pathEnv := desc.EnvPrefix + "_PATH"
+		modelEnv := desc.EnvPrefix + "_MODEL"
+		if e, ok := probe(desc.ID, pathEnv, desc.DefaultCommand, modelEnv); ok {
+			agents[desc.ID] = e
+		}
 	}
 	if e, ok := probe("cursor", "MULTICA_CURSOR_PATH", "cursor-agent", "MULTICA_CURSOR_MODEL"); ok {
 		agents["cursor"] = e
