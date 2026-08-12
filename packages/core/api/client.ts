@@ -139,6 +139,11 @@ import type {
   WebhookDelivery,
   NotificationPreferenceResponse,
   NotificationPreferences,
+  PluginBindingRequest,
+  PluginCatalogResponse,
+  PluginInstallation,
+  PluginInstallationListResponse,
+  PluginReleaseRequest,
   GitHubPullRequest,
   ListGitHubInstallationsResponse,
   ListGitHubRepositoriesResponse,
@@ -342,6 +347,12 @@ import {
   IssueViewListSchema,
   IssueViewPreferenceSchema,
   EMPTY_ISSUE_VIEW_PREFERENCE,
+  EMPTY_PLUGIN_CATALOG,
+  EMPTY_PLUGIN_INSTALLATION,
+  EMPTY_PLUGIN_INSTALLATION_LIST,
+  PluginCatalogResponseSchema,
+  PluginInstallationListResponseSchema,
+  PluginInstallationSchema,
   type IssueView,
   type IssueViewPreference,
   type CreateIssueViewRequest,
@@ -2120,6 +2131,78 @@ export class ApiClient {
     return this.fetch(`/api/workspaces/${id}`, {
       method: "PATCH",
       body: JSON.stringify(data),
+    });
+  }
+
+  async listPluginCatalog(workspaceId: string): Promise<PluginCatalogResponse> {
+    let raw: unknown;
+    try {
+      raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/catalog`);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) return EMPTY_PLUGIN_CATALOG;
+      throw error;
+    }
+    return parseWithFallback(raw, PluginCatalogResponseSchema, EMPTY_PLUGIN_CATALOG, {
+      endpoint: "GET /api/workspaces/{id}/plugins/catalog",
+    });
+  }
+
+  async listPluginInstallations(workspaceId: string): Promise<PluginInstallationListResponse> {
+    let raw: unknown;
+    try {
+      raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins`);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) return EMPTY_PLUGIN_INSTALLATION_LIST;
+      throw error;
+    }
+    return parseWithFallback(raw, PluginInstallationListResponseSchema, EMPTY_PLUGIN_INSTALLATION_LIST, {
+      endpoint: "GET /api/workspaces/{id}/plugins",
+    });
+  }
+
+  async installPlugin(workspaceId: string, request: PluginReleaseRequest): Promise<PluginInstallation> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/install`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    return parseWithFallback(raw, PluginInstallationSchema, EMPTY_PLUGIN_INSTALLATION, {
+      endpoint: "POST /api/workspaces/{id}/plugins/install",
+    });
+  }
+
+  async upgradePlugin(workspaceId: string, installationId: string, request: PluginReleaseRequest): Promise<PluginInstallation> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/${installationId}/upgrade`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    return parseWithFallback(raw, PluginInstallationSchema, EMPTY_PLUGIN_INSTALLATION, {
+      endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/upgrade",
+    });
+  }
+
+  async setPluginEnabled(
+    workspaceId: string,
+    installationId: string,
+    enabled: boolean,
+    binding: PluginBindingRequest,
+  ): Promise<PluginInstallation> {
+    const action = enabled ? "enable" : "disable";
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/${installationId}/${action}`, {
+      method: "POST",
+      body: JSON.stringify(binding),
+    });
+    return parseWithFallback(raw, PluginInstallationSchema, EMPTY_PLUGIN_INSTALLATION, {
+      endpoint: `POST /api/workspaces/{id}/plugins/{installationId}/${action}`,
+    });
+  }
+
+  async rollbackPlugin(workspaceId: string, installationId: string, version: string): Promise<PluginInstallation> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/${installationId}/rollback`, {
+      method: "POST",
+      body: JSON.stringify({ version }),
+    });
+    return parseWithFallback(raw, PluginInstallationSchema, EMPTY_PLUGIN_INSTALLATION, {
+      endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/rollback",
     });
   }
 

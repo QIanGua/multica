@@ -16,6 +16,7 @@ import {
   Keyboard,
   ListTodo,
   Zap,
+  Blocks,
 } from "lucide-react";
 import { GitHubMark } from "./github-mark";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@multica/ui/components/ui/tabs";
@@ -38,6 +39,7 @@ import { LabelsTab } from "./labels-tab";
 import { PropertiesTab } from "./properties-tab";
 import { QuickActionsTab } from "./quick-actions-tab";
 import { KeyboardShortcutsTab } from "./keyboard-shortcuts-tab";
+import { PluginsTab } from "./plugins-tab";
 import { CollapsedNavTrigger } from "../../layout/page-header";
 import { useT } from "../../i18n";
 
@@ -62,6 +64,7 @@ const WORKSPACE_TAB_KEYS = [
   "labels",
   "properties",
   "quick_actions",
+  "plugins",
 ] as const;
 const WORKSPACE_TAB_VALUES = {
   general: "workspace",
@@ -73,6 +76,7 @@ const WORKSPACE_TAB_VALUES = {
   labels: "labels",
   properties: "properties",
   quick_actions: "quick-actions",
+  plugins: "plugins",
 } as const;
 const WORKSPACE_TAB_ICONS = {
   general: Settings,
@@ -84,6 +88,7 @@ const WORKSPACE_TAB_ICONS = {
   labels: Tags,
   properties: SlidersHorizontal,
   quick_actions: Zap,
+  plugins: Blocks,
 } as const;
 
 const DEFAULT_TAB = "profile";
@@ -241,6 +246,7 @@ export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
           <TabsContent value="labels"><LabelsTab /></TabsContent>
           <TabsContent value="properties"><PropertiesTab /></TabsContent>
           <TabsContent value="quick-actions"><QuickActionsTab /></TabsContent>
+          <TabsContent value="plugins"><PluginsTab /></TabsContent>
           {extraAccountTabs?.map((tab) => (
             <TabsContent key={tab.value} value={tab.value}>{tab.content}</TabsContent>
           ))}

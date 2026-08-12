@@ -49,6 +49,9 @@ import type {
   ListLabelsResponse,
   ListWebhookDeliveriesResponse,
   NotificationPreferenceResponse,
+  PluginCatalogResponse,
+  PluginInstallation,
+  PluginInstallationListResponse,
   ResourceLabelsResponse,
   RuntimeModelListRequest,
   SearchIssuesResponse,
@@ -60,6 +63,99 @@ import type {
 } from "../types";
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
+
+export const PluginBindingSchema = z.object({
+  scope_type: z.string().default("workspace"),
+  scope_id: z.string().default(""),
+  enabled: z.boolean().default(false),
+  revision: z.number().default(0),
+}).loose();
+
+export const PluginInstallationSchema = z.object({
+  id: z.string(),
+  plugin_key: z.string().default(""),
+  display_name: z.string().default(""),
+  desired_version: z.string().default(""),
+  active_version: z.string().optional(),
+  enabled: z.boolean().default(false),
+  desired_generation: z.number().default(0),
+  active_generation: z.number().default(0),
+  lifecycle_status: z.string().default("error"),
+  health_state: z.string().optional(),
+  health_reason: z.string().optional(),
+  contributions: z.array(z.string()).default([]),
+  bindings: z.array(PluginBindingSchema).default([]),
+}).loose();
+
+export const EMPTY_PLUGIN_INSTALLATION: PluginInstallation = {
+  id: "",
+  plugin_key: "",
+  display_name: "",
+  desired_version: "",
+  enabled: false,
+  desired_generation: 0,
+  active_generation: 0,
+  lifecycle_status: "error",
+  contributions: [],
+  bindings: [],
+};
+
+export const PluginInstallationListResponseSchema = z.object({
+  plugins: z.array(PluginInstallationSchema).default([]),
+}).loose();
+
+export const EMPTY_PLUGIN_INSTALLATION_LIST: PluginInstallationListResponse = {
+  plugins: [],
+};
+
+export const PluginCatalogContributionSchema = z.object({
+  key: z.string(),
+  type: z.string().default(""),
+  name: z.string().default(""),
+  description: z.string().default(""),
+  entry_path: z.string().default(""),
+  entry_digest: z.string().default(""),
+}).loose();
+
+export const PluginCatalogReleaseSchema = z.object({
+  plugin_key: z.string(),
+  name: z.string().default(""),
+  description: z.string().default(""),
+  version: z.string(),
+  publisher: z.string().default(""),
+  publisher_type: z.string().default(""),
+  trust_tier: z.string().default(""),
+  source_kind: z.string().default("bundled"),
+  source_ref: z.string().default(""),
+  requested_capabilities: z.array(z.string()).default([]),
+  host_api: z.string().default(""),
+  required_daemon_features: z.array(z.string()).default([]),
+  signature_key_id: z.string().default(""),
+  signature_verified: z.boolean().default(false),
+  manifest_digest: z.string().default(""),
+  archive_digest: z.string().default(""),
+  artifact_digest: z.string().default(""),
+  compatible: z.boolean().default(false),
+  compatibility_reason: z.string().optional(),
+  contributions: z.array(PluginCatalogContributionSchema).default([]),
+  installation: PluginInstallationSchema.optional(),
+}).loose();
+
+export const PluginCatalogResponseSchema = z.object({
+  releases: z.array(PluginCatalogReleaseSchema).default([]),
+  diagnostics: z.array(z.object({
+    source_ref: z.string().default(""),
+    code: z.string().default("unknown"),
+    message: z.string().default(""),
+  }).loose()).default([]),
+  supported: z.boolean().optional().default(true),
+}).loose();
+
+export const EMPTY_PLUGIN_CATALOG: PluginCatalogResponse = {
+  releases: [],
+  diagnostics: [],
+  supported: false,
+};
 
 export const GitHubInstallationSchema = z.object({
   id: z.string(),
