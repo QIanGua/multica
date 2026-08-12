@@ -24,6 +24,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -2370,6 +2371,83 @@ func TestExecuteAndDrain_NetworkFailureKeepsResumeSession(t *testing.T) {
 	}
 }
 
+// TestExecuteAndDrain_AuthResolutionOnResumeRecoversInTurn is the GH #6777
+// regression, driven through the same two-attempt sequence the daemon runs.
+//
+// The reported symptom was a Chat that alternated success / failure forever:
+// turn 1 opened a session and worked; turn 2 resumed it and died with the
+// provider's auth-resolution error; the server-side resume guards then
+// blacklisted that session so turn 3 started fresh and worked again, and so on.
+// Server-side blacklisting alone can only produce that alternation — curing the
+// FAILING turn needs the in-turn fresh retry, which never fired because nothing
+// identified the error as fatal-to-resume. This asserts the whole recovery:
+// the gate opens on attempt 1, and a cold attempt 2 succeeds with its own
+// session id.
+func TestExecuteAndDrain_AuthResolutionOnResumeRecoversInTurn(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDaemon(t)
+
+	const authErr = `hermes provider error: "Could not resolve authentication method. Expected either api_key or auth_token to be set. Or for one of the X-Api-Key or Authorization headers to be explicitly omitted"`
+
+	fb := &fakeBackend{
+		results: []agent.Result{
+			// Attempt 1: resumed session, provider identity unusable.
+			{Status: "failed", Error: authErr, SessionID: "ses_resumed"},
+			// Attempt 2: cold session re-resolves the provider from config.
+			{Status: "completed", Output: "hello", SessionID: "ses_fresh"},
+		},
+	}
+
+	opts := agent.ExecOptions{ResumeSessionID: "ses_resumed"}
+	result, tools, err := d.executeAndDrain(context.Background(), fb, "p", opts, slog.Default(), "t", "", new(atomic.Int32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The adapter must NOT claim the resume was rejected — nothing rejected it,
+	// and Result.ResumeRejected is documented as excluding auth failures. The
+	// recovery has to come from the gate instead.
+	if result.ResumeRejected {
+		t.Fatal("an auth-resolution failure must not be reported as a rejected resume")
+	}
+	if !shouldRetryWithFreshSession(result, opts.ResumeSessionID, tools, "hermes") {
+		t.Fatal("a resumed session that cannot resolve auth must retry once from a fresh session; without this the failing turn is never cured and the user sees alternating failures")
+	}
+
+	// What runTask does on that verdict: retire the prior session and re-run
+	// cold. Mirrored here so the sequence — not just the predicate — is pinned.
+	retired := opts.ResumeSessionID
+	freshOpts := opts
+	freshOpts.ResumeSessionID = ""
+	retry, retryTools, err := d.executeAndDrain(context.Background(), fb, "p", freshOpts, slog.Default(), "t", "", new(atomic.Int32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	final, _ := reconcileFreshRetryResult(result, result.Usage, tools, retry, retryTools, nil)
+
+	if final.Status != "completed" {
+		t.Fatalf("status = %q, want completed — the user's message must succeed on this turn", final.Status)
+	}
+	if final.SessionID != "ses_fresh" {
+		t.Fatalf("session id = %q, want ses_fresh so the next turn resumes the working session", final.SessionID)
+	}
+	if final.SessionID == retired {
+		t.Fatal("the dead session must not become the resume pointer again")
+	}
+	if int(fb.idx.Load()) != 2 {
+		t.Fatalf("expected exactly 2 attempts (one retry, not a loop), got %d", fb.idx.Load())
+	}
+	if fb.calls[1].ResumeSessionID != "" {
+		t.Fatalf("retry asked to resume %q; it must be a cold start", fb.calls[1].ResumeSessionID)
+	}
+	// The server-side half of the fix still has to hold: even though this turn
+	// recovered, the failed attempt's error must keep that session out of every
+	// later resume lookup.
+	if !taskfailure.AuthMethodUnresolved(result.Error) {
+		t.Fatal("the failed attempt's error must still be recognised so ResumeUnsafeFailure and the resume queries retire the dead session")
+	}
+}
+
 func TestShouldRetryWithFreshSession(t *testing.T) {
 	t.Parallel()
 
@@ -2650,6 +2728,89 @@ func TestShouldRetryWithFreshSession(t *testing.T) {
 			priorSessionID: "thr_oversized",
 			tools:          1,
 			provider:       "codex",
+			want:           false,
+		},
+		{
+			// GH #6777: the alternating Chat failure. Hermes rebuilds the
+			// resumed session but persists a normalised provider identity that
+			// can no longer resolve its credentials, so the turn dies with the
+			// SDK's auth-resolution message. Nothing rejected the resume, so
+			// ResumeRejected is false and correctly so — the adapter cannot
+			// tell this from a bad credential. Only this gate knows the run was
+			// a resume, and a fresh session re-resolves the provider from
+			// current config.
+			name: "hermes resumed session that cannot resolve auth retries",
+			result: agent.Result{
+				Status:    "failed",
+				Error:     `hermes provider error: "Could not resolve authentication method. Expected either api_key or auth_token to be set. Or for one of the X-Api-Key or Authorization headers to be explicitly omitted"`,
+				SessionID: "ses_resumed",
+			},
+			priorSessionID: "ses_resumed",
+			provider:       "hermes",
+			want:           true,
+		},
+		{
+			// The same failure surfacing one ACP step earlier: a resumed
+			// session whose persisted provider was flattened gets a
+			// non-redundant session/set_model, which re-runs provider
+			// auto-detection and mis-routes (MUL-5029). The adapter wraps the
+			// message instead of replacing it, which is why matching the
+			// phrase here covers all three lifecycle steps at once.
+			name: "hermes set_model auth-resolution failure on resume retries",
+			result: agent.Result{
+				Status:    "failed",
+				Error:     `hermes could not switch to model "custom:deepseek-v4-pro": session/set_model: Could not resolve authentication method. Expected either api_key or auth_token to be set.`,
+				SessionID: "ses_resumed",
+			},
+			priorSessionID: "ses_resumed",
+			provider:       "hermes",
+			want:           true,
+		},
+		{
+			// The tools gate is untouched by the new evidence, exactly as for
+			// the poisoned-history branch above: a turn that already acted is
+			// never replayed. Its session is still retired at report time by
+			// ResumeUnsafeFailure's matching text guard.
+			name: "hermes auth-resolution failure after a tool ran never retries",
+			result: agent.Result{
+				Status:    "failed",
+				Error:     `hermes provider error: "Could not resolve authentication method. Expected either api_key or auth_token to be set."`,
+				SessionID: "ses_resumed",
+			},
+			priorSessionID: "ses_resumed",
+			tools:          1,
+			provider:       "hermes",
+			want:           false,
+		},
+		{
+			// The load-bearing scope limit: on a COLD run the same message
+			// means the agent's provider config really is incomplete. There is
+			// no session to blame and no fresh session to fall back to, so the
+			// error must reach the user instead of burning a second run. The
+			// priorSessionID gate is what encodes that distinction.
+			name: "cold run that cannot resolve auth does not retry",
+			result: agent.Result{
+				Status: "failed",
+				Error:  `hermes provider error: "Could not resolve authentication method. Expected either api_key or auth_token to be set."`,
+			},
+			priorSessionID: "",
+			provider:       "hermes",
+			want:           false,
+		},
+		{
+			// Narrowness guard, mirroring the SQL side's auth-adjacent test: a
+			// rejected credential is about the credential, not the session's
+			// copy of the provider, and a fresh session replays it verbatim.
+			// Widening the phrase to any authentication-shaped error would
+			// discard healthy conversation pointers on every such failure.
+			name: "hermes rejected credential on resume keeps the session",
+			result: agent.Result{
+				Status:    "failed",
+				Error:     `hermes provider error: "401 authentication_error: invalid x-api-key"`,
+				SessionID: "ses_resumed",
+			},
+			priorSessionID: "ses_resumed",
+			provider:       "hermes",
 			want:           false,
 		},
 	}

@@ -6713,6 +6713,35 @@ func shouldRetryWithFreshSession(result agent.Result, priorSessionID string, too
 	if taskfailure.UnresumableHistory(result.Error) {
 		return true
 	}
+	// Third form of positive evidence, and the same shape of argument: the
+	// resume was not refused — the runtime happily rebuilt the session — but
+	// the provider identity it rebuilt can no longer resolve its own
+	// credentials, so the turn dies with "Could not resolve authentication
+	// method" (GH #6777). The credentials are fine; only the session's copy of
+	// the provider is broken, which is precisely what a fresh session
+	// re-resolves from current config.
+	//
+	// This is the exception the Result.ResumeRejected doc calls out: adapters
+	// must NOT flag auth errors, because a genuine credential failure keeps the
+	// session so the platform's own retry can continue the conversation. The
+	// distinction is resume-vs-fresh, not the error text — and priorSessionID
+	// above already establishes that this run WAS a resume. On a cold run the
+	// same error means the config really is wrong and this gate never sees it.
+	//
+	// Deciding here rather than in each ACP adapter is what makes it correct
+	// for every step of the ACP lifecycle: the failure surfaces at
+	// session/resume, at session/set_model (a resumed session whose persisted
+	// provider was normalised gets a redundant set_model that re-routes to the
+	// wrong provider — MUL-5029) or at session/prompt, and only two of those
+	// three carry any resume-failure signal today. The final error text carries
+	// the phrase on all three.
+	//
+	// Worst case, the config genuinely is broken: the fresh attempt fails the
+	// same way, the user sees the same error once, and the single-retry budget
+	// bounds the cost. That is the same trade the branch above already makes.
+	if taskfailure.AuthMethodUnresolved(result.Error) {
+		return true
+	}
 	// Everything below is a bounded compatibility path for the backends that
 	// cannot answer question 1 at all. For every other backend a false
 	// ResumeRejected is a real answer — it checked and this was not a
