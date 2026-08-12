@@ -66,12 +66,6 @@ interface ActorAvatarProps {
    * and agents, while picker/menu controls keep their own click behavior.
    */
   profileLink?: boolean;
-  /**
-   * Let the profile link own its click even when the avatar is nested inside
-   * a host control. Use only when clicking the avatar should navigate instead
-   * of activating the surrounding picker/menu trigger.
-   */
-  profileLinkOwnsClick?: boolean;
 }
 
 const FOCUSABLE_ANCESTOR_SELECTOR =
@@ -88,7 +82,6 @@ export function ActorAvatar({
   showStatusDot,
   hoverCardVariant = "profile",
   profileLink,
-  profileLinkOwnsClick,
 }: ActorAvatarProps) {
   const { getActorName, getActorInitials, getActorAvatarUrl } = useActorName();
   const paths = useWorkspacePaths();
@@ -131,12 +124,7 @@ export function ActorAvatar({
           : null
     : null;
   const content = profileHref ? (
-    <ActorAvatarProfileLink
-      href={profileHref}
-      profileLinkOwnsClick={profileLinkOwnsClick}
-    >
-      {dotted}
-    </ActorAvatarProfileLink>
+    <ActorAvatarProfileLink href={profileHref}>{dotted}</ActorAvatarProfileLink>
   ) : (
     dotted
   );
@@ -162,19 +150,15 @@ export function ActorAvatar({
 
 /**
  * Not an `<a>` on purpose: the avatar is often composed inside menu items,
- * options and buttons, where it yields to the surrounding control by default.
- * A deliberate secondary-link surface can opt into owning the click; that
- * path prevents the enclosing control or anchor from acting. The cost is no
- * native context menu, so modifier and middle clicks are implemented here
- * with the same intent semantics as AppLink.
+ * options and buttons, where it yields the click to the surrounding control.
+ * The cost is no native context menu, so modifier and middle clicks are
+ * implemented here with the same intent semantics as AppLink.
  */
 function ActorAvatarProfileLink({
   href,
-  profileLinkOwnsClick,
   children,
 }: {
   href: string;
-  profileLinkOwnsClick?: boolean;
   children: React.ReactNode;
 }) {
   // Web note: the trigger is a `<span role="link">`, not an anchor, so there
@@ -184,7 +168,6 @@ function ActorAvatarProfileLink({
   const intentNavigate = useIntentNavigate();
 
   const insideControl = (event: React.SyntheticEvent) =>
-    !profileLinkOwnsClick &&
     !!event.currentTarget.parentElement?.closest(PROFILE_LINK_CONTROL_SELECTOR);
 
   const open = (intent: LinkClickIntent) => intentNavigate(href, intent);

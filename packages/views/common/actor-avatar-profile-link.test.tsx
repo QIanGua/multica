@@ -86,13 +86,7 @@ function PickerWrapper({ children }: { children: React.ReactNode }) {
   );
 }
 
-function renderCardPicker({
-  adapter,
-  profileLinkOwnsClick,
-}: {
-  adapter: NavigationAdapter;
-  profileLinkOwnsClick?: boolean;
-}) {
+function renderCardPicker(adapter: NavigationAdapter) {
   return render(
     <NavigationProvider value={adapter}>
       <AppLink href="/acme/issues/issue-1">
@@ -103,7 +97,7 @@ function renderCardPicker({
                 <ActorAvatar
                   actorType="member"
                   actorId={MEMBER_ID}
-                  profileLinkOwnsClick={profileLinkOwnsClick}
+                  enableHoverCard
                 />
                 <span>Change assignee</span>
               </span>
@@ -137,23 +131,9 @@ describe("ActorAvatar profile link", () => {
     expect(open).not.toHaveBeenCalled();
   });
 
-  it("owns and cancels the real card-link click without opening the picker", () => {
-    const push = vi.fn();
-    const { container } = renderCardPicker({
-      adapter: makeAdapter({ push }),
-      profileLinkOwnsClick: true,
-    });
-    const avatar = container.querySelector('[data-slot="avatar"]');
-
-    expect(avatar).not.toBeNull();
-    expect(fireEvent.click(avatar!)).toBe(false);
-    expect(push).toHaveBeenCalledWith(HREF);
-    expect(screen.queryByTestId("mounted-picker")).not.toBeInTheDocument();
-  });
-
   it("opens the deferred picker while cancelling the enclosing card link", () => {
     const push = vi.fn();
-    renderCardPicker({ adapter: makeAdapter({ push }) });
+    renderCardPicker(makeAdapter({ push }));
 
     expect(fireEvent.click(screen.getByText("Change assignee"))).toBe(false);
     expect(screen.getByTestId("mounted-picker")).toHaveAttribute("data-open", "true");
@@ -162,7 +142,7 @@ describe("ActorAvatar profile link", () => {
 
   it("yields to the picker by default without leaking native card navigation", () => {
     const push = vi.fn();
-    const { container } = renderCardPicker({ adapter: makeAdapter({ push }) });
+    const { container } = renderCardPicker(makeAdapter({ push }));
     const avatar = container.querySelector('[data-slot="avatar"]');
 
     expect(avatar).not.toBeNull();
