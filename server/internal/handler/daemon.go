@@ -766,7 +766,8 @@ func (h *Handler) mergeLegacyRuntimes(r *http.Request, registered db.AgentRuntim
 // the teardown rolled back.
 var errRuntimeMergeFenced = errors.New("runtime merge refused by the task-write fence")
 
-// mergeLegacyRuntime folds one legacy runtime row into the freshly registered one.
+// mergeLegacyRuntime folds one legacy runtime row into the freshly registered one,
+// as a single transaction.
 //
 // Order is load-bearing. Tasks move first, because that statement carries the
 // workspace fence (lock_task_owner_workspaces) and is the only step that can tell
@@ -775,9 +776,32 @@ var errRuntimeMergeFenced = errors.New("runtime merge refused by the task-write 
 // with no history looks like, and treating a fenced refusal as success would take
 // us straight to DeleteAgentRuntime below — where agent_task_queue's
 // ON DELETE CASCADE would delete the history this merge is supposed to carry
-// forward (MUL-5999 review). Nothing after this point runs unless the fence agreed.
+// forward (MUL-5999 review).
+//
+// One transaction, because the fence's workspace lock lives only as long as the
+// statement that took it. Run as four autocommit statements, the merge had two
+// ways to leave the tenant inconsistent and the registration reporting success:
+//
+//   - a transient failure on the agent reassignment left tasks pointing at the new
+//     runtime while their agents stayed on the old one, self-healing only on some
+//     later registration;
+//   - worse, in the gap after the task commit a workspace teardown could lock and
+//     delete the target runtime, whose UnbindTasksFromRuntime step clears
+//     runtime_id on the tasks that had just moved. The next merge looks for tasks
+//     by the OLD runtime id, so that history was permanently detached.
+//
+// Holding the fence lock from the first statement to COMMIT closes both: the
+// teardown cannot start deleting the target until this merge finishes, and any
+// failure rolls the whole merge back to its starting state.
 func (h *Handler) mergeLegacyRuntime(ctx context.Context, newRuntimeID, oldRuntimeID pgtype.UUID, legacyID, provider string) error {
-	reassignment, err := h.Queries.ReassignTasksToRuntime(ctx, db.ReassignTasksToRuntimeParams{
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin merge tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := h.Queries.WithTx(tx)
+
+	reassignment, err := qtx.ReassignTasksToRuntime(ctx, db.ReassignTasksToRuntimeParams{
 		NewRuntimeID: newRuntimeID,
 		OldRuntimeID: oldRuntimeID,
 	})
@@ -788,7 +812,7 @@ func (h *Handler) mergeLegacyRuntime(ctx context.Context, newRuntimeID, oldRunti
 		return errRuntimeMergeFenced
 	}
 
-	agents, err := h.Queries.ReassignAgentsToRuntime(ctx, db.ReassignAgentsToRuntimeParams{
+	agents, err := qtx.ReassignAgentsToRuntime(ctx, db.ReassignAgentsToRuntimeParams{
 		NewRuntimeID: newRuntimeID,
 		OldRuntimeID: oldRuntimeID,
 	})
@@ -796,14 +820,21 @@ func (h *Handler) mergeLegacyRuntime(ctx context.Context, newRuntimeID, oldRunti
 		return fmt.Errorf("reassign agents: %w", err)
 	}
 
-	if err := h.Queries.RecordRuntimeLegacyDaemonID(ctx, db.RecordRuntimeLegacyDaemonIDParams{
+	// Inside the transaction this can no longer be best-effort: a failed statement
+	// poisons the transaction, so it either lands with the rest of the merge or the
+	// merge is rolled back.
+	if err := qtx.RecordRuntimeLegacyDaemonID(ctx, db.RecordRuntimeLegacyDaemonIDParams{
 		ID:             newRuntimeID,
 		LegacyDaemonID: strToText(legacyID),
 	}); err != nil {
-		slog.Warn("legacy runtime merge: record legacy daemon_id failed", "legacy_daemon_id", legacyID, "error", err)
+		return fmt.Errorf("record legacy daemon_id: %w", err)
 	}
-	if err := h.Queries.DeleteAgentRuntime(ctx, oldRuntimeID); err != nil {
+	if err := qtx.DeleteAgentRuntime(ctx, oldRuntimeID); err != nil {
 		return fmt.Errorf("delete old runtime: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit merge: %w", err)
 	}
 
 	slog.Info("legacy runtime merged",

@@ -34,32 +34,31 @@ func enqueueViaRealQuery(ctx context.Context, q *db.Queries, agentID, runtimeID,
 	return err
 }
 
-// waitForBlockedWriter blocks until some other backend is waiting on a lock while
-// running a statement that mentions querySnippet, so a race test can be sure the
-// writer really is queued before the other side commits. Fails the test on timeout
-// rather than proceeding, so a missed race shows up as a failure instead of a
-// vacuous pass.
-func waitForBlockedWriter(t *testing.T, ctx context.Context, querySnippet string) {
+// waitForBlockedWriter blocks until the given backend is waiting on a lock, so a
+// race test can be sure the writer really is queued before the other side commits.
+// The pid comes from the writer itself rather than being guessed from statement
+// text, which on a shared test database could match an unrelated backend. Fails the
+// test on timeout rather than proceeding, so a missed race shows up as a failure
+// instead of a vacuous pass.
+func waitForBlockedWriter(t *testing.T, ctx context.Context, pid int32) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		var waiting int
+		var waiting bool
 		if err := testPool.QueryRow(ctx, `
-SELECT count(*)
-FROM pg_stat_activity
-WHERE pid <> pg_backend_pid()
-  AND wait_event_type = 'Lock'
-  AND state = 'active'
-  AND query LIKE '%' || $1 || '%'
-`, querySnippet).Scan(&waiting); err != nil {
+SELECT EXISTS (
+    SELECT 1 FROM pg_stat_activity
+    WHERE pid = $1 AND state = 'active' AND wait_event_type = 'Lock'
+)
+`, pid).Scan(&waiting); err != nil {
 			t.Fatalf("poll pg_stat_activity: %v", err)
 		}
-		if waiting > 0 {
+		if waiting {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("no backend blocked on a lock while running a statement mentioning %q; the race was not set up", querySnippet)
+	t.Fatalf("backend %d never parked on a lock; the race was not set up", pid)
 }
 
 // TestTaskOwnershipWritesCallTheFence is the guard that keeps the fence from being
@@ -273,19 +272,45 @@ func TestTaskWriteFence_QueuedWriterCannotLandAfterTeardownCommits(t *testing.T)
 
 	var wg sync.WaitGroup
 	var writerErr error
+	writerPID := make(chan int32, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		bg := context.Background()
+		// A dedicated connection so the writer can report the backend the race
+		// waits on, and so the enqueue still runs as its own autocommit statement
+		// the way a real one does.
+		conn, err := testPool.Acquire(bg)
+		if err != nil {
+			writerErr = err
+			close(writerPID)
+			return
+		}
+		defer conn.Release()
+
+		var pid int32
+		if err := conn.QueryRow(bg, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			writerErr = err
+			close(writerPID)
+			return
+		}
+		writerPID <- pid
+
 		// No lock_timeout: this writer is supposed to wait for teardown, which is
 		// what a real enqueue arriving mid-teardown does.
-		writerErr = enqueueViaRealQuery(context.Background(), testHandler.Queries,
-			f.victimAgent, f.victimRuntime, f.victimIssue)
+		writerErr = enqueueViaRealQuery(bg, db.New(conn), f.victimAgent, f.victimRuntime, f.victimIssue)
 	}()
+
+	pid, ok := <-writerPID
+	if !ok {
+		wg.Wait()
+		t.Fatalf("writer could not start: %v", writerErr)
+	}
 
 	// Wait until the writer is genuinely parked on a lock rather than trusting a
 	// fixed sleep: on a loaded machine a sleep can elapse before the writer even
 	// reaches the fence, and the test would then pass without exercising the race.
-	waitForBlockedWriter(t, ctx, "agent_task_queue")
+	waitForBlockedWriter(t, ctx, pid)
 
 	if _, err := teardown.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, f.victimID); err != nil {
 		t.Fatalf("delete workspace: %v", err)
@@ -452,6 +477,115 @@ RETURNING id
 	}
 	if !rowExists(t, "agent_task_queue", f.taskViaRuntime) {
 		t.Error("a completed merge lost the old runtime's task")
+	}
+}
+
+// TestMergeLegacyRuntime_RollsBackWhenAStepFails is the fault-injection half of the
+// merge contract: the four statements have to land together or not at all.
+//
+// Run as autocommit statements the merge could commit the task reassignment and
+// then fail on the agent reassignment, leaving tasks on the new runtime and their
+// agents on the old one while daemon registration still reported success. Worse,
+// the fence's workspace lock ended with its own statement, so a teardown could slip
+// into that gap, delete the target runtime and clear runtime_id on the tasks that
+// had just moved — history the next merge could no longer find, because it looks up
+// tasks by the OLD runtime id.
+//
+// The failure is injected in the database rather than through a code seam, so the
+// test exercises the real statements: a trigger makes any agent row moving onto the
+// merge target raise.
+func TestMergeLegacyRuntime_RollsBackWhenAStepFails(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "mergerollback")
+
+	var target string
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO agent_runtime (workspace_id, name, runtime_mode, provider, status, device_info, metadata, owner_id)
+VALUES ($1, 'rollback merge target', 'cloud', 'delete-test', 'offline', '', '{}'::jsonb, $2)
+RETURNING id
+`, f.victimID, testUserID).Scan(&target); err != nil {
+		t.Fatalf("create merge target: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+CREATE OR REPLACE FUNCTION mul5999_fail_agent_move() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF NEW.name = 'victim agent' AND NEW.runtime_id IS DISTINCT FROM OLD.runtime_id THEN
+        RAISE EXCEPTION 'injected failure moving agent onto the merge target';
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+`); err != nil {
+		t.Fatalf("create injection function: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+CREATE TRIGGER mul5999_fail_agent_move
+BEFORE UPDATE OF runtime_id ON agent
+FOR EACH ROW EXECUTE FUNCTION mul5999_fail_agent_move()
+`); err != nil {
+		t.Fatalf("create injection trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		bg := context.Background()
+		_, _ = testPool.Exec(bg, `DROP TRIGGER IF EXISTS mul5999_fail_agent_move ON agent`)
+		_, _ = testPool.Exec(bg, `DROP FUNCTION IF EXISTS mul5999_fail_agent_move()`)
+	})
+
+	err := testHandler.mergeLegacyRuntime(ctx, parseUUID(target), parseUUID(f.victimRuntime),
+		"legacy-daemon", "delete-test")
+	if err == nil {
+		t.Fatal("merge reported success even though the agent reassignment failed")
+	}
+	if !strings.Contains(err.Error(), "reassign agents") {
+		t.Errorf("error = %v, want the agent reassignment failure", err)
+	}
+
+	// Everything must look exactly as it did before the call.
+	var taskRuntime, agentRuntime string
+	if err := testPool.QueryRow(ctx,
+		`SELECT runtime_id FROM agent_task_queue WHERE id = $1`, f.taskViaRuntime).Scan(&taskRuntime); err != nil {
+		t.Fatalf("read task runtime: %v", err)
+	}
+	if taskRuntime != f.victimRuntime {
+		t.Errorf("task moved to %s; the task reassignment was not rolled back", taskRuntime)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT runtime_id FROM agent WHERE id = $1`, f.victimAgent).Scan(&agentRuntime); err != nil {
+		t.Fatalf("read agent runtime: %v", err)
+	}
+	if agentRuntime != f.victimRuntime {
+		t.Errorf("agent runtime = %s, want the original %s", agentRuntime, f.victimRuntime)
+	}
+	if !rowExists(t, "agent_runtime", f.victimRuntime) {
+		t.Error("the old runtime was deleted by a merge that failed")
+	}
+	if !rowExists(t, "agent_runtime", target) {
+		t.Error("the merge target disappeared")
+	}
+	var legacyRecorded bool
+	if err := testPool.QueryRow(ctx,
+		`SELECT legacy_daemon_id IS NOT NULL FROM agent_runtime WHERE id = $1`, target).Scan(&legacyRecorded); err != nil {
+		t.Fatalf("read legacy daemon id: %v", err)
+	}
+	if legacyRecorded {
+		t.Error("the legacy daemon_id audit write survived a rolled-back merge")
+	}
+
+	// With the injection removed the same merge completes, so the rollback above
+	// was not just a permanently broken fixture.
+	if _, err := testPool.Exec(ctx, `DROP TRIGGER mul5999_fail_agent_move ON agent`); err != nil {
+		t.Fatalf("drop injection trigger: %v", err)
+	}
+	if err := testHandler.mergeLegacyRuntime(ctx, parseUUID(target), parseUUID(f.victimRuntime),
+		"legacy-daemon", "delete-test"); err != nil {
+		t.Fatalf("merge after removing the injection: %v", err)
+	}
+	if rowExists(t, "agent_runtime", f.victimRuntime) {
+		t.Error("the old runtime survived a completed merge")
 	}
 }
 
