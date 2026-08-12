@@ -367,12 +367,23 @@ SET runtime_id = @new_runtime_id
 WHERE runtime_id = @old_runtime_id;
 
 -- name: ReassignTasksToRuntime :execrows
+-- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- locks the owners' workspace rows in the writer's own transaction and returns
+-- false once they are gone, so this statement writes no row instead of stranding
+-- a task in a workspace that has just been deleted (MUL-5999).
 -- Re-points every queued/running/completed task referencing old_runtime_id.
 -- Required before deleting the old runtime row because agent_task_queue has
 -- an ON DELETE CASCADE FK that would otherwise drop historical tasks.
+WITH fence AS MATERIALIZED (
+    -- Once per statement rather than once per row: the predicate is VOLATILE, so
+    -- calling it from the WHERE clause of a bulk UPDATE would re-run it for every
+    -- candidate row.
+    SELECT lock_task_owner_workspaces(NULL, NULL, @new_runtime_id) AS ok
+)
 UPDATE agent_task_queue
 SET runtime_id = @new_runtime_id
-WHERE runtime_id = @old_runtime_id;
+WHERE runtime_id = @old_runtime_id
+  AND (SELECT ok FROM fence);
 
 -- name: RecordRuntimeLegacyDaemonID :exec
 -- Remembers the most recent hostname-derived daemon_id that was merged into

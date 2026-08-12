@@ -1,0 +1,406 @@
+package handler
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+)
+
+// enqueueViaRealQuery creates a task through the generated CreateAgentTask query —
+// the actual production enqueue path, fence included. Raw INSERTs in tests would
+// bypass the fence, which lives in the application SQL rather than in a trigger.
+func enqueueViaRealQuery(ctx context.Context, q *db.Queries, agentID, runtimeID, issueID string) error {
+	params := db.CreateAgentTaskParams{
+		AgentID:   parseUUID(agentID),
+		RuntimeID: parseUUID(runtimeID),
+		Priority:  0,
+	}
+	if issueID != "" {
+		params.IssueID = parseUUID(issueID)
+	}
+	_, err := q.CreateAgentTask(ctx, params)
+	return err
+}
+
+// TestTaskOwnershipWritesCallTheFence is the guard that keeps the fence from being
+// a convention. Every statement that inserts an agent_task_queue row, or assigns
+// one of its ownership columns, has to call lock_task_owner_workspaces — a new
+// write path that forgets it would silently reopen the insert-after-sweep window
+// that MUL-5999's teardown depends on being closed.
+//
+// This is the trade for not using a row trigger: the write path names its own
+// fence, and CI checks that it did.
+func TestTaskOwnershipWritesCallTheFence(t *testing.T) {
+	queryDir := filepath.Join("..", "..", "pkg", "db", "queries")
+	entries, err := os.ReadDir(queryDir)
+	if err != nil {
+		t.Fatalf("read query dir: %v", err)
+	}
+
+	nameRe := regexp.MustCompile(`(?m)^-- name: (\S+)`)
+	// Go's regexp has no lookahead, so the SET clause is isolated first and its
+	// ownership assignments are inspected individually. Clearing runtime_id cannot
+	// move a task into another workspace, so `= NULL` is exempt; teardown's own
+	// detach only touches parent_task_id.
+	setClauseRe := regexp.MustCompile(`(?is)\bSET\b(.*?)(?:\bWHERE\b|\bFROM\b|\bRETURNING\b|;)`)
+	ownerAssignRe := regexp.MustCompile(`(?i)\b(agent_id|issue_id|runtime_id)\s*=\s*(\S+)`)
+
+	assignsOwner := func(code string) bool {
+		for _, clause := range setClauseRe.FindAllStringSubmatch(code, -1) {
+			for _, assign := range ownerAssignRe.FindAllStringSubmatch(clause[1], -1) {
+				if !strings.EqualFold(strings.TrimSuffix(assign[2], ","), "NULL") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	checked := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(queryDir, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		text := string(body)
+		matches := nameRe.FindAllStringSubmatchIndex(text, -1)
+		for i, m := range matches {
+			stop := len(text)
+			if i+1 < len(matches) {
+				stop = matches[i+1][0]
+			}
+			stmt := text[m[0]:stop]
+			name := text[m[2]:m[3]]
+			// Strip comment lines so prose cannot satisfy or trip the check.
+			var sqlOnly strings.Builder
+			for _, line := range strings.Split(stmt, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "--") {
+					continue
+				}
+				sqlOnly.WriteString(line)
+				sqlOnly.WriteString("\n")
+			}
+			code := sqlOnly.String()
+
+			writesOwnership := strings.Contains(code, "INSERT INTO agent_task_queue") ||
+				(strings.Contains(code, "UPDATE agent_task_queue") && assignsOwner(code))
+			if !writesOwnership {
+				continue
+			}
+			checked++
+			if !strings.Contains(code, "lock_task_owner_workspaces(") {
+				t.Errorf("%s: %s writes agent_task_queue ownership without calling "+
+					"lock_task_owner_workspaces; that reopens the workspace-delete race "+
+					"(see migration 284)", entry.Name(), name)
+			}
+		}
+	}
+	if checked < 9 {
+		t.Errorf("only %d ownership-writing statements found; the detector probably stopped matching", checked)
+	}
+}
+
+// TestTaskWriteFence_BlocksOnWorkspaceLockAlone shows the fence, and only the
+// fence, standing between a concurrent enqueue and a workspace being torn down.
+//
+// The holder locks ONLY the workspace row — no agent, issue or runtime row — so no
+// foreign key on agent_task_queue has anything to block on: none of them
+// references workspace. Anything that blocks here is the fence taking FOR KEY
+// SHARE on the owners' workspace row from inside the writer's own statement.
+func TestTaskWriteFence_BlocksOnWorkspaceLockAlone(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "fenceonly")
+
+	holder, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin holder: %v", err)
+	}
+	defer holder.Rollback(ctx)
+	// Exactly what LockWorkspaceForDelete does, and nothing else.
+	if _, err := holder.Exec(ctx, `SELECT id FROM workspace WHERE id = $1 FOR UPDATE`, f.victimID); err != nil {
+		t.Fatalf("lock workspace row: %v", err)
+	}
+
+	blockedEnqueue := func(name, agentID, runtimeID, issueID string) {
+		t.Helper()
+		writer, err := testPool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("%s: begin: %v", name, err)
+		}
+		defer writer.Rollback(ctx)
+		if _, err := writer.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+			t.Fatalf("%s: set lock_timeout: %v", name, err)
+		}
+		err = enqueueViaRealQuery(ctx, testHandler.Queries.WithTx(writer), agentID, runtimeID, issueID)
+		if err == nil {
+			t.Errorf("%s: enqueue committed while the workspace row was locked; the fence is not in the write path", name)
+			return
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Errorf("%s: got %v, want lock_not_available (55P03)", name, err)
+		}
+	}
+
+	blockedEnqueue("enqueue via the victim's agent", f.victimAgent, f.neighbourRuntime, f.neighbourIssue)
+	blockedEnqueue("enqueue via the victim's runtime", f.neighbourAgent, f.victimRuntime, f.neighbourIssue)
+	blockedEnqueue("enqueue via the victim's issue", f.neighbourAgent, f.neighbourRuntime, f.victimIssue)
+
+	// Reassignment onto the victim's runtime is fenced too.
+	reassign, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin reassign: %v", err)
+	}
+	defer reassign.Rollback(ctx)
+	if _, err := reassign.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+		t.Fatalf("reassign: set lock_timeout: %v", err)
+	}
+	_, err = testHandler.Queries.WithTx(reassign).ReassignTasksToRuntime(ctx, db.ReassignTasksToRuntimeParams{
+		NewRuntimeID: parseUUID(f.victimRuntime),
+		OldRuntimeID: parseUUID(f.neighbourRuntime),
+	})
+	var pgErr *pgconn.PgError
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Errorf("reassignment onto the victim's runtime: got %v, want lock_not_available (55P03)", err)
+	}
+
+	// A workspace nobody is deleting is unaffected.
+	unrelated, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin unrelated: %v", err)
+	}
+	defer unrelated.Rollback(ctx)
+	if _, err := unrelated.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+		t.Fatalf("unrelated: set lock_timeout: %v", err)
+	}
+	if err := enqueueViaRealQuery(ctx, testHandler.Queries.WithTx(unrelated),
+		f.neighbourAgent, f.neighbourRuntime, f.neighbourIssue); err != nil {
+		t.Errorf("neighbour-only enqueue was blocked by the victim's workspace lock: %v", err)
+	}
+
+	// Status-only updates are the hot path and must not touch the fence at all.
+	statusUpdate, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin status update: %v", err)
+	}
+	defer statusUpdate.Rollback(ctx)
+	if _, err := statusUpdate.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+		t.Fatalf("status update: set lock_timeout: %v", err)
+	}
+	if _, err := statusUpdate.Exec(ctx,
+		`UPDATE agent_task_queue SET status = 'failed' WHERE id = $1`, f.taskViaAgent); err != nil {
+		t.Errorf("status-only update was blocked: %v", err)
+	}
+}
+
+// TestTaskWriteFence_QueuedWriterCannotLandAfterTeardownCommits is the race the
+// review asked for, run as an actual race: a writer queues behind the workspace
+// lock while teardown is in flight, teardown commits, and the writer must then be
+// unable to put a row in the table.
+//
+// It also discriminates the fence from the foreign keys. The writer's failure is
+// "no row written" — CreateAgentTask is a :one, so it comes back as
+// pgx.ErrNoRows because the fence's predicate was false. An FK doing the work
+// instead would surface as SQLSTATE 23503, which the assertion rejects.
+func TestTaskWriteFence_QueuedWriterCannotLandAfterTeardownCommits(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "queuedwriter")
+
+	teardown, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin teardown: %v", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = teardown.Rollback(ctx)
+		}
+	}()
+
+	// The teardown transaction, in the order the handler does it.
+	if _, err := teardown.Exec(ctx, `SELECT id FROM workspace WHERE id = $1 FOR UPDATE`, f.victimID); err != nil {
+		t.Fatalf("lock workspace: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var writerErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// No lock_timeout: this writer is supposed to wait for teardown, which is
+		// what a real enqueue arriving mid-teardown does.
+		writerErr = enqueueViaRealQuery(context.Background(), testHandler.Queries,
+			f.victimAgent, f.victimRuntime, f.victimIssue)
+	}()
+
+	// Give the writer time to reach the lock and block on it.
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := teardown.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, f.victimID); err != nil {
+		t.Fatalf("delete workspace: %v", err)
+	}
+	if err := teardown.Commit(ctx); err != nil {
+		t.Fatalf("commit teardown: %v", err)
+	}
+	committed = true
+
+	wg.Wait()
+
+	if writerErr == nil {
+		t.Fatal("the queued enqueue landed a task after teardown committed; the fence did not hold")
+	}
+	if !errors.Is(writerErr, pgx.ErrNoRows) {
+		var pgErr *pgconn.PgError
+		if errors.As(writerErr, &pgErr) && pgErr.Code == "23503" {
+			t.Fatalf("the write was rejected by a foreign key (%s), not by the fence; "+
+				"the fence must hold on its own once the legacy FKs go away", pgErr.Code)
+		}
+		t.Fatalf("writer error = %v, want pgx.ErrNoRows from the fence returning false", writerErr)
+	}
+
+	var leftover int
+	if err := testPool.QueryRow(ctx, `
+SELECT count(*) FROM agent_task_queue WHERE agent_id = $1 OR runtime_id = $2 OR issue_id = $3
+`, f.victimAgent, f.victimRuntime, f.victimIssue).Scan(&leftover); err != nil {
+		t.Fatalf("count leftovers: %v", err)
+	}
+	if leftover != 0 {
+		t.Errorf("%d task rows are left pointing at the deleted workspace's owners", leftover)
+	}
+}
+
+// TestTaskWriteFence_LocksWorkspacesInIDOrder covers the deadlock surface the
+// review flagged: a task may reference owners in different workspaces, so the
+// fence can lock more than one workspace row, and two writers touching the same
+// pair from opposite directions must not be able to take them in opposite orders.
+//
+// The fence sorts by workspace id, so both writers queue on the lower id first.
+// The test runs the two mirrored writes concurrently and requires that both
+// succeed — a deadlock would surface as 40P01 on one of them.
+func TestTaskWriteFence_LocksWorkspacesInIDOrder(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "lockorder")
+
+	const rounds = 25
+
+	// One pending task per (issue, agent) is enforced by a partial unique index, so
+	// each round needs its own issue pair; otherwise the rounds collide on that
+	// index instead of exercising the lock order.
+	victimIssues := make([]string, rounds)
+	neighbourIssues := make([]string, rounds)
+	for i := 0; i < rounds; i++ {
+		if err := testPool.QueryRow(ctx, `
+INSERT INTO issue (workspace_id, title, creator_type, creator_id, number)
+VALUES ($1, $2, 'member', $3, $4) RETURNING id
+`, f.victimID, "lock-order victim "+strconv.Itoa(i), testUserID, i+100).Scan(&victimIssues[i]); err != nil {
+			t.Fatalf("seed victim issue %d: %v", i, err)
+		}
+		if err := testPool.QueryRow(ctx, `
+INSERT INTO issue (workspace_id, title, creator_type, creator_id, number)
+VALUES ($1, $2, 'member', $3, $4) RETURNING id
+`, f.neighbourID, "lock-order neighbour "+strconv.Itoa(i), testUserID, i+100).Scan(&neighbourIssues[i]); err != nil {
+			t.Fatalf("seed neighbour issue %d: %v", i, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2*rounds)
+	for i := 0; i < rounds; i++ {
+		wg.Add(2)
+		// Owners drawn from both workspaces, in mirrored roles.
+		go func(i int) {
+			defer wg.Done()
+			errs[2*i] = enqueueViaRealQuery(ctx, testHandler.Queries,
+				f.victimAgent, f.neighbourRuntime, neighbourIssues[i])
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			errs[2*i+1] = enqueueViaRealQuery(ctx, testHandler.Queries,
+				f.neighbourAgent, f.victimRuntime, victimIssues[i])
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			t.Fatalf("write %d deadlocked (40P01): the fence is not locking workspaces in a fixed order", i)
+		}
+		t.Errorf("write %d failed: %v", i, err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+DELETE FROM agent_task_queue
+WHERE (agent_id = $1 AND runtime_id = $2) OR (agent_id = $3 AND runtime_id = $4)
+`, f.victimAgent, f.neighbourRuntime, f.neighbourAgent, f.victimRuntime); err != nil {
+		t.Fatalf("clean up: %v", err)
+	}
+}
+
+// TestLockTaskOwnerWorkspaces_RejectsUnresolvableOwner pins the hole the review
+// found in the first version of this fence: counting only the owners that still
+// resolve made a deleted owner invisible, and the statement fell through to the
+// foreign key. A reference that does not resolve must make the predicate false on
+// its own.
+func TestLockTaskOwnerWorkspaces_RejectsUnresolvableOwner(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "unresolvable")
+	missing := "00000000-0000-0000-0000-0000000000ff"
+
+	for name, args := range map[string][3]any{
+		"missing agent":               {missing, nil, nil},
+		"missing issue":               {nil, missing, nil},
+		"missing runtime":             {nil, nil, missing},
+		"one of three owners missing": {f.victimAgent, missing, f.victimRuntime},
+	} {
+		var ok bool
+		if err := testPool.QueryRow(ctx,
+			`SELECT lock_task_owner_workspaces($1, $2, $3)`, args[0], args[1], args[2]).Scan(&ok); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if ok {
+			t.Errorf("%s: fence returned true; the write would fall through to the foreign key", name)
+		}
+	}
+
+	var ok bool
+	if err := testPool.QueryRow(ctx, `SELECT lock_task_owner_workspaces($1, $2, $3)`,
+		f.victimAgent, f.victimIssue, f.victimRuntime).Scan(&ok); err != nil {
+		t.Fatalf("all owners present: %v", err)
+	}
+	if !ok {
+		t.Error("fence returned false for a fully resolvable row")
+	}
+}
+
+var _ = pgtype.UUID{}

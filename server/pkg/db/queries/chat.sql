@@ -905,6 +905,10 @@ SELECT * FROM chat_message
 WHERE id = $1;
 
 -- name: CreateChatTask :one
+-- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- locks the owners' workspace rows in the writer's own transaction and returns
+-- false once they are gone, so this statement writes no row instead of stranding
+-- a task in a workspace that has just been deleted (MUL-5999).
 -- The chat sender (initiator) is a direct_human originator and accountable;
 -- attribution provenance is stamped so this path is not a NULL-source enqueue
 -- bypass (MUL-4302 §2).
@@ -914,7 +918,7 @@ INSERT INTO agent_task_queue (
     runtime_connected_apps, originator_source, trigger_evidence_kind, trigger_evidence_ref_id,
     fire_at
 )
-VALUES (
+SELECT
     $1, $2, NULL,
     CASE WHEN sqlc.narg('fire_at')::timestamptz IS NULL THEN 'queued' ELSE 'deferred' END,
     $3, $4, $5,
@@ -927,7 +931,7 @@ VALUES (
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
     sqlc.narg('fire_at')::timestamptz
-)
+WHERE lock_task_owner_workspaces($1, NULL, $2)
 RETURNING *;
 
 -- name: PromoteChannelChatTasksIfMediaReady :many
