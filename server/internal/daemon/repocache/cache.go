@@ -278,12 +278,18 @@ func (l *repoLock) activity() (maintenance bool, waiters int) {
 	return l.held && l.maintenance, l.foregroundWaiters
 }
 
-func (l *repoLock) cancelMaintenance() {
+func (l *repoLock) cancelMaintenanceAndWait() {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.maintenanceCancel != nil {
-		l.maintenanceCancel(ErrMaintenancePreempted)
+	for l.maintenance {
+		if l.maintenanceCancel != nil {
+			l.maintenanceCancel(ErrMaintenancePreempted)
+		}
+		changed := l.changed
+		l.mu.Unlock()
+		<-changed
+		l.mu.Lock()
 	}
+	l.mu.Unlock()
 }
 
 // New creates a new repo cache rooted at the given directory.
@@ -317,12 +323,15 @@ func (c *Cache) Activity() Activity {
 	return activity
 }
 
-// CancelMaintenance asks every active low-priority repository operation to
-// stop. Task dispatch uses this before launching an agent because a task may
-// reuse an existing worktree and never pass through CreateWorktree's gate.
+// CancelMaintenance stops every active low-priority repository operation and
+// waits for it to release repository ownership. Task dispatch uses this as a
+// barrier before launching an agent because a task may reuse an existing
+// worktree and never pass through CreateWorktree's gate. Waiting also ensures
+// interrupted-maintenance lock cleanup completes before direct agent Git work
+// can create its own lock files.
 func (c *Cache) CancelMaintenance() {
 	c.repoLocks.Range(func(_, value any) bool {
-		value.(*repoLock).cancelMaintenance()
+		value.(*repoLock).cancelMaintenanceAndWait()
 		return true
 	})
 }

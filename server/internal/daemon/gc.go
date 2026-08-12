@@ -837,17 +837,7 @@ func (d *Daemon) pruneRepoWorktreesContext(ctx context.Context, workspacesRoot s
 }
 
 func (d *Daemon) maintainRepoCache(ctx context.Context, barePath string, stats *gcStats) {
-	if d.activeTasks.Load() > 0 {
-		d.logger.Debug("gc: repo maintenance deferred while tasks are active", "repo", barePath)
-		return
-	}
 	d.withRepoMaintenance(ctx, barePath, func(maintenanceCtx context.Context) {
-		// Close the race between the outer idle check and acquiring the
-		// repository gate. A task that starts after this check calls
-		// CancelMaintenance and cancels maintenanceCtx.
-		if d.activeTasks.Load() > 0 {
-			return
-		}
 		d.pruneWorktreeLocked(maintenanceCtx, barePath)
 		if maintenanceCtx.Err() == nil {
 			d.evictRepoCacheLocked(maintenanceCtx, barePath, stats)
@@ -1106,8 +1096,8 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 	}
 	// Agent CLIs can mutate linked-worktree refs directly, outside the daemon's
 	// in-process repository gate. Do not start heavy maintenance while any task
-	// is active; a checkout that starts after this check still preempts through
-	// the maintenance context below.
+	// is active; a new task or checkout that arrives after this check preempts
+	// through the maintenance context below.
 	if d.activeTasks.Load() > 0 {
 		d.logger.Debug("gc: heavy repo maintenance deferred while tasks are active", "repo", barePath)
 		return
@@ -1132,11 +1122,11 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 		before := snapshotRepoMaintenanceLocks(barePath)
 		if out, err := runGitCommandContext(ctx, barePath, step.timeout, step.args...); err != nil {
 			completed = false
-			if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, repocache.ErrMaintenancePreempted)) && d.activeTasks.Load() == 0 {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, repocache.ErrMaintenancePreempted) {
 				d.cleanupNewRepoMaintenanceLocks(barePath, before)
 			}
 			if errors.Is(context.Cause(ctx), repocache.ErrMaintenancePreempted) {
-				d.logger.Info("gc: git maintenance preempted for checkout",
+				d.logger.Info("gc: git maintenance preempted for foreground work",
 					"repo", barePath,
 					"command", strings.Join(step.args, " "),
 				)
@@ -1183,8 +1173,9 @@ type repoMaintenanceLockSnapshot map[string]struct{}
 
 // snapshotRepoMaintenanceLocks records only lock paths known to be produced by
 // the maintenance commands below. Cleanup later removes a path only if it did
-// not exist in this snapshot, the process tree is confirmed gone, and no agent
-// task became active. Pre-existing or concurrently-owned files are preserved.
+// not exist in this snapshot and the process tree is confirmed gone. Checkout
+// waits on the same repo gate, and task dispatch waits for CancelMaintenance's
+// barrier, so no agent Git work can create a competing lock before cleanup.
 func snapshotRepoMaintenanceLocks(barePath string) repoMaintenanceLockSnapshot {
 	locks := make(repoMaintenanceLockSnapshot)
 	for _, path := range repoMaintenanceLockPaths(barePath) {

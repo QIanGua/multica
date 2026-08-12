@@ -196,6 +196,48 @@ func TestCancelMaintenanceStopsMaintenanceWithoutARepoCheckout(t *testing.T) {
 	}
 }
 
+func TestCancelMaintenanceWaitsForCleanupBarrier(t *testing.T) {
+	t.Parallel()
+
+	cache := New(t.TempDir(), testLogger())
+	const barePath = "/cache/cleanup-barrier.git"
+	entered := make(chan struct{})
+	cancelled := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	maintenanceDone := make(chan struct{})
+	go func() {
+		_, _ = cache.WithRepoMaintenance(context.Background(), barePath, func(ctx context.Context) error {
+			close(entered)
+			<-ctx.Done()
+			close(cancelled)
+			<-releaseCleanup
+			return context.Cause(ctx)
+		})
+		close(maintenanceDone)
+	}()
+	<-entered
+
+	cancelDone := make(chan struct{})
+	go func() {
+		cache.CancelMaintenance()
+		close(cancelDone)
+	}()
+	<-cancelled
+	select {
+	case <-cancelDone:
+		t.Fatal("CancelMaintenance returned before maintenance cleanup released the repo")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseCleanup)
+	select {
+	case <-cancelDone:
+	case <-time.After(time.Second):
+		t.Fatal("CancelMaintenance did not return after maintenance cleanup completed")
+	}
+	<-maintenanceDone
+}
+
 func TestCreateWorktreeContextReturnsBusyAfterBoundedLockWait(t *testing.T) {
 	t.Parallel()
 

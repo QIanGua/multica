@@ -1054,6 +1054,28 @@ func TestPruneWorktree_RemovesOnlyStaleAgentBranches(t *testing.T) {
 	}
 }
 
+func TestMaintainRepoCacheRunsLightCleanupWhileTaskActive(t *testing.T) {
+	t.Parallel()
+
+	d := newGCTestDaemon(t, http.NewServeMux())
+	sourceRepo := createGCGitRepo(t)
+	barePath := filepath.Join(t.TempDir(), "cache.git")
+	runGitForGC(t, "", "clone", "--bare", sourceRepo, barePath)
+	const staleBranch = "agent/stale/87654321"
+	runGitForGC(t, "", "-C", barePath, "branch", staleBranch, "HEAD")
+
+	d.activeTasks.Add(1)
+	defer d.activeTasks.Add(-1)
+	d.maintainRepoCache(context.Background(), barePath, &gcStats{})
+
+	if gitRefExists(t, barePath, "refs/heads/"+staleBranch) {
+		t.Fatalf("expected stale branch %q to be deleted while a task is active", staleBranch)
+	}
+	if _, err := os.Stat(filepath.Join(barePath, repoMaintenanceMarker)); err != nil {
+		t.Fatalf("heavy maintenance should remain pending while a task is active: %v", err)
+	}
+}
+
 // TestPruneWorktree_IgnoresLiteralAgentBranch ensures the GC pattern is scoped
 // to the `agent/` namespace. A repo whose only `agent`-shaped ref is the
 // literal `refs/heads/agent` (no slash) must be left untouched — the
@@ -1279,6 +1301,82 @@ func TestCleanupNewRepoMaintenanceLocksPreservesPreexistingFiles(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("unowned lock %s was removed: %v", path, err)
 		}
+	}
+}
+
+func TestPruneWorktreePreemptionCleansLocksBeforeTaskStarts(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("requires a POSIX shell: %v", err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git not found: %v", err)
+	}
+
+	d := newGCTestDaemon(t, http.NewServeMux())
+	sourceRepo := createGCGitRepo(t)
+	cache := repocache.New(filepath.Join(d.cfg.WorkspacesRoot, ".repos"), slog.Default())
+	if err := cache.Sync("ws1", []repocache.RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("cache sync failed: %v", err)
+	}
+	d.repoCache = cache
+	barePath := cache.Lookup("ws1", sourceRepo)
+	runGitForGC(t, "", "-C", barePath, "branch", "agent/stale/87654321", "HEAD")
+
+	lockPath := filepath.Join(barePath, "refs", "remotes", "origin", "main.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	startedPath := filepath.Join(t.TempDir(), "maintenance-started")
+	binDir := t.TempDir()
+	fakeGit := filepath.Join(binDir, "git")
+	script := `#!/bin/sh
+if [ "$3" = "reflog" ] && [ "$4" = "expire" ]; then
+  : > "$2/refs/remotes/origin/main.lock"
+  : > "$MULTICA_TEST_MAINTENANCE_STARTED"
+  trap 'exit 143' TERM INT
+  while :; do sleep 1; done
+fi
+exec "$MULTICA_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(fakeGit, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MULTICA_TEST_REAL_GIT", realGit)
+	t.Setenv("MULTICA_TEST_MAINTENANCE_STARTED", startedPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	pruneDone := make(chan struct{})
+	go func() {
+		d.pruneWorktree(barePath)
+		close(pruneDone)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(startedPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for heavy maintenance to start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Match production task dispatch order: mark the task active, then cancel
+	// maintenance and wait for its cleanup barrier before agent code starts.
+	d.activeTasks.Add(1)
+	defer d.activeTasks.Add(-1)
+	cache.CancelMaintenance()
+	select {
+	case <-pruneDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pruneWorktree did not finish after preemption")
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("maintenance lock survived real task preemption, stat error = %v", err)
+	}
+	if err := cache.Fetch(barePath); err != nil {
+		t.Fatalf("fetch did not recover after preempted maintenance cleanup: %v", err)
 	}
 }
 
