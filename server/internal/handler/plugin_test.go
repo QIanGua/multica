@@ -41,6 +41,15 @@ func TestPluginHTTPLifecycleForInstalledReferenceRelease(t *testing.T) {
 	if recorder.Code != http.StatusOK || !bytes.Contains(recorder.Body.Bytes(), []byte(`"signature_verified":true`)) || !bytes.Contains(recorder.Body.Bytes(), []byte(plugintest.ReviewReadinessPluginKey)) {
 		t.Fatalf("catalog status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
+	var catalogPayload struct {
+		Diagnostics json.RawMessage `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &catalogPayload); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if !bytes.Equal(catalogPayload.Diagnostics, []byte(`[]`)) {
+		t.Fatalf("empty catalog diagnostics must be an array, got %s", catalogPayload.Diagnostics)
+	}
 
 	recorder = httptest.NewRecorder()
 	testHandler.InstallPlugin(recorder, pluginHandlerRequest(

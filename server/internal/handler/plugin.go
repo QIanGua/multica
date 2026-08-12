@@ -228,9 +228,13 @@ func (h *Handler) ListPluginCatalog(w http.ResponseWriter, r *http.Request) {
 		}
 		responses = append(responses, response)
 	}
+	diagnostics := h.PluginService.CatalogDiagnostics()
+	if diagnostics == nil {
+		diagnostics = []pluginbundled.Diagnostic{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"releases":    responses,
-		"diagnostics": h.PluginService.CatalogDiagnostics(),
+		"diagnostics": diagnostics,
 	})
 }
 
