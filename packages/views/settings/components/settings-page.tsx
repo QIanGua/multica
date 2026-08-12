@@ -16,7 +16,6 @@ import {
   Keyboard,
   ListTodo,
   Zap,
-  Blocks,
 } from "lucide-react";
 import { GitHubMark } from "./github-mark";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@multica/ui/components/ui/tabs";
@@ -34,7 +33,6 @@ import { RepositoriesTab } from "./repositories-tab";
 import { GitHubTab } from "./github-tab";
 import { IntegrationsTab } from "./integrations-tab";
 import { LabsTab } from "./labs-tab";
-import { PluginsTab } from "./plugins-tab";
 import { NotificationsTab } from "./notifications-tab";
 import { LabelsTab } from "./labels-tab";
 import { PropertiesTab } from "./properties-tab";
@@ -59,7 +57,6 @@ const WORKSPACE_TAB_KEYS = [
   "repositories",
   "github",
   "integrations",
-  "plugins",
   "labs",
   "members",
   "labels",
@@ -71,7 +68,6 @@ const WORKSPACE_TAB_VALUES = {
   repositories: "repositories",
   github: "github",
   integrations: "integrations",
-  plugins: "plugins",
   labs: "labs",
   members: "members",
   labels: "labels",
@@ -83,7 +79,6 @@ const WORKSPACE_TAB_ICONS = {
   repositories: FolderGit2,
   github: GitHubMark,
   integrations: Plug,
-  plugins: Blocks,
   labs: FlaskConical,
   members: Users,
   labels: Tags,
@@ -241,7 +236,6 @@ export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
           <TabsContent value="repositories"><RepositoriesTab /></TabsContent>
           <TabsContent value="github"><GitHubTab /></TabsContent>
           <TabsContent value="integrations"><IntegrationsTab /></TabsContent>
-          <TabsContent value="plugins"><PluginsTab /></TabsContent>
           <TabsContent value="labs"><LabsTab /></TabsContent>
           <TabsContent value="members"><MembersTab /></TabsContent>
           <TabsContent value="labels"><LabelsTab /></TabsContent>

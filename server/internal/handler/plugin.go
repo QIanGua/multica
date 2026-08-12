@@ -6,7 +6,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/multica-ai/multica/server/internal/pluginbundle"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -97,36 +96,7 @@ func (h *Handler) ListPlugins(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"plugins": responses,
-		"catalog": []map[string]any{{
-			"plugin_key":    pluginbundle.ReviewReadinessPluginKey,
-			"version":       pluginbundle.ReviewReadinessVersion,
-			"bundled":       true,
-			"contributions": []string{"review-readiness"},
-		}},
 	})
-}
-
-func (h *Handler) InstallPlugin(w http.ResponseWriter, r *http.Request) {
-	workspaceID, actorID, ok := pluginRequestIDs(w, r)
-	if !ok {
-		return
-	}
-	pluginKey := chi.URLParam(r, "pluginKey")
-	if pluginKey != pluginbundle.ReviewReadinessPluginKey {
-		writeError(w, http.StatusNotFound, "plugin not found")
-		return
-	}
-	installation, err := h.PluginService.InstallBundledReviewReadiness(r.Context(), workspaceID, actorID)
-	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	}
-	response, err := h.pluginInstallationResponse(r, installation, nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load plugin")
-		return
-	}
-	writeJSON(w, http.StatusCreated, response)
 }
 
 type pluginBindingRequest struct {

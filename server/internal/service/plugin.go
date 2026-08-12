@@ -9,7 +9,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/multica-ai/multica/server/internal/pluginbundle"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
@@ -26,10 +25,19 @@ func NewPluginService(queries *db.Queries, txStarter TxStarter) *PluginService {
 	return &PluginService{Queries: queries, TxStarter: txStarter}
 }
 
-// InstallBundledReviewReadiness publishes the built-in release into the
-// generic registry (idempotently), installs it disabled, and activates an
-// empty snapshot. EnablePlugin is the explicit capability/binding boundary.
-func (s *PluginService) InstallBundledReviewReadiness(ctx context.Context, workspaceID, actorID pgtype.UUID) (db.PluginInstallation, error) {
+// PluginReleasePublication carries the trust decision made by the acquisition
+// boundary alongside a release already validated by plugincontract.
+type PluginReleasePublication struct {
+	Release       plugincontract.ValidatedRelease
+	PublisherType string
+	TrustTier     string
+}
+
+// InstallPluginRelease publishes an already validated release into the
+// immutable registry (idempotently), installs it disabled, and activates an
+// empty snapshot. Acquisition, signature trust roots, and user-facing catalogs
+// intentionally live outside the lifecycle foundation.
+func (s *PluginService) InstallPluginRelease(ctx context.Context, workspaceID, actorID pgtype.UUID, publication PluginReleasePublication) (db.PluginInstallation, error) {
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
 		return db.PluginInstallation{}, err
@@ -37,7 +45,7 @@ func (s *PluginService) InstallBundledReviewReadiness(ctx context.Context, works
 	defer tx.Rollback(ctx) //nolint:errcheck
 	q := s.Queries.WithTx(tx)
 
-	identity, release, err := ensureReviewReadinessRelease(ctx, q)
+	identity, release, err := ensurePluginRelease(ctx, q, publication)
 	if err != nil {
 		return db.PluginInstallation{}, err
 	}
@@ -59,15 +67,17 @@ func (s *PluginService) InstallBundledReviewReadiness(ctx context.Context, works
 	if err != nil {
 		return db.PluginInstallation{}, fmt.Errorf("create plugin installation: %w", err)
 	}
-	if _, err := q.CreatePluginGrantRevision(ctx, db.CreatePluginGrantRevisionParams{
-		Capability:     plugincontract.CapabilityAgentSkillContribute,
-		Decision:       "granted",
-		Limits:         []byte(`{}`),
-		ApprovedBy:     actorID,
-		InstallationID: installation.ID,
-		WorkspaceID:    workspaceID,
-	}); err != nil {
-		return db.PluginInstallation{}, fmt.Errorf("create plugin grant: %w", err)
+	for _, capability := range publication.Release.Manifest.RequestedCapabilities {
+		if _, err := q.CreatePluginGrantRevision(ctx, db.CreatePluginGrantRevisionParams{
+			Capability:     capability,
+			Decision:       "granted",
+			Limits:         []byte(`{}`),
+			ApprovedBy:     actorID,
+			InstallationID: installation.ID,
+			WorkspaceID:    workspaceID,
+		}); err != nil {
+			return db.PluginInstallation{}, fmt.Errorf("create plugin grant: %w", err)
+		}
 	}
 	if _, err := s.reconcileWorkspaceTx(ctx, q, workspaceID); err != nil {
 		return db.PluginInstallation{}, err
@@ -78,40 +88,47 @@ func (s *PluginService) InstallBundledReviewReadiness(ctx context.Context, works
 	return s.Queries.GetPluginInstallation(ctx, installation.ID)
 }
 
-func ensureReviewReadinessRelease(ctx context.Context, q *db.Queries) (db.PluginIdentity, db.PluginRelease, error) {
-	releaseData, files, err := pluginbundle.ReviewReadinessRelease()
-	if err != nil {
-		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("validate bundled plugin: %w", err)
+func ensurePluginRelease(ctx context.Context, q *db.Queries, publication PluginReleasePublication) (db.PluginIdentity, db.PluginRelease, error) {
+	releaseData := publication.Release
+	manifest := releaseData.Manifest
+	if publication.PublisherType == "" || publication.TrustTier == "" {
+		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("plugin publisher type and trust tier are required")
 	}
-	if err := q.LockPluginRegistryKey(ctx, pluginbundle.ReviewReadinessPluginKey); err != nil {
+	if len(releaseData.Files) == 0 {
+		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("validated plugin release contains no artifact files")
+	}
+	if err := q.LockPluginRegistryKey(ctx, manifest.Metadata.Key); err != nil {
 		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("lock plugin registry key: %w", err)
 	}
 
-	identity, err := q.GetPluginIdentityByKey(ctx, pluginbundle.ReviewReadinessPluginKey)
+	identity, err := q.GetPluginIdentityByKey(ctx, manifest.Metadata.Key)
 	if errors.Is(err, pgx.ErrNoRows) {
 		identity, err = q.CreatePluginIdentity(ctx, db.CreatePluginIdentityParams{
-			PluginKey:     pluginbundle.ReviewReadinessPluginKey,
-			DisplayName:   releaseData.Manifest.Metadata.Name,
-			PublisherID:   releaseData.Manifest.Metadata.Publisher,
-			PublisherType: "official",
-			TrustTier:     "official",
+			PluginKey:     manifest.Metadata.Key,
+			DisplayName:   manifest.Metadata.Name,
+			PublisherID:   manifest.Metadata.Publisher,
+			PublisherType: publication.PublisherType,
+			TrustTier:     publication.TrustTier,
 		})
 	}
 	if err != nil {
 		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("ensure plugin identity: %w", err)
 	}
+	if identity.PublisherID != manifest.Metadata.Publisher || identity.PublisherType != publication.PublisherType || identity.TrustTier != publication.TrustTier {
+		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("plugin identity %q conflicts with its registered publisher", manifest.Metadata.Key)
+	}
 
 	release, err := q.GetPluginReleaseByVersion(ctx, db.GetPluginReleaseByVersionParams{
 		PluginID: identity.ID,
-		Version:  pluginbundle.ReviewReadinessVersion,
+		Version:  manifest.Metadata.Version,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		manifestJSON, marshalErr := json.Marshal(releaseData.Manifest)
+		manifestJSON, marshalErr := json.Marshal(manifest)
 		if marshalErr != nil {
 			return db.PluginIdentity{}, db.PluginRelease{}, marshalErr
 		}
 		release, err = q.CreatePluginRelease(ctx, db.CreatePluginReleaseParams{
-			Version:        pluginbundle.ReviewReadinessVersion,
+			Version:        manifest.Metadata.Version,
 			Manifest:       manifestJSON,
 			ManifestDigest: releaseData.ManifestDigest,
 			SourceKind:     releaseData.SourceKind,
@@ -121,7 +138,7 @@ func ensureReviewReadinessRelease(ctx context.Context, q *db.Queries) (db.Plugin
 			ArtifactDigest: releaseData.ArtifactDigest,
 			ArtifactSize:   releaseData.ArtifactSize,
 			Signature:      releaseData.Signature,
-			SignatureKeyID: pgtype.Text{String: releaseData.SignatureKeyID, Valid: true},
+			SignatureKeyID: pgtype.Text{String: releaseData.SignatureKeyID, Valid: releaseData.SignatureKeyID != ""},
 			PluginID:       identity.ID,
 		})
 		if err == nil {
@@ -147,7 +164,7 @@ func ensureReviewReadinessRelease(ctx context.Context, q *db.Queries) (db.Plugin
 			}
 		}
 		if err == nil {
-			for _, file := range files {
+			for _, file := range releaseData.Files {
 				_, err = q.CreatePluginArtifactFile(ctx, db.CreatePluginArtifactFileParams{
 					Path:      file.Path,
 					Digest:    file.Digest,
@@ -163,6 +180,9 @@ func ensureReviewReadinessRelease(ctx context.Context, q *db.Queries) (db.Plugin
 	}
 	if err != nil {
 		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("ensure plugin release: %w", err)
+	}
+	if release.ManifestDigest != releaseData.ManifestDigest || release.ArtifactDigest != releaseData.ArtifactDigest || release.ArchiveDigest != releaseData.ArchiveDigest {
+		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("plugin release %s@%s conflicts with immutable registry content", manifest.Metadata.Key, manifest.Metadata.Version)
 	}
 	return identity, release, nil
 }

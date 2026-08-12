@@ -30,6 +30,7 @@ type ValidatedRelease struct {
 	SignatureKeyID    string
 	Signature         []byte
 	Contributions     []ValidatedContribution
+	Files             []ArtifactFile
 }
 
 type ValidatedContribution struct {
@@ -116,5 +117,6 @@ func ValidateReleaseCandidate(candidate ReleaseCandidate, verifier ReleaseVerifi
 		SignatureKeyID:    candidate.SignatureKeyID,
 		Signature:         append([]byte(nil), candidate.Signature...),
 		Contributions:     contributions,
+		Files:             append([]ArtifactFile(nil), artifact.Files...),
 	}, nil
 }

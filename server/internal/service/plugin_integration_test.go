@@ -9,11 +9,12 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/testutil/plugintest"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-func TestReviewReadinessPluginInstallEnablePinDisableAndRetry(t *testing.T) {
+func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	ctx := context.Background()
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
@@ -81,7 +82,15 @@ func TestReviewReadinessPluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	taskService := NewTaskService(queries, pool, nil, nil)
 	workspaceUUID := util.MustParseUUID(workspaceID)
 	actorUUID := util.MustParseUUID(userID)
-	installation, err := pluginService.InstallBundledReviewReadiness(ctx, workspaceUUID, actorUUID)
+	release, err := plugintest.ReviewReadinessRelease()
+	if err != nil {
+		t.Fatalf("reference release: %v", err)
+	}
+	installation, err := pluginService.InstallPluginRelease(ctx, workspaceUUID, actorUUID, PluginReleasePublication{
+		Release:       release,
+		PublisherType: "official",
+		TrustTier:     "official",
+	})
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}

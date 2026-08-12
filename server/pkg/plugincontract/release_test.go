@@ -53,6 +53,9 @@ func TestValidateReleaseCandidateRequiresAndVerifiesBundledSignature(t *testing.
 	if len(validated.Contributions) != 1 {
 		t.Fatalf("contributions = %d, want 1", len(validated.Contributions))
 	}
+	if len(validated.Files) != 3 {
+		t.Fatalf("files = %d, want 3", len(validated.Files))
+	}
 	contribution := validated.Contributions[0]
 	if contribution.Type != ContributionAgentSkillV1 || contribution.EntryDigest == "" {
 		t.Fatalf("validated contribution = %#v", contribution)

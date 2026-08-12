@@ -177,8 +177,6 @@ import type {
   CreateBillingCheckoutSessionResponse,
   BillingCheckoutSessionStatus,
   CreateBillingPortalSessionResponse,
-  PluginInstallation,
-  ListWorkspacePluginsResponse,
 } from "../types";
 import type { OnboardingCompletionPath } from "../onboarding/types";
 import type {
@@ -2122,38 +2120,6 @@ export class ApiClient {
     return this.fetch(`/api/workspaces/${id}`, {
       method: "PATCH",
       body: JSON.stringify(data),
-    });
-  }
-
-  // Workspace plugins (Plugin V1 demo control surface)
-  async listWorkspacePlugins(workspaceId: string): Promise<ListWorkspacePluginsResponse> {
-    return this.fetch(`/api/workspaces/${workspaceId}/plugins`);
-  }
-
-  async installWorkspacePlugin(
-    workspaceId: string,
-    pluginKey: string,
-  ): Promise<PluginInstallation> {
-    return this.fetch(`/api/workspaces/${workspaceId}/plugins/${encodeURIComponent(pluginKey)}/install`, {
-      method: "POST",
-    });
-  }
-
-  async enableWorkspacePlugin(
-    workspaceId: string,
-    installationId: string,
-  ): Promise<PluginInstallation> {
-    return this.fetch(`/api/workspaces/${workspaceId}/plugins/${installationId}/enable`, {
-      method: "POST",
-    });
-  }
-
-  async disableWorkspacePlugin(
-    workspaceId: string,
-    installationId: string,
-  ): Promise<PluginInstallation> {
-    return this.fetch(`/api/workspaces/${workspaceId}/plugins/${installationId}/disable`, {
-      method: "POST",
     });
   }
 

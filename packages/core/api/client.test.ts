@@ -442,51 +442,6 @@ describe("ApiClient workspace working agents", () => {
   });
 });
 
-describe("ApiClient workspace plugins", () => {
-  it("uses the Plugin V1 lifecycle endpoints", async () => {
-    const installation = {
-      id: "installation-1",
-      plugin_key: "ai.multica.software-delivery",
-      display_name: "Software Delivery",
-      desired_version: "1.0.0",
-      enabled: false,
-      desired_generation: 1,
-      active_generation: 1,
-      lifecycle_status: "installed",
-      contributions: ["review-readiness"],
-    };
-    const fetchMock = vi.fn().mockImplementation(() =>
-      Promise.resolve(
-        new Response(JSON.stringify(installation), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
-      ),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
-    const client = new ApiClient("https://api.example.test");
-    await client.installWorkspacePlugin("ws-1", installation.plugin_key);
-    await client.enableWorkspacePlugin("ws-1", installation.id);
-    await client.disableWorkspacePlugin("ws-1", installation.id);
-
-    expect(fetchMock.mock.calls.map(([url, init]) => [url, init.method])).toEqual([
-      [
-        "https://api.example.test/api/workspaces/ws-1/plugins/ai.multica.software-delivery/install",
-        "POST",
-      ],
-      [
-        "https://api.example.test/api/workspaces/ws-1/plugins/installation-1/enable",
-        "POST",
-      ],
-      [
-        "https://api.example.test/api/workspaces/ws-1/plugins/installation-1/disable",
-        "POST",
-      ],
-    ]);
-  });
-});
-
 describe("ApiClient label response schemas", () => {
   it("falls back safely for malformed label catalog, label, and resource responses", async () => {
     const fetchMock = vi.fn().mockImplementation(() =>

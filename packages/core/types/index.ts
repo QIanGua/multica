@@ -266,8 +266,3 @@ export type {
   BillingCheckoutSessionStatus,
   CreateBillingPortalSessionResponse,
 } from "./billing";
-export type {
-  PluginInstallation,
-  PluginCatalogEntry,
-  ListWorkspacePluginsResponse,
-} from "./plugin";

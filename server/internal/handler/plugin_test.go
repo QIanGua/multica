@@ -3,13 +3,14 @@ package handler
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/multica-ai/multica/server/internal/pluginbundle"
+	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/testutil/plugintest"
+	"github.com/multica-ai/multica/server/internal/util"
 )
 
 func pluginHandlerRequest(method, path string, body []byte, params map[string]string) *http.Request {
@@ -23,7 +24,7 @@ func pluginHandlerRequest(method, path string, body []byte, params map[string]st
 	return request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, routeContext))
 }
 
-func TestPluginHTTPInstallEnableDisableAndRollback(t *testing.T) {
+func TestPluginHTTPLifecycleForInstalledReferenceRelease(t *testing.T) {
 	cleanup := func() {
 		ctx := context.Background()
 		testPool.Exec(ctx, `DELETE FROM plugin_health WHERE workspace_id = $1`, testWorkspaceID)
@@ -36,22 +37,22 @@ func TestPluginHTTPInstallEnableDisableAndRollback(t *testing.T) {
 	cleanup()
 	t.Cleanup(cleanup)
 
-	params := map[string]string{"id": testWorkspaceID, "pluginKey": pluginbundle.ReviewReadinessPluginKey}
-	recorder := httptest.NewRecorder()
-	testHandler.InstallPlugin(recorder, pluginHandlerRequest(http.MethodPost, "/plugins/install", nil, params))
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("install status=%d body=%s", recorder.Code, recorder.Body.String())
+	release, err := plugintest.ReviewReadinessRelease()
+	if err != nil {
+		t.Fatalf("reference release: %v", err)
 	}
-	var installed pluginInstallationResponse
-	if err := json.Unmarshal(recorder.Body.Bytes(), &installed); err != nil {
-		t.Fatal(err)
-	}
-	if installed.PluginKey != pluginbundle.ReviewReadinessPluginKey || installed.Enabled {
-		t.Fatalf("unexpected install response: %+v", installed)
+	installed, err := testHandler.PluginService.InstallPluginRelease(
+		context.Background(),
+		util.MustParseUUID(testWorkspaceID),
+		util.MustParseUUID(testUserID),
+		service.PluginReleasePublication{Release: release, PublisherType: "official", TrustTier: "official"},
+	)
+	if err != nil {
+		t.Fatalf("install reference release: %v", err)
 	}
 
-	params = map[string]string{"id": testWorkspaceID, "installationId": installed.ID}
-	recorder = httptest.NewRecorder()
+	params := map[string]string{"id": testWorkspaceID, "installationId": uuidToString(installed.ID)}
+	recorder := httptest.NewRecorder()
 	testHandler.EnablePlugin(recorder, pluginHandlerRequest(http.MethodPost, "/plugins/enable", nil, params))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("enable status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -59,7 +60,7 @@ func TestPluginHTTPInstallEnableDisableAndRollback(t *testing.T) {
 
 	recorder = httptest.NewRecorder()
 	testHandler.ListPlugins(recorder, pluginHandlerRequest(http.MethodGet, "/plugins", nil, map[string]string{"id": testWorkspaceID}))
-	if recorder.Code != http.StatusOK || !bytes.Contains(recorder.Body.Bytes(), []byte(pluginbundle.ReviewReadinessPluginKey)) {
+	if recorder.Code != http.StatusOK || !bytes.Contains(recorder.Body.Bytes(), []byte(plugintest.ReviewReadinessPluginKey)) {
 		t.Fatalf("list status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 
