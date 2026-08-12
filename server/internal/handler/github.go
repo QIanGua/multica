@@ -1279,14 +1279,88 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 	// authorized the installation for; we deliberately don't gate on the
 	// workspace.repos registry — that list is "code the agent clones", not a
 	// webhook subscription (MUL-4343).
+	//
+	// Fanning out means an identifier can resolve in more than one workspace at
+	// once (issue prefixes are not globally unique and issue numbers restart at
+	// 1 per workspace, so two bound workspaces can both own a real "ABC-100").
+	// Resolve that ambiguity BEFORE any workspace links, so no workspace acts on
+	// a closing keyword we cannot attribute — see ambiguousCloseIdentifiers.
+	ambiguousCloses := h.ambiguousCloseIdentifiers(ctx, insts, &p)
 	for _, inst := range insts {
-		h.mirrorPullRequestForWorkspace(ctx, inst.WorkspaceID, inst.InstallationID, &p)
+		h.mirrorPullRequestForWorkspace(ctx, inst.WorkspaceID, inst.InstallationID, &p, ambiguousCloses)
 	}
 	// The PR row(s) now carry the new head; ask the API pipeline for the
 	// authoritative CI + mergeability snapshot for that head. The webhook is
 	// only the doorbell — its own mergeable/checks payload is not used for
 	// display anymore (MUL-5265).
 	h.PRRefresh.Enqueue(p.Installation.ID, p.Repository.Owner.Login, p.Repository.Name, p.PullRequest.Number)
+}
+
+// ambiguousCloseIdentifiers returns the closing identifiers on this PR that
+// resolve to a real issue in MORE THAN ONE of the workspaces bound to the
+// delivering installation.
+//
+// Issue prefixes are deliberately not globally unique (#2797) and issue numbers
+// restart at 1 in every workspace, so once #5183 fanned PR webhooks out to every
+// bound workspace, "Closes ABC-100" could resolve to a genuine — but different —
+// issue in each of them. Linking in both is recoverable noise; auto-advancing
+// both to done is not, because it silently rewrites the status of an issue in a
+// workspace that has nothing to do with this PR (#6804).
+//
+// So when we cannot attribute a closing keyword to one workspace, no workspace
+// gets to act on it: the link rows are still written (they are visible and a
+// human can unlink them) but close_intent is withheld, which keeps the
+// auto-advance gate shut. The cost is that the workspace that legitimately owns
+// the PR also loses auto-complete for that identifier — deliberate, since we
+// have no evidence for which one that is.
+//
+// Only closing identifiers are checked, and only when the installation has more
+// than one binding: a PR with no closing keyword, or an installation bound to a
+// single workspace (the overwhelmingly common case), does no extra work at all.
+func (h *Handler) ambiguousCloseIdentifiers(ctx context.Context, insts []db.GithubInstallation, p *ghPullRequestPayload) map[string]struct{} {
+	if len(insts) < 2 {
+		return nil
+	}
+	idents := extractClosingIdentifiers(p.PullRequest.Title, p.PullRequest.Body)
+	if len(idents) == 0 {
+		return nil
+	}
+	// Count per identifier how many bound workspaces resolve it. A workspace
+	// with auto-link disabled never writes a link row, so it is not a competing
+	// claimant and must not suppress a workspace that would legitimately act.
+	counts := make(map[string]int, len(idents))
+	for _, inst := range insts {
+		if !h.workspaceAutoLinkPRsEnabled(ctx, inst.WorkspaceID) {
+			continue
+		}
+		prefix := h.getIssuePrefix(ctx, inst.WorkspaceID)
+		for _, id := range idents {
+			if _, ok := h.lookupIssueByIdentifier(ctx, inst.WorkspaceID, prefix, id); ok {
+				counts[id]++
+			}
+		}
+	}
+	var ambiguous map[string]struct{}
+	for _, id := range idents {
+		if counts[id] < 2 {
+			continue
+		}
+		if ambiguous == nil {
+			ambiguous = make(map[string]struct{}, len(idents))
+		}
+		ambiguous[id] = struct{}{}
+		// The symptom this prevents (an issue advancing to done for no visible
+		// reason) is otherwise untraceable back to GitHub, so leave a breadcrumb
+		// naming the collision an operator has to resolve by changing a prefix.
+		slog.Warn("github: ambiguous closing identifier across bound workspaces, withholding close intent",
+			"identifier", id,
+			"workspaces", counts[id],
+			"installation_id", p.Installation.ID,
+			"repo", p.Repository.Owner.Login+"/"+p.Repository.Name,
+			"pr_number", p.PullRequest.Number,
+		)
+	}
+	return ambiguous
 }
 
 // ghCIEventPayload captures the shared shape of the check_suite / check_run /
@@ -1386,7 +1460,11 @@ func (h *Handler) triggerPRRefreshFromCIEvent(ctx context.Context, body []byte) 
 // the workspace's github toggles), advances issues on terminal events, and
 // broadcasts the change. Invoked once per workspace bound to the delivering
 // installation.
-func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype.UUID, installationID int64, p *ghPullRequestPayload) {
+//
+// ambiguousCloses carries the identifiers whose closing keyword resolved in more
+// than one bound workspace; they link but never carry close_intent, so they can
+// never advance an issue to done. Nil for the single-binding case.
+func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype.UUID, installationID int64, p *ghPullRequestPayload, ambiguousCloses map[string]struct{}) {
 	state := derivePRState(p.PullRequest.State, p.PullRequest.Draft, p.PullRequest.Merged)
 	mergeable, clearMergeable := derivePRMergeableState(p.Action, p.PullRequest.MergeableState, baseRefChanged(p.Changes))
 	pr, err := h.Queries.UpsertGitHubPullRequest(ctx, db.UpsertGitHubPullRequestParams{
@@ -1481,6 +1559,13 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 				continue
 			}
 			_, declared := closingIdents[id]
+			if _, ambiguous := ambiguousCloses[id]; ambiguous {
+				// Cannot attribute this closing keyword to one workspace, so
+				// nobody acts on it. Falling through with declared=false also
+				// clears close_intent on a row a pre-#6804 delivery had already
+				// set, so a re-fired webhook heals the stored decision.
+				declared = false
+			}
 			closeIntent := declared && !preserveCloseIntent
 			_, qualifies := qualifyingIdents[id]
 			referenceOnly := !qualifies

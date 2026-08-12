@@ -2893,6 +2893,131 @@ func TestWebhook_PullRequest_FansOutToBoundWorkspaces(t *testing.T) {
 	}
 }
 
+// TestWebhook_PullRequest_AmbiguousCloseAcrossWorkspaces is the #6804
+// regression. Two workspaces bound to the same installation share an issue
+// prefix (permitted by #2797) and both own a real issue at the same number
+// (issue numbers restart at 1 per workspace), so a PR titled "Fix AMB-<n>"
+// resolves in BOTH after the #5183 fan-out. The PR must still link in both —
+// the link is visible and a human can unlink it — but neither issue may be
+// auto-advanced to done, because nothing in the event says which workspace the
+// PR belongs to. Before the fix, the workspace that had nothing to do with the
+// PR was silently moved to done.
+func TestWebhook_PullRequest_AmbiguousCloseAcrossWorkspaces(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	secret := "ambiguous-close-secret"
+	t.Setenv("GITHUB_WEBHOOK_SECRET", secret)
+
+	// Both workspaces answer to "AMB" — the collision #2797 allows.
+	setWorkspaceIssuePrefixForTest(t, "AMB")
+
+	// Workspace B is the shared test workspace and owns the issue the PR is
+	// really for.
+	w := httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "ambiguous close test",
+		"status": "in_progress",
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: %d %s", w.Code, w.Body.String())
+	}
+	var issueB IssueResponse
+	json.NewDecoder(w.Body).Decode(&issueB)
+
+	const repo = "ambiguous-close-repo"
+	const prNumber int32 = 6804
+	const installationID int64 = 660480000
+
+	testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
+	testPool.Exec(ctx, `DELETE FROM workspace WHERE slug = $1`, "ambiguous-close-ws-a")
+	wsA, err := testHandler.Queries.CreateWorkspace(ctx, db.CreateWorkspaceParams{
+		Name: "ambiguous-close-ws-a", Slug: "ambiguous-close-ws-a", IssuePrefix: "AMB",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	// Workspace A's own issue at the SAME number. `number` is an explicit
+	// column, so we can place the collision directly instead of pumping the
+	// workspace's issue counter up to B's.
+	issueA, err := testHandler.Queries.CreateIssue(ctx, db.CreateIssueParams{
+		WorkspaceID: wsA.ID,
+		Title:       "unrelated issue that happens to share a number",
+		Status:      "in_progress",
+		Priority:    "none",
+		CreatorType: "member",
+		CreatorID:   parseUUID(testUserID),
+		Number:      issueB.Number,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue in workspace A: %v", err)
+	}
+
+	for _, wsID := range []pgtype.UUID{parseUUID(testWorkspaceID), wsA.ID} {
+		if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
+			WorkspaceID: wsID, InstallationID: installationID, AccountLogin: "acme", AccountType: "User",
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+	}
+
+	t.Cleanup(func() {
+		bg := context.Background()
+		testPool.Exec(bg, `DELETE FROM issue_pull_request WHERE issue_id = ANY($1)`,
+			[]string{issueB.ID, uuidToString(issueA.ID)})
+		testPool.Exec(bg, `DELETE FROM github_pull_request WHERE repo_owner = 'acme' AND repo_name = $1`, repo)
+		testPool.Exec(bg, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
+		testPool.Exec(bg, `DELETE FROM activity_log WHERE issue_id = ANY($1)`,
+			[]string{issueB.ID, uuidToString(issueA.ID)})
+		testPool.Exec(bg, `DELETE FROM issue WHERE id = ANY($1)`,
+			[]string{issueB.ID, uuidToString(issueA.ID)})
+		testPool.Exec(bg, `DELETE FROM workspace WHERE id = $1`, wsA.ID)
+	})
+
+	// firePullRequestWebhook titles the PR "Fix <identifier>", which is a
+	// closing keyword under closingIdentifierRe — exactly the payload that
+	// used to auto-advance both issues.
+	firePullRequestWebhook(t, secret, issueB.Identifier, installationID, repo, prNumber, "open")
+	firePullRequestWebhook(t, secret, issueB.Identifier, installationID, repo, prNumber, "merged")
+
+	// The link still lands in both workspaces: suppressing the link would hide
+	// the collision, and hiding it is what made #6804 hard to notice.
+	for _, tc := range []struct {
+		name    string
+		issueID pgtype.UUID
+	}{
+		{"workspace B (owns the PR)", parseUUID(issueB.ID)},
+		{"workspace A (collision)", issueA.ID},
+	} {
+		linked, err := testHandler.Queries.ListPullRequestsByIssue(ctx, tc.issueID)
+		if err != nil {
+			t.Fatalf("%s: ListPullRequestsByIssue: %v", tc.name, err)
+		}
+		if len(linked) != 1 {
+			t.Fatalf("%s: expected the PR to still link, got %d links", tc.name, len(linked))
+		}
+
+		var closeIntent bool
+		if err := testPool.QueryRow(ctx,
+			`SELECT close_intent FROM issue_pull_request WHERE issue_id = $1`, tc.issueID,
+		).Scan(&closeIntent); err != nil {
+			t.Fatalf("%s: read close_intent: %v", tc.name, err)
+		}
+		if closeIntent {
+			t.Errorf("%s: close_intent must be withheld while the identifier is ambiguous", tc.name)
+		}
+
+		issue, err := testHandler.Queries.GetIssue(ctx, tc.issueID)
+		if err != nil {
+			t.Fatalf("%s: GetIssue: %v", tc.name, err)
+		}
+		if issue.Status == "done" {
+			t.Errorf("%s: issue was auto-advanced to done on an ambiguous close (#6804)", tc.name)
+		}
+	}
+}
+
 // TestSecondWorkspaceBindDoesNotUnbindFirst is the #4823 regression: binding
 // the same GitHub App installation in a second workspace must NOT overwrite the
 // first workspace's binding. Both bindings coexist, and re-binding an existing
