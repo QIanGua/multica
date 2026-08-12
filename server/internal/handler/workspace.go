@@ -1012,11 +1012,13 @@ func sweepTasksForOwner(
 // workspace.
 //
 // Defence in depth on top of the real fence. The fence that closes the
-// insert-after-sweep window is migration 284's BEFORE trigger on
-// agent_task_queue: every task write takes FOR KEY SHARE on its owners' workspace
-// rows, which conflicts with the FOR UPDATE that LockWorkspaceForDelete holds for
-// this whole transaction. That fence is explicit, in-transaction by construction,
-// and independent of the legacy foreign keys.
+// insert-after-sweep window is migration 284's lock_task_owner_rows, a predicate
+// every ownership-writing statement calls in its own WHERE clause: it takes
+// FOR KEY SHARE on the workspace rows behind the task's owners and then on the
+// owner rows themselves, which conflicts with the FOR UPDATE that
+// LockWorkspaceForDelete holds for this whole transaction. Called from the writing
+// statement, so it is in the writer's transaction by construction, and independent
+// of the legacy foreign keys.
 //
 // These owner-row locks add a second, narrower barrier — they also block
 // ownership-changing UPDATEs of tasks that already exist — and cost nothing to

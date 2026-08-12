@@ -152,4 +152,3 @@ BEGIN
     RETURN locked = required;
 END;
 $$;
-
