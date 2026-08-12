@@ -1,13 +1,19 @@
-import { MessagesSquare, Webhook } from "lucide-react";
 import { DingTalkMark } from "./dingtalk-mark";
+import { LarkMark } from "./lark-mark";
+import { SlackMark } from "./slack-mark";
 import { WecomMark } from "./wecom-mark";
 
 type IntegrationChannel = "lark" | "slack" | "dingtalk" | "wecom";
 
+// Every channel gets its own brand mark, never a generic lucide glyph: the icon
+// is what tells a reader which platform the section belongs to, and a stand-in
+// speech bubble or plug says nothing (see WecomMark, #6585). lucide-react ships
+// no brand icons, so a new channel needs its own `*-mark.tsx` before it can be
+// listed here.
 export function IntegrationChannelIcon({ channel }: { channel: IntegrationChannel }) {
   const icon = {
-    lark: <Webhook className="h-4 w-4" />,
-    slack: <MessagesSquare className="h-4 w-4" />,
+    lark: <LarkMark className="h-4 w-4" />,
+    slack: <SlackMark className="h-4 w-4" />,
     dingtalk: <DingTalkMark className="h-5 w-5" />,
     wecom: <WecomMark className="h-4 w-4" />,
   }[channel];
