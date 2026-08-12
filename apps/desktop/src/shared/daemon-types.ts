@@ -19,6 +19,12 @@ export interface ManagedRuntimeSetupStatus {
   startedAt: string;
   version?: string;
   source?: "user" | "managed";
+  /**
+   * Why the install failed, in the provider's own words. Set only on the
+   * "failed" phase — without it the UI can say nothing beyond "failed", and
+   * a dead network looks identical to a full disk.
+   */
+  error?: string;
 }
 
 export interface DaemonStatus {

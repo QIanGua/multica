@@ -1,6 +1,9 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
-import type { UpdateRuntimeModelConnectionRequest } from "../types";
+import type {
+  UpdateRuntimeModelConnectionRequest,
+  ValidateModelConnectionRequest,
+} from "../types";
 import { runtimeModelsKeys } from "./models";
 import { runtimeKeys } from "./queries";
 import { workspaceKeys } from "../workspace/queries";
@@ -84,6 +87,20 @@ export function useUpdateRuntimeModelConnection(wsId: string) {
         queryKey: runtimeModelsKeys.forRuntime(variables.runtimeId),
       });
     },
+  });
+}
+
+/**
+ * Verifies a candidate model connection before it is saved.
+ *
+ * Not cached: the answer depends on provider-side state (key revoked, balance
+ * spent) that can change between attempts, and a stale "valid" is exactly the
+ * wrong thing to reuse.
+ */
+export function useValidateModelConnection() {
+  return useMutation({
+    mutationFn: (request: ValidateModelConnectionRequest) =>
+      api.validateModelConnection(request),
   });
 }
 

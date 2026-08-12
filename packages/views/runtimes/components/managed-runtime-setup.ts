@@ -8,6 +8,12 @@ export interface ManagedRuntimeSetupStatus {
   startedAt: string;
   version?: string;
   source?: "user" | "managed";
+  /**
+   * Why the install failed, in the installer's own words. Set only on the
+   * "failed" phase; without it the UI can say nothing beyond "failed".
+   * Mirrors the same field on the desktop DaemonStatus payload.
+   */
+  error?: string;
 }
 
 const PENDING_MANAGED_RUNTIME_ID_PREFIX = "pending-managed-runtime:";

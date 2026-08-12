@@ -42,6 +42,8 @@ import type {
   AgentRuntime,
   RuntimeModelConnection,
   UpdateRuntimeModelConnectionRequest,
+  ValidateModelConnectionRequest,
+  ModelConnectionValidation,
   RuntimeProfile,
   CreateRuntimeProfileRequest,
   UpdateRuntimeProfileRequest,
@@ -346,6 +348,7 @@ import {
   RuntimeModelListRequestSchema,
   MALFORMED_RUNTIME_MODEL_LIST_REQUEST,
   RuntimeModelConnectionSchema,
+  ModelConnectionValidationSchema,
 } from "./schemas";
 
 /** Identifies the calling client to the server.
@@ -1658,6 +1661,26 @@ export class ApiClient {
       RuntimeModelConnectionSchema,
       emptyRuntimeModelConnection(runtimeId),
       { endpoint: "PUT /api/runtimes/:id/model-connection" },
+    );
+  }
+
+  /**
+   * Verifies provider + endpoint + model + key together before anything is
+   * saved. A rejected key comes back as `valid: false` with a 200, so only a
+   * genuinely broken request throws here.
+   */
+  async validateModelConnection(
+    data: ValidateModelConnectionRequest,
+  ): Promise<ModelConnectionValidation> {
+    const raw = await this.fetch<unknown>(
+      `/api/runtimes/model-connection/validate`,
+      { method: "POST", body: JSON.stringify(data) },
+    );
+    return parseWithFallback(
+      raw,
+      ModelConnectionValidationSchema,
+      { valid: false, outcome: "unknown" as const },
+      { endpoint: "POST /api/runtimes/model-connection/validate" },
     );
   }
 

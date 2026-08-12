@@ -481,5 +481,40 @@
     "table_cache_r": "缓存读",
     "table_cache_w": "缓存写",
     "no_data": "还没有使用数据"
+  },
+  "built_in": {
+    "offer_title": "使用 Multica 内置运行时",
+    "offer_subtitle": "Multica 会在这台电脑上准备好执行环境，你只需要提供一个模型 API Key。",
+    "offer_action": "安装并配置",
+    "failed_title": "内置运行时没有安装成功",
+    "failed_subtitle": "你的电脑没有被改动。可以重试，或者连接你已有的 AI 编程工具。",
+    "retry_action": "重试",
+    "install_failed_generic": "安装失败。",
+    "installing_title": "正在准备内置运行时",
+    "installing_downloading": "正在下载并校验，只需要这一次。",
+    "installing_registering": "就快好了，正在等待运行时上线。",
+    "ready_title": "内置运行时已就绪",
+    "ready_subtitle": "这台电脑上的智能体可以开始工作了。",
+    "connect": {
+      "title": "连接模型",
+      "subtitle": "选一个提供商并粘贴它的 API Key，这台电脑上的所有智能体都会使用它。",
+      "provider_label": "模型提供商",
+      "more_providers": "更多提供商",
+      "api_key_label": "API Key",
+      "api_key_placeholder": "粘贴 API Key",
+      "api_key_hint": "保存在这个运行时上，之后不会再显示。保存前我们会先验证一次。",
+      "get_key": "去获取 {{provider}} API Key",
+      "submit": "连接模型",
+      "verifying": "验证中...",
+      "saving": "保存中...",
+      "no_key": "我还没有 API Key",
+      "error_invalid_key": "这个 Key 被拒绝了，请确认是否完整复制。",
+      "error_quota": "Key 是有效的，但账户余额已用完。",
+      "error_rate_limited": "提供商正在限流，请稍后再试。",
+      "error_model": "这个账户无法使用该模型。",
+      "error_endpoint": "无法访问该提供商的 API。",
+      "error_network": "连接不上提供商，请检查网络。",
+      "error_generic": "提供商拒绝了这次请求。"
+    }
   }
 }

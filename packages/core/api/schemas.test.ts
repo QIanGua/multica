@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AppConfigSchema,
+  ModelConnectionValidationSchema,
   WecomInstallationSchema,
   ListWecomInstallationsResponseSchema,
   RedeemWecomBindingTokenResponseSchema,
@@ -1336,5 +1337,50 @@ describe("WeCom installation schemas", () => {
       { endpoint: "POST /api/wecom/binding/redeem" },
     );
     expect(redeem).toEqual(EMPTY_REDEEM_WECOM_BINDING_TOKEN_RESPONSE);
+  });
+});
+
+describe("ModelConnectionValidationSchema", () => {
+  it("keeps a successful verification without an outcome", () => {
+    const parsed = ModelConnectionValidationSchema.parse({ valid: true });
+    expect(parsed.valid).toBe(true);
+    expect(parsed.outcome).toBeUndefined();
+  });
+
+  it("passes through a known failure outcome and its detail", () => {
+    const parsed = ModelConnectionValidationSchema.parse({
+      valid: false,
+      outcome: "invalid_key",
+      status: 401,
+      detail: "bad key",
+    });
+    expect(parsed.outcome).toBe("invalid_key");
+    expect(parsed.status).toBe(401);
+    expect(parsed.detail).toBe("bad key");
+  });
+
+  it("folds an outcome this build predates into 'unknown' instead of dropping the verdict", () => {
+    const parsed = ModelConnectionValidationSchema.parse({
+      valid: false,
+      outcome: "region_blocked",
+    });
+    expect(parsed.valid).toBe(false);
+    expect(parsed.outcome).toBe("unknown");
+  });
+
+  it("treats a missing 'valid' as not verified rather than assuming success", () => {
+    const parsed = ModelConnectionValidationSchema.parse({});
+    expect(parsed.valid).toBe(false);
+  });
+
+  it("falls back on a malformed response", () => {
+    const parsed = parseWithFallback(
+      "not json",
+      ModelConnectionValidationSchema,
+      { valid: false, outcome: "unknown" as const },
+      { endpoint: "POST /api/runtimes/model-connection/validate" },
+    );
+    expect(parsed.valid).toBe(false);
+    expect(parsed.outcome).toBe("unknown");
   });
 });

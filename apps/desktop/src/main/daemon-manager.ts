@@ -553,6 +553,14 @@ async function getCliBinaryVersion(): Promise<string | null> {
   return cachedCliBinaryVersion;
 }
 
+/**
+ * Installs a managed runtime and reports every transition to the renderer.
+ *
+ * Only ever reached from an explicit user action (onboarding's "install the
+ * built-in runtime", or the same offer on the Runtimes page). It is
+ * deliberately NOT called on daemon start: downloading a runtime is a
+ * decision, and a user who already has Claude Code should never pay for it.
+ */
 async function ensureManagedRuntime(
   bin: string,
   provider: string,
@@ -561,6 +569,10 @@ async function ensureManagedRuntime(
   if (inFlight) return inFlight;
 
   const startedAt = new Date().toISOString();
+  // Surface the install in the daemon state machine too, so the status pill
+  // says "Installing runtime…" instead of looking idle for the whole download.
+  const stateBeforeInstall = currentState;
+  currentState = "installing_runtime";
   setManagedRuntimeSetup({ provider, phase: "installing", startedAt });
 
   const install = new Promise<void>((resolve, reject) => {
@@ -572,9 +584,9 @@ async function ensureManagedRuntime(
         env: desktopSpawnEnv(),
         maxBuffer: 64 * 1024,
       },
-      (error, stdout) => {
+      (error, stdout, stderr) => {
         if (error) {
-          reject(error);
+          reject(new Error(managedRuntimeFailureReason(error, stderr)));
           return;
         }
         try {
@@ -601,40 +613,33 @@ async function ensureManagedRuntime(
   try {
     await install;
   } catch (err) {
-    setManagedRuntimeSetup({ provider, phase: "failed", startedAt });
+    managedRuntimeSetupFailures.add(provider);
+    // The reason has to reach the UI. Without it the user sees "Installation
+    // failed" and cannot tell a dead network from a full disk.
+    setManagedRuntimeSetup({
+      provider,
+      phase: "failed",
+      startedAt,
+      error: err instanceof Error ? err.message : String(err),
+    });
     throw err;
   } finally {
     managedRuntimeInstallPromises.delete(provider);
+    if (currentState === "installing_runtime") {
+      currentState = stateBeforeInstall;
+    }
   }
 }
 
-function startManagedRuntimeSetup(
-  bin: string,
-  provider: string,
-  options: { force?: boolean } = {},
-): void {
-  if (options.force) {
-    managedRuntimeSetupFailures.delete(provider);
-  } else if (managedRuntimeSetupFailures.has(provider)) {
-    return;
-  }
-
-  void ensureManagedRuntime(bin, provider).catch((err) => {
-    managedRuntimeSetupFailures.add(provider);
-    // Pi setup must not prevent a user-installed Claude/Codex/etc. runtime
-    // from starting. Explicit retry clears this process-local failure cache.
-    console.warn(
-      `[daemon] ${provider} runtime setup failed; continuing without it:`,
-      err,
-    );
-  });
-}
-
-function startDesktopManagedRuntimesSetup(
-  bin: string,
-  options: { force?: boolean } = {},
-): void {
-  startManagedRuntimeSetup(bin, "pi", options);
+/** Keeps the most useful line of a failed install for the user to read. */
+function managedRuntimeFailureReason(error: Error, stderr: string): string {
+  const stderrLine = stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .pop();
+  const message = stderrLine || error.message || "installation failed";
+  return message.length > 300 ? `${message.slice(0, 300)}…` : message;
 }
 
 /**
@@ -999,8 +1004,6 @@ async function startDaemon(): Promise<{ success: boolean; error?: string }> {
   const bin = await resolveCliBinary();
   if (!bin) return { success: false, error: "multica CLI is not installed" };
 
-  startDesktopManagedRuntimesSetup(bin);
-
   const active = await ensureActiveProfile();
   if (!active) {
     return { success: false, error: "Waiting for the service address" };
@@ -1130,9 +1133,7 @@ function startPolling(): void {
  * stopped/running state machine. Called once at startup and again on
  * user-triggered `daemon:retry-install`.
  */
-async function bootstrapCli(
-  options: { forceManagedRuntimeSetup?: boolean } = {},
-): Promise<void> {
+async function bootstrapCli(): Promise<void> {
   const bin = await resolveCliBinary();
   if (!bin) {
     currentState = "cli_not_found";
@@ -1142,9 +1143,6 @@ async function bootstrapCli(
   currentState = "stopped";
   sendStatus({ state: "stopped" });
   startPolling();
-  startDesktopManagedRuntimesSetup(bin, {
-    force: options.forceManagedRuntimeSetup,
-  });
 }
 
 function stopPolling(): void {
@@ -1272,6 +1270,26 @@ export function setupDaemonManager(
     withManagedRuntimeSetup(await fetchHealth()),
   );
   ipcMain.handle("daemon:probe-runtimes", () => probeLocalRuntimes());
+  // Explicit, user-initiated install of a Multica-managed runtime. Retrying
+  // after a failure is the same call: the process-local failure cache only
+  // guards the automatic path, and there no longer is one.
+  ipcMain.handle(
+    "daemon:install-runtime",
+    async (_event, provider: string): Promise<{ success: boolean; error?: string }> => {
+      const bin = await resolveCliBinary();
+      if (!bin) return { success: false, error: "multica CLI is not installed" };
+      managedRuntimeSetupFailures.delete(provider);
+      try {
+        await ensureManagedRuntime(bin, provider);
+        return { success: true };
+      } catch (err) {
+        return {
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+  );
   // The host's OS name, available regardless of daemon state. The Runtimes
   // page uses it as a fallback identity for "this machine" when no
   // app-managed daemon is reporting a device name (e.g. the daemon runs
@@ -1296,7 +1314,7 @@ export function setupDaemonManager(
     // A retry-install may land a new CLI at a different version; drop the
     // cached version string so the next check re-reads the binary.
     cachedCliBinaryVersion = undefined;
-    await bootstrapCli({ forceManagedRuntimeSetup: true });
+    await bootstrapCli();
   });
   ipcMain.handle("daemon:get-prefs", () => loadPrefs());
   ipcMain.handle(

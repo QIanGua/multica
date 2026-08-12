@@ -121,6 +121,37 @@ export interface UpdateRuntimeModelConnectionRequest {
   api_key?: string;
 }
 
+/**
+ * Why a verification attempt failed, in the order a user can act on it.
+ * `unknown` covers a backend that reports an outcome this build predates.
+ */
+export type ModelConnectionProbeOutcome =
+  | "invalid_key"
+  | "insufficient_quota"
+  | "rate_limited"
+  | "model_not_found"
+  | "endpoint_not_found"
+  | "provider_error"
+  | "network_unreachable"
+  | "unknown";
+
+export interface ValidateModelConnectionRequest {
+  provider: string;
+  api: string;
+  base_url: string;
+  model: string;
+  api_key: string;
+}
+
+export interface ModelConnectionValidation {
+  valid: boolean;
+  /** Empty when `valid` is true. */
+  outcome?: ModelConnectionProbeOutcome;
+  status?: number;
+  /** The provider's own message, already scrubbed of the submitted key. */
+  detail?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Custom runtime profiles (MUL-3284)
 //

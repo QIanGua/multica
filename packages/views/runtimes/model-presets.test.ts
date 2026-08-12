@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   PI_PROVIDER_PRESETS,
+  defaultPresetForLocale,
   findPiProviderPreset,
+  orderPresetsForLocale,
   piProviderCatalogModels,
 } from "./model-presets";
 
@@ -110,5 +112,54 @@ describe("Pi provider presets", () => {
       })?.id,
     ).toBe("xai");
     expect(piProviderCatalogModels("Moonshot")).toContain("kimi-k3");
+  });
+});
+
+describe("orderPresetsForLocale", () => {
+  it("leads with providers a Chinese user can actually sign up for", () => {
+    const ordered = orderPresetsForLocale("zh-Hans");
+    expect(ordered.slice(0, 4).map((p) => p.id)).toEqual([
+      "deepseek",
+      "kimi",
+      "zai",
+      "minimax",
+    ]);
+  });
+
+  it("leads with the global providers for English", () => {
+    const ordered = orderPresetsForLocale("en");
+    expect(ordered[0]?.id).toBe("openai");
+  });
+
+  it("falls back to the English order for an unknown locale", () => {
+    expect(orderPresetsForLocale("xx-YY").map((p) => p.id)).toEqual(
+      orderPresetsForLocale("en").map((p) => p.id),
+    );
+    expect(orderPresetsForLocale(undefined)[0]?.id).toBe("openai");
+  });
+
+  it("never drops a preset from any locale", () => {
+    for (const locale of ["zh-Hans", "en", "ja", "ko", "xx"]) {
+      const ordered = orderPresetsForLocale(locale);
+      expect(ordered).toHaveLength(PI_PROVIDER_PRESETS.length);
+      expect(new Set(ordered.map((p) => p.id)).size).toBe(
+        PI_PROVIDER_PRESETS.length,
+      );
+    }
+  });
+
+  it("matches the language regardless of region or case", () => {
+    expect(orderPresetsForLocale("ZH_CN")[0]?.id).toBe("deepseek");
+  });
+
+  it("gives every preset a key console link", () => {
+    for (const preset of PI_PROVIDER_PRESETS) {
+      expect(preset.consoleUrl).toMatch(/^https:\/\//);
+    }
+  });
+
+  it("defaults to the locale's first provider", () => {
+    expect(defaultPresetForLocale("zh-Hans").id).toBe("deepseek");
+    expect(defaultPresetForLocale("en").id).toBe("openai");
   });
 });

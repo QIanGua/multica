@@ -481,5 +481,40 @@
     "table_cache_r": "キャッシュ R",
     "table_cache_w": "キャッシュ W",
     "no_data": "まだ使用量データがありません"
+  },
+  "built_in": {
+    "offer_title": "Multica の内蔵 runtime を使う",
+    "offer_subtitle": "Multica がこのコンピュータに実行環境を用意します。用意していただくのはモデルの API キーだけです。",
+    "offer_action": "インストールして設定",
+    "failed_title": "内蔵 runtime をインストールできませんでした",
+    "failed_subtitle": "コンピュータには何も変更されていません。再試行するか、すでにお持ちのコーディング CLI を接続してください。",
+    "retry_action": "再試行",
+    "install_failed_generic": "インストールに失敗しました。",
+    "installing_title": "内蔵 runtime を準備しています",
+    "installing_downloading": "ダウンロードして検証しています。これは一度だけです。",
+    "installing_registering": "もう少しです — runtime がオンラインになるのを待っています。",
+    "ready_title": "内蔵 runtime の準備ができました",
+    "ready_subtitle": "このコンピュータの agent が作業を開始できます。",
+    "connect": {
+      "title": "モデルを接続",
+      "subtitle": "プロバイダーを選び、API キーを貼り付けてください。このコンピュータのすべての agent がこれを使います。",
+      "provider_label": "モデルプロバイダー",
+      "more_providers": "他のプロバイダー",
+      "api_key_label": "API キー",
+      "api_key_placeholder": "API キーを貼り付け",
+      "api_key_hint": "この runtime に保存され、以後は表示されません。保存前に検証します。",
+      "get_key": "{{provider}} の API キーを取得",
+      "submit": "モデルを接続",
+      "verifying": "検証中...",
+      "saving": "保存中...",
+      "no_key": "API キーをまだ持っていません",
+      "error_invalid_key": "このキーは拒否されました。すべてコピーできているか確認してください。",
+      "error_quota": "キーは有効ですが、アカウントの残高がありません。",
+      "error_rate_limited": "プロバイダーがレート制限中です。しばらくしてから再試行してください。",
+      "error_model": "このアカウントではこのモデルを利用できません。",
+      "error_endpoint": "そのプロバイダーの API に到達できませんでした。",
+      "error_network": "プロバイダーに接続できません。ネットワークを確認してください。",
+      "error_generic": "プロバイダーがリクエストを拒否しました。"
+    }
   }
 }
