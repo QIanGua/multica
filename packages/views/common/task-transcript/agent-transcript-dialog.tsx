@@ -233,6 +233,7 @@ export function AgentTranscriptDialog({
   const [elapsed, setElapsed] = useState("");
   const [copied, setCopied] = useState(false);
   const [copiedWorkdir, setCopiedWorkdir] = useState(false);
+  const [copiedBranch, setCopiedBranch] = useState(false);
   const [agentInfo, setAgentInfo] = useState<Agent | null>(null);
   const [runtimeInfo, setRuntimeInfo] = useState<AgentRuntime | null>(null);
   // Row-level expand overrides. A row the user toggled follows the toggle; any
@@ -491,6 +492,17 @@ export function AgentTranscriptDialog({
     });
   }, [task.relative_work_dir]);
 
+  // Worktree-mode runs deliver a branch instead of edits in the working copy,
+  // so copying the name is the fastest path to `git diff <branch>`.
+  const handleCopyBranch = useCallback(() => {
+    if (!task.branch_name) return;
+    void copyText(task.branch_name).then((ok) => {
+      if (!ok) return;
+      setCopiedBranch(true);
+      setTimeout(() => setCopiedBranch(false), 2000);
+    });
+  }, [task.branch_name]);
+
   const handleCopyAll = useCallback(() => {
     // Copy the full body of each event (not the truncated row summary), with
     // the same secret redaction the detail view applies.
@@ -633,6 +645,7 @@ export function AgentTranscriptDialog({
   const hasRunDetails =
     !!runtimeInfo ||
     !!task.relative_work_dir ||
+    !!task.branch_name ||
     !!createdLabel ||
     !!startedLabel ||
     !!completedLabel ||
@@ -743,6 +756,16 @@ export function AgentTranscriptDialog({
                           onCopy={handleCopyWorkdir}
                           copied={copiedWorkdir}
                           copyTitle={t(($) => $.transcript.copy_workdir)}
+                        />
+                      )}
+                      {task.branch_name && (
+                        <RunDetailRow
+                          label={t(($) => $.transcript.details_branch)}
+                          value={task.branch_name}
+                          mono
+                          onCopy={handleCopyBranch}
+                          copied={copiedBranch}
+                          copyTitle={t(($) => $.transcript.copy_branch)}
                         />
                       )}
                       {createdLabel && (

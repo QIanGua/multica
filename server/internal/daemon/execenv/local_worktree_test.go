@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -641,5 +642,113 @@ func TestPrepareWorktreeModeUsesPerIssueCodexSessionStore(t *testing.T) {
 	// And it must be the stable per-issue store, not a task-local directory.
 	if strings.Contains(firstSessions, shortID("aaaa1111-2222-3333-4444-555566667777")) {
 		t.Errorf("sessions dir is task-scoped (%s); it will not survive the next turn", firstSessions)
+	}
+}
+
+// The daemon runs its sidecar cleanup before Finalize commits. If that cleanup
+// fails, committing anyway would deliver a branch whose content is Multica's
+// own runtime files — the exact leak this mode promises to prevent. The abort
+// must therefore stop the commit AND keep the worktree, since the agent's work
+// is still in it.
+func TestFinalizeAbortRefusesToCommitAndKeepsWorktree(t *testing.T) {
+	repo := newTestRepo(t)
+	wt := prepareForTest(t, repo)
+
+	writeFile(t, filepath.Join(wt.Path, "agent-output.txt"), "real work\n")
+	writeFile(t, filepath.Join(wt.Path, ".agent_context", "issue_context.md"), "runtime brief\n")
+
+	wt.AbortWithReason(errors.New("cleanup failed"))
+	outcome, err := wt.Finalize(worktreeTestLogger())
+
+	if err == nil {
+		t.Fatal("Finalize returned nil error after an abort")
+	}
+	if outcome.Branch != "" {
+		t.Errorf("Branch = %q, want empty: nothing may be delivered after an abort", outcome.Branch)
+	}
+	if outcome.AutoCommitted {
+		t.Error("AutoCommitted = true; the abort must prevent the commit")
+	}
+	if outcome.PreservedPath != wt.Path {
+		t.Errorf("PreservedPath = %q, want %q", outcome.PreservedPath, wt.Path)
+	}
+	// Nothing committed: the branch must still be sitting on its base.
+	tip := gitRun(t, repo, "rev-parse", wt.Branch)
+	if tip != wt.BaseCommit {
+		t.Errorf("branch moved to %s; the sidecar-carrying commit was delivered anyway", tip)
+	}
+	// And the work is still recoverable on disk.
+	if got := readFile(t, filepath.Join(wt.Path, "agent-output.txt")); got != "real work\n" {
+		t.Errorf("agent work was destroyed: %q", got)
+	}
+	if list := gitRun(t, repo, "worktree", "list"); !strings.Contains(list, wt.Path) {
+		t.Errorf("preserved worktree is no longer registered:\n%s", list)
+	}
+}
+
+// The first reason is the one closest to the root cause, so later aborts must
+// not overwrite it.
+func TestAbortWithReasonKeepsFirstReason(t *testing.T) {
+	repo := newTestRepo(t)
+	wt := prepareForTest(t, repo)
+	t.Cleanup(func() { removeLocalWorktreeDir(repo, wt.Path, worktreeTestLogger()) })
+
+	wt.AbortWithReason(errors.New("first"))
+	wt.AbortWithReason(errors.New("second"))
+	wt.AbortWithReason(nil)
+
+	_, err := wt.Finalize(worktreeTestLogger())
+	if err == nil || !strings.Contains(err.Error(), "first") {
+		t.Fatalf("want the first reason preserved, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "second") {
+		t.Errorf("later abort overwrote the original reason: %v", err)
+	}
+}
+
+// An untracked symlink is content the user can see. Replaying it faithfully is
+// ambiguous (link vs target, targets outside the repo), so the snapshot must
+// fail rather than hand the agent a tree with a file quietly missing.
+func TestPrepareLocalWorktreeFailsOnUntrackedSymlink(t *testing.T) {
+	repo := newTestRepo(t)
+	if err := os.Symlink(filepath.Join(repo, "tracked.txt"), filepath.Join(repo, "shortcut.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	_, err := PrepareLocalWorktree(LocalWorktreeParams{
+		LocalPath: repo,
+		EnvRoot:   t.TempDir(),
+		AgentName: "J",
+		TaskID:    "task-symlink",
+	}, worktreeTestLogger())
+
+	if err == nil {
+		t.Fatal("expected prepare to fail rather than silently drop the symlink")
+	}
+	if !strings.Contains(err.Error(), "untracked") {
+		t.Errorf("error should name the untracked replay, got: %v", err)
+	}
+	if list := gitRun(t, repo, "worktree", "list"); strings.Count(list, "\n") != 0 {
+		t.Errorf("aborted prepare left a worktree registered:\n%s", list)
+	}
+}
+
+// Discard is the abandon path for a Prepare that fails after the worktree
+// exists. Without it every such failure leaves a registration in the user's
+// repo and a branch no task ever ran in.
+func TestDiscardRemovesWorktreeAndBranch(t *testing.T) {
+	repo := newTestRepo(t)
+	wt := prepareForTest(t, repo)
+
+	wt.Discard(worktreeTestLogger())
+
+	if _, err := os.Stat(wt.Path); !os.IsNotExist(err) {
+		t.Errorf("worktree directory survived Discard: %v", err)
+	}
+	if list := gitRun(t, repo, "worktree", "list"); strings.Contains(list, wt.Path) {
+		t.Errorf("worktree still registered after Discard:\n%s", list)
+	}
+	if out, err := gitTry(t, repo, "rev-parse", "--verify", wt.Branch); err == nil {
+		t.Errorf("branch survived Discard, resolves to %s", out)
 	}
 }

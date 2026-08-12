@@ -58,7 +58,8 @@ multica project resource remove <project-id> <resource-id> --output json
 directory, one task at a time; a second task waits in `waiting_local_directory`. `worktree` gives each task its own
 git worktree of that repo, so tasks run concurrently and each delivers its work as an `agent/<agent>/<task>` branch
 in the user's repo instead of editing the working copy. `worktree` requires the path to be a git repository with at
-least one commit; tasks fail with an explicit error otherwise. Saving `worktree` is also refused (HTTP 422, code
+least one commit; tasks fail with an explicit error otherwise. The daemon version is gated twice — at save time and again
+against the daemon that claims each task — so a downgraded machine gets its tasks cancelled rather than run in place. Saving `worktree` is also refused (HTTP 422, code
 `daemon_version_unsupported`) while the daemon on that machine is older than the release that ships the mode — the
 fix is upgrading that daemon, then retrying. Pass an empty value to clear it back to the default.
 

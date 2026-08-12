@@ -609,3 +609,30 @@ describe("AgentTranscriptDialog", () => {
     expect(await screen.findByText(expected)).toBeInTheDocument();
   });
 });
+
+// A worktree-mode run never touches the user's working copy: the branch is the
+// only pointer to what it produced. Showing it in Run details is what makes the
+// result findable — including for a run that failed partway, which still
+// commits whatever the agent had done.
+describe("AgentTranscriptDialog — delivered branch", () => {
+  it("shows the branch and copies it", async () => {
+    renderDialog(items, {
+      task: { ...baseTask, branch_name: "agent/j/abc12345" },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Run details" }));
+
+    expect(screen.getByText("agent/j/abc12345")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByTitle("Copy branch name"));
+    expect(copyTextMock).toHaveBeenCalledWith("agent/j/abc12345");
+  });
+
+  it("renders nothing for tasks that delivered no branch", async () => {
+    renderDialog(items, { task: { ...baseTask, branch_name: undefined } });
+
+    await userEvent.click(screen.getByRole("button", { name: "Run details" }));
+
+    expect(screen.queryByTitle("Copy branch name")).not.toBeInTheDocument();
+  });
+});

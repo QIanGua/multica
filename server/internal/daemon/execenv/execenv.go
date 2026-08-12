@@ -383,6 +383,13 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// written so the sidecars land inside the disposable worktree instead of
 	// the user's directory.
 	var localWorktree *LocalWorktree
+	// Tracks whether Prepare reached its successful return. Everything after
+	// worktree creation can still fail — context files, provider homes, MCP
+	// config — and on those paths the caller never receives an Environment, so
+	// nothing downstream knows a worktree exists to clean up. Without the
+	// rollback below, each such failure would leave a registration in the
+	// user's repo and a branch that no task ever ran in.
+	prepareSucceeded := false
 	if params.LocalWorktree != nil {
 		wtParams := *params.LocalWorktree
 		wtParams.EnvRoot = envRoot
@@ -393,6 +400,14 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		if err != nil {
 			return nil, err
 		}
+		defer func() {
+			if prepareSucceeded {
+				return
+			}
+			// Safe to discard unconditionally: no agent has run yet, so the
+			// worktree holds only what Prepare itself put there.
+			localWorktree.Discard(logger)
+		}()
 		workDir = localWorktree.WorkDir
 		// The resource may point at a subdirectory that holds only ignored
 		// files, in which case git doesn't materialise it in the worktree.
@@ -540,6 +555,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	}
 
 	logger.Info("execenv: prepared env", "root", envRoot, "repos_available", len(params.Task.Repos))
+	prepareSucceeded = true
 	return env, nil
 }
 

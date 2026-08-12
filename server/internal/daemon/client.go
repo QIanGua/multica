@@ -401,13 +401,19 @@ func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []Tas
 	}, nil)
 }
 
-func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, failureReason string, sessionRolloutMissing bool, retiredSessionID string) error {
+func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID string) error {
 	body := map[string]any{"error": errMsg}
 	if sessionID != "" {
 		body["session_id"] = sessionID
 	}
 	if workDir != "" {
 		body["work_dir"] = workDir
+	}
+	// A failed run can still have delivered a branch: worktree mode commits
+	// whatever the agent left before removing the worktree, so partial work
+	// survives — but only if its name travels with the failure report.
+	if branchName != "" {
+		body["branch_name"] = branchName
 	}
 	if failureReason != "" {
 		body["failure_reason"] = failureReason

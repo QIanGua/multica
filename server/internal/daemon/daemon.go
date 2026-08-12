@@ -5260,11 +5260,16 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		}
 		taskLog.Info("task did not complete, reporting failure", "status", result.Status, "failure_reason", failureReason)
 		if err := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:                  terminalTaskReportFail,
-			taskID:                taskID,
-			errorMessage:          result.Comment,
-			sessionID:             result.SessionID,
-			workDir:               result.WorkDir,
+			kind:         terminalTaskReportFail,
+			taskID:       taskID,
+			errorMessage: result.Comment,
+			sessionID:    result.SessionID,
+			workDir:      result.WorkDir,
+			// Worktree mode commits the agent's leftovers before tearing the
+			// worktree down, so a failed run routinely still has a branch. This
+			// is the case where the user most needs it: the task went wrong and
+			// they want to see how far it got.
+			branchName:            result.BranchName,
 			failureReason:         failureReason,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
@@ -5287,7 +5292,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	case terminalTaskReportComplete:
 		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
 	case terminalTaskReportFail:
-		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID)
+		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}
@@ -6355,8 +6360,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// in place, leave them behind in the user's tree.
 	if env.LocalDirectory || env.LocalWorktree != nil {
 		defer func() {
+			var cleanupErr error
 			if cerr := execenv.CleanupRuntimeConfig(env.WorkDir, provider); cerr != nil {
-				d.logger.Warn("execenv: cleanup runtime config failed (non-fatal)", "error", cerr)
+				cleanupErr = cerr
+				d.logger.Warn("execenv: cleanup runtime config failed", "error", cerr)
 			}
 			// Excise the sidecar tree (.agent_context/, .multica/,
 			// provider-specific .claude/skills/ etc.) that Prepare wrote
@@ -6367,7 +6374,23 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// every other file Prepare placed under WorkDir. Together
 			// they round-trip the workdir to its exact pre-task bytes.
 			if cerr := execenv.CleanupSidecars(env.RootDir); cerr != nil {
-				d.logger.Warn("execenv: cleanup sidecars failed (non-fatal)", "error", cerr)
+				if cleanupErr == nil {
+					cleanupErr = cerr
+				}
+				d.logger.Warn("execenv: cleanup sidecars failed", "error", cerr)
+			}
+			// In worktree mode a failed cleanup is NOT survivable: Finalize is
+			// about to `git add -A`, so whatever the cleanup could not remove
+			// gets committed and delivered as the task's branch — a diff whose
+			// content is Multica's own runtime files, which is precisely what
+			// this mode promises never to produce. Tell Finalize to abort
+			// instead, so nothing is committed and the worktree is kept for
+			// inspection. (In place there is no commit and no branch, so a
+			// cleanup failure stays a warning: the leftover files are visible
+			// in the user's own tree and removable by hand.)
+			if cleanupErr != nil && env.LocalWorktree != nil {
+				env.LocalWorktree.AbortWithReason(fmt.Errorf(
+					"could not remove the runtime's own files from the worktree before committing: %w", cleanupErr))
 			}
 		}()
 	}

@@ -27,6 +27,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
+	agentpkg "github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/redact"
@@ -2686,7 +2687,74 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		)
 	}
 
+	// Last gate before dispatch: refuse to hand a worktree-mode local_directory
+	// task to a daemon that cannot implement the mode.
+	//
+	// The save-time gate in project_resource.go cannot cover this. It checks the
+	// version at the moment the resource is written; a machine downgraded
+	// afterwards still claims tasks, and an old daemon json-skips execution_mode
+	// entirely — it would run the task IN PLACE, editing the working copy the
+	// user asked to isolate. That is the exact outcome worktree mode exists to
+	// prevent, so it fails closed here, against the version of the runtime that
+	// is actually claiming.
+	if reason := worktreeClaimBlockReason(resp.ProjectResources, runtime); reason != "" {
+		slog.Error("task claim: runtime too old for worktree mode; cancelling rather than running in place",
+			"task_id", uuidToString(task.ID),
+			"runtime_id", runtimeID,
+			"daemon_id", runtime.DaemonID.String,
+			"reason", reason,
+		)
+		// Cancel rather than leave it dispatched: the resource is pinned to this
+		// daemon, so redelivery would hand it straight back to the same too-old
+		// runtime forever. A cancelled task with a reason is something the user
+		// can act on; a task that silently re-queues is not.
+		if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+			slog.Error("task claim: cancel after worktree version gate failed",
+				"task_id", uuidToString(task.ID), "error", cerr)
+		}
+		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, &claimBuildFailure{
+			outcome: "error_worktree_daemon_version",
+			status:  http.StatusUnprocessableEntity,
+			message: reason,
+		}
+	}
+
 	return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, nil
+}
+
+// worktreeClaimBlockReason returns a user-facing reason when this runtime must
+// not run the task, or "" when it may proceed.
+//
+// Only resources bound to the claiming runtime's own daemon are considered: a
+// project may carry one local_directory per machine, and another machine's
+// worktree resource says nothing about this one's ability to run the task.
+func worktreeClaimBlockReason(resources []ProjectResourceData, runtime db.AgentRuntime) string {
+	if !runtime.DaemonID.Valid || runtime.DaemonID.String == "" {
+		return ""
+	}
+	for _, res := range resources {
+		if res.ResourceType != "local_directory" {
+			continue
+		}
+		var ref localDirectoryRef
+		if err := json.Unmarshal(res.ResourceRef, &ref); err != nil {
+			continue
+		}
+		if ref.ExecutionMode != localDirectoryModeWorktree || ref.DaemonID != runtime.DaemonID.String {
+			continue
+		}
+		current := readRuntimeCLIVersion(runtime.Metadata)
+		if err := agentpkg.CheckMinCLIVersionFor(current, agentpkg.MinLocalWorktreeCLIVersion); err != nil {
+			shown := current
+			if strings.TrimSpace(shown) == "" {
+				shown = "unknown"
+			}
+			return fmt.Sprintf(
+				"this project's local directory %q is set to run tasks in isolated git worktrees, but the Multica runtime on that machine is %s and needs %s or newer; update it, or switch the resource back to in_place",
+				ref.LocalPath, shown, agentpkg.MinLocalWorktreeCLIVersion)
+		}
+	}
+	return ""
 }
 
 // ClaimTaskByRuntime atomically claims the next queued task for a runtime.
@@ -3115,6 +3183,10 @@ type TaskCompleteRequest struct {
 	Output    string `json:"output"`
 	SessionID string `json:"session_id"` // Claude session ID for future resumption
 	WorkDir   string `json:"work_dir"`   // working directory used during execution
+	// BranchName is the branch this run delivered its work on. Worktree-mode
+	// local_directory tasks never touch the user's working copy, so this is the
+	// only pointer to where the changes went. Empty for every other task kind.
+	BranchName string `json:"branch_name,omitempty"`
 	// SessionRolloutMissing: the daemon withheld this task's Codex session
 	// because its rollout was missing (MUL-5305). Clear the resume pointer and
 	// flag the continuity gap for the next claim.
@@ -3173,7 +3245,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// transaction (force session_id NULL + flag the row), so an auto-retry the
 	// same commit creates and wakes can never observe the withheld pointer or a
 	// missing continuity-gap flag.
-	task, err := h.TaskService.CompleteTask(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.SessionRolloutMissing, req.RetiredSessionID)
+	task, err := h.TaskService.CompleteTask(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.BranchName, req.SessionRolloutMissing, req.RetiredSessionID)
 	if err != nil {
 		// A CompleteTask error is an infrastructure failure (transaction /
 		// assistant-outcome write), not a bad request: an already-finalized
@@ -3802,6 +3874,10 @@ type TaskFailRequest struct {
 	SessionID     string `json:"session_id,omitempty"`
 	WorkDir       string `json:"work_dir,omitempty"`
 	FailureReason string `json:"failure_reason,omitempty"`
+	// BranchName: a failed run can still have produced a branch — worktree mode
+	// commits whatever the agent left before tearing the worktree down. Report
+	// it so a partially-successful run is still findable.
+	BranchName string `json:"branch_name,omitempty"`
 	// SessionRolloutMissing: the daemon withheld this task's Codex session
 	// because its rollout was missing (MUL-5305). Clear the resume pointer and
 	// flag the continuity gap for the next claim.
@@ -3842,7 +3918,7 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 	// keep a stale mid-flight pin) and flagging the row in the same commit that
 	// creates and wakes the auto-retry, so the retry can never claim the withheld
 	// pointer or miss the continuity gap.
-	task, err := h.TaskService.FailTask(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID)
+	task, err := h.TaskService.FailTask(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID)
 	if err != nil {
 		// A FailTask error is an infrastructure failure (the terminal
 		// transaction that also clears the withheld session, writes the

@@ -100,6 +100,10 @@ type LocalWorktree struct {
 	// DirtyBaseCaptured records that the user had uncommitted tracked edits
 	// which were replayed into the worktree.
 	DirtyBaseCaptured bool
+	// aborted, when set, makes Finalize refuse to commit or remove anything.
+	// Set by the daemon when a pre-commit step failed in a way that would make
+	// the committed branch wrong (see AbortWithReason).
+	aborted error
 	// UntrackedCopied / UntrackedSkipped report the untracked-file replay.
 	// A non-zero skip count means the bounds below were hit and the agent is
 	// looking at less than the user has on disk; it is logged at warn level so
@@ -249,16 +253,17 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		return nil, fmt.Errorf("execenv: could not replay the untracked files from %q into the task worktree: %w", gitRoot, err)
 	}
 	if skipped > 0 {
-		// The bounds exist to stop a pathological repo from hanging the copy,
-		// but a truncated replay is still a tree the user would not recognise,
-		// so it fails rather than quietly under-copying. The message names the
-		// way out, because the usual cause is build output that should have
-		// been gitignored in the first place.
+		// Any untracked file we could not reproduce makes the worktree a tree
+		// the user would not recognise, so this fails rather than quietly
+		// under-copying. Causes: the size/count bounds (usually build output
+		// that should have been gitignored), an untracked symlink, or a file
+		// that disappeared mid-snapshot. The message names the common fix
+		// without claiming to know which one it was.
 		removeLocalWorktreeDir(gitRoot, worktreePath, logger)
 		deleteBranch(gitRoot, actualBranch, logger)
-		return nil, fmt.Errorf("execenv: %q has more untracked files than worktree mode replays "+
-			"(copied %d, %d left over; limits are %d files / %d MiB) — gitignore or clean up the untracked files, "+
-			"or switch the resource back to in_place",
+		return nil, fmt.Errorf("execenv: could not replay every untracked file from %q into the task worktree "+
+			"(copied %d, %d left over; the replay covers regular files up to %d files / %d MiB and does not follow symlinks) "+
+			"— gitignore or clean up the untracked files, or switch the resource back to in_place",
 			gitRoot, copied, skipped, maxUntrackedFiles, maxUntrackedBytes>>20)
 	}
 	wt.UntrackedCopied = copied
@@ -339,6 +344,26 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 
 	outcome := LocalWorktreeOutcome{Branch: w.Branch}
 
+	// Something before the commit went wrong in a way that would make the
+	// delivered branch misleading. Commit nothing and keep the worktree: the
+	// agent's work is still in it, and so is whatever the caller could not
+	// clean up, which a human can now look at directly.
+	if w.aborted != nil {
+		// Report NO branch. One exists in the user's repo, but nothing was
+		// committed to it, so naming it as this task's result would point them
+		// at a branch that is missing the very work they are looking for. The
+		// preserved worktree path below is the honest pointer.
+		outcome.Branch = ""
+		outcome.PreservedPath = w.Path
+		if logger != nil {
+			logger.Error("execenv: worktree finalize aborted; nothing committed, worktree kept for inspection",
+				"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "error", w.aborted)
+		}
+		return outcome, fmt.Errorf(
+			"refusing to deliver branch %s: %w; the task worktree is preserved at %s (listed by `git worktree list` in %s)",
+			w.Branch, w.aborted, w.Path, w.GitRoot)
+	}
+
 	// Treat "can't tell" like "dirty": committing costs an empty commit at
 	// worst, while assuming clean risks deleting the agent's edits.
 	dirty, statusErr := worktreeIsDirty(w.Path)
@@ -386,6 +411,40 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		)
 	}
 	return outcome, nil
+}
+
+// Discard tears a worktree down without delivering anything: unregister it,
+// delete its directory, drop its branch.
+//
+// For the abandon-before-the-agent-ran case only. Finalize is the path that
+// preserves work; this one assumes there is none to preserve, so callers must
+// be sure nothing has run in the worktree yet.
+func (w *LocalWorktree) Discard(logger *slog.Logger) {
+	if w == nil {
+		return
+	}
+	unlock := lockGitRoot(w.GitRoot)
+	defer unlock()
+	removeLocalWorktreeDir(w.GitRoot, w.Path, logger)
+	deleteBranch(w.GitRoot, w.Branch, logger)
+	if logger != nil {
+		logger.Info("execenv: local worktree discarded before the agent ran",
+			"git_root", w.GitRoot, "path", w.Path, "branch", w.Branch)
+	}
+}
+
+// AbortWithReason marks the worktree undeliverable. Finalize will then commit
+// nothing, remove nothing, and return an error naming the preserved path.
+//
+// This exists because the decision "is this branch safe to deliver?" is made
+// outside this package — the daemon knows whether its own sidecar cleanup
+// succeeded — while the only code that can act on it is Finalize. The first
+// reason wins: it is the one closest to the root cause.
+func (w *LocalWorktree) AbortWithReason(err error) {
+	if w == nil || err == nil || w.aborted != nil {
+		return
+	}
+	w.aborted = err
 }
 
 // commitBaseline records the user's replayed uncommitted state as the first
@@ -556,9 +615,33 @@ func copyUntrackedFiles(gitRoot, worktreePath string, logger *slog.Logger) (copi
 		}
 		src := filepath.Join(gitRoot, rel)
 		info, statErr := os.Lstat(src)
-		if statErr != nil || !info.Mode().IsRegular() {
-			// Vanished between listing and copying, or not a regular file
-			// (socket, fifo, symlink). Nothing useful to replay.
+		if statErr != nil {
+			// Listed a moment ago, unreadable now — the tree changed under us,
+			// so the snapshot no longer matches what the user has. Counted, not
+			// skipped silently: the caller fails the task on a non-zero count.
+			skipped++
+			if logger != nil {
+				logger.Warn("execenv: untracked file vanished between listing and copy",
+					"file", rel, "error", statErr)
+			}
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			// An untracked symlink is content the user can see. Reproducing it
+			// faithfully means deciding whether to copy the link or its target
+			// — including targets outside the repo — so this replay does not
+			// try. Count it so the task fails rather than handing the agent a
+			// tree with a file quietly missing.
+			skipped++
+			if logger != nil {
+				logger.Warn("execenv: untracked symlink not replayed into worktree", "file", rel)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			// Sockets, FIFOs, devices: not content, and not something an agent
+			// can meaningfully read from a copy. Skipping them does not make the
+			// snapshot misleading, so this one stays uncounted.
 			continue
 		}
 		if info.Size() > budget {

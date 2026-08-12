@@ -367,6 +367,18 @@ export interface AgentTask {
    */
   relative_work_dir?: string;
   /**
+   * Git branch this run delivered its work on. Set only by worktree-mode
+   * local_directory tasks, where the agent never touches the user's working
+   * copy — the branch is the only pointer to what it produced.
+   *
+   * Present on failed runs too: worktree mode commits whatever the agent left
+   * before tearing the worktree down, so a run that died partway still has
+   * something worth finding. Unlike `work_dir` this is safe to render
+   * verbatim; it is a ref inside the user's own repo, not a filesystem path.
+   * Older backends omit it — render conditionally.
+   */
+  branch_name?: string;
+  /**
    * Resolved accountable-human provenance of this run (MUL-4302 §9): who it ran
    * "on behalf of", how that was resolved, and the evidence/lineage. Present on
    * user-facing task surfaces; older backends omit it — render conditionally.
