@@ -92,6 +92,43 @@ func TestHumanLocalCommandRejectsWorkdirTaskMarker(t *testing.T) {
 	}
 }
 
+func TestHumanLocalCommandRejectsExplicitTaskIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		envName string
+		command string
+	}{
+		{name: "agent ID blocks setup", envName: "MULTICA_AGENT_ID", command: "setup"},
+		{name: "task ID blocks daemon stop", envName: "MULTICA_TASK_ID", command: "daemon stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("MULTICA_AGENT_ID", "")
+			t.Setenv("MULTICA_TASK_ID", "")
+			t.Setenv(cli.TaskConfigRootEnv, "")
+			t.Setenv("MULTICA_DAEMON_PORT", "")
+			t.Setenv(tc.envName, "task-identity")
+
+			if err := requireHumanLocalCommand(tc.command); err == nil || !strings.Contains(err.Error(), "daemon-managed task") {
+				t.Fatalf("%s with %s was not rejected: %v", tc.command, tc.envName, err)
+			}
+		})
+	}
+}
+
+func TestMissingServerConfigMessageExplainsPortOnlyContext(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("MULTICA_AGENT_ID", "")
+	t.Setenv("MULTICA_TASK_ID", "")
+	t.Setenv(cli.TaskConfigRootEnv, "")
+	t.Setenv("MULTICA_DAEMON_PORT", "20032")
+
+	message := missingServerConfigMessage()
+	if !strings.Contains(message, "MULTICA_DAEMON_PORT") || !strings.Contains(message, "remove") {
+		t.Fatalf("missing server message = %q, want stale port recovery guidance", message)
+	}
+}
+
 // TestNewAPIClient_WorkdirParentEscapeFailsClosed reproduces the confirmed
 // impersonation escape: a sandbox fault strips every MULTICA_* env var from
 // an agent subprocess, which then runs `multica` from the *parent* directory

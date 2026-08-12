@@ -332,9 +332,13 @@ func resolveServerURL(cmd *cobra.Command) string {
 	if val := tryResolveServerURL(cmd); val != "" {
 		return val
 	}
-	fmt.Fprintln(os.Stderr, "No server configured. Run 'multica setup' first.")
+	fmt.Fprintln(os.Stderr, missingServerConfigMessage())
 	os.Exit(1)
 	return "" // unreachable
+}
+
+func missingServerConfigMessage() string {
+	return fmt.Sprintf("No server configured. Run 'multica setup' first%s.", daemonPortOnlyContextHint())
 }
 
 func resolveHumanServerURL(cmd *cobra.Command) string {
