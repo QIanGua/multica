@@ -406,8 +406,13 @@ func claudeAPICatalogCached() (models []claudeAPIModel, ok, fresh bool) {
 // "advertised but doesn't work" outcome this whole issue exists to avoid, and
 // the model list is exactly where we have no per-agent signal to fix it.
 //
-// `capabilities.effort` has no such problem: which levels a model accepts is a
-// property of the model, not of the account asking. That half is kept below.
+// `capabilities.effort` is reached by the same argument, one layer down: an
+// agent can override ANTHROPIC_BASE_URL as well as the key, so the deployment
+// behind a model id at execution time need not be the one that answered. It is
+// kept only because it is confined to a direction that cannot go wrong — see
+// claudeEffortAllowForModel, which lets discovery shrink the shipped level set
+// and never widen it.
+//
 // Restoring dynamic model ids needs an agent-scoped catalog (the discovery
 // request would have to carry the agent's resolved credentials) — a protocol
 // change, tracked separately, not something a comment can make safe.

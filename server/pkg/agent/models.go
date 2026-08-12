@@ -153,9 +153,11 @@ func ListModels(ctx context.Context, providerType, executablePath string) (Catal
 		//
 		// The model LIST stays static on purpose: it is discovered per runtime
 		// while tasks execute per agent with the agent's own credentials, so a
-		// discovered id is not evidence the agent that picks it can run it. Only
-		// the per-model effort catalog is refined from the Models API, which is a
-		// property of the model rather than of the account. See claude_catalog.go.
+		// discovered id is not evidence the agent that picks it can run it. The
+		// Models API may only NARROW the per-model effort catalog for the same
+		// reason — a runtime-scoped answer cannot speak for the executing
+		// credential, so it is allowed to shrink what this build ships and never
+		// to widen it. See claude_catalog.go.
 		models := claudeStaticModels()
 		discovered, discoveredOK := claudeAPICatalog(ctx)
 		annotateClaudeThinking(ctx, models, executablePath, discovered, discoveredOK)

@@ -471,8 +471,9 @@ func TestFetchClaudeAPIModelsDoesNotMutateCallerClient(t *testing.T) {
 // evidence that the agent picking it can run it. Publishing one would be the
 // "advertised but doesn't work" outcome this issue exists to prevent.
 //
-// Effort capabilities are not account-scoped and are still applied — that is
-// the half this discovery is allowed to influence.
+// Effort capabilities are still applied, but only as a narrowing — see
+// TestClaudeEffortAllowForModelOnlyNarrows. That is the one direction a
+// runtime-scoped answer cannot get wrong, not a claim that it is trustworthy.
 func TestListModelsClaudeNeverAddsDiscoveredModelIDs(t *testing.T) {
 	// Mutates package-global caches and the fetch hook; must stay serial.
 	resetClaudeAPICatalogForTests()
