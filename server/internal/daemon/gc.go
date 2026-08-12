@@ -371,6 +371,13 @@ func (d *Daemon) applyManagedArtifactFallback(taskDir string, meta *execenv.GCMe
 	if meta.CompletedAt.IsZero() || time.Since(meta.CompletedAt) <= d.cfg.GCArtifactTTL {
 		return action
 	}
+	// completed_at never moves again for a task that stays non-terminal, so
+	// without this the decision stays "reclaim" forever and every cycle pays
+	// for a reservation and a removal pass that finds nothing. Racing a
+	// re-provision here is harmless: the next cycle picks it up.
+	if !hasManagedArtifact(taskDir) {
+		return action
+	}
 	d.logger.Info("gc: eligible for managed artifact cleanup",
 		"dir", filepath.Base(taskDir),
 		"kind", string(meta.Kind),
@@ -737,8 +744,97 @@ func (d *Daemon) cleanTaskArtifacts(taskDir string, patterns []string) (removed 
 	return d.cleanTaskArtifactsMatching(taskDir, newArtifactMatcher(patterns, execenv.ManagedReclaimableArtifactSubpaths()))
 }
 
+// cleanManagedTaskArtifacts removes the exact daemon-managed artifact subpaths
+// under taskDir.
+//
+// The managed set is a list of exact relative paths, so these are addressed
+// directly rather than searched for. Walking the whole task tree to find a
+// directory whose location is already known costs a full repo checkout's worth
+// of stat calls, and a task that stays non-terminal — an active chat session —
+// pays it on every GC cycle for as long as it lives, long after the cache is
+// gone. cleanTaskArtifacts still walks, because its basename patterns can match
+// at any depth; this one has nothing to search for.
 func (d *Daemon) cleanManagedTaskArtifacts(taskDir string) (removed int, bytes int64, perPattern map[string]int) {
-	return d.cleanTaskArtifactsMatching(taskDir, newArtifactMatcher(nil, execenv.ManagedReclaimableArtifactSubpaths()))
+	perPattern = map[string]int{}
+	if taskDir == "" {
+		return
+	}
+	absRoot, err := filepath.Abs(taskDir)
+	if err != nil {
+		return
+	}
+	for _, subpath := range execenv.ManagedReclaimableArtifactSubpaths() {
+		rel, ok := safeRelativePath(subpath)
+		if !ok {
+			continue
+		}
+		target, ok := managedArtifactTarget(absRoot, rel)
+		if !ok {
+			continue
+		}
+		size := dirSize(target)
+		if rmErr := os.RemoveAll(target); rmErr != nil {
+			d.logger.Warn("gc: artifact remove failed", "path", target, "error", rmErr)
+			continue
+		}
+		removed++
+		bytes += size
+		perPattern[managedArtifactPatternPrefix+filepath.ToSlash(rel)]++
+		d.logger.Info("gc: artifact removed", "path", target, "bytes", size)
+	}
+	return
+}
+
+// managedArtifactTarget resolves one managed relative subpath under absRoot to
+// an absolute path that is safe to remove, reporting false when there is
+// nothing to reclaim.
+//
+// The tree walk this replaces refused to descend through symlinks and Windows
+// junctions: the per-task codex-home links the user's real skills, Codex
+// session store and plugin cache into itself, so following one would put
+// RemoveAll inside the user's home. Addressing the path directly means every
+// component between absRoot and the leaf has to be re-checked, not just the
+// leaf. See linkedDirModes.
+//
+// Containment needs no separate check: safeRelativePath has already rejected
+// absolute paths and anything that escapes upward, and filepath.Clean leaves no
+// interior "..", so joining the components one at a time cannot leave absRoot.
+func managedArtifactTarget(absRoot, rel string) (string, bool) {
+	current := absRoot
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			// Already reclaimed, never created, or unreadable — all three mean
+			// "nothing for this cycle to do".
+			return "", false
+		}
+		if info.Mode()&linkedDirModes != 0 || !info.IsDir() {
+			return "", false
+		}
+	}
+	return current, true
+}
+
+// hasManagedArtifact reports whether any managed subpath is actually present.
+// Without this the decision layer keeps returning gcActionCleanManagedArtifacts
+// for a long-lived task whose completed_at never moves again, so every cycle
+// takes an env-root reservation and logs a reclaim that removes nothing.
+func hasManagedArtifact(taskDir string) bool {
+	absRoot, err := filepath.Abs(taskDir)
+	if err != nil {
+		return false
+	}
+	for _, subpath := range execenv.ManagedReclaimableArtifactSubpaths() {
+		rel, ok := safeRelativePath(subpath)
+		if !ok {
+			continue
+		}
+		if _, ok := managedArtifactTarget(absRoot, rel); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Daemon) cleanTaskArtifactsMatching(taskDir string, matcher artifactMatcher) (removed int, bytes int64, perPattern map[string]int) {

@@ -266,6 +266,105 @@ func TestManagedArtifact_LocalDirectoryChatReclaimsSandboxBin(t *testing.T) {
 	assertKept(t, taskDir, "logs/run.log", ".gc_meta.json")
 }
 
+// Once the cache is gone, a long-lived active chat must stop re-deciding to
+// reclaim it. completed_at never moves again for a session that stays active,
+// so without a presence check the GC would take an env-root reservation and run
+// a removal pass every cycle, forever, for a directory with nothing to give.
+func TestManagedArtifact_SecondCycleIsANoOp(t *testing.T) {
+	t.Parallel()
+	chatID := "aaaaaaaa-0000-0000-0000-000000000007"
+	d := newGCTestDaemon(t, chatGCMux(chatID, "active"))
+
+	taskDir := createTaskDir(t, d.cfg.WorkspacesRoot, "ws", "repeat-chat", &execenv.GCMeta{
+		Kind:          execenv.GCKindChat,
+		ChatSessionID: chatID,
+		WorkspaceID:   "ws",
+		CompletedAt:   time.Now().Add(-24 * time.Hour),
+	})
+	writeFile(t, filepath.Join(taskDir, sandboxBinRel, "codex"), 4096)
+
+	first := d.shouldCleanTaskDir(context.Background(), taskDir)
+	if first != gcActionCleanManagedArtifacts {
+		t.Fatalf("first cycle: want gcActionCleanManagedArtifacts, got %d", first)
+	}
+	d.applyGCAction(taskDir, first, &gcStats{byPattern: map[string]int{}})
+	assertGone(t, taskDir, sandboxBinRel)
+
+	for cycle := 2; cycle <= 3; cycle++ {
+		if got := d.shouldCleanTaskDir(context.Background(), taskDir); got != gcActionSkip {
+			t.Fatalf("cycle %d: want gcActionSkip once the cache is gone, got %d", cycle, got)
+		}
+	}
+
+	// A later Codex run re-provisions the cache; the GC must notice it again.
+	writeFile(t, filepath.Join(taskDir, sandboxBinRel, "codex"), 4096)
+	if got := d.shouldCleanTaskDir(context.Background(), taskDir); got != gcActionCleanManagedArtifacts {
+		t.Fatalf("want reclaim after re-provision, got %d", got)
+	}
+}
+
+// The direct-path removal replaced a tree walk that refused to descend through
+// symlinks and junctions. It has to refuse at every component, not just the
+// leaf — codex-home links the user's real ~/.codex content into itself.
+func TestManagedArtifact_DirectRemovalDoesNotFollowLinks(t *testing.T) {
+	t.Parallel()
+	d := newGCTestDaemon(t, http.NewServeMux())
+
+	for _, tc := range []struct {
+		name     string
+		linkPath string
+	}{
+		{name: "leaf", linkPath: sandboxBinRel},
+		{name: "parent", linkPath: "codex-home"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			taskDir := t.TempDir()
+			outside := t.TempDir()
+			keepFile := filepath.Join(outside, "keep")
+			writeFile(t, keepFile, 10)
+			// Mirror the shape that makes this dangerous: the link target is
+			// the user's real ~/.codex, which has a .sandbox-bin of its own.
+			// Traversing the link would resolve the managed path onto it.
+			userSandboxBin := filepath.Join(outside, ".sandbox-bin", "user-owned")
+			writeFile(t, userSandboxBin, 10)
+
+			linkPath := filepath.Join(taskDir, filepath.FromSlash(tc.linkPath))
+			if err := os.MkdirAll(filepath.Dir(linkPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, linkPath); err != nil {
+				t.Skipf("symlink not supported: %v", err)
+			}
+
+			removed, bytes, _ := d.cleanManagedTaskArtifacts(taskDir)
+			if removed != 0 || bytes != 0 {
+				t.Fatalf("removed=%d bytes=%d, want 0 through a link", removed, bytes)
+			}
+			for _, keep := range []string{keepFile, userSandboxBin} {
+				if _, err := os.Stat(keep); err != nil {
+					t.Fatalf("link target was touched: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// A repository directory that merely shares the managed leaf name is not the
+// managed path and must survive the direct removal.
+func TestManagedArtifact_DirectRemovalIgnoresSameNamedUserDir(t *testing.T) {
+	t.Parallel()
+	d := newGCTestDaemon(t, http.NewServeMux())
+
+	taskDir := t.TempDir()
+	writeFile(t, filepath.Join(taskDir, "workdir/repo/.sandbox-bin/user-owned"), 32)
+	writeFile(t, filepath.Join(taskDir, "codex-home/auth.json"), 32)
+
+	if removed, _, _ := d.cleanManagedTaskArtifacts(taskDir); removed != 0 {
+		t.Fatalf("removed=%d, want 0 when the managed path is absent", removed)
+	}
+	assertKept(t, taskDir, "workdir/repo/.sandbox-bin/user-owned", "codex-home/auth.json")
+}
+
 // When the batch issue check cannot answer (server error, scoped token), the
 // task data stays but the regenerable cache is still reclaimed.
 func TestManagedArtifact_UnreachableIssueStillReclaimsCache(t *testing.T) {
