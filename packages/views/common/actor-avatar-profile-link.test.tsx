@@ -10,8 +10,10 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
+import { AppLink } from "../navigation/app-link";
 import { NavigationProvider } from "../navigation/context";
 import type { NavigationAdapter } from "../navigation/types";
+import { DeferredPopup } from "./deferred-popup";
 
 vi.mock("@multica/core/workspace/hooks", () => ({
   useActorName: () => ({
@@ -72,6 +74,53 @@ function renderAvatar(adapter: NavigationAdapter) {
   );
 }
 
+function PickerWrapper({ children }: { children: React.ReactNode }) {
+  const stop = (event: React.SyntheticEvent) => {
+    event.stopPropagation();
+    event.preventDefault();
+  };
+  return (
+    <div onClick={stop} onMouseDown={stop} onPointerDown={stop}>
+      {children}
+    </div>
+  );
+}
+
+function renderCardPicker({
+  adapter,
+  profileLinkOwnsClick,
+}: {
+  adapter: NavigationAdapter;
+  profileLinkOwnsClick?: boolean;
+}) {
+  return render(
+    <NavigationProvider value={adapter}>
+      <AppLink href="/acme/issues/issue-1">
+        <PickerWrapper>
+          <DeferredPopup
+            trigger={
+              <span>
+                <ActorAvatar
+                  actorType="member"
+                  actorId={MEMBER_ID}
+                  profileLinkOwnsClick={profileLinkOwnsClick}
+                />
+                <span>Change assignee</span>
+              </span>
+            }
+          >
+            {(open) => (
+              <span data-testid="mounted-picker" data-open={String(open)}>
+                Picker mounted
+              </span>
+            )}
+          </DeferredPopup>
+        </PickerWrapper>
+      </AppLink>
+    </NavigationProvider>,
+  );
+}
+
 describe("ActorAvatar profile link", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -88,25 +137,38 @@ describe("ActorAvatar profile link", () => {
     expect(open).not.toHaveBeenCalled();
   });
 
-  it("can own the click when nested inside a host control", () => {
+  it("owns and cancels the real card-link click without opening the picker", () => {
     const push = vi.fn();
-    const hostClick = vi.fn();
+    const { container } = renderCardPicker({
+      adapter: makeAdapter({ push }),
+      profileLinkOwnsClick: true,
+    });
+    const avatar = container.querySelector('[data-slot="avatar"]');
 
-    render(
-      <NavigationProvider value={makeAdapter({ push })}>
-        <button type="button" onClick={hostClick}>
-          <ActorAvatar
-            actorType="member"
-            actorId={MEMBER_ID}
-            profileLinkInControls
-          />
-        </button>
-      </NavigationProvider>,
-    );
-    fireEvent.click(screen.getByRole("link"));
-
+    expect(avatar).not.toBeNull();
+    expect(fireEvent.click(avatar!)).toBe(false);
     expect(push).toHaveBeenCalledWith(HREF);
-    expect(hostClick).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("mounted-picker")).not.toBeInTheDocument();
+  });
+
+  it("opens the deferred picker while cancelling the enclosing card link", () => {
+    const push = vi.fn();
+    renderCardPicker({ adapter: makeAdapter({ push }) });
+
+    expect(fireEvent.click(screen.getByText("Change assignee"))).toBe(false);
+    expect(screen.getByTestId("mounted-picker")).toHaveAttribute("data-open", "true");
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("yields to the picker by default without leaking native card navigation", () => {
+    const push = vi.fn();
+    const { container } = renderCardPicker({ adapter: makeAdapter({ push }) });
+    const avatar = container.querySelector('[data-slot="avatar"]');
+
+    expect(avatar).not.toBeNull();
+    expect(fireEvent.click(avatar!)).toBe(false);
+    expect(screen.getByTestId("mounted-picker")).toHaveAttribute("data-open", "true");
+    expect(push).not.toHaveBeenCalled();
   });
 
   it("uses openInNewTab for cmd/ctrl click when available (desktop)", () => {
