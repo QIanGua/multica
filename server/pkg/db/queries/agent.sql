@@ -1199,6 +1199,36 @@ SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
 WHERE id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
+-- name: SetAgentTaskBranchName :exec
+-- Records the delivered branch on a task that has already reached a terminal
+-- state. Needed for cancellation: the daemon finalizes its worktree (committing
+-- whatever the agent produced) BEFORE it learns the task was cancelled, so the
+-- branch exists but the cancel path has no result payload to carry it. Without
+-- this the branch is real and completely undiscoverable from the UI.
+--
+-- Never overwrites a name already recorded by a complete/fail callback.
+UPDATE agent_task_queue
+SET branch_name = COALESCE(branch_name, sqlc.arg('branch_name'))
+WHERE id = sqlc.arg('id');
+
+-- name: CancelAgentTaskWithReason :one
+-- Cancels a task AND records why, for cancellations the user did not ask for.
+--
+-- Plain CancelAgentTask leaves error/failure_reason NULL, which is right for a
+-- user-initiated cancel — the user knows why. A server-initiated one is the
+-- opposite: without a persisted reason the run surfaces as an unexplained
+-- "cancelled", and the only trace is a 4xx in a daemon log the user never sees.
+-- Retrying cannot help either (the task is refused for a durable reason), so
+-- this is a terminal state that has to carry its own explanation.
+UPDATE agent_task_queue
+SET status = 'cancelled',
+    completed_at = now(),
+    error = sqlc.arg('error'),
+    failure_reason = sqlc.arg('failure_reason'),
+    prepare_lease_expires_at = NULL
+WHERE id = sqlc.arg('id') AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING *;
+
 -- name: CancelQueuedAgentTask :one
 -- Queue editing is a compare-and-set: never cancel a task that the daemon
 -- promoted between the user's click and this statement.

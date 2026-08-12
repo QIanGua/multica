@@ -4903,11 +4903,15 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// Check if we were cancelled by the polling goroutine.
 	select {
 	case <-cancelledByPoll:
-		taskLog.Info("task cancelled during execution, discarding result")
+		taskLog.Info("task cancelled during execution, discarding result",
+			"branch_name", result.BranchName)
 		// runner.run has returned, so the transcript flush is complete —
 		// tell the server it can settle its deferred chat finalization
 		// (#5219). Best-effort: the sweeper grace period covers a lost ack.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID); ackErr != nil {
+		// The branch rides along because the worktree was already finalized
+		// before this check: the partial work is committed either way, and the
+		// only question is whether the user can find it.
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, result.BranchName); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
@@ -4941,10 +4945,12 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// anyway. Reuse shouldInterruptAgent so this guard honors the same
 	// signals as the in-flight watcher.
 	if status, err := d.client.GetTaskStatus(ctx, task.ID); shouldInterruptAgent(status, err) {
-		taskLog.Info("task cancelled during execution, discarding result", "status", status, "error", err)
+		taskLog.Info("task cancelled during execution, discarding result",
+			"status", status, "error", err, "branch_name", result.BranchName)
 		// Same contract as the poll-cancelled path above: the transcript is
-		// flushed, so let the server settle its deferred chat finalization.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID); ackErr != nil {
+		// flushed, so let the server settle its deferred chat finalization, and
+		// carry the finalized branch so cancelled work stays discoverable.
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, result.BranchName); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
@@ -5228,10 +5234,14 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		// "agent_error" coarse bucket.
 		fallbackErrMsg := fmt.Sprintf("complete task failed: %s", err.Error())
 		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:                  terminalTaskReportFail,
-			taskID:                taskID,
-			errorMessage:          fallbackErrMsg,
-			sessionID:             result.SessionID,
+			kind:         terminalTaskReportFail,
+			taskID:       taskID,
+			errorMessage: fallbackErrMsg,
+			// The agent succeeded here — only the server's complete callback was
+			// rejected. Its branch is real and already committed, so it must
+			// survive the downgrade to a failure report.
+			branchName: result.BranchName,
+			sessionID:  result.SessionID,
 			workDir:               result.WorkDir,
 			failureReason:         taskfailure.Classify(fallbackErrMsg).String(),
 			sessionRolloutMissing: result.SessionRolloutMissing,

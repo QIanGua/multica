@@ -80,6 +80,10 @@ What the agent sees, and what you get back:
 
 Because the worktree lives in the runtime's workspace directory, it is reclaimed on the normal cleanup schedule; only the branch persists in your repo.
 
+<Callout type="warn">
+**Self-hosted operators:** isolation for this mode is enforced by the server (at save time and again when a runtime claims each task), so a runtime downgraded at any point is caught. The combination that is *not* caught is rolling the server back to a build that predates this feature while runtimes below the minimum are still connected — an old server has no gate, and an old runtime ignores `execution_mode` and would run the task in place. Do not roll the server back past this release while `worktree` resources exist unless every runtime on those machines is up to date.
+</Callout>
+
 <Callout type="info">
 Worktree mode covers git repositories. A plain non-git directory still runs serially — that is what `in_place` is for.
 </Callout>

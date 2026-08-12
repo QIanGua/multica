@@ -2706,9 +2706,18 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		)
 		// Cancel rather than leave it dispatched: the resource is pinned to this
 		// daemon, so redelivery would hand it straight back to the same too-old
-		// runtime forever. A cancelled task with a reason is something the user
-		// can act on; a task that silently re-queues is not.
-		if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+		// runtime forever.
+		//
+		// Cancel WITH the reason persisted on the row. The 4xx below only
+		// reaches the daemon's log, and the batch-claim path drops the task from
+		// its response entirely — so without this the user is left with a task
+		// that says "cancelled" and nothing else, for a condition only they can
+		// fix (update the app on that machine).
+		if _, cerr := h.Queries.CancelAgentTaskWithReason(r.Context(), db.CancelAgentTaskWithReasonParams{
+			ID:            task.ID,
+			Error:         pgtype.Text{String: reason, Valid: true},
+			FailureReason: pgtype.Text{String: "local_directory_error", Valid: true},
+		}); cerr != nil {
 			slog.Error("task claim: cancel after worktree version gate failed",
 				"task_id", uuidToString(task.ID), "error", cerr)
 		}
@@ -3230,10 +3239,14 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 			"failure_reason", taskfailure.ReasonAgentContextOverflow,
 		)
 		h.failTask(w, r, taskID, workspaceID, TaskFailRequest{
-			Error:                 req.Output,
-			FailureReason:         string(taskfailure.ReasonAgentContextOverflow),
-			SessionID:             req.SessionID,
-			WorkDir:               req.WorkDir,
+			Error:         req.Output,
+			FailureReason: string(taskfailure.ReasonAgentContextOverflow),
+			SessionID:     req.SessionID,
+			WorkDir:       req.WorkDir,
+			// Carry the branch across the reroute. The run still delivered one:
+			// it ran out of context, it did not fail to produce anything, and
+			// dropping the name here would hide the work it did commit.
+			BranchName:            req.BranchName,
 			SessionRolloutMissing: req.SessionRolloutMissing,
 			RetiredSessionID:      req.RetiredSessionID,
 		})
@@ -4031,11 +4044,33 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 // task cancellation and finished flushing the transcript. Settles the chat
 // finalization that CancelTaskWithResult deferred for a started-but-empty
 // transcript (#5219); idempotent when nothing was deferred.
+// TaskCancelAckRequest is the body of the daemon's cancel acknowledgement.
+type TaskCancelAckRequest struct {
+	// BranchName: a cancelled worktree task has already committed whatever the
+	// agent produced — the worktree is finalized before the daemon learns of
+	// the cancellation. The rest of the result is discarded on this path, so
+	// this is the only channel that can report where the work went.
+	BranchName string `json:"branch_name,omitempty"`
+}
+
 func (h *Handler) AckTaskCancelled(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
 	if !ok {
 		return
+	}
+	// Body is optional: older daemons send `{}`, and a decode failure must not
+	// break the cancellation contract this endpoint exists for.
+	var req TaskCancelAckRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if strings.TrimSpace(req.BranchName) != "" {
+		if err := h.Queries.SetAgentTaskBranchName(r.Context(), db.SetAgentTaskBranchNameParams{
+			ID:         task.ID,
+			BranchName: pgtype.Text{String: req.BranchName, Valid: true},
+		}); err != nil {
+			slog.Warn("cancel ack: record branch name failed",
+				"task_id", taskID, "error", err)
+		}
 	}
 	h.TaskService.FinalizeDeferredCancelledChat(r.Context(), task.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

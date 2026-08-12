@@ -344,8 +344,16 @@ func (c *Client) MarkTaskWaitingLocalDirectory(ctx context.Context, taskID, reas
 // returns after executeAndDrain's drain wait), so the server can settle its
 // deferred chat finalization now instead of waiting out the sweeper grace
 // period (#5219). Idempotent server-side.
-func (c *Client) AckTaskCancelled(ctx context.Context, taskID string) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), map[string]any{}, nil)
+func (c *Client) AckTaskCancelled(ctx context.Context, taskID, branchName string) error {
+	body := map[string]any{}
+	// A cancelled worktree task has already finalized: its partial work is
+	// committed to a branch in the user's repo. The cancel path discards the
+	// rest of the result, so this ack is the only channel left to report where
+	// that work went — otherwise the branch exists and nothing points at it.
+	if branchName != "" {
+		body["branch_name"] = branchName
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), body, nil)
 }
 
 func (c *Client) ReportProgress(ctx context.Context, taskID, summary string, step, total int) error {
