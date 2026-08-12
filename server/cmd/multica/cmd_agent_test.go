@@ -63,6 +63,35 @@ func chdirWithDaemonTaskMarker(t *testing.T) {
 	})
 }
 
+func TestHumanLocalCommandDistinguishesPortHintFromTaskIdentity(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("MULTICA_AGENT_ID", "")
+	t.Setenv("MULTICA_TASK_ID", "")
+	t.Setenv(cli.TaskConfigRootEnv, "")
+	t.Setenv("MULTICA_DAEMON_PORT", "20032")
+
+	if err := requireHumanLocalCommand("login"); err != nil {
+		t.Fatalf("port-only host context rejected login: %v", err)
+	}
+
+	t.Setenv(cli.TaskConfigRootEnv, filepath.Join(t.TempDir(), "task-multica"))
+	if err := requireHumanLocalCommand("login"); err == nil || !strings.Contains(err.Error(), "daemon-managed task") {
+		t.Fatalf("task config root did not reject login: %v", err)
+	}
+}
+
+func TestHumanLocalCommandRejectsWorkdirTaskMarker(t *testing.T) {
+	chdirWithDaemonTaskMarker(t)
+	t.Setenv("MULTICA_AGENT_ID", "")
+	t.Setenv("MULTICA_TASK_ID", "")
+	t.Setenv(cli.TaskConfigRootEnv, "")
+	t.Setenv("MULTICA_DAEMON_PORT", "")
+
+	if err := requireHumanLocalCommand("daemon stop"); err == nil || !strings.Contains(err.Error(), "daemon-managed task") {
+		t.Fatalf("workdir task marker did not reject daemon stop: %v", err)
+	}
+}
+
 // TestNewAPIClient_WorkdirParentEscapeFailsClosed reproduces the confirmed
 // impersonation escape: a sandbox fault strips every MULTICA_* env var from
 // an agent subprocess, which then runs `multica` from the *parent* directory
@@ -467,6 +496,7 @@ func TestNewAPIClient_AgentContextRequiresTaskToken(t *testing.T) {
 }
 
 func TestNewAPIClient_DaemonPortRequiresTaskToken(t *testing.T) {
+	t.Chdir(t.TempDir())
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MULTICA_SERVER_URL", "http://127.0.0.1:8080")
 	t.Setenv("MULTICA_WORKSPACE_ID", "workspace-123")
@@ -485,6 +515,9 @@ func TestNewAPIClient_DaemonPortRequiresTaskToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mat_ token") {
 		t.Fatalf("newAPIClient() error = %q, want mat_ token guidance", err.Error())
+	}
+	if !strings.Contains(err.Error(), "MULTICA_DAEMON_PORT") || !strings.Contains(err.Error(), "remove") {
+		t.Fatalf("newAPIClient() error = %q, want stale port recovery guidance", err.Error())
 	}
 }
 
