@@ -436,7 +436,7 @@ ORDER BY t.id;
 -- =====================
 
 -- name: CreateAutopilotTask :one
--- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
 -- a task in a workspace that has just been deleted (MUL-5999).
@@ -464,7 +464,7 @@ SELECT
     sqlc.narg(originator_source),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id)
-WHERE lock_task_owner_workspaces($1, NULL, $2)
+WHERE lock_task_owner_rows($1, NULL, $2)
 RETURNING *;
 
 -- name: GetAutopilotTaskByRun :one

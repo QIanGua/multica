@@ -769,9 +769,10 @@ var errRuntimeMergeFenced = errors.New("runtime merge refused by the task-write 
 // mergeLegacyRuntime folds one legacy runtime row into the freshly registered one,
 // as a single transaction.
 //
-// Order is load-bearing. Tasks move first, because that statement carries the
-// workspace fence (lock_task_owner_workspaces) and is the only step that can tell
-// us the target workspace is being torn down. Its verdict is separate from its row
+// Order is load-bearing. The fence comes first — workspace row, then both runtime
+// rows FOR UPDATE — and tasks move next, because that statement carries the same
+// fence predicate every task write uses and is the only step that can tell us the
+// target workspace is being torn down. Its verdict is separate from its row
 // count for exactly this reason: "0 tasks reassigned" is also what a legacy runtime
 // with no history looks like, and treating a fenced refusal as success would take
 // us straight to DeleteAgentRuntime below — where agent_task_queue's
@@ -800,6 +801,26 @@ func (h *Handler) mergeLegacyRuntime(ctx context.Context, newRuntimeID, oldRunti
 	}
 	defer tx.Rollback(ctx)
 	qtx := h.Queries.WithTx(tx)
+
+	// Fence, in the same order every task write uses: workspace row first, then the
+	// owner rows. Without the FOR UPDATE on the runtimes, a concurrent enqueue
+	// against the OLD runtime slipped through after the task scan — writers hold
+	// only FOR KEY SHARE on the workspace, and so did this merge, and two KEY SHARE
+	// locks do not conflict — and DeleteAgentRuntime below then removed that
+	// brand-new task through ON DELETE CASCADE.
+	runtimeIDs := []pgtype.UUID{oldRuntimeID, newRuntimeID}
+	if err := qtx.LockWorkspaceForRuntimeMerge(ctx, runtimeIDs); err != nil {
+		return fmt.Errorf("lock workspace: %w", err)
+	}
+	locked, err := qtx.LockRuntimesForMerge(ctx, runtimeIDs)
+	if err != nil {
+		return fmt.Errorf("lock runtimes: %w", err)
+	}
+	if len(locked) != len(runtimeIDs) {
+		// One of them went away while we were queueing for the lock; the fence
+		// inside the reassignment would refuse anyway.
+		return errRuntimeMergeFenced
+	}
 
 	reassignment, err := qtx.ReassignTasksToRuntime(ctx, db.ReassignTasksToRuntimeParams{
 		NewRuntimeID: newRuntimeID,

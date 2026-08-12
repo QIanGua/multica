@@ -278,7 +278,7 @@ WHERE agent_id = $1
 ORDER BY created_at DESC;
 
 -- name: CreateAgentTask :one
--- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
 -- a task in a workspace that has just been deleted (MUL-5999).
@@ -318,11 +318,11 @@ SELECT
     sqlc.narg(rerun_of_task_id),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id)
-WHERE lock_task_owner_workspaces($1, $3, $2)
+WHERE lock_task_owner_rows($1, $3, $2)
 RETURNING *;
 
 -- name: CreateDeferredChannelIssueTask :one
--- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
 -- a task in a workspace that has just been deleted (MUL-5999).
@@ -359,7 +359,7 @@ SELECT
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
     @fire_at
-WHERE lock_task_owner_workspaces($1, $3, $2)
+WHERE lock_task_owner_rows($1, $3, $2)
 RETURNING *;
 
 -- name: PromoteDeferredChannelIssueTask :one
@@ -384,7 +384,7 @@ WHERE id = @id
   AND originator_user_id IS NOT DISTINCT FROM sqlc.narg(expected_originator_user_id)::uuid;
 
 -- name: CreateQuickCreateTask :one
--- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
 -- a task in a workspace that has just been deleted (MUL-5999).
@@ -408,11 +408,11 @@ SELECT
     sqlc.narg(originator_source),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id)
-WHERE lock_task_owner_workspaces($1, NULL, $2)
+WHERE lock_task_owner_rows($1, NULL, $2)
 RETURNING *;
 
 -- name: CreateDeferredAgentTask :one
--- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
 -- a task in a workspace that has just been deleted (MUL-5999).
@@ -443,11 +443,11 @@ SELECT
     sqlc.narg(delegated_from_task_id),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id)
-WHERE lock_task_owner_workspaces($1, $3, $2)
+WHERE lock_task_owner_rows($1, $3, $2)
 RETURNING *;
 
 -- name: LinkTaskToIssue :exec
--- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
 -- a task in a workspace that has just been deleted (MUL-5999).
@@ -459,10 +459,10 @@ RETURNING *;
 UPDATE agent_task_queue
 SET issue_id = $2
 WHERE id = $1 AND issue_id IS NULL
-  AND lock_task_owner_workspaces(NULL, $2, NULL);
+  AND lock_task_owner_rows(NULL, $2, NULL);
 
 -- name: CreateRetryTask :one
--- Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+-- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
 -- a task in a workspace that has just been deleted (MUL-5999).
@@ -548,7 +548,7 @@ SELECT
     p.chat_input_task_id, sqlc.narg(fire_at)
 FROM agent_task_queue p
 WHERE p.id = $1
-  AND lock_task_owner_workspaces(p.agent_id, p.issue_id, p.runtime_id)
+  AND lock_task_owner_rows(p.agent_id, p.issue_id, p.runtime_id)
 RETURNING *;
 
 -- name: CancelAgentTasksByIssue :many

@@ -706,6 +706,68 @@ func (q *Queries) LockAgentRuntime(ctx context.Context, id pgtype.UUID) (AgentRu
 	return i, err
 }
 
+const lockRuntimesForMerge = `-- name: LockRuntimesForMerge :many
+SELECT id FROM agent_runtime
+WHERE id = ANY($1::uuid[])
+ORDER BY id
+FOR UPDATE
+`
+
+// Step 2: the runtime rows themselves, FOR UPDATE, in id order.
+//
+// FOR UPDATE is the point. A task write's fence takes FOR KEY SHARE on the runtime
+// it references, and KEY SHARE conflicts with UPDATE but not with another KEY
+// SHARE — so while the merge held only the workspace's KEY SHARE, a concurrent
+// enqueue against the OLD runtime went straight through after the task scan and was
+// then silently removed by ON DELETE CASCADE when the old runtime was deleted.
+// Holding FOR UPDATE on both runtimes from before the scan until COMMIT means a
+// late writer either commits first (and the scan sees its task) or waits and finds
+// the runtime gone, which its fence reports as "no row written".
+//
+// Both runtimes are locked in one ordered statement so two merges running in
+// opposite directions cannot take the same pair in opposite orders.
+//
+// Returns the ids it actually locked: a caller that asked for two and got fewer
+// knows a runtime disappeared before it got there and must abandon the merge.
+func (q *Queries) LockRuntimesForMerge(ctx context.Context, runtimeIds []pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, lockRuntimesForMerge, runtimeIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockWorkspaceForRuntimeMerge = `-- name: LockWorkspaceForRuntimeMerge :exec
+SELECT 1 FROM workspace w
+WHERE w.id IN (
+    SELECT r.workspace_id FROM agent_runtime r WHERE r.id = ANY($1::uuid[])
+)
+ORDER BY w.id
+FOR KEY SHARE
+`
+
+// Step 1 of the legacy runtime merge's fence, and the same first step every task
+// write takes (lock_task_owner_rows, migration 284): the workspace row, FOR KEY
+// SHARE. Taking it here rather than relying on the fence inside the reassignment
+// keeps the merge's lock order identical to the writers' — workspaces before owner
+// rows — so the two can never hold each other's next lock (MUL-5999).
+func (q *Queries) LockWorkspaceForRuntimeMerge(ctx context.Context, runtimeIds []pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockWorkspaceForRuntimeMerge, runtimeIds)
+	return err
+}
+
 const markAgentRuntimeOnline = `-- name: MarkAgentRuntimeOnline :one
 UPDATE agent_runtime
 SET status = 'online', last_seen_at = now(), updated_at = now()
@@ -825,7 +887,7 @@ WITH fence AS MATERIALIZED (
     -- Once per statement rather than once per row: the predicate is VOLATILE, so
     -- calling it from the WHERE clause of a bulk UPDATE would re-run it for every
     -- candidate row.
-    SELECT lock_task_owner_workspaces(NULL, NULL, $1) AS ok
+    SELECT lock_task_owner_rows(NULL, NULL, $1) AS ok
 ),
 reassigned AS (
     UPDATE agent_task_queue
@@ -849,7 +911,7 @@ type ReassignTasksToRuntimeRow struct {
 	ReassignedTasks int64 `json:"reassigned_tasks"`
 }
 
-// Fenced against workspace teardown: lock_task_owner_workspaces (migration 284)
+// Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 // locks the owners' workspace rows in the writer's own transaction and returns
 // false once they are gone, so this statement writes no row instead of stranding
 // a task in a workspace that has just been deleted (MUL-5999).

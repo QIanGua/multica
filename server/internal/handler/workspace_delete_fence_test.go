@@ -63,7 +63,7 @@ SELECT EXISTS (
 
 // TestTaskOwnershipWritesCallTheFence is the guard that keeps the fence from being
 // a convention. Every statement that inserts an agent_task_queue row, or assigns
-// one of its ownership columns, has to call lock_task_owner_workspaces — a new
+// one of its ownership columns, has to call lock_task_owner_rows — a new
 // write path that forgets it would silently reopen the insert-after-sweep window
 // that MUL-5999's teardown depends on being closed.
 //
@@ -130,9 +130,9 @@ func TestTaskOwnershipWritesCallTheFence(t *testing.T) {
 				continue
 			}
 			checked++
-			if !strings.Contains(code, "lock_task_owner_workspaces(") {
+			if !strings.Contains(code, "lock_task_owner_rows(") {
 				t.Errorf("%s: %s writes agent_task_queue ownership without calling "+
-					"lock_task_owner_workspaces; that reopens the workspace-delete race "+
+					"lock_task_owner_rows; that reopens the workspace-delete race "+
 					"(see migration 284)", entry.Name(), name)
 			}
 		}
@@ -589,12 +589,153 @@ FOR EACH ROW EXECUTE FUNCTION mul5999_fail_agent_move()
 	}
 }
 
-// TestLockTaskOwnerWorkspaces_RejectsUnresolvableOwner pins the hole the review
+// TestRuntimeMerge_LateWriteToOldRuntimeIsFencedNotCascaded is the regression test
+// for the race the review reproduced: an enqueue that arrives against the OLD
+// runtime after the merge has scanned its tasks.
+//
+// Before this fix the writer was not blocked at all — writers hold FOR KEY SHARE on
+// the workspace and so did the merge, and two KEY SHARE locks do not conflict — so
+// the insert committed and was then silently removed by agent_task_queue's
+// ON DELETE CASCADE when the merge deleted the old runtime. The reviewer measured
+// exactly that: `INSERT 0 1`, then the row count going from 1 to 0.
+//
+// The merge's statement sequence is driven by hand here so it can be stopped after
+// the agent update and before the old runtime is deleted, which is where the window
+// used to be. The writer must block on the fence, and once the merge commits it must
+// come back as "no row written" — not 23503, and not a row that exists briefly and
+// then disappears.
+func TestRuntimeMerge_LateWriteToOldRuntimeIsFencedNotCascaded(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "latewrite")
+
+	var target string
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO agent_runtime (workspace_id, name, runtime_mode, provider, status, device_info, metadata, owner_id)
+VALUES ($1, 'late write merge target', 'cloud', 'delete-test', 'offline', '', '{}'::jsonb, $2)
+RETURNING id
+`, f.victimID, testUserID).Scan(&target); err != nil {
+		t.Fatalf("create merge target: %v", err)
+	}
+
+	merge, err := testHandler.TxStarter.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin merge tx: %v", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = merge.Rollback(ctx)
+		}
+	}()
+	qtx := testHandler.Queries.WithTx(merge)
+	runtimeIDs := []pgtype.UUID{parseUUID(f.victimRuntime), parseUUID(target)}
+
+	// The merge, up to the point just before the old runtime is deleted.
+	if err := qtx.LockWorkspaceForRuntimeMerge(ctx, runtimeIDs); err != nil {
+		t.Fatalf("lock workspace: %v", err)
+	}
+	locked, err := qtx.LockRuntimesForMerge(ctx, runtimeIDs)
+	if err != nil {
+		t.Fatalf("lock runtimes: %v", err)
+	}
+	if len(locked) != 2 {
+		t.Fatalf("locked %d runtimes, want 2", len(locked))
+	}
+	reassignment, err := qtx.ReassignTasksToRuntime(ctx, db.ReassignTasksToRuntimeParams{
+		NewRuntimeID: parseUUID(target),
+		OldRuntimeID: parseUUID(f.victimRuntime),
+	})
+	if err != nil {
+		t.Fatalf("reassign tasks: %v", err)
+	}
+	if !reassignment.FenceOk {
+		t.Fatal("the merge's own fence refused a live target")
+	}
+	if _, err := qtx.ReassignAgentsToRuntime(ctx, db.ReassignAgentsToRuntimeParams{
+		NewRuntimeID: parseUUID(target),
+		OldRuntimeID: parseUUID(f.victimRuntime),
+	}); err != nil {
+		t.Fatalf("reassign agents: %v", err)
+	}
+
+	// A concurrent enqueue that still believes in the old runtime.
+	var wg sync.WaitGroup
+	var writerErr error
+	writerPID := make(chan int32, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bg := context.Background()
+		conn, err := testPool.Acquire(bg)
+		if err != nil {
+			writerErr = err
+			close(writerPID)
+			return
+		}
+		defer conn.Release()
+		var pid int32
+		if err := conn.QueryRow(bg, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			writerErr = err
+			close(writerPID)
+			return
+		}
+		writerPID <- pid
+		writerErr = enqueueViaRealQuery(bg, db.New(conn), f.victimAgent, f.victimRuntime, f.victimIssue)
+	}()
+
+	pid, ok := <-writerPID
+	if !ok {
+		wg.Wait()
+		t.Fatalf("writer could not start: %v", writerErr)
+	}
+	// The whole point: the writer must be parked, not sailing past the merge.
+	waitForBlockedWriter(t, ctx, pid)
+
+	if err := qtx.DeleteAgentRuntime(ctx, parseUUID(f.victimRuntime)); err != nil {
+		t.Fatalf("delete old runtime: %v", err)
+	}
+	if err := merge.Commit(ctx); err != nil {
+		t.Fatalf("commit merge: %v", err)
+	}
+	committed = true
+
+	wg.Wait()
+
+	if writerErr == nil {
+		t.Fatal("the late enqueue landed against a runtime the merge was deleting; " +
+			"it would have been removed by ON DELETE CASCADE")
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(writerErr, &pgErr) && pgErr.Code == "23503" {
+		t.Fatalf("the late write was rejected by a foreign key (%s), not by the fence", pgErr.Code)
+	}
+	if !errors.Is(writerErr, pgx.ErrNoRows) {
+		t.Fatalf("writer error = %v, want pgx.ErrNoRows from the fence returning false", writerErr)
+	}
+
+	// The merge's own history survived, and nothing is pointing at the deleted runtime.
+	if !rowExists(t, "agent_task_queue", f.taskViaRuntime) {
+		t.Error("the merge lost the old runtime's task")
+	}
+	var onTarget bool
+	if err := testPool.QueryRow(ctx,
+		`SELECT runtime_id = $1 FROM agent_task_queue WHERE id = $2`, target, f.taskViaRuntime).Scan(&onTarget); err != nil {
+		t.Fatalf("read task runtime: %v", err)
+	}
+	if !onTarget {
+		t.Error("the task was not moved onto the merge target")
+	}
+}
+
+// TestLockTaskOwnerRows_RejectsUnresolvableOwner pins the hole the review
 // found in the first version of this fence: counting only the owners that still
 // resolve made a deleted owner invisible, and the statement fell through to the
 // foreign key. A reference that does not resolve must make the predicate false on
 // its own.
-func TestLockTaskOwnerWorkspaces_RejectsUnresolvableOwner(t *testing.T) {
+func TestLockTaskOwnerRows_RejectsUnresolvableOwner(t *testing.T) {
 	if testPool == nil {
 		t.Skip("database not available")
 	}
@@ -610,7 +751,7 @@ func TestLockTaskOwnerWorkspaces_RejectsUnresolvableOwner(t *testing.T) {
 	} {
 		var ok bool
 		if err := testPool.QueryRow(ctx,
-			`SELECT lock_task_owner_workspaces($1, $2, $3)`, args[0], args[1], args[2]).Scan(&ok); err != nil {
+			`SELECT lock_task_owner_rows($1, $2, $3)`, args[0], args[1], args[2]).Scan(&ok); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		if ok {
@@ -619,7 +760,7 @@ func TestLockTaskOwnerWorkspaces_RejectsUnresolvableOwner(t *testing.T) {
 	}
 
 	var ok bool
-	if err := testPool.QueryRow(ctx, `SELECT lock_task_owner_workspaces($1, $2, $3)`,
+	if err := testPool.QueryRow(ctx, `SELECT lock_task_owner_rows($1, $2, $3)`,
 		f.victimAgent, f.victimIssue, f.victimRuntime).Scan(&ok); err != nil {
 		t.Fatalf("all owners present: %v", err)
 	}
