@@ -396,3 +396,101 @@ func TestManagedArtifact_UnreachableIssueStillReclaimsCache(t *testing.T) {
 	assertGone(t, taskDir, sandboxBinRel)
 	assertKept(t, taskDir, "output/result.md", ".gc_meta.json")
 }
+
+// The managed reclaim used to share cleanTaskArtifacts' tree walk and now
+// addresses its paths directly. The two must agree on exactly what they remove
+// — this pins that equivalence against the walk, which is still live for the
+// basename patterns, so a future managed subpath or a change to either side
+// cannot silently drift them apart.
+func TestManagedArtifact_DirectRemovalMatchesTreeWalk(t *testing.T) {
+	t.Parallel()
+
+	fixtures := map[string]func(t *testing.T, dir string){
+		"managed present": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, sandboxBinRel, "codex"), 4096)
+			writeFile(t, filepath.Join(dir, "codex-home/auth.json"), 16)
+		},
+		"managed absent": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, "codex-home/auth.json"), 16)
+		},
+		"user-owned same name only": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, "workdir/repo/.sandbox-bin/keep"), 16)
+		},
+		"both managed and user-owned": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, sandboxBinRel, "codex"), 4096)
+			writeFile(t, filepath.Join(dir, "workdir/repo/.sandbox-bin/keep"), 16)
+		},
+		"nested content and .git": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, sandboxBinRel, "a/b/c/codex"), 2048)
+			writeFile(t, filepath.Join(dir, sandboxBinRel, ".git/objects/x"), 16)
+			writeFile(t, filepath.Join(dir, "workdir/repo/.git/objects/y"), 16)
+		},
+		"codex-home is a regular file": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, "codex-home"), 16)
+		},
+		"sandbox-bin is a regular file": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, sandboxBinRel), 16)
+		},
+		"leaf symlink": func(t *testing.T, dir string) {
+			outside := t.TempDir()
+			writeFile(t, filepath.Join(outside, ".sandbox-bin/x"), 16)
+			if err := os.MkdirAll(filepath.Join(dir, "codex-home"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(dir, sandboxBinRel)); err != nil {
+				t.Skipf("symlink not supported: %v", err)
+			}
+		},
+		"parent symlink": func(t *testing.T, dir string) {
+			outside := t.TempDir()
+			writeFile(t, filepath.Join(outside, ".sandbox-bin/x"), 16)
+			if err := os.Symlink(outside, filepath.Join(dir, "codex-home")); err != nil {
+				t.Skipf("symlink not supported: %v", err)
+			}
+		},
+		"empty task dir": func(t *testing.T, dir string) {},
+	}
+
+	d := newGCTestDaemon(t, http.NewServeMux())
+	walkMatcher := newArtifactMatcher(nil, execenv.ManagedReclaimableArtifactSubpaths())
+
+	for name, setup := range fixtures {
+		t.Run(name, func(t *testing.T) {
+			walked, direct := t.TempDir(), t.TempDir()
+			setup(t, walked)
+			setup(t, direct)
+
+			wRemoved, wBytes, wPattern := d.cleanTaskArtifactsMatching(walked, walkMatcher)
+			dRemoved, dBytes, dPattern := d.cleanManagedTaskArtifacts(direct)
+
+			if wRemoved != dRemoved || wBytes != dBytes || fmt.Sprint(wPattern) != fmt.Sprint(dPattern) {
+				t.Fatalf("walk=(%d,%d,%v) direct=(%d,%d,%v)", wRemoved, wBytes, wPattern, dRemoved, dBytes, dPattern)
+			}
+			if w, dd := survivingTree(t, walked), survivingTree(t, direct); fmt.Sprint(w) != fmt.Sprint(dd) {
+				t.Fatalf("survivors differ:\n walk=%v\n direct=%v", w, dd)
+			}
+		})
+	}
+}
+
+// survivingTree lists every path left under root, relative to it, without
+// following links out of the tree.
+func survivingTree(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	_ = filepath.WalkDir(root, func(p string, e os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return nil
+		}
+		out = append(out, rel)
+		if e.Type()&os.ModeSymlink != 0 {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return out
+}
