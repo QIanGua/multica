@@ -416,10 +416,43 @@ func requireTaskLocalConfigRoot() error {
 // set up, or operate the human-owned local daemon/profile. Task API commands
 // remain available with the injected mat_ token; these local commands do not.
 func requireHumanLocalCommand(command string) error {
-	if inDaemonTaskIdentityContext() {
-		return fmt.Errorf("%s is not available inside a daemon-managed task", command)
+	if !inDaemonTaskIdentityContext() {
+		return nil
 	}
-	return nil
+	// A workdir marker with no task identity in the environment is the one
+	// signal that can outlive the task that wrote it: a local_directory run
+	// that never cleaned up leaves it in the user's own repository, where it
+	// disables every command below this function for that whole directory tree
+	// until someone deletes the file by hand (MUL-6132). Try to retire it
+	// automatically, and when that cannot be proven safe, at least name it —
+	// the bare message below sends the user to the source to find out which
+	// file to remove. Mirrors newAPIClient's leftover-marker handling.
+	if markerPath := leftoverDaemonTaskMarkerPath(); markerPath != "" {
+		if healStaleDaemonTaskMarker(markerPath) {
+			fmt.Fprintf(os.Stderr, "multica: removed a stale daemon task marker at %s (no daemon-managed task is running)\n", markerPath)
+			return nil
+		}
+		return fmt.Errorf("%s is not available inside a daemon-managed task; detected a daemon task marker at %s — if you are not running inside an agent task this is likely a leftover, remove it and retry", command, markerPath)
+	}
+	return fmt.Errorf("%s is not available inside a daemon-managed task", command)
+}
+
+// leftoverDaemonTaskMarkerPath returns the workdir marker path when a marker is
+// the ONLY reason the CLI considers itself inside a daemon-managed task, and ""
+// otherwise.
+//
+// Any MULTICA_* task identity in the environment means the daemon really did
+// launch this process, so the marker is doing its job and neither the message
+// nor the self-heal below applies. MULTICA_DAEMON_PORT is treated the same way
+// even though it is not sufficient on its own for identity: it still says a
+// daemon environment is present, which is not a leftover's fingerprint.
+func leftoverDaemonTaskMarkerPath() string {
+	if inAgentExecutionContext() ||
+		strings.TrimSpace(os.Getenv(cli.TaskConfigRootEnv)) != "" ||
+		strings.TrimSpace(os.Getenv("MULTICA_DAEMON_PORT")) != "" {
+		return ""
+	}
+	return daemonTaskContextMarkerPath()
 }
 
 func hasDaemonTaskContextMarker() bool {
