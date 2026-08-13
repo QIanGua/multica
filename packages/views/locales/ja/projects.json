@@ -133,7 +133,8 @@
     "mode_badge_worktree": "並行",
     "mode_badge_worktree_tooltip": "タスクはそれぞれの git ワークツリーで同時に実行され、ブランチとして成果を返します。作業コピーは変更されません。",
     "toast_local_mode_updated": "実行モードを更新しました",
-    "toast_local_mode_update_failed": "実行モードを更新できませんでした"
+    "toast_local_mode_update_failed": "実行モードを更新できませんでした",
+    "mode_badge_in_place": "直接"
   },
   "delete_dialog": {
     "title": "プロジェクトを削除",
