@@ -22,6 +22,9 @@ import type {
   CreateBillingCheckoutSessionResponse,
   CreateBillingPortalSessionResponse,
   WorkspaceSubscriptionEntitlements,
+  WorkspaceSubscriptionSummary,
+  WorkspaceSubscriptionPrice,
+  WorkspaceSubscriptionPrices,
   CreateWorkspaceSubscriptionCheckoutResponse,
   WorkspaceSubscriptionSeatReconcileResult,
   CreateWorkspaceSubscriptionPortalResponse,
@@ -2162,27 +2165,44 @@ export const EMPTY_CREATE_BILLING_PORTAL_SESSION_RESPONSE: CreateBillingPortalSe
 };
 
 // ---------------------------------------------------------------------------
-// Workspace subscription schemas (/api/cloud-subscriptions/*)
+// Workspace subscriptions (`/api/cloud-subscriptions/*`)
 //
-// Malformed snapshots fall back to null, never a synthetic Free plan. An
-// unavailable or newer upstream contract must not visually downgrade a paid
-// workspace. The transforms also keep snake_case at the wire boundary.
+// These schemas are the compatibility boundary with multica-cloud. Three rules
+// hold for all of them:
+//
+//  1. There is no fallback value. Callers get `null` on any parse failure and
+//     must render "unavailable" — never a synthetic Free plan, because that
+//     turns an upstream outage or an older cloud into a silent downgrade of a
+//     paying workspace.
+//  2. `.loose()` keeps unknown keys, so a cloud that adds fields does not break
+//     an older client.
+//  3. `plan` and `status` stay open strings. A new plan or Stripe status must
+//     surface as unknown rather than be coerced into a known one.
 
+const WorkspaceSubscriptionIntervalSchema = z.enum(["month", "year"]);
+
+// Stripe hosts Checkout and Portal, so those URLs leave the app. `z.string()
+// .url()` is not enough on its own — `new URL("javascript:...")` parses — and
+// the caller hands this value to location.assign, so the scheme is pinned here.
 const StripeHostedURLSchema = z.string().url().refine(
   (value) => value.startsWith("https://"),
   { message: "Stripe hosted URL must use HTTPS" },
 );
+
 
 export const WorkspaceSubscriptionEntitlementsSchema = z
   .object({
     workspace_id: z.string(),
     plan: z.string(),
     status: z.string(),
+    // Cloud documents seats as >= 1, but accepting 0 costs nothing and keeps a
+    // workspace that momentarily reports no human members readable instead of
+    // failing the whole snapshot.
     seats: z.number().int().nonnegative(),
     issue_window: z.number().int().nonnegative().nullable(),
     autopilot_runs: z.number().int().nonnegative().nullable(),
     current_period_end: z.string().nullable().optional(),
-    snapshot_expires_at: z.string().nullable(),
+    snapshot_expires_at: z.string().nullable().optional(),
     version: z.number().int().nonnegative(),
   })
   .loose()
@@ -2195,8 +2215,73 @@ export const WorkspaceSubscriptionEntitlementsSchema = z
       issueWindow: value.issue_window,
       autopilotRuns: value.autopilot_runs,
       currentPeriodEnd: value.current_period_end ?? null,
-      snapshotExpiresAt: value.snapshot_expires_at,
+      snapshotExpiresAt: value.snapshot_expires_at ?? null,
       version: value.version,
+    }),
+  );
+
+export const WorkspaceSubscriptionSummarySchema = z
+  .object({
+    entitlement: WorkspaceSubscriptionEntitlementsSchema,
+    billing_interval: WorkspaceSubscriptionIntervalSchema.nullable().optional(),
+    actual_seats: z.number().int().nonnegative(),
+    billed_seats: z.number().int().nonnegative().nullable().optional(),
+    pending_seat_quantity: z.number().int().nonnegative().nullable().optional(),
+    cancel_at_period_end: z.boolean().optional(),
+    grace_until: z.string().nullable().optional(),
+    has_stripe_customer: z.boolean().optional(),
+  })
+  .loose()
+  .transform(
+    (value): WorkspaceSubscriptionSummary => ({
+      entitlement: value.entitlement,
+      billingInterval: value.billing_interval ?? null,
+      actualSeats: value.actual_seats,
+      billedSeats: value.billed_seats ?? null,
+      pendingSeatQuantity: value.pending_seat_quantity ?? null,
+      cancelAtPeriodEnd: value.cancel_at_period_end ?? false,
+      graceUntil: value.grace_until ?? null,
+      hasStripeCustomer: value.has_stripe_customer ?? false,
+    }),
+  );
+
+const WorkspaceSubscriptionPriceSchema = (
+  expected: "month" | "year",
+) =>
+  z
+    .object({
+      currency: z.string().min(1),
+      // Reject 0 and negatives: a free or malformed Price must read as
+      // "price unavailable", not as a real amount shown next to a purchase
+      // button.
+      unit_amount: z.number().int().positive(),
+      // Pinned to the slot it arrived in. Cloud validates this too, but a
+      // schema that accepted a yearly Price under `month` would let the UI
+      // quote a yearly amount as a monthly one — the schema is an independent
+      // boundary, so it checks the correspondence itself.
+      interval: z.literal(expected),
+      interval_count: z.number().int().positive(),
+    })
+    .loose()
+    .transform(
+      (value): WorkspaceSubscriptionPrice => ({
+        currency: value.currency,
+        unitAmount: value.unit_amount,
+        interval: value.interval,
+        intervalCount: value.interval_count,
+      }),
+    );
+
+export const WorkspaceSubscriptionPricesSchema = z
+  .object({
+    month: WorkspaceSubscriptionPriceSchema("month"),
+    year: WorkspaceSubscriptionPriceSchema("year"),
+  })
+  .loose()
+  .transform(
+    (value): WorkspaceSubscriptionPrices => ({
+      month: value.month,
+      year: value.year,
     }),
   );
 
