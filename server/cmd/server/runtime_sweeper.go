@@ -43,6 +43,9 @@ const (
 	// gauge saturates at this value rather than turning a safety signal into an
 	// unbounded recurring scan when a large task backlog exists.
 	runtimeGCBlockedScanLimit = 1000
+	// runtimeGCTickTimeout bounds the whole GC stage so lock contention cannot
+	// starve the stale-runtime and task sweeps that run before it every 30s.
+	runtimeGCTickTimeout = 15 * time.Second
 	// runtimeGCOperationTimeout prevents one contended or unhealthy runtime from
 	// stalling every later sweeper stage indefinitely.
 	runtimeGCOperationTimeout = 5 * time.Second
@@ -246,7 +249,14 @@ func filterStaleRuntimesByLiveness(ctx context.Context, candidates []db.SelectSt
 // each runtime then gets an independent transaction so one bad row cannot abort
 // the whole sweep.
 func gcRuntimes(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Queries, metrics *obsmetrics.BusinessMetrics, bus *events.Bus) {
-	countCtx, cancelCount := context.WithTimeout(ctx, runtimeGCOperationTimeout)
+	gcRuntimesWithBudget(ctx, txStarter, queries, metrics, bus, runtimeGCTickTimeout)
+}
+
+func gcRuntimesWithBudget(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Queries, metrics *obsmetrics.BusinessMetrics, bus *events.Bus, budget time.Duration) {
+	gcCtx, cancelGC := context.WithTimeout(ctx, budget)
+	defer cancelGC()
+
+	countCtx, cancelCount := context.WithTimeout(gcCtx, runtimeGCOperationTimeout)
 	blocked, err := queries.CountStaleOfflineRuntimesBlockedByTasks(countCtx, db.CountStaleOfflineRuntimesBlockedByTasksParams{
 		StaleSeconds: offlineRuntimeTTLSeconds,
 		MaxRows:      runtimeGCBlockedScanLimit,
@@ -254,7 +264,6 @@ func gcRuntimes(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Q
 	cancelCount()
 	if err != nil {
 		slog.Warn("runtime GC: failed to count task-blocked runtimes", "error", err)
-		metrics.RecordRuntimeGCFailed()
 	} else {
 		metrics.SetRuntimeGCBlocked(blocked)
 		if blocked > 0 {
@@ -263,7 +272,7 @@ func gcRuntimes(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Q
 		}
 	}
 
-	listCtx, cancelList := context.WithTimeout(ctx, runtimeGCOperationTimeout)
+	listCtx, cancelList := context.WithTimeout(gcCtx, runtimeGCOperationTimeout)
 	candidates, err := queries.ListStaleOfflineRuntimeGCCandidates(listCtx, db.ListStaleOfflineRuntimeGCCandidatesParams{
 		StaleSeconds: offlineRuntimeTTLSeconds,
 		MaxPerTick:   runtimeGCBatchSize,
@@ -280,11 +289,21 @@ func gcRuntimes(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Q
 
 	gcWorkspaces := make(map[string]bool)
 	deleted := 0
-	for _, runtimeID := range candidates {
-		runtimeCtx, cancelRuntime := context.WithTimeout(ctx, runtimeGCOperationTimeout)
+	for i, runtimeID := range candidates {
+		if gcCtx.Err() != nil {
+			slog.Info("runtime GC: tick budget exhausted",
+				"deleted", deleted, "remaining_candidates", len(candidates)-i)
+			break
+		}
+		runtimeCtx, cancelRuntime := context.WithTimeout(gcCtx, runtimeGCOperationTimeout)
 		workspaceID, didDelete, taskBlocked, err := gcRuntime(runtimeCtx, txStarter, queries, runtimeID)
 		cancelRuntime()
 		if err != nil {
+			if gcCtx.Err() != nil {
+				slog.Info("runtime GC: tick budget exhausted",
+					"deleted", deleted, "remaining_candidates", len(candidates)-i)
+				break
+			}
 			slog.Warn("runtime GC: failed to delete stale offline runtime",
 				"runtime_id", util.UUIDToString(runtimeID), "error", err)
 			metrics.RecordRuntimeGCFailed()

@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -248,7 +250,10 @@ func TestRuntimeGC_RuntimeLockRejectsConcurrentEnqueue(t *testing.T) {
 		})
 		writerDone <- err
 	}()
-	waitForRuntimeGCBlockedWriter(t, ctx, writerPID)
+	if err := waitForRuntimeGCBlockedWriter(ctx, writerPID); err != nil {
+		close(proceed)
+		t.Fatal(err)
+	}
 	close(proceed)
 
 	result := <-gcDone
@@ -265,6 +270,43 @@ func TestRuntimeGC_RuntimeLockRejectsConcurrentEnqueue(t *testing.T) {
 	if tasks != 0 {
 		t.Fatalf("concurrent enqueue created %d tasks for deleted runtime", tasks)
 	}
+}
+
+func TestRuntimeGC_TickBudgetBoundsWholeBatch(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database connection")
+	}
+	ctx := context.Background()
+	runtimeID := createRuntimeGCFixtureRuntime(t, ctx, "tick-budget")
+	starter := &blockingRuntimeGCTxStarter{}
+
+	startedAt := time.Now()
+	gcRuntimesWithBudget(ctx, starter, db.New(testPool), nil, nil, 250*time.Millisecond)
+	elapsed := time.Since(startedAt)
+
+	if got := starter.begins.Load(); got != 1 {
+		t.Fatalf("GC transactions started = %d, want 1 before the tick budget stopped the batch", got)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("GC exceeded its tick budget by too much: %s", elapsed)
+	}
+	var runtimeRows int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_runtime WHERE id = $1`, runtimeID).Scan(&runtimeRows); err != nil {
+		t.Fatalf("count budget-blocked runtime: %v", err)
+	}
+	if runtimeRows != 1 {
+		t.Fatalf("runtime rows after tick timeout = %d, want 1", runtimeRows)
+	}
+}
+
+type blockingRuntimeGCTxStarter struct {
+	begins atomic.Int32
+}
+
+func (s *blockingRuntimeGCTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	s.begins.Add(1)
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 type failRuntimeDeleteTxStarter struct {
@@ -331,8 +373,7 @@ func (row signalRuntimeLockRow) Scan(dest ...any) error {
 	return err
 }
 
-func waitForRuntimeGCBlockedWriter(t *testing.T, ctx context.Context, pid int32) {
-	t.Helper()
+func waitForRuntimeGCBlockedWriter(ctx context.Context, pid int32) error {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		var waiting bool
@@ -342,14 +383,14 @@ func waitForRuntimeGCBlockedWriter(t *testing.T, ctx context.Context, pid int32)
 				WHERE pid = $1 AND state = 'active' AND wait_event_type = 'Lock'
 			)
 		`, pid).Scan(&waiting); err != nil {
-			t.Fatalf("poll writer lock: %v", err)
+			return fmt.Errorf("poll writer lock: %w", err)
 		}
 		if waiting {
-			return
+			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("writer backend %d never blocked on the runtime GC lock", pid)
+	return fmt.Errorf("writer backend %d never blocked on the runtime GC lock", pid)
 }
 
 func createRuntimeGCFixtureRuntime(t *testing.T, ctx context.Context, suffix string) string {
