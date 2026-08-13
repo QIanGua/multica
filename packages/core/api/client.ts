@@ -185,6 +185,9 @@ import type {
   CreateBillingCheckoutSessionResponse,
   BillingCheckoutSessionStatus,
   CreateBillingPortalSessionResponse,
+  WorkspaceSubscriptionEntitlements,
+  WorkspaceSubscriptionSummary,
+  WorkspaceSubscriptionPrices,
 } from "../types";
 import type { OnboardingCompletionPath } from "../onboarding/types";
 import type {
@@ -287,6 +290,9 @@ import {
   CreateBillingCheckoutSessionResponseSchema,
   BillingCheckoutSessionStatusSchema,
   CreateBillingPortalSessionResponseSchema,
+  WorkspaceSubscriptionEntitlementsSchema,
+  WorkspaceSubscriptionSummarySchema,
+  WorkspaceSubscriptionPricesSchema,
   DingTalkInstallationSchema,
   DingTalkGroupRouteSchema,
   ListDingTalkGroupRoutesResponseSchema,
@@ -1553,6 +1559,46 @@ export class ApiClient {
       CreateBillingPortalSessionResponseSchema,
       EMPTY_CREATE_BILLING_PORTAL_SESSION_RESPONSE,
       { endpoint: "POST /api/cloud-billing/portal-sessions" },
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Workspace subscriptions — the server resolves the workspace from the
+  // authenticated request context, so no caller names one. Every method
+  // returns null rather than a placeholder when the response does not match
+  // the contract: an older cloud, a 503, or a malformed body must surface as
+  // "unavailable" and never as a downgrade to Free.
+  // ---------------------------------------------------------------------
+
+  async getWorkspaceSubscriptionEntitlements(): Promise<WorkspaceSubscriptionEntitlements | null> {
+    const raw = await this.fetch<unknown>(
+      "/api/cloud-subscriptions/entitlements",
+    );
+    return parseWithFallback<WorkspaceSubscriptionEntitlements | null>(
+      raw,
+      WorkspaceSubscriptionEntitlementsSchema,
+      null,
+      { endpoint: "GET /api/cloud-subscriptions/entitlements" },
+    );
+  }
+
+  async getWorkspaceSubscriptionSummary(): Promise<WorkspaceSubscriptionSummary | null> {
+    const raw = await this.fetch<unknown>("/api/cloud-subscriptions/summary");
+    return parseWithFallback<WorkspaceSubscriptionSummary | null>(
+      raw,
+      WorkspaceSubscriptionSummarySchema,
+      null,
+      { endpoint: "GET /api/cloud-subscriptions/summary" },
+    );
+  }
+
+  async getWorkspaceSubscriptionPrices(): Promise<WorkspaceSubscriptionPrices | null> {
+    const raw = await this.fetch<unknown>("/api/cloud-subscriptions/prices");
+    return parseWithFallback<WorkspaceSubscriptionPrices | null>(
+      raw,
+      WorkspaceSubscriptionPricesSchema,
+      null,
+      { endpoint: "GET /api/cloud-subscriptions/prices" },
     );
   }
 

@@ -71,5 +71,8 @@
     "refresh": "刷新",
     "paging": "第 {{page}} / {{totalPages}} 页 · 共 {{total}} 条",
     "date_dash": "—"
+  },
+  "return_page": {
+    "redirecting": "正在返回工作区账单页…"
   }
 }

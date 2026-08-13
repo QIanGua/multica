@@ -71,5 +71,8 @@
     "refresh": "更新",
     "paging": "{{page}} / {{totalPages}} ページ · 合計 {{total}}件",
     "date_dash": "—"
+  },
+  "return_page": {
+    "redirecting": "ワークスペースの請求ページに戻ります…"
   }
 }

@@ -71,5 +71,8 @@
     "refresh": "새로고침",
     "paging": "{{page}} / {{totalPages}} 페이지 · 총 {{total}}개",
     "date_dash": "—"
+  },
+  "return_page": {
+    "redirecting": "워크스페이스 결제 페이지로 돌아갑니다…"
   }
 }
