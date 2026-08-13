@@ -169,6 +169,7 @@ func TestBusinessMetricsRuntimeGC(t *testing.T) {
 	m.RecordRuntimeGCDeleted()
 	m.RecordRuntimeGCFailed()
 	m.SetRuntimeGCBlocked(3)
+	m.RecordRuntimeGCBlockedObservationFailed()
 
 	if got := testutil.ToFloat64(m.runtimeGCDeleted); got != 1 {
 		t.Fatalf("runtime GC deleted = %v, want 1", got)
@@ -178,6 +179,9 @@ func TestBusinessMetricsRuntimeGC(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(m.runtimeGCBlocked); got != 3 {
 		t.Fatalf("runtime GC blocked = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(m.runtimeGCBlockedObservationFailed); got != 1 {
+		t.Fatalf("runtime GC blocked observation failures = %v, want 1", got)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -250,11 +251,11 @@ func TestRuntimeGC_RuntimeLockRejectsConcurrentEnqueue(t *testing.T) {
 		})
 		writerDone <- err
 	}()
-	if err := waitForRuntimeGCBlockedWriter(ctx, writerPID); err != nil {
-		close(proceed)
-		t.Fatal(err)
-	}
+	waitErr := waitForRuntimeGCBlockedWriter(ctx, writerPID)
 	close(proceed)
+	if waitErr != nil {
+		t.Fatal(waitErr)
+	}
 
 	result := <-gcDone
 	if result.err != nil || !result.deleted || result.blocked {
@@ -281,7 +282,7 @@ func TestRuntimeGC_TickBudgetBoundsWholeBatch(t *testing.T) {
 	starter := &blockingRuntimeGCTxStarter{}
 
 	startedAt := time.Now()
-	gcRuntimesWithBudget(ctx, starter, db.New(testPool), nil, nil, 250*time.Millisecond)
+	gcRuntimesWithBudget(ctx, starter, db.New(testPool), nil, events.New(), 250*time.Millisecond)
 	elapsed := time.Since(startedAt)
 
 	if got := starter.begins.Load(); got != 1 {

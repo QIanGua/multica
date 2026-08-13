@@ -264,6 +264,7 @@ func gcRuntimesWithBudget(ctx context.Context, txStarter runtimeGCTxStarter, que
 	cancelCount()
 	if err != nil {
 		slog.Warn("runtime GC: failed to count task-blocked runtimes", "error", err)
+		metrics.RecordRuntimeGCBlockedObservationFailed()
 	} else {
 		metrics.SetRuntimeGCBlocked(blocked)
 		if blocked > 0 {
