@@ -67,15 +67,18 @@ func markerIsTaskScoped(markerPath string) bool {
 	return strings.TrimSpace(marker.AgentID) != "" || strings.TrimSpace(marker.IssueID) != ""
 }
 
-// leftoverMarkerSuffix renders the shared tail both refusal paths append when a
-// workdir marker is the only daemon signal: newAPIClient for API commands and
-// requireHumanLocalCommand for the local daemon/profile commands.
+// leftoverMarkerSuffix renders the shared tail every refusal path appends when
+// a task-scoped workdir marker is the only daemon signal:
 //
-// Both refusals have the same cause and the same remedy, so they say the same
-// thing. Keeping the wording in one place is what stops the two paths from
-// drifting again — before MUL-6132 only the API path named the file, so whether
-// a user could act on the error depended on which command they happened to run
-// first (MUL-6132 review).
+//   - newAPIClient, for API commands
+//   - requireHumanLocalCommand, for the local daemon/profile commands
+//   - requireTaskLocalConfigRoot, for config show/set and auth status
+//
+// All three refusals have the same cause and the same remedy, so they say the
+// same thing. Keeping the wording in one place is what stops them from drifting
+// again — before MUL-6132 only the API path named the file, so whether a user
+// could act on the error depended on which command they happened to run first
+// (MUL-6132 review).
 //
 // The CLI deliberately stops at naming the file rather than deleting it.
 // Removing the marker is removing a fail-closed guard, and no check the CLI can

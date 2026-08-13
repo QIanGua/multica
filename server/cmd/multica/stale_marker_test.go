@@ -77,11 +77,12 @@ func clearDaemonEnvSignals(t *testing.T) {
 	t.Setenv(cli.TaskConfigRootEnv, "")
 }
 
-// TestLeftoverMarkerReportedIdenticallyOnBothRefusalPaths is the regression test
-// for the split the MUL-6132 review found: only the API path named the marker
-// file, so whether a user could act on the refusal depended on which command
-// they happened to run first. Both paths must now point at the same file with
-// the same remedy.
+// TestLeftoverMarkerReportedIdenticallyOnEveryRefusalPath is the regression test
+// for the split the MUL-6132 reviews found: at first only the API path named the
+// marker file, and after that requireTaskLocalConfigRoot was still left out, so
+// whether a user could act on the refusal depended on which command they
+// happened to run first. All three paths must point at the same file with the
+// same remedy.
 func TestLeftoverMarkerReportedIdenticallyOnEveryRefusalPath(t *testing.T) {
 	for _, marker := range []struct{ name, body string }{
 		{name: "issue task", body: issueTaskMarker()},
