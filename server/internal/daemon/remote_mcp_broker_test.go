@@ -90,6 +90,33 @@ func TestRemoteMCPProxyRejectsUnapprovedToolWithoutCallingUpstream(t *testing.T)
 	}
 }
 
+func TestRemoteMCPProxyPreservesAcceptedNotificationStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			t.Fatalf("upstream method = %s", request.Method)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer upstream.Close()
+	endpoint, _ := url.Parse(upstream.URL)
+	proxy := &remoteMCPProxy{
+		endpoint: endpoint, client: upstream.Client(), path: "/capability",
+		semaphore: make(chan struct{}, remoteMCPMaxConcurrency),
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/capability", bytes.NewBufferString(
+		`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`,
+	))
+	response := httptest.NewRecorder()
+	proxy.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusAccepted)
+	}
+	if response.Body.Len() != 0 {
+		t.Fatalf("notification response body = %q, want empty", response.Body.String())
+	}
+}
+
 func TestRemoteMCPProxyRechecksCredentialBeforeUpstreamCall(t *testing.T) {
 	called := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))

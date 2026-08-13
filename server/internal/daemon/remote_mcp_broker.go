@@ -341,7 +341,7 @@ func (proxy *remoteMCPProxy) ServeHTTP(w http.ResponseWriter, request *http.Requ
 			w.Header().Set(header, value)
 		}
 	}
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(response.StatusCode)
 	_, _ = w.Write(responseBody)
 	resultClass = "success"
 }
