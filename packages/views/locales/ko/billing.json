@@ -121,8 +121,7 @@
     },
     "past_due": {
       "title": "결제 정보를 확인해야 합니다",
-      "description": "Pro 이용을 유지하려면 Billing Portal에서 결제 수단을 업데이트하세요.",
-      "grace_description": "Pro 이용을 유지하려면 {{date}} 전에 결제 수단을 업데이트하세요."
+      "description": "Pro 이용을 유지하려면 Billing Portal에서 결제 수단을 업데이트하세요."
     },
     "read_only": {
       "title": "결제 정보 읽기 전용",

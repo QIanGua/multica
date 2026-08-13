@@ -53,6 +53,21 @@ import {
 
 const CHECKOUT_SYNC_TIMEOUT_MS = 30_000;
 
+type WorkspaceBillingReturnResult = "success" | "cancel" | "portal";
+
+function parseReturnResult(
+  value: string | null,
+): WorkspaceBillingReturnResult | null {
+  switch (value) {
+    case "success":
+    case "cancel":
+    case "portal":
+      return value;
+    default:
+      return null;
+  }
+}
+
 function createIdempotencyKey(prefix: string, wsId: string): string {
   const suffix =
     globalThis.crypto?.randomUUID?.() ??
@@ -112,7 +127,23 @@ function BillingTabContent() {
   const currentMember = useCurrentMember(wsId);
   const canManage =
     currentMember.role === "owner" || currentMember.role === "admin";
-  const returnResult = navigation.searchParams.get("result");
+  const returnResultParam = parseReturnResult(
+    navigation.searchParams.get("result"),
+  );
+  const returnSessionId = navigation.searchParams.get("session_id");
+  const callbackKey =
+    navigation.searchParams.has("result") ||
+    navigation.searchParams.has("session_id")
+      ? `${navigation.searchParams.get("result") ?? ""}:${returnSessionId ?? ""}`
+      : null;
+  const [returnState, setReturnState] = useState<{
+    workspaceId: string | null;
+    result: WorkspaceBillingReturnResult | null;
+  }>({ workspaceId: wsId || null, result: returnResultParam });
+  const returnResult =
+    returnState.workspaceId === null || returnState.workspaceId === wsId
+      ? returnState.result
+      : null;
   const [interval, setInterval] =
     useState<WorkspaceSubscriptionInterval>("month");
   const [checkoutConfirmOpen, setCheckoutConfirmOpen] = useState(false);
@@ -129,6 +160,7 @@ function BillingTabContent() {
     key: string;
   } | null>(null);
   const portalIntentKeyRef = useRef<string | null>(null);
+  const consumedCallbackKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     checkoutIntentRef.current = null;
@@ -137,6 +169,24 @@ function BillingTabContent() {
     setActionError(null);
     setReconcileMessage(null);
   }, [wsId]);
+
+  // Consume Stripe callback params once, then remove them with replace so a
+  // refresh, copied URL, or settings-tab round trip cannot replay a banner or
+  // restart subscription polling. Keep unrelated params, especially `tab`.
+  useEffect(() => {
+    if (!callbackKey || consumedCallbackKeyRef.current === callbackKey) return;
+    consumedCallbackKeyRef.current = callbackKey;
+    setReturnState({ workspaceId: wsId || null, result: returnResultParam });
+    if (returnResultParam === "cancel") checkoutIntentRef.current = null;
+
+    const params = new URLSearchParams(navigation.searchParams);
+    params.delete("result");
+    params.delete("session_id");
+    const query = params.toString();
+    navigation.replace(
+      query ? `${navigation.pathname}?${query}` : navigation.pathname,
+    );
+  }, [callbackKey, navigation, returnResultParam, wsId]);
 
   useEffect(() => {
     if (returnResult !== "success") {
@@ -259,6 +309,11 @@ function BillingTabContent() {
     }
   };
 
+  const handleCheckoutConfirmOpenChange = (open: boolean) => {
+    setCheckoutConfirmOpen(open);
+    if (!open) checkoutIntentRef.current = null;
+  };
+
   const handlePortal = async () => {
     setActionError(null);
     const key =
@@ -353,7 +408,6 @@ function BillingTabContent() {
   }
 
   const periodEnd = formatDate(entitlements.currentPeriodEnd, locale);
-  const graceEnd = formatDate(entitlements.snapshotExpiresAt, locale);
   const isFree = entitlements.plan === "free";
   const isPro = entitlements.plan === "pro";
   const hasManagedSubscription =
@@ -424,11 +478,7 @@ function BillingTabContent() {
           <AlertCircle />
           <AlertTitle>{t(($) => $.workspace.past_due.title)}</AlertTitle>
           <AlertDescription>
-            {graceEnd
-              ? t(($) => $.workspace.past_due.grace_description, {
-                  date: graceEnd,
-                })
-              : t(($) => $.workspace.past_due.description)}
+            {t(($) => $.workspace.past_due.description)}
           </AlertDescription>
         </Alert>
       ) : null}
@@ -650,7 +700,7 @@ function BillingTabContent() {
 
       <AlertDialog
         open={checkoutConfirmOpen}
-        onOpenChange={setCheckoutConfirmOpen}
+        onOpenChange={handleCheckoutConfirmOpenChange}
       >
         <AlertDialogContent>
           <AlertDialogHeader>

@@ -121,8 +121,7 @@
     },
     "past_due": {
       "title": "Payment needs attention",
-      "description": "Open the Billing Portal to update your payment method and keep Pro access.",
-      "grace_description": "Update your payment method before {{date}} to keep Pro access."
+      "description": "Open the Billing Portal to update your payment method and keep Pro access."
     },
     "read_only": {
       "title": "Read-only billing access",

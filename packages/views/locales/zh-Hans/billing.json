@@ -121,8 +121,7 @@
     },
     "past_due": {
       "title": "付款信息需要处理",
-      "description": "打开 Billing Portal 更新付款方式，以继续使用 Pro。",
-      "grace_description": "请在 {{date}} 前更新付款方式，以继续使用 Pro。"
+      "description": "打开 Billing Portal 更新付款方式，以继续使用 Pro。"
     },
     "read_only": {
       "title": "账单只读权限",

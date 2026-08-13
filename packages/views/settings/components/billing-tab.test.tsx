@@ -1,6 +1,7 @@
-import { screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiError } from "@multica/core/api";
 import { configStore } from "@multica/core/config";
 import { BILLING_WORKSPACE_SUBSCRIPTIONS_FLAG } from "@multica/core/feature-flags";
 import { renderWithI18n } from "../../test/i18n";
@@ -60,12 +61,16 @@ vi.mock("@multica/core/permissions", () => ({
   useCurrentMember: () => ({ role: mocks.role, isLoading: false }),
 }));
 
+const navigationState = {
+  search: "tab=billing",
+  replace: vi.fn(),
+};
 vi.mock("../../navigation", () => ({
   useNavigation: () => ({
     pathname: "/acme/settings",
-    searchParams: new URLSearchParams("tab=billing"),
+    searchParams: new URLSearchParams(navigationState.search),
     push: vi.fn(),
-    replace: vi.fn(),
+    replace: navigationState.replace,
     back: vi.fn(),
     getShareableUrl: vi.fn(),
   }),
@@ -78,6 +83,7 @@ import { BillingTab } from "./billing-tab";
 describe("BillingTab", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    navigationState.search = "tab=billing";
     mocks.role = "owner";
     Object.assign(mocks.entitlements, {
       plan: "free",
@@ -181,6 +187,93 @@ describe("BillingTab", () => {
     );
   });
 
+  it("starts a new Checkout intent after explicit cancellation", async () => {
+    const user = userEvent.setup();
+    mocks.checkout
+      .mockRejectedValueOnce(new Error("network lost after submit"))
+      .mockResolvedValueOnce({
+        requestId: "request-2",
+        sessionId: "cs_test_2",
+        url: "https://checkout.stripe.com/test-session-2",
+      });
+    renderWithI18n(<BillingTab />);
+
+    await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+    await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+    await screen.findByText("Billing action failed");
+
+    await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+    await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+
+    await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(2));
+    expect(mocks.checkout.mock.calls[1]?.[0].idempotencyKey).not.toBe(
+      mocks.checkout.mock.calls[0]?.[0].idempotencyKey,
+    );
+  });
+
+  it.each([
+    [503, "Billing is temporarily unavailable. Retry in a moment."],
+    [
+      403,
+      "Your workspace role no longer allows this action. Refresh the page to see your current access.",
+    ],
+  ])("maps a %s Checkout response to actionable copy", async (status, copy) => {
+    const user = userEvent.setup();
+    mocks.checkout.mockRejectedValue(
+      new ApiError("request failed", status, "Request Failed"),
+    );
+    renderWithI18n(<BillingTab />);
+
+    await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+    await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+
+    expect(await screen.findByText(copy)).toBeInTheDocument();
+  });
+
+  it("consumes cancel callback params once while preserving the active tab", () => {
+    navigationState.search =
+      "tab=billing&result=cancel&session_id=cs_test_1&source=email";
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("Checkout canceled")).toBeInTheDocument();
+    expect(navigationState.replace).toHaveBeenCalledOnce();
+    expect(navigationState.replace).toHaveBeenCalledWith(
+      "/acme/settings?tab=billing&source=email",
+    );
+  });
+
+  it("polls after a success callback and surfaces a bounded sync timeout", () => {
+    vi.useFakeTimers();
+    navigationState.search = "tab=billing&result=success&session_id=cs_test_1";
+    try {
+      renderWithI18n(<BillingTab />);
+
+      expect(
+        screen.getByText("Activating your subscription"),
+      ).toBeInTheDocument();
+      expect(mocks.useQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ refetchInterval: 2_000 }),
+      );
+      expect(navigationState.replace).toHaveBeenCalledWith(
+        "/acme/settings?tab=billing",
+      );
+
+      act(() => vi.advanceTimersByTime(30_000));
+
+      expect(
+        screen.getByText(
+          "Payment was received, but the subscription is still syncing. Refresh this page in a moment.",
+        ),
+      ).toBeInTheDocument();
+      expect(navigationState.replace).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps plan facts visible but hides subscription mutations from members", () => {
     mocks.role = "member";
 
@@ -243,6 +336,7 @@ describe("BillingTab", () => {
     renderWithI18n(<BillingTab />);
 
     expect(screen.getByText("Payment needs attention")).toBeInTheDocument();
+    expect(screen.queryByText("Sep 1, 2026")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Manage billing" }),
     ).toBeInTheDocument();

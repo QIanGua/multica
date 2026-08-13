@@ -709,6 +709,24 @@ describe("ApiClient schema fallback", () => {
       await expect(client.getWorkspaceSubscriptionEntitlements()).resolves.toBeNull();
     });
 
+    it("accepts an empty workspace entitlement snapshot", async () => {
+      stubFetchJson({
+        workspace_id: "workspace-1",
+        plan: "free",
+        status: "inactive",
+        seats: 0,
+        issue_window: 1000,
+        autopilot_runs: 100,
+        snapshot_expires_at: null,
+        version: 0,
+      });
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.getWorkspaceSubscriptionEntitlements(),
+      ).resolves.toMatchObject({ seats: 0, plan: "free" });
+    });
+
     it("sends the Checkout idempotency key in the header and body", async () => {
       stubFetchJson(
         {

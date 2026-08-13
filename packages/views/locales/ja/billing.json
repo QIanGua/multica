@@ -121,8 +121,7 @@
     },
     "past_due": {
       "title": "お支払い方法の確認が必要です",
-      "description": "Pro を継続するには Billing Portal でお支払い方法を更新してください。",
-      "grace_description": "Pro を継続するには {{date}} までにお支払い方法を更新してください。"
+      "description": "Pro を継続するには Billing Portal でお支払い方法を更新してください。"
     },
     "read_only": {
       "title": "請求情報の閲覧のみ",

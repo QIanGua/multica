@@ -2145,7 +2145,7 @@ export const WorkspaceSubscriptionEntitlementsSchema = z
     workspace_id: z.string(),
     plan: z.string(),
     status: z.string(),
-    seats: z.number().int().positive(),
+    seats: z.number().int().nonnegative(),
     issue_window: z.number().int().nonnegative().nullable(),
     autopilot_runs: z.number().int().nonnegative().nullable(),
     current_period_end: z.string().nullable().optional(),
