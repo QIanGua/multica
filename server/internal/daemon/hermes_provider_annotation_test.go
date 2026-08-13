@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
@@ -17,55 +18,47 @@ const hermesProviderUnconfiguredError = `hermes session/new failed: session/new:
 func TestAnnotateHermesProviderUnconfigured(t *testing.T) {
 	t.Parallel()
 
-	const overlay = "/home/u/multica_workspaces/ws/abc123/hermes-home"
-	const source = "/home/u/.hermes"
-
-	t.Run("names both homes", func(t *testing.T) {
+	t.Run("explains what hermes could not", func(t *testing.T) {
 		t.Parallel()
-		got := annotateHermesProviderUnconfigured(hermesProviderUnconfiguredError, "hermes", overlay, source)
+		got := annotateHermesProviderUnconfigured(hermesProviderUnconfiguredError, "hermes", true)
 
 		// The original text has to survive: it is what the runtime actually
-		// said, and the annotation is additive context, not a replacement.
+		// said, and the hint is additive context, not a replacement.
 		if !strings.Contains(got, "No LLM provider configured") {
 			t.Errorf("the runtime's own message must be preserved, got: %s", got)
 		}
-		// Both paths, because they answer different questions: the overlay is
-		// what Hermes read, the source home is where the user's config was
-		// expected to be. Reporting only one leaves the user guessing again.
-		if !strings.Contains(got, overlay) {
-			t.Errorf("annotation must name the overlay HERMES_HOME, got: %s", got)
-		}
-		if !strings.Contains(got, source) {
-			t.Errorf("annotation must name the source home it was seeded from, got: %s", got)
-		}
-		if !strings.Contains(got, "custom_env") {
-			t.Errorf("annotation must name the actionable remedy, got: %s", got)
+		// The hint has to carry the insight Hermes' own remedy lacks — that a
+		// different home was read — and point at where the path is recorded.
+		for _, want := range []string{"HERMES_HOME", "hermes home resolved", "custom_env"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("hint must mention %q, got: %s", want, got)
+			}
 		}
 	})
 
 	t.Run("leaves unrelated failures alone", func(t *testing.T) {
 		t.Parallel()
 		cases := []struct {
-			name     string
-			errMsg   string
-			provider string
-			overlay  string
+			name         string
+			errMsg       string
+			provider     string
+			overlayBuilt bool
 		}{
 			// A different provider's error can carry similar words; the
 			// HERMES_HOME advice would be nonsense there.
-			{"other provider", hermesProviderUnconfiguredError, "codex", overlay},
+			{"other provider", hermesProviderUnconfiguredError, "codex", true},
 			// No overlay was built, so there is no seeding story to tell.
-			{"no overlay", hermesProviderUnconfiguredError, "hermes", ""},
+			{"no overlay", hermesProviderUnconfiguredError, "hermes", false},
 			// An expired or rejected credential is a different failure: the
 			// config WAS found. Widening into it would send users to the wrong
-			// fix, which is the very thing this annotation exists to stop.
-			{"auth failure", "hermes session/prompt failed: 401 invalid api key", "hermes", overlay},
-			{"empty", "", "hermes", overlay},
+			// fix, which is the very thing this hint exists to stop.
+			{"auth failure", "hermes session/prompt failed: 401 invalid api key", "hermes", true},
+			{"empty", "", "hermes", true},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
-				if got := annotateHermesProviderUnconfigured(tc.errMsg, tc.provider, tc.overlay, source); got != tc.errMsg {
+				if got := annotateHermesProviderUnconfigured(tc.errMsg, tc.provider, tc.overlayBuilt); got != tc.errMsg {
 					t.Errorf("error text must be untouched, got: %s", got)
 				}
 			})
@@ -73,41 +66,74 @@ func TestAnnotateHermesProviderUnconfigured(t *testing.T) {
 	})
 }
 
-// TestAnnotationIsClassifierRelevantHenceAnnotatedLast is why the call site
-// annotates only after every classifier has read errMsg.
+// TestAnnotationCannotChangeMachineDecisions is the guard behind keeping the
+// hint free of interpolated input.
 //
-// The annotation embeds two filesystem paths the user chose, and Classify
-// matches substrings anywhere in the text — so a directory name can satisfy a
-// rule. Rule 1 (context overflow) keys on "token" AND "limit" and is evaluated
-// before rule 2 (missing config), so a home under /srv/token-cache/limit/ is
-// enough to relabel this failure. That is not cosmetic: failure_reason drives
-// retry eligibility and resume blacklisting.
+// The annotated text does not stop at the daemon: it travels to the server as
+// the task's error, is persisted in agent_task_queue.error, and is re-scanned
+// there for the life of the row — by service.ResumeUnsafeFailure on the write
+// path and by the ILIKE/regex guards in GetLastTaskSession /
+// GetLastChatTaskSession on every later resume lookup. Those guards decide
+// whether a session pointer survives.
 //
-// The ordering is the fix. This test pins the hazard the ordering protects
-// against, so anyone tempted to annotate earlier sees the cost first.
-func TestAnnotationIsClassifierRelevantHenceAnnotatedLast(t *testing.T) {
+// So anything embedded in this text gets a vote on session recovery. Paths are
+// user-controlled (HERMES_HOME via the agent's custom_env, the overlay root via
+// MULTICA_WORKSPACES_ROOT), and a home under /srv/400-invalid_request_error/ is
+// a legal directory that would trip the poisoned-request guard on a failure
+// that has nothing to do with it. A constant hint has no such vote.
+func TestAnnotationCannotChangeMachineDecisions(t *testing.T) {
 	t.Parallel()
 
-	unannotated := taskfailure.Classify(hermesProviderUnconfiguredError)
-	if unannotated != taskfailure.ReasonAgentMissingConfig {
-		t.Fatalf("precondition: this failure should classify as missing_config, got %q", unannotated)
+	// Reasons paired with the error texts a real run reports them for.
+	cases := []struct {
+		name   string
+		errMsg string
+		reason string
+	}{
+		{"the failure this hint targets", hermesProviderUnconfiguredError, "agent_error.missing_config"},
+		{"poisoned request", `API error 400: {"type":"invalid_request_error","message":"bad image"}`, "api_invalid_request"},
+		{"auth method unresolved", "hermes session/resume failed: Could not resolve authentication method", "agent_error.unknown"},
+		{"empty assistant message", `messages.2: assistant message content must not be empty`, "agent_error.unknown"},
+		{"context overflow", "API Error: prompt is too long: 250000 tokens > 200000 maximum", "agent_error.context_overflow"},
 	}
 
-	// Ordinary paths: nothing in the annotation is classifier-relevant, so the
-	// common case would be safe even if it were classified.
-	benign := annotateHermesProviderUnconfigured(hermesProviderUnconfiguredError, "hermes",
-		"/home/u/multica_workspaces/ws/abc123/hermes-home", "/home/u/.hermes")
-	if got := taskfailure.Classify(benign); got != unannotated {
-		t.Errorf("ordinary paths should not perturb classification: %q -> %q", unannotated, got)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Annotate unconditionally — the gate is tested above; here we
+			// want the hint attached to every shape to prove it is inert.
+			annotated := tc.errMsg + hermesProviderUnconfiguredHint
 
-	// Adversarial-but-legal paths: they do perturb it. If this assertion ever
-	// starts failing, Classify's rules changed such that annotation text is no
-	// longer classifier-relevant — re-read the ordering comment at the call
-	// site before relying on that.
-	hostile := annotateHermesProviderUnconfigured(hermesProviderUnconfiguredError, "hermes",
-		"/srv/token-cache/limit/hermes-home", "/srv/token-cache/limit/.hermes")
-	if got := taskfailure.Classify(hostile); got == unannotated {
-		t.Errorf("expected annotation text to be able to perturb classification (that is why it runs last), but %q survived", got)
+			if got, want := taskfailure.Classify(annotated), taskfailure.Classify(tc.errMsg); got != want {
+				t.Errorf("hint moved the failure reason: %q -> %q", want, got)
+			}
+			if got, want := service.ResumeUnsafeFailure(tc.reason, annotated),
+				service.ResumeUnsafeFailure(tc.reason, tc.errMsg); got != want {
+				t.Errorf("hint changed resume safety: %v -> %v", want, got)
+			}
+		})
+	}
+}
+
+// TestAnnotationAvoidsPersistedRowGuards covers the one reader the test above
+// cannot execute: the SQL text guards in pkg/db/queries/agent.sql, which scan
+// agent_task_queue.error long after the daemon that wrote it is gone. Keep this
+// list in sync with GetLastTaskSession / GetLastChatTaskSession — a hint that
+// matched one of these would quietly exclude healthy sessions from resume.
+func TestAnnotationAvoidsPersistedRowGuards(t *testing.T) {
+	t.Parallel()
+
+	hint := strings.ToLower(hermesProviderUnconfiguredHint)
+	forbidden := []string{
+		"400", "invalid_request_error",
+		"image dimensions exceed max allowed size", "image.source.base64.data",
+		"could not resolve authentication method",
+		"must not be empty", "must be non-empty", "must have non-empty",
+		"non-empty content", "cannot be empty", "should not be empty",
+	}
+	for _, phrase := range forbidden {
+		if strings.Contains(hint, phrase) {
+			t.Errorf("hint contains %q, which a persisted-row resume guard matches on", phrase)
+		}
 	}
 }

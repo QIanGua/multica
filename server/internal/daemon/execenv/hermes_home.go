@@ -658,11 +658,11 @@ func writeDerivedHermesConfig(sharedHome, hermesHome string, env map[string]stri
 		// source home: the user's own config is somewhere else, and Hermes'
 		// own error ("run `hermes model`") cannot say where.
 		if fi, statErr := os.Stat(sharedHome); statErr != nil || !fi.IsDir() {
-			logger.Warn("execenv: hermes source home does not exist; this task runs WITHOUT the user's provider config or credentials",
-				"source_home", sharedHome)
+			logger.Warn("execenv: hermes source home does not exist; this task runs without file-backed provider config or credentials, though the environment may still supply them",
+				"source_home", sharedHome, "overlay_home", hermesHome)
 		} else {
-			logger.Warn("execenv: hermes source home has no config.yaml; this task runs without a configured provider unless credentials come from the environment",
-				"source_home", sharedHome)
+			logger.Warn("execenv: hermes source home has no config.yaml; this task runs without a configured provider unless the environment supplies one",
+				"source_home", sharedHome, "overlay_home", hermesHome)
 		}
 		doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}}
 		if err := setHermesExternalDirs(doc, computeHermesExternalDirs(sharedHome, nil, env)); err != nil {

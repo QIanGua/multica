@@ -6886,15 +6886,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// fact.
 			failureReason = taskfailure.Classify(errMsg).String()
 		}
-		// Strictly after every classifier above has read errMsg. The
-		// annotation embeds two filesystem paths, and Classify matches
-		// substrings anywhere in the text, so annotating earlier would let a
-		// directory name pick the failure_reason: a home under
-		// /srv/token-cache/limit/ satisfies rule 1 (context overflow), which
-		// is evaluated before rule 2 (missing config) and feeds retry
-		// eligibility and resume blacklisting. This is for the human reading
-		// the task; it must not decide where the failure is filed.
-		errMsg = annotateHermesProviderUnconfigured(errMsg, provider, env.HermesHome, hermesSourceHome)
+		// After the classifiers above have read errMsg. The hint is fixed
+		// prose chosen to match none of the resume guards (see its const), so
+		// ordering is not what makes it safe — but it keeps the machine
+		// decisions reading exactly what the runtime reported, and leaves the
+		// annotation on the outside where a future edit is visibly a change to
+		// human-facing text rather than to classifier input.
+		errMsg = annotateHermesProviderUnconfigured(errMsg, provider, env.HermesHome != "")
 		return TaskResult{
 			Status:        "blocked",
 			Comment:       errMsg,
@@ -7930,29 +7928,47 @@ func hermesLaunchArgs(customArgs []string, overlayActive bool) []string {
 	return agent.StripHermesProfileArgs(customArgs, sel)
 }
 
-// annotateHermesProviderUnconfigured appends the two Hermes homes this task
-// actually used to a "no LLM provider configured" failure.
+// hermesProviderUnconfiguredHint is appended verbatim to a "no LLM provider
+// configured" failure. It is a CONSTANT, and that is a correctness property,
+// not a style choice — see annotateHermesProviderUnconfigured.
 //
-// Hermes reports that failure against whichever HERMES_HOME it was started
-// with and tells the user to run `hermes model` — but under Multica it was
-// started with a per-task overlay, seeded from a source home the daemon
-// resolved from ITS OWN process environment. When those two disagree with
-// where the user keeps their config, the remedy Hermes names edits a file the
-// task will never read, and every attempt fails identically. That is GH #6872:
-// eight documented workarounds, none of which could have worked, because
-// nothing on the failure path named the directory being read.
+// It must stay clear of every phrase the resume guards match, because this text
+// is persisted in agent_task_queue.error and re-scanned there indefinitely:
+// service.ResumeUnsafeFailure, taskfailure.Classify, and the ILIKE/regex guards
+// in pkg/db/queries/agent.sql (GetLastTaskSession / GetLastChatTaskSession).
+// TestAnnotationCannotChangeMachineDecisions pins that.
+const hermesProviderUnconfiguredHint = " [multica] hermes did not read the HERMES_HOME your shell uses: " +
+	"this task ran against a per-task overlay, seeded from the home the daemon process resolved. " +
+	"The daemon log line \"hermes home resolved\" for this task names that source home — if your hermes " +
+	"config lives somewhere else, set HERMES_HOME in the agent's custom_env to point at it."
+
+// annotateHermesProviderUnconfigured explains a "no LLM provider configured"
+// failure that Hermes itself cannot explain.
 //
-// Text only — the caller has already classified the failure, and this
-// deliberately does not change the reason, the status, or the control flow.
-// Both values are paths the daemon itself derived, never credentials.
-func annotateHermesProviderUnconfigured(errMsg, provider, overlayHome, sourceHome string) string {
-	if provider != "hermes" || overlayHome == "" || !taskfailure.ProviderUnconfigured(errMsg) {
+// Hermes reports it against whichever HERMES_HOME it was started with and tells
+// the user to run `hermes model` — but under Multica it was started with a
+// per-task overlay, seeded from a source home the daemon resolved from ITS OWN
+// process environment. When that disagrees with where the user keeps their
+// config, the remedy Hermes names edits a file the task will never read, and
+// every attempt fails identically. That is GH #6872: eight documented
+// workarounds, none of which could have worked.
+//
+// The two paths themselves are deliberately NOT interpolated here. They are
+// user-controlled (HERMES_HOME comes from the agent's custom_env, the overlay
+// root from MULTICA_WORKSPACES_ROOT), and this string is persisted as the
+// task's error text, which the resume guards keep matching against for the life
+// of the row. A source home under /srv/400-invalid_request_error/ would trip
+// ResumeUnsafeFailure and the SQL guard, dropping a healthy session pointer —
+// a directory name must never decide whether a session can be resumed. So the
+// hint is fixed prose and names the log line that does carry the paths.
+//
+// Text only: the caller has already classified the failure, and this changes no
+// reason, status, or control flow.
+func annotateHermesProviderUnconfigured(errMsg, provider string, overlayActive bool) string {
+	if provider != "hermes" || !overlayActive || !taskfailure.ProviderUnconfigured(errMsg) {
 		return errMsg
 	}
-	return fmt.Sprintf(
-		"%s [multica] hermes ran with HERMES_HOME=%s, a per-task overlay seeded from %s. "+
-			"If your hermes config lives elsewhere, point the agent at it by setting HERMES_HOME in its custom_env.",
-		errMsg, overlayHome, sourceHome)
+	return errMsg + hermesProviderUnconfiguredHint
 }
 
 func layerCustomEnvAndHermesHome(agentEnv, customEnv map[string]string, overlayHome string, logger *slog.Logger) {
