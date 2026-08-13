@@ -358,6 +358,13 @@ func canonicalJSON(raw json.RawMessage) (json.RawMessage, error) {
 
 func ToolSetDigest(tools []pluginruntime.RemoteMCPTool) (string, error) {
 	copyTools := append([]pluginruntime.RemoteMCPTool(nil), tools...)
+	for i := range copyTools {
+		canonical, err := canonicalJSON(copyTools[i].InputSchema)
+		if err != nil {
+			return "", fmt.Errorf("tool %q input schema: %w", copyTools[i].Name, err)
+		}
+		copyTools[i].InputSchema = canonical
+	}
 	sort.Slice(copyTools, func(i, j int) bool { return copyTools[i].Name < copyTools[j].Name })
 	raw, err := json.Marshal(copyTools)
 	if err != nil {

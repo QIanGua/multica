@@ -2,9 +2,13 @@ package remotemcp
 
 import (
 	"context"
+	"encoding/json"
 	"net/netip"
 	"strings"
 	"testing"
+
+	"github.com/multica-ai/multica/server/pkg/plugincontract"
+	"github.com/multica-ai/multica/server/pkg/pluginruntime"
 )
 
 type staticResolver map[string][]netip.Addr
@@ -52,5 +56,31 @@ func TestContainsProtocolVersion(t *testing.T) {
 	}
 	if containsString([]string{"2024-11-05"}, "2025-03-26") {
 		t.Fatal("undeclared protocol version was accepted")
+	}
+}
+
+func TestToolSetDigestIgnoresInputSchemaObjectKeyOrder(t *testing.T) {
+	firstSchema := json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"count":{"type":"number"}}}`)
+	secondSchema := json.RawMessage(`{"properties":{"count":{"type":"number"},"query":{"type":"string"}},"type":"object"}`)
+	canonical, err := canonicalJSON(firstSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemaDigest := plugincontract.DigestBytes(canonical)
+
+	first, err := ToolSetDigest([]pluginruntime.RemoteMCPTool{{
+		Name: "search", InputSchema: firstSchema, SchemaDigest: schemaDigest, Risk: "read",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ToolSetDigest([]pluginruntime.RemoteMCPTool{{
+		Name: "search", InputSchema: secondSchema, SchemaDigest: schemaDigest, Risk: "read",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("digest depends on input schema object key order: %s != %s", first, second)
 	}
 }
