@@ -259,11 +259,10 @@ func newAPIClient(cmd *cobra.Command) (*cli.APIClient, error) {
 		// MULTICA_TASK_ID / MULTICA_DAEMON_PORT), the likeliest cause outside a
 		// real task is a leftover marker from a crashed daemon task in a
 		// local_directory. Name the exact file so a normal user can recover
-		// instead of hitting an opaque "requires mat_ token" error.
-		if !inAgentExecutionContext() && os.Getenv("MULTICA_DAEMON_PORT") == "" {
-			if markerPath := daemonTaskContextMarkerPath(); markerPath != "" {
-				return nil, fmt.Errorf("agent execution context requires MULTICA_TOKEN to be a task-scoped mat_ token; detected a daemon task marker at %s — if you are not running inside an agent task this is likely a leftover, remove it and retry", markerPath)
-			}
+		// instead of hitting an opaque "requires mat_ token" error. Shares its
+		// wording with requireHumanLocalCommand: same cause, same remedy.
+		if markerPath := leftoverDaemonTaskMarkerPath(); markerPath != "" {
+			return nil, fmt.Errorf("agent execution context requires MULTICA_TOKEN to be a task-scoped mat_ token%s", leftoverMarkerSuffix(markerPath))
 		}
 		return nil, fmt.Errorf("agent execution context requires MULTICA_TOKEN to be a task-scoped mat_ token%s", daemonPortOnlyContextHint())
 	}
@@ -428,31 +427,9 @@ func requireHumanLocalCommand(command string) error {
 	// the bare message below sends the user to the source to find out which
 	// file to remove. Mirrors newAPIClient's leftover-marker handling.
 	if markerPath := leftoverDaemonTaskMarkerPath(); markerPath != "" {
-		if healStaleDaemonTaskMarker(markerPath) {
-			fmt.Fprintf(os.Stderr, "multica: removed a stale daemon task marker at %s (no daemon-managed task is running)\n", markerPath)
-			return nil
-		}
-		return fmt.Errorf("%s is not available inside a daemon-managed task; detected a daemon task marker at %s — if you are not running inside an agent task this is likely a leftover, remove it and retry", command, markerPath)
+		return fmt.Errorf("%s is not available inside a daemon-managed task%s", command, leftoverMarkerSuffix(markerPath))
 	}
 	return fmt.Errorf("%s is not available inside a daemon-managed task", command)
-}
-
-// leftoverDaemonTaskMarkerPath returns the workdir marker path when a marker is
-// the ONLY reason the CLI considers itself inside a daemon-managed task, and ""
-// otherwise.
-//
-// Any MULTICA_* task identity in the environment means the daemon really did
-// launch this process, so the marker is doing its job and neither the message
-// nor the self-heal below applies. MULTICA_DAEMON_PORT is treated the same way
-// even though it is not sufficient on its own for identity: it still says a
-// daemon environment is present, which is not a leftover's fingerprint.
-func leftoverDaemonTaskMarkerPath() string {
-	if inAgentExecutionContext() ||
-		strings.TrimSpace(os.Getenv(cli.TaskConfigRootEnv)) != "" ||
-		strings.TrimSpace(os.Getenv("MULTICA_DAEMON_PORT")) != "" {
-		return ""
-	}
-	return daemonTaskContextMarkerPath()
 }
 
 func hasDaemonTaskContextMarker() bool {
