@@ -1,0 +1,51 @@
+{
+  "api_version": "multica.plugin/v1",
+  "kind": "Plugin",
+  "metadata": {
+    "key": "dev.multica.exa-search",
+    "name": "Exa Search",
+    "description": "Reference Remote MCP Plugin for Exa web search and content fetching",
+    "version": "0.1.0",
+    "publisher": "multica.examples"
+  },
+  "compatibility": {
+    "host_api": ">=1.0.0 <2.0.0",
+    "required_daemon_features": [
+      "execution-manifest-v1",
+      "remote-mcp-v1"
+    ]
+  },
+  "requested_capabilities": [
+    "tool.remote-mcp.connect"
+  ],
+  "contributes": {
+    "remote_mcp": [
+      {
+        "key": "exa-search",
+        "name": "Exa Search",
+        "description": "Search the public web and fetch page content through Exa's hosted MCP server",
+        "transport": "streamable-http",
+        "protocol_versions": ["2025-03-26", "2024-11-05"],
+        "endpoint_policy": {
+          "allowed_hosts": ["mcp.exa.ai"]
+        },
+        "tool_intent": [
+          {
+            "name": "web_search_exa",
+            "description": "Search the web for a topic and return relevant content",
+            "risk": "read"
+          },
+          {
+            "name": "web_fetch_exa",
+            "description": "Fetch webpage content as clean markdown",
+            "risk": "read"
+          }
+        ],
+        "configuration_schema": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
+}

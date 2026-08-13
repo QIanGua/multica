@@ -80,4 +80,4 @@ Workspace quotas currently allow 100 private releases and 256 MiB of validated a
 - **Installation is healthy but the Skill is absent**: confirm at least one workspace or Agent Binding is enabled and that the new task matches that scope.
 - **Permission denied**: installation, update, rollback, Binding changes, and uninstall require a workspace `owner` or `admin`.
 
-Skill contributions do not include network access or Secrets. Remote MCP tools use the separate `tool.remote-mcp.v1` contribution and lifecycle described in [Remote MCP Plugins](/docs/developers/remote-mcp-plugins). V1 still does not include Git/HTTP registries, install hooks, arbitrary executable code, UI contributions, automation contributions, community distribution, publisher verification, billing, or artifact garbage collection.
+V1 does not include remote MCP, Secrets, network grants, Git/HTTP registries, install hooks, arbitrary executable code, UI contributions, automation contributions, community distribution, publisher verification, billing, or artifact garbage collection.
