@@ -154,6 +154,77 @@ describe("CreateProjectModal — local directory execution mode", () => {
     pickedIsGitRepo = true;
   });
 
+  // Preselection, not a silent default change: a git repo the runtime can
+  // actually run worktree mode on starts on parallel, because that is the mode
+  // that fits — and the user sees it selected in a control they can flip before
+  // creating anything.
+  it("preselects parallel for a git repository", async () => {
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+
+    expect(screen.getByRole("button", { name: /^Parallel$/i })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  it("preselects direct for a plain folder", async () => {
+    pickedIsGitRepo = false;
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+
+    expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument();
+  });
+
+  // A runtime that cannot run the mode must not be preselected into it, or the
+  // create call would be rejected by the server's version gate.
+  it("preselects direct when the daemon is too old, even for a git repository", async () => {
+    runtimeCliVersion = "0.1.0";
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+
+    expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument();
+  });
+
+  // Older desktop builds do not report is_git_repo. The option stays available
+  // (the daemon has the final say), but we do not guess parallel on the user's
+  // behalf without evidence.
+  it("preselects direct when the desktop build cannot report git-ness", async () => {
+    pickedIsGitRepo = undefined;
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+
+    expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument();
+    // Still selectable — unknown is permissive about what the user MAY choose.
+    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).not.toBeDisabled();
+  });
+
+  // The preselection is a starting point, not a correction: once the user says
+  // what they want, a later folder change must not silently undo it.
+  it("keeps an explicit choice when the folder changes to another git repository", async () => {
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+    await user.click(screen.getByRole("radio", { name: /Edit this folder directly/i }));
+    expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument();
+
+    // Re-pick (the mocked picker returns the same git repo).
+    await user.click(screen.getByRole("button", { name: /Change directory/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument(),
+    );
+  });
+
   // The whole point of this entry point: the mode is part of setting the
   // folder up, not something to go and change afterwards.
   it("offers the mode next to the change-directory action once a folder is picked", async () => {
@@ -162,8 +233,9 @@ describe("CreateProjectModal — local directory execution mode", () => {
 
     await pickLocalDirectory(user);
 
-    // The compact button uses the short label; the picker carries the full title.
-    expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument();
+    // The compact button uses the short label; the picker carries the full
+    // title. A git repo preselects parallel, so that is the label here.
+    expect(screen.getByRole("button", { name: /^Parallel$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Change directory/i })).toBeInTheDocument();
   });
 
