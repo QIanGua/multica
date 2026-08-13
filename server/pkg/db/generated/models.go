@@ -162,6 +162,7 @@ type AgentTaskQueue struct {
 	QuickActionsDisabled      bool        `json:"quick_actions_disabled"`
 	RegenerateQuickActionsFor pgtype.UUID `json:"regenerate_quick_actions_for"`
 	PluginExecutionManifestID pgtype.UUID `json:"plugin_execution_manifest_id"`
+	BranchName                pgtype.Text `json:"branch_name"`
 }
 
 type AgentToLabel struct {

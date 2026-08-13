@@ -4961,6 +4961,11 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// flushed, so let the server settle its deferred chat finalization, and
 		// carry the finalized branch so cancelled work stays discoverable. No
 		// error to carry here — this branch is only reached with err == nil.
+		// This fires for ANY observed terminal status; the server applies the
+		// payload only to a cancelled row (status CAS), because for
+		// completed/failed rows the complete/fail callback is the
+		// authoritative channel and a stale run's late ack must not touch
+		// them.
 		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, TaskCancelAck{BranchName: result.BranchName}); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}

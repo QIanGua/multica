@@ -2720,8 +2720,23 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		// NotifyTaskFinished waking capacity/serial waiters. A direct query
 		// leaves all of those stale.
 		if _, cerr := h.TaskService.CancelTaskWithReason(r.Context(), task.ID, reason, "local_directory_error"); cerr != nil {
-			slog.Error("task claim: cancel after worktree version gate failed",
+			// The cancel did not commit, so the row is still claimed. The
+			// daemon is about to be refused, so left alone the task would
+			// strand in dispatched until stale reclaim, with no visible
+			// reason. Requeue it instead — the next claim re-runs this gate
+			// and retries the cancel — and report a 5xx so the daemon reads
+			// this as a transient server problem, not a claim refusal.
+			slog.Error("task claim: cancel after worktree version gate failed; requeueing so the gate can run again",
 				"task_id", uuidToString(task.ID), "error", cerr)
+			if _, rerr := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); rerr != nil {
+				slog.Error("task claim: requeue after worktree-gate cancel failure failed; stale reclaim will recover it",
+					"task_id", uuidToString(task.ID), "error", rerr)
+			}
+			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, &claimBuildFailure{
+				outcome: "error_worktree_gate_cancel",
+				status:  http.StatusInternalServerError,
+				message: "failed to cancel a worktree task blocked by daemon version; task requeued",
+			}
 		}
 		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, &claimBuildFailure{
 			outcome: "error_worktree_daemon_version",
@@ -4075,7 +4090,14 @@ func (h *Handler) AckTaskCancelled(w http.ResponseWriter, r *http.Request) {
 	// fields are the only pointer to a cancelled task's work, and the daemon
 	// retries this ack on transient failures — a warn-and-200 would turn one
 	// DB blip into a permanently undiscoverable branch. Both writes never
-	// overwrite already-recorded values, so replays are idempotent.
+	// overwrite already-recorded values, so replays are idempotent — and both
+	// carry a status='cancelled' CAS, because the daemon acks on EVERY
+	// terminal status it observes: a late ack from a stale run must not stamp
+	// its branch or error onto a completed/failed row whose own callback is
+	// the authoritative channel. A CAS-refused write is a deliberate no-op
+	// (Exec reports no error), so the ack still returns 200 — there is
+	// nothing for the daemon to retry — and the rebroadcast below is guarded
+	// by the same status check inside RebroadcastCancelledTask.
 	delivered := false
 	if branch := strings.TrimSpace(req.BranchName); branch != "" {
 		if err := h.Queries.SetAgentTaskBranchName(r.Context(), db.SetAgentTaskBranchNameParams{

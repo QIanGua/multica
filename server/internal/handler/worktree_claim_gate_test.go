@@ -405,6 +405,42 @@ func TestBranchNameSurvivesEveryTerminalPath(t *testing.T) {
 			t.Errorf("error = %q after replay, want unchanged", gotErr)
 		}
 	})
+
+	// The daemon acks on EVERY terminal status it observes, so a stale run's
+	// late ack can arrive for a row that completed or failed WITHOUT a branch.
+	// Those rows' own complete/fail callbacks are the authoritative channel —
+	// the ack's status CAS must keep it from backfilling them.
+	t.Run("late cancel ack leaves a completed row untouched", func(t *testing.T) {
+		taskID := newTask(t, "running")
+		post(t, taskID, "complete", map[string]any{"output": "all done"}, testHandler.CompleteTask)
+		post(t, taskID, "cancel-ack", map[string]any{
+			"branch_name":    "agent/j/stale011",
+			"error_message":  "stale preserved-path message",
+			"failure_reason": "local_directory_error",
+		}, testHandler.AckTaskCancelled)
+		if got := readBranch(t, taskID); got != "" {
+			t.Errorf("branch_name = %q, want empty — a late ack backfilled a completed row", got)
+		}
+		gotErr, gotReason := readError(t, taskID)
+		if gotErr != "" || gotReason != "" {
+			t.Errorf("error/failure_reason = %q/%q, want both empty on a completed row", gotErr, gotReason)
+		}
+	})
+
+	t.Run("late cancel ack leaves a failed row untouched", func(t *testing.T) {
+		taskID := newTask(t, "running")
+		post(t, taskID, "fail", map[string]any{"error": "agent crashed"}, testHandler.FailTask)
+		post(t, taskID, "cancel-ack", map[string]any{
+			"branch_name": "agent/j/stale012",
+		}, testHandler.AckTaskCancelled)
+		if got := readBranch(t, taskID); got != "" {
+			t.Errorf("branch_name = %q, want empty — a late ack backfilled a failed row", got)
+		}
+		gotErr, _ := readError(t, taskID)
+		if gotErr != "agent crashed" {
+			t.Errorf("error = %q, want the fail callback's own message preserved", gotErr)
+		}
+	})
 }
 
 // The claim gate cancels the task; the reason has to land on the row. The 4xx
@@ -651,5 +687,94 @@ func TestClaimTask_WorktreeGateAllowsCurrentRuntime(t *testing.T) {
 	}
 	if status != "dispatched" {
 		t.Errorf("status = %q, want dispatched", status)
+	}
+}
+
+// injectCancelFailureForTask installs a row-scoped trigger that makes any
+// UPDATE flipping this task to 'cancelled' raise — real fault injection at the
+// layer the gate's cancel actually fails at. The requeue path (status back to
+// 'queued') passes through untouched, which is exactly the recovery the gate
+// must take.
+func injectCancelFailureForTask(t *testing.T, ctx context.Context, taskID string) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION wtgate_fail_cancel() RETURNS trigger AS $fn$
+		BEGIN
+			IF NEW.status = 'cancelled' THEN
+				RAISE EXCEPTION 'injected cancel failure';
+			END IF;
+			RETURN NEW;
+		END $fn$ LANGUAGE plpgsql
+	`); err != nil {
+		t.Fatalf("create fault function: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`CREATE TRIGGER wtgate_fail_cancel_trg BEFORE UPDATE ON agent_task_queue
+		 FOR EACH ROW WHEN (OLD.id = '`+taskID+`'::uuid) EXECUTE FUNCTION wtgate_fail_cancel()`); err != nil {
+		t.Fatalf("create fault trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DROP TRIGGER IF EXISTS wtgate_fail_cancel_trg ON agent_task_queue`)
+		testPool.Exec(ctx, `DROP FUNCTION IF EXISTS wtgate_fail_cancel`)
+	})
+}
+
+// When the gate's cancel itself fails, the claimed row must NOT strand in
+// dispatched (the daemon was refused the task, so nothing would ever run or
+// release it until stale reclaim). The gate requeues it so the next claim
+// re-runs the gate and retries the cancel.
+func TestClaimTask_WorktreeGateCancelFailureRequeuesSingular(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	const daemonID = "wtgate-cancelfail-daemon"
+	runtimeID, taskID := seedWorktreeGateClaimFixture(t, ctx, "WT gate cancelfail", daemonID, "0.4.10")
+	injectCancelFailureForTask(t, ctx, taskID)
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, daemonID)
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 (transient server problem, not a claim refusal), got %d: %s", w.Code, w.Body.String())
+	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task: %v", err)
+	}
+	if status != "queued" {
+		t.Errorf("status = %q, want queued — a stranded dispatched row waits on stale reclaim with no reason", status)
+	}
+}
+
+func TestClaimTask_WorktreeGateCancelFailureRequeuesBatch(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID, taskID := seedWorktreeGateClaimFixture(t, ctx, "WT gate cancelfail batch", batchClaimTestDaemonID, "0.4.10")
+	injectCancelFailureForTask(t, ctx, taskID)
+
+	w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 5)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch claim: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Tasks []AgentTaskResponse `json:"tasks"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tasks) != 0 {
+		t.Fatalf("blocked worktree task leaked into the batch response: %+v", resp.Tasks)
+	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task: %v", err)
+	}
+	if status != "queued" {
+		t.Errorf("status = %q, want queued after the batch gate's cancel failed", status)
 	}
 }

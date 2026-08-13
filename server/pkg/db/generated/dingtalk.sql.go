@@ -260,6 +260,9 @@ type GetDingTalkGroupRouteInWorkspaceParams struct {
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 }
 
+// Handler diagnosis deliberately uses the same active-installation boundary as
+// reassignment. Retained routes stay available for reconnect internally, but a
+// revoked installation's route is not a PATCH-visible resource.
 func (q *Queries) GetDingTalkGroupRouteInWorkspace(ctx context.Context, arg GetDingTalkGroupRouteInWorkspaceParams) (DingtalkGroupRoute, error) {
 	row := q.db.QueryRow(ctx, getDingTalkGroupRouteInWorkspace, arg.ID, arg.WorkspaceID)
 	var i DingtalkGroupRoute
@@ -420,14 +423,14 @@ const reassignDingTalkGroupRoute = `-- name: ReassignDingTalkGroupRoute :one
 WITH workspace_guard AS MATERIALIZED (
     SELECT w.id
     FROM workspace w
-    WHERE w.id = $2
+    WHERE w.id = $1
     FOR KEY SHARE
 ), target_agent AS MATERIALIZED (
     SELECT a.id
     FROM agent a
     JOIN workspace_guard w ON w.id = a.workspace_id
-    WHERE a.id = $1
-      AND a.workspace_id = $2
+    WHERE a.id = $2
+      AND a.workspace_id = $1
       AND a.kind = 'user'
       AND a.archived_at IS NULL
     FOR SHARE
@@ -436,8 +439,8 @@ WITH workspace_guard AS MATERIALIZED (
     FROM channel_installation i
     JOIN dingtalk_group_route r ON r.installation_id = i.id
     WHERE r.id = $3
-      AND r.workspace_id = $2
-      AND i.workspace_id = $2
+      AND r.workspace_id = $1
+      AND i.workspace_id = $1
       AND i.channel_type = 'dingtalk'
       AND i.status = 'active'
       AND EXISTS (SELECT 1 FROM target_agent)
@@ -447,11 +450,11 @@ WITH workspace_guard AS MATERIALIZED (
     FROM dingtalk_group_route r
     JOIN active_installation i ON i.id = r.installation_id
     WHERE r.id = $3
-      AND r.workspace_id = $2
+      AND r.workspace_id = $1
     FOR UPDATE OF r
 ), updated AS (
     UPDATE dingtalk_group_route r
-    SET agent_id = $1,
+    SET agent_id = $2,
         revision = r.revision + 1,
         updated_at = now()
     FROM target t
@@ -474,8 +477,8 @@ FROM updated
 `
 
 type ReassignDingTalkGroupRouteParams struct {
-	AgentID     pgtype.UUID `json:"agent_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	AgentID     pgtype.UUID `json:"agent_id"`
 	ID          pgtype.UUID `json:"id"`
 }
 
@@ -503,7 +506,7 @@ type ReassignDingTalkGroupRouteRow struct {
 // PATCH-first may finish before revoke, while revoke-first makes PATCH wait,
 // re-check status, and return no row without touching the route or binding.
 func (q *Queries) ReassignDingTalkGroupRoute(ctx context.Context, arg ReassignDingTalkGroupRouteParams) (ReassignDingTalkGroupRouteRow, error) {
-	row := q.db.QueryRow(ctx, reassignDingTalkGroupRoute, arg.AgentID, arg.WorkspaceID, arg.ID)
+	row := q.db.QueryRow(ctx, reassignDingTalkGroupRoute, arg.WorkspaceID, arg.AgentID, arg.ID)
 	var i ReassignDingTalkGroupRouteRow
 	err := row.Scan(
 		&i.ID,
