@@ -406,6 +406,14 @@ func requireTaskLocalConfigRoot() error {
 		return nil
 	}
 	if strings.TrimSpace(os.Getenv(cli.TaskConfigRootEnv)) == "" {
+		// The third refusal path a leftover marker can trigger, alongside
+		// newAPIClient and requireHumanLocalCommand. It has to name the file
+		// too: a user hitting this one through `config show` or `auth status`
+		// is as stuck as one hitting the others, and "which command did you
+		// happen to run first" must not decide whether the error is actionable.
+		if markerPath := leftoverDaemonTaskMarkerPath(); markerPath != "" {
+			return fmt.Errorf("daemon-managed task requires a task-local Multica config root in %s%s", cli.TaskConfigRootEnv, leftoverMarkerSuffix(markerPath))
+		}
 		return fmt.Errorf("daemon-managed task requires a task-local Multica config root in %s%s", cli.TaskConfigRootEnv, daemonPortOnlyContextHint())
 	}
 	return nil
@@ -418,14 +426,13 @@ func requireHumanLocalCommand(command string) error {
 	if !inDaemonTaskIdentityContext() {
 		return nil
 	}
-	// A workdir marker with no task identity in the environment is the one
-	// signal that can outlive the task that wrote it: a local_directory run
-	// that never cleaned up leaves it in the user's own repository, where it
+	// A task-scoped workdir marker with no task identity in the environment is
+	// the one signal that can outlive the task that wrote it: a local_directory
+	// run that never cleaned up leaves it in the user's own repository, where it
 	// disables every command below this function for that whole directory tree
-	// until someone deletes the file by hand (MUL-6132). Try to retire it
-	// automatically, and when that cannot be proven safe, at least name it —
-	// the bare message below sends the user to the source to find out which
-	// file to remove. Mirrors newAPIClient's leftover-marker handling.
+	// until someone deletes the file by hand (MUL-6132). Name it, so the user
+	// knows which file that is; the bare message below sends them to the source
+	// instead. Mirrors newAPIClient's leftover-marker handling.
 	if markerPath := leftoverDaemonTaskMarkerPath(); markerPath != "" {
 		return fmt.Errorf("%s is not available inside a daemon-managed task%s", command, leftoverMarkerSuffix(markerPath))
 	}

@@ -209,10 +209,14 @@ func skillSlugCandidate(baseSlug string, attempt int) string {
 // writeSidecarManifest persists m to {envRoot}/{sidecarManifestFile}.
 // Empty manifests are still written so a later Cleanup that finds the
 // file knows tracking was attempted (vs. an old build that predates this
-// mechanism, where the file is absent and Cleanup must no-op). Failures
-// are returned to the caller; the caller treats them as non-fatal because
-// a missed manifest only degrades local_directory cleanup, not task
-// execution.
+// mechanism, where the file is absent and Cleanup must no-op).
+//
+// Failures are returned to the caller, and how much they matter depends on
+// where the sidecars landed. For a cloud envRoot the manifest is a convenience
+// the GC can do without, so Prepare logs and continues. For an in-place
+// local_directory run it is the only record of what was written into the user's
+// own repository, so Prepare treats the failure as fatal and rolls back while
+// it still holds the in-memory manifest (MUL-6132).
 func writeSidecarManifest(envRoot string, m *sidecarManifest) error {
 	if envRoot == "" {
 		return nil

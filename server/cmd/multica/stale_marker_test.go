@@ -10,11 +10,11 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
 
-// seedDaemonTaskMarker writes a task-scoped daemon marker into a fresh temp
+// seedMarker writes a daemon marker with the given body into a fresh temp
 // directory and chdirs into a nested subdirectory, so the CLI's upward walk has
 // to find it the same way it would in a user's repository. Returns the marker
 // path.
-func seedDaemonTaskMarker(t *testing.T) string {
+func seedMarker(t *testing.T, body string) string {
 	t.Helper()
 
 	workDir := t.TempDir()
@@ -22,7 +22,6 @@ func seedDaemonTaskMarker(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
 		t.Fatalf("create marker dir: %v", err)
 	}
-	body := `{"managed_by":"` + execenv.TaskContextMarkerManagedBy + `","agent_id":"agent-1","issue_id":"issue-1"}`
 	if err := os.WriteFile(markerPath, []byte(body), 0o644); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
@@ -32,6 +31,42 @@ func seedDaemonTaskMarker(t *testing.T) string {
 	}
 	t.Chdir(nested)
 	return markerPath
+}
+
+// issueTaskMarker is the marker an issue task writes: agent and issue both set.
+func issueTaskMarker() string {
+	return `{"managed_by":"` + execenv.TaskContextMarkerManagedBy + `","agent_id":"agent-1","issue_id":"issue-1"}`
+}
+
+// chatTaskMarker is the marker a chat task writes. It has no issue, which is
+// why task identity cannot be defined as "agent_id AND issue_id".
+func chatTaskMarker() string {
+	return `{"managed_by":"` + execenv.TaskContextMarkerManagedBy + `","agent_id":"agent-1"}`
+}
+
+// workspacesRootMarker is the permanent node-wide guard: managed_by and nothing
+// else. EnsureWorkspacesRootMarker writes exactly this.
+func workspacesRootMarker() string {
+	return `{"managed_by":"` + execenv.TaskContextMarkerManagedBy + `"}`
+}
+
+func seedDaemonTaskMarker(t *testing.T) string {
+	t.Helper()
+	return seedMarker(t, issueTaskMarker())
+}
+
+// refusalPaths returns every CLI entry point that can refuse because of a
+// leftover marker, so a new one cannot be added without deciding whether it
+// reports the file.
+func refusalPaths() map[string]func() error {
+	return map[string]func() error{
+		"human-local": func() error { return requireHumanLocalCommand("daemon stop") },
+		"api": func() error {
+			_, err := newAPIClient(testCmd())
+			return err
+		},
+		"task-local-config": requireTaskLocalConfigRoot,
+	}
 }
 
 func clearDaemonEnvSignals(t *testing.T) {
@@ -47,35 +82,67 @@ func clearDaemonEnvSignals(t *testing.T) {
 // file, so whether a user could act on the refusal depended on which command
 // they happened to run first. Both paths must now point at the same file with
 // the same remedy.
-func TestLeftoverMarkerReportedIdenticallyOnBothRefusalPaths(t *testing.T) {
-	markerPath := seedDaemonTaskMarker(t)
+func TestLeftoverMarkerReportedIdenticallyOnEveryRefusalPath(t *testing.T) {
+	for _, marker := range []struct{ name, body string }{
+		{name: "issue task", body: issueTaskMarker()},
+		{name: "chat task", body: chatTaskMarker()},
+	} {
+		t.Run(marker.name, func(t *testing.T) {
+			markerPath := seedMarker(t, marker.body)
+			clearDaemonEnvSignals(t)
+			t.Setenv("MULTICA_TOKEN", "")
+			t.Setenv("MULTICA_SERVER_URL", "http://127.0.0.1:8080")
+
+			for name, refuse := range refusalPaths() {
+				err := refuse()
+				if err == nil {
+					t.Fatalf("%s: got nil error; want refusal on a leftover marker", name)
+				}
+				if !strings.Contains(err.Error(), markerPath) {
+					t.Fatalf("%s error should name the marker path %q; got %q", name, markerPath, err.Error())
+				}
+				if !strings.Contains(err.Error(), "leftover") {
+					t.Fatalf("%s error should hint it may be a leftover; got %q", name, err.Error())
+				}
+			}
+
+			// The CLI never removes the marker: taking down a fail-closed guard
+			// needs a proof the CLI cannot produce, because the daemon's active
+			// task count only rises after a claim returns.
+			if _, statErr := os.Stat(markerPath); statErr != nil {
+				t.Fatalf("CLI must not delete the marker: %v", statErr)
+			}
+		})
+	}
+}
+
+// TestWorkspacesRootMarkerNeverReportedAsLeftover is the regression test for the
+// permanent node-wide guard. It shares a filename with the per-task marker but
+// is re-created by the daemon on every start and must never expire. Telling
+// anyone to delete it — a user, or an agent subprocess that lost its
+// environment and is reading this error — closes the hole it exists to cover.
+func TestWorkspacesRootMarkerNeverReportedAsLeftover(t *testing.T) {
+	markerPath := seedMarker(t, workspacesRootMarker())
 	clearDaemonEnvSignals(t)
 	t.Setenv("MULTICA_TOKEN", "")
 	t.Setenv("MULTICA_SERVER_URL", "http://127.0.0.1:8080")
 
-	humanErr := requireHumanLocalCommand("daemon stop")
-	if humanErr == nil {
-		t.Fatal("requireHumanLocalCommand() = nil; want refusal on a leftover marker")
-	}
-	_, apiErr := newAPIClient(testCmd())
-	if apiErr == nil {
-		t.Fatal("newAPIClient() = nil error; want refusal on a leftover marker")
+	if got := leftoverDaemonTaskMarkerPath(); got != "" {
+		t.Fatalf("leftoverDaemonTaskMarkerPath() = %q; want \"\" for the workspaces root marker", got)
 	}
 
-	for name, err := range map[string]error{"human-local": humanErr, "api": apiErr} {
-		if !strings.Contains(err.Error(), markerPath) {
-			t.Fatalf("%s error should name the marker path %q; got %q", name, markerPath, err.Error())
+	for name, refuse := range refusalPaths() {
+		err := refuse()
+		if err == nil {
+			t.Fatalf("%s: got nil error; want the plain refusal to stay in place", name)
 		}
-		if !strings.Contains(err.Error(), "leftover") {
-			t.Fatalf("%s error should hint it may be a leftover; got %q", name, err.Error())
+		if strings.Contains(err.Error(), "leftover") || strings.Contains(err.Error(), "remove it") {
+			t.Fatalf("%s must not describe the workspaces root marker as removable; got %q", name, err.Error())
 		}
 	}
 
-	// The CLI never removes the marker: taking down a fail-closed guard needs a
-	// proof the CLI cannot produce, because the daemon's active task count only
-	// rises after a claim returns.
 	if _, statErr := os.Stat(markerPath); statErr != nil {
-		t.Fatalf("CLI must not delete the marker: %v", statErr)
+		t.Fatalf("workspaces root marker must survive: %v", statErr)
 	}
 }
 
