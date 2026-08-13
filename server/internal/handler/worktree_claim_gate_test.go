@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -846,4 +847,158 @@ func TestRuntimeHasCapability(t *testing.T) {
 			t.Errorf("metadata %q reported the capability as present", string(metadata))
 		}
 	}
+}
+
+func runtimeRow(daemonID string, seenAt time.Time, caps ...string) db.AgentRuntime {
+	rt := db.AgentRuntime{
+		DaemonID:   pgtype.Text{String: daemonID, Valid: daemonID != ""},
+		LastSeenAt: pgtype.Timestamptz{Time: seenAt, Valid: !seenAt.IsZero()},
+	}
+	payload := map[string]any{"cli_version": "9.9.9"}
+	if len(caps) > 0 {
+		payload["capabilities"] = caps
+	}
+	rt.Metadata, _ = json.Marshal(payload)
+	return rt
+}
+
+// Deregistering a runtime only flips the row to offline — its metadata,
+// capabilities included, survives — and ListAgentRuntimes returns every row. So
+// "any row advertised it" keeps answering yes long after the machine downgraded,
+// and the save gate and UI would keep offering a mode the claim gate then
+// refuses. Newest-seen row wins.
+func TestDaemonAdvertisesWorktreeUsesNewestRow(t *testing.T) {
+	const daemon = "daemon-a"
+	older := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+
+	t.Run("stale capable row does not rescue a downgraded daemon", func(t *testing.T) {
+		rows := []db.AgentRuntime{
+			runtimeRow(daemon, older, "local-worktree-v1"), // left behind by the old capable build
+			runtimeRow(daemon, newer),                      // what the machine runs now
+		}
+		if daemonAdvertisesWorktree(rows, daemon) {
+			t.Error("a stale capable row was allowed to vouch for a downgraded daemon")
+		}
+	})
+
+	t.Run("newest capable row wins over an older incapable one", func(t *testing.T) {
+		rows := []db.AgentRuntime{
+			runtimeRow(daemon, older),
+			runtimeRow(daemon, newer, "local-worktree-v1"), // the upgrade
+		}
+		if !daemonAdvertisesWorktree(rows, daemon) {
+			t.Error("an upgraded daemon was not recognised")
+		}
+	})
+
+	t.Run("row order does not matter", func(t *testing.T) {
+		rows := []db.AgentRuntime{
+			runtimeRow(daemon, newer),
+			runtimeRow(daemon, older, "local-worktree-v1"),
+		}
+		if daemonAdvertisesWorktree(rows, daemon) {
+			t.Error("result depended on slice order")
+		}
+	})
+
+	t.Run("a row that never reported loses to one that did", func(t *testing.T) {
+		var never time.Time
+		rows := []db.AgentRuntime{
+			runtimeRow(daemon, never, "local-worktree-v1"),
+			runtimeRow(daemon, newer),
+		}
+		if daemonAdvertisesWorktree(rows, daemon) {
+			t.Error("a never-seen row outvoted a live one")
+		}
+	})
+
+	t.Run("ignores other daemons and empty ids", func(t *testing.T) {
+		rows := []db.AgentRuntime{runtimeRow("daemon-b", newer, "local-worktree-v1")}
+		if daemonAdvertisesWorktree(rows, daemon) {
+			t.Error("another machine's row vouched for this daemon")
+		}
+		if daemonAdvertisesWorktree(rows, "") {
+			t.Error("empty daemon id matched a row")
+		}
+		if daemonAdvertisesWorktree(nil, daemon) {
+			t.Error("no rows at all reported capable")
+		}
+	})
+}
+
+// The bridge the whole gate rests on: what the daemon advertises on the
+// register request has to survive onto the runtime row, or the save gate and
+// the UI read an empty capability list and refuse a machine that is perfectly
+// capable. Drives the real DaemonRegister handler.
+func TestDaemonRegisterPersistsCapabilities(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	const daemonID = "capability-roundtrip-daemon"
+
+	register := func(t *testing.T, capabilities string) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := newDaemonTokenRequest("POST", "/api/daemon/register", map[string]any{
+			"workspace_id": testWorkspaceID,
+			"daemon_id":    daemonID,
+			"device_name":  "capability-roundtrip-device",
+			"runtimes": []map[string]any{
+				{"name": "cap-runtime", "type": "claude", "version": "1.0.0", "status": "online"},
+			},
+		}, testWorkspaceID, daemonID)
+		if capabilities != "" {
+			req.Header.Set("X-Client-Capabilities", capabilities)
+		} else {
+			req.Header.Del("X-Client-Capabilities")
+		}
+		testHandler.DaemonRegister(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("DaemonRegister: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var resp map[string]any
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		runtimes, ok := resp["runtimes"].([]any)
+		if !ok || len(runtimes) == 0 {
+			t.Fatalf("expected runtimes in response, got %v", resp)
+		}
+		id := runtimes[0].(map[string]any)["id"].(string)
+		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, id) })
+		return id
+	}
+
+	assertCapable := func(t *testing.T, runtimeID string, want bool) {
+		t.Helper()
+		var metadata []byte
+		if err := testPool.QueryRow(ctx,
+			`SELECT metadata FROM agent_runtime WHERE id = $1`, runtimeID).Scan(&metadata); err != nil {
+			t.Fatalf("read metadata: %v", err)
+		}
+		if got := runtimeHasCapability(metadata, protocol.DaemonCapabilityLocalWorktreeV1); got != want {
+			t.Errorf("capability persisted = %v, want %v (metadata: %s)", got, want, metadata)
+		}
+	}
+
+	t.Run("advertised capability lands on the row", func(t *testing.T) {
+		id := register(t, protocol.DaemonCapabilitySkillBundlesV1+","+protocol.DaemonCapabilityLocalWorktreeV1)
+		assertCapable(t, id, true)
+	})
+
+	// An older daemon sends no header at all. Re-registering must overwrite the
+	// row rather than leave a capable-looking one behind — that is precisely the
+	// downgrade the save gate has to notice.
+	t.Run("re-registering without the header clears it", func(t *testing.T) {
+		id := register(t, protocol.DaemonCapabilitySkillBundlesV1+","+protocol.DaemonCapabilityLocalWorktreeV1)
+		assertCapable(t, id, true)
+
+		again := register(t, "")
+		if again != id {
+			t.Fatalf("expected the same runtime row on re-register, got %s then %s", id, again)
+		}
+		assertCapable(t, id, false)
+	})
 }

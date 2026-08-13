@@ -196,23 +196,49 @@ func (h *Handler) requireWorktreeCapableDaemon(w http.ResponseWriter, r *http.Re
 	return false
 }
 
-// daemonAdvertisesWorktree reports whether any runtime registered by this
-// daemon advertised worktree support. Any of them is enough: they are all the
-// same binary on one machine, and a stale sibling row simply has not
-// re-registered yet.
+// daemonAdvertisesWorktree reports whether the daemon's MOST RECENTLY SEEN
+// runtime row advertised worktree support.
+//
+// Deliberately not "any row advertised it". Deregistering a runtime only flips
+// the row to offline — its metadata survives — and ListAgentRuntimes returns
+// every row. So a machine that once ran a capable daemon, then downgraded,
+// still has an old capable row sitting next to the fresh incapable one, and an
+// any-match would keep saying yes forever. Newest-wins reads the machine's
+// CURRENT binary, which is the question being asked.
+//
+// A row missing the capability is never skipped: being the newest is what makes
+// it authoritative, not whether its answer is convenient.
 func daemonAdvertisesWorktree(runtimes []db.AgentRuntime, daemonID string) bool {
 	if strings.TrimSpace(daemonID) == "" {
 		return false
 	}
-	for _, rt := range runtimes {
+	var newest *db.AgentRuntime
+	for i := range runtimes {
+		rt := &runtimes[i]
 		if !rt.DaemonID.Valid || rt.DaemonID.String != daemonID {
 			continue
 		}
-		if runtimeHasCapability(rt.Metadata, protocol.DaemonCapabilityLocalWorktreeV1) {
-			return true
+		if newest == nil || runtimeSeenAfter(rt, newest) {
+			newest = rt
 		}
 	}
-	return false
+	if newest == nil {
+		return false
+	}
+	return runtimeHasCapability(newest.Metadata, protocol.DaemonCapabilityLocalWorktreeV1)
+}
+
+// runtimeSeenAfter orders two rows of the same daemon by last_seen_at. A row
+// that never reported (NULL) sorts oldest, so a live row always wins over one
+// that never checked in.
+func runtimeSeenAfter(candidate, current *db.AgentRuntime) bool {
+	if !candidate.LastSeenAt.Valid {
+		return false
+	}
+	if !current.LastSeenAt.Valid {
+		return true
+	}
+	return candidate.LastSeenAt.Time.After(current.LastSeenAt.Time)
 }
 
 // latestDaemonCLIVersion returns the cli_version of the freshest runtime row

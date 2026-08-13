@@ -194,3 +194,41 @@ export function runtimeSupportsLocalWorktree(metadata: unknown): boolean {
   const caps = (metadata as { capabilities?: unknown }).capabilities;
   return Array.isArray(caps) && caps.includes(LOCAL_WORKTREE_CAPABILITY);
 }
+
+/** Minimal runtime shape this module needs; keeps callers from importing types. */
+type RuntimeCapabilityRow = {
+  daemon_id?: string | null;
+  last_seen_at?: string | null;
+  metadata?: unknown;
+};
+
+/**
+ * Whether the machine behind `daemonId` currently runs a daemon that supports
+ * worktree mode, judged by its MOST RECENTLY SEEN runtime row.
+ *
+ * Deliberately not "any row advertised it". Deregistering a runtime only marks
+ * the row offline — its metadata survives — so a machine that once ran a
+ * capable daemon and then downgraded still has an old capable row beside the
+ * fresh incapable one, and an any-match would answer yes forever. The server's
+ * `daemonAdvertisesWorktree` uses the same newest-wins rule; the two must agree
+ * or the UI offers a mode the API will refuse.
+ */
+export function daemonSupportsLocalWorktree(
+  runtimes: RuntimeCapabilityRow[],
+  daemonId: string | null | undefined,
+): boolean {
+  if (!daemonId) return false;
+  let newest: RuntimeCapabilityRow | undefined;
+  for (const rt of runtimes) {
+    if (rt.daemon_id !== daemonId) continue;
+    if (!newest) {
+      newest = rt;
+      continue;
+    }
+    // A row that never reported sorts oldest, so a live row always wins.
+    const candidateSeen = rt.last_seen_at ?? "";
+    const currentSeen = newest.last_seen_at ?? "";
+    if (candidateSeen > currentSeen) newest = rt;
+  }
+  return newest ? runtimeSupportsLocalWorktree(newest.metadata) : false;
+}

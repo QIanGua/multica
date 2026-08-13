@@ -29,9 +29,9 @@ import type {
 } from "@multica/core/types";
 import {
   MIN_LOCAL_WORKTREE_CLI_VERSION,
+  daemonSupportsLocalWorktree,
   readRuntimeCliVersion,
   runtimeListOptions,
-  runtimeSupportsLocalWorktree,
 } from "@multica/core/runtimes";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
@@ -140,15 +140,11 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
   // be changed from the web app or from a different device. Using the local
   // daemon here would report "too old" for every resource whenever the viewer
   // is not on that machine.
-  // Capability, not version: see runtimeSupportsLocalWorktree. Any runtime on
-  // the machine advertising it is enough — they are the same binary, and a
-  // sibling row may simply not have re-registered yet.
-  const daemonSupportsWorktree = (daemonId: string | null): boolean => {
-    if (!daemonId) return false;
-    return runtimes.some(
-      (rt) => rt.daemon_id === daemonId && runtimeSupportsLocalWorktree(rt.metadata),
-    );
-  };
+  // Capability, not version, and judged by the daemon's newest runtime row —
+  // see daemonSupportsLocalWorktree for why an any-match would keep saying yes
+  // after a downgrade.
+  const daemonSupportsWorktree = (daemonId: string | null): boolean =>
+    daemonSupportsLocalWorktree(runtimes, daemonId);
   const cliVersionForDaemon = (daemonId: string | null): string => {
     if (!daemonId) return "";
     return (
