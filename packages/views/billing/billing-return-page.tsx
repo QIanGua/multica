@@ -34,6 +34,10 @@ import { useT } from "../i18n";
  */
 
 const RESULT_VALUES = new Set(["success", "cancel", "portal"]);
+// Same shape check the rest of core uses for route UUIDs. Only a well-formed ID
+// is worth carrying anywhere, and this one can end up in a third-party OAuth
+// state on the login detour below.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function BillingReturnPage() {
   const { t } = useT("billing");
@@ -41,7 +45,9 @@ export function BillingReturnPage() {
   const user = useAuthStore((s) => s.user);
   const isAuthLoading = useAuthStore((s) => s.isLoading);
 
-  const workspaceIdParam = navigation.searchParams.get("workspace_id");
+  const workspaceIdRaw = navigation.searchParams.get("workspace_id");
+  const workspaceIdParam =
+    workspaceIdRaw && UUID_RE.test(workspaceIdRaw) ? workspaceIdRaw : null;
   const resultParam = navigation.searchParams.get("result");
   const result = resultParam && RESULT_VALUES.has(resultParam) ? resultParam : null;
 
@@ -65,13 +71,24 @@ export function BillingReturnPage() {
   useEffect(() => {
     if (isAuthLoading) return;
     // Checkout can take long enough for a session to expire, so an
-    // unauthenticated return is a normal case rather than an error. Carry this
-    // exact URL through login so the user resumes the return instead of landing
-    // on their default workspace with no idea whether the payment took.
-    // sanitizeNextUrl in the login page only accepts relative paths, so this
-    // cannot be turned into an off-site redirect.
+    // unauthenticated return is a normal case rather than an error. Carry enough
+    // to resume the return so the user does not land on their default workspace
+    // with no idea whether the payment took.
+    //
+    // Rebuilt from the two values this page actually uses, NOT forwarded whole:
+    // the login page embeds `next` verbatim in the Google OAuth `state`, so
+    // anything left in here — Stripe's `session_id`, any future cloud param —
+    // would be handed to a third party for no functional reason.
+    // sanitizeNextUrl on the login side also accepts relative paths only, so
+    // this cannot become an off-site redirect.
     if (!user) {
-      const returnTo = `${navigation.pathname}?${navigation.searchParams.toString()}`;
+      const resume = new URLSearchParams();
+      if (workspaceIdParam) resume.set("workspace_id", workspaceIdParam);
+      if (result) resume.set("result", result);
+      const query = resume.toString();
+      const returnTo = query
+        ? `${navigation.pathname}?${query}`
+        : navigation.pathname;
       navigation.replace(`${paths.login()}?next=${encodeURIComponent(returnTo)}`);
       return;
     }
@@ -92,11 +109,18 @@ export function BillingReturnPage() {
     navigation,
     result,
     user,
+    workspaceIdParam,
     workspaces,
   ]);
 
   // The workspace list is what turns an ID into a slug, so without it there is
   // no destination to send anyone to. Retrying beats an endless spinner.
+  //
+  // The copy below deliberately claims nothing about the outcome. This page
+  // cannot know it: `cancel` means the user backed out, `portal` may have been
+  // opened and closed, and even `success` only means Stripe finished — the
+  // subscription is not recorded until the webhook lands. Asserting "saved" on a
+  // payment result screen is the one thing worse than saying "check Billing".
   if (isWorkspacesError) {
     return (
       <ReturnMessage
@@ -116,9 +140,8 @@ export function BillingReturnPage() {
     );
   }
 
-  // Deleted workspace, revoked membership, or a hand-edited link. The billing
-  // change itself is already recorded server-side, so say that plainly instead
-  // of dropping the user on an unrelated workspace with no explanation.
+  // Deleted workspace, revoked membership, a missing or malformed workspace_id,
+  // or a hand-edited link.
   if (isUnresolvable) {
     return (
       <ReturnMessage

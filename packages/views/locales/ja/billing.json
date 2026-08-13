@@ -74,10 +74,10 @@
   },
   "return_page": {
     "redirecting": "ワークスペースの請求ページに戻ります…",
-    "load_failed_title": "ワークスペースを読み込めませんでした",
-    "load_failed_description": "請求の変更は保存されました。ワークスペース一覧を読み込めなかったため、該当の請求ページへ戻せませんでした。",
-    "workspace_missing_title": "このワークスペースは利用できません",
-    "workspace_missing_description": "請求の変更は保存されましたが、このワークスペースが削除されたかアクセス権が変更されたため、請求設定を開けません。",
+    "load_failed_title": "ワークスペースの請求ページを開けませんでした",
+    "load_failed_description": "Stripe から戻りましたが、ワークスペース一覧を読み込めず該当の請求ページを開けませんでした。「ワークスペース設定 → 請求」で現在の状態を確認してください。",
+    "workspace_missing_title": "ワークスペースが見つかりません",
+    "workspace_missing_description": "Stripe から戻りましたが、このワークスペースは利用できません。削除されたか、アクセス権が変更された可能性があります。対象のワークスペースの請求ページで現在の状態を確認してください。",
     "retry": "再試行",
     "go_to_app": "Multica を開く"
   }

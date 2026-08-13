@@ -74,10 +74,10 @@
   },
   "return_page": {
     "redirecting": "正在返回工作区账单页…",
-    "load_failed_title": "无法加载你的工作区",
-    "load_failed_description": "账单变更已保存。只是暂时无法加载工作区列表，因此没法把你送回对应的账单页。",
-    "workspace_missing_title": "该工作区对你已不可用",
-    "workspace_missing_description": "账单变更已保存，但该工作区已被删除或你的访问权限发生变化，因此无法打开它的账单设置。",
+    "load_failed_title": "无法打开工作区账单页",
+    "load_failed_description": "你已从 Stripe 返回，但我们无法加载工作区列表来打开对应的账单页。请到「工作区设置 → 账单」确认当前状态。",
+    "workspace_missing_title": "找不到该工作区",
+    "workspace_missing_description": "你已从 Stripe 返回，但该工作区对你已不可用——可能已被删除，或你的访问权限发生了变化。请到你预期的那个工作区的账单页确认当前状态。",
     "retry": "重试",
     "go_to_app": "前往 Multica"
   }
