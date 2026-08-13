@@ -1864,6 +1864,11 @@ func resolveResumedSessionID(requested string, response json.RawMessage) (string
 // response carrying neither shape falls back to the requested id and reports
 // landed=true, so a runtime that reports nothing keeps its previous behaviour
 // rather than declaring every turn's history lost.
+//
+// That residual blind spot is bounded on the daemon side: the resume gate only
+// hands a session id to a run whose session store actually holds a transcript
+// (sessionHomeReachable), so a silent runtime can misreport a stale session but
+// never an absent one.
 func resolveHermesResumedSessionID(requested string, response json.RawMessage) (string, bool) {
 	got := extractACPSessionID(response)
 	if got == "" {

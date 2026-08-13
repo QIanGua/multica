@@ -102,99 +102,179 @@ func hermesConversationSegment(task TaskContextForEnv) string {
 	return ""
 }
 
+// hermesSessionMount is what a mount attempt actually achieved.
+//
+// The two facts are deliberately separate. Mounted says state.db resolves to
+// the store; HistoryPresent says the store holds a database to resume. A
+// mounted-but-empty store is the normal shape of a conversation's first turn,
+// and also what a GC reclaim, a profile switch or an operator's `rm` leaves
+// behind — treating "mounted" as "resumable" would forward a session id into an
+// empty database, which is the silent restart this whole change exists to kill.
+type hermesSessionMount struct {
+	Mounted        bool
+	HistoryPresent bool
+}
+
+// hermesSessionLink creates the store link. Indirected so a test can simulate a
+// host that cannot create symlinks — the degradation path is the one that must
+// never destroy a database, so it needs coverage everywhere, not only on
+// Windows.
+var hermesSessionLink = os.Symlink
+
+// hermesSessionCopy copies one file of a migration. Indirected so a test can
+// fail the second file of the state.db family and prove the store is never left
+// holding a partially migrated conversation.
+var hermesSessionCopy = copyFile
+
 // mountHermesSessionDB points the overlay's state.db at the conversation's
-// store, so the transcript outlives the task. It reports whether the mount is
-// in place: a false with a nil error means this platform could not create the
-// link and the caller must keep the database task-local (the previous
-// behaviour) rather than run against a half-mounted store.
+// store, so the transcript outlives the task.
+//
+// The order of operations is the contract. Nothing that could destroy an
+// existing database happens until the link has actually been created (under a
+// staging name), because the alternative — migrate, delete, then discover this
+// host cannot symlink — turns a working task-local conversation into an empty
+// one on exactly the hosts the degradation path exists to protect. A false
+// Mounted with a nil error therefore means "nothing was touched; keep the
+// database task-local", which is the pre-existing behaviour.
 //
 // Idempotent across Reuse: a link already pointing at the store is left alone.
 // A real state.db left by an older daemon — or by a task that ran before this
 // conversation had a store — is migrated into an empty store rather than
 // dropped, so upgrading mid-conversation does not discard the transcript the
 // user is in the middle of.
-func mountHermesSessionDB(hermesHome, storeDir string, logger *slog.Logger) (bool, error) {
+func mountHermesSessionDB(hermesHome, storeDir string, logger *slog.Logger) (hermesSessionMount, error) {
 	dst := filepath.Join(hermesHome, hermesSessionDBEntry)
 	target := filepath.Join(storeDir, hermesSessionDBEntry)
 
 	if err := os.MkdirAll(storeDir, 0o700); err != nil {
-		return false, fmt.Errorf("create hermes session store %s: %w", storeDir, err)
+		return hermesSessionMount{}, fmt.Errorf("create hermes session store %s: %w", storeDir, err)
 	}
 
-	if fi, err := os.Lstat(dst); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			if current, rlErr := os.Readlink(dst); rlErr == nil && filepath.Clean(current) == filepath.Clean(target) {
-				touchHermesSessionStore(storeDir, logger)
-				return true, nil
-			}
-		} else if fi.Mode().IsRegular() {
-			if err := migrateHermesTaskSessionDB(hermesHome, storeDir, logger); err != nil {
-				return false, err
-			}
+	fi, err := os.Lstat(dst)
+	switch {
+	case err == nil && fi.Mode()&os.ModeSymlink != 0:
+		if current, rlErr := os.Readlink(dst); rlErr == nil && filepath.Clean(current) == filepath.Clean(target) {
+			// Already mounted (Reuse). The link can still be dangling — the GC
+			// may have reclaimed the store since the last turn — so the history
+			// question is answered from the store, never from the link.
+			touchHermesSessionStore(storeDir, logger)
+			return hermesSessionMount{Mounted: true, HistoryPresent: hermesStoreHasSessionDB(storeDir)}, nil
 		}
-		if err := removeHermesTaskSessionDB(hermesHome); err != nil {
-			return false, err
-		}
-	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("stat hermes session db %s: %w", dst, err)
+	case err != nil && !os.IsNotExist(err):
+		return hermesSessionMount{}, fmt.Errorf("stat hermes session db %s: %w", dst, err)
 	}
 
-	// A real symlink, never a copy. createFileLink falls back to copying on a
-	// Windows host that cannot symlink, and a copied SQLite database would
-	// take every write of this turn to a file the next task throws away —
-	// worse than the task-local behaviour it replaces, because it would look
-	// like it worked. Report "not mounted" instead and let the caller keep the
-	// database task-local.
-	if err := os.Symlink(target, dst); err != nil {
+	// Prove the host can link BEFORE anything destructive. A real symlink,
+	// never a copy: createFileLink falls back to copying on a Windows host that
+	// cannot symlink, and a copied SQLite database would absorb every write of
+	// this turn into a file the next task throws away — worse than staying
+	// task-local, because it looks like it worked.
+	staged := filepath.Join(hermesHome, hermesSessionLinkStagingEntry)
+	if err := os.RemoveAll(staged); err != nil {
+		return hermesSessionMount{}, fmt.Errorf("clear stale session link staging %s: %w", staged, err)
+	}
+	if err := hermesSessionLink(target, staged); err != nil {
 		logger.Warn("execenv: hermes session store not mounted; conversation history stays task-local",
 			"store", storeDir,
 			"error", err,
 		)
-		return false, nil
+		return hermesSessionMount{}, nil
+	}
+	defer os.RemoveAll(staged) // no-op once the staging link has been renamed into place
+
+	if err := migrateHermesTaskSessionDB(hermesHome, storeDir, logger); err != nil {
+		return hermesSessionMount{}, err
+	}
+	if err := removeHermesTaskSessionDB(hermesHome); err != nil {
+		return hermesSessionMount{}, err
+	}
+	// Publish the link. Fails closed: the database is already safe in the store
+	// by this point, so a rename failure means a broken filesystem, not lost
+	// history, and the task must not start against a home with no state.db path
+	// at all.
+	if err := os.Rename(staged, dst); err != nil {
+		return hermesSessionMount{}, fmt.Errorf("publish hermes session link %s: %w", dst, err)
 	}
 	// Stamp the store as just-used: mounting it does not touch its mtime, so
 	// without this the GC's idle check could reclaim a long-idle conversation
 	// right as a task picks it back up.
 	touchHermesSessionStore(storeDir, logger)
-	return true, nil
+	return hermesSessionMount{Mounted: true, HistoryPresent: hermesStoreHasSessionDB(storeDir)}, nil
+}
+
+// hermesSessionLinkStagingEntry is where the store link is created before it is
+// published over state.db. Dot-prefixed so isHermesTaskLocalStateEntry does not
+// match it and the family cleanup cannot remove the link it is about to
+// publish.
+const hermesSessionLinkStagingEntry = ".multica-session-link"
+
+// hermesStoreHasSessionDB reports whether storeDir holds a session database
+// with content. A zero-length file is what SQLite leaves after an `open` that
+// never wrote a page, and resuming against it is the same amnesia as an absent
+// one — so it counts as no history, not as history.
+func hermesStoreHasSessionDB(storeDir string) bool {
+	fi, err := os.Stat(filepath.Join(storeDir, hermesSessionDBEntry))
+	return err == nil && fi.Mode().IsRegular() && fi.Size() > 0
 }
 
 // migrateHermesTaskSessionDB carries a task-local state.db into an empty store
 // so a daemon upgrade does not restart the conversation that is already in
 // flight. The journal sidecars come with it: a database whose task was killed
-// mid-write holds its most recent commits in `-wal`, and copying the database
+// mid-write holds its most recent commits in `-wal`, and carrying the database
 // alone would silently truncate the transcript to the last checkpoint.
 //
-// Only an empty store is migrated into — a store that already holds a
-// database is this conversation's real history and must never be overwritten.
+// The whole family is copied into a staging directory and published with one
+// rename, exactly as the memory store's migration does, because the caller
+// deletes the source as soon as this returns nil. Copying straight into the
+// store would let a failure after the main database land leave a store that
+// looks migrated: the next attempt would skip the migration, delete the source,
+// and take the un-checkpointed tail of the conversation with it.
+//
+// Only an empty store is migrated into — a store that already holds a database
+// is this conversation's real history and must never be overwritten.
 func migrateHermesTaskSessionDB(hermesHome, storeDir string, logger *slog.Logger) error {
-	if _, err := os.Stat(filepath.Join(storeDir, hermesSessionDBEntry)); err == nil {
+	if hermesStoreHasSessionDB(storeDir) {
 		return nil // store already holds this conversation — never overwrite it
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("stat hermes session store db %s: %w", storeDir, err)
 	}
 
 	entries, err := os.ReadDir(hermesHome)
 	if err != nil {
 		return fmt.Errorf("read overlay home %s: %w", hermesHome, err)
 	}
-	migrated := 0
+	family := make([]string, 0, 3)
 	for _, entry := range entries {
-		name := entry.Name()
-		if !isHermesTaskLocalStateEntry(name) || !entry.Type().IsRegular() {
-			continue
+		if isHermesTaskLocalStateEntry(entry.Name()) && entry.Type().IsRegular() {
+			family = append(family, entry.Name())
 		}
-		if err := copyFile(filepath.Join(hermesHome, name), filepath.Join(storeDir, name)); err != nil {
+	}
+	if len(family) == 0 {
+		return nil
+	}
+
+	staging, err := newHermesStoreStaging(storeDir)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging) // no-op once the staging dir has been promoted
+
+	for _, name := range family {
+		if err := hermesSessionCopy(filepath.Join(hermesHome, name), filepath.Join(staging, name)); err != nil {
 			return fmt.Errorf("migrate task-local hermes session db %s into %s: %w", name, storeDir, err)
 		}
-		migrated++
 	}
-	if migrated > 0 {
-		logger.Info("execenv: migrated task-local hermes session db into conversation store",
-			"store", storeDir,
-			"files", migrated,
-		)
+
+	promoted, err := promoteHermesStoreStaging(staging, storeDir)
+	if err != nil {
+		return err
 	}
+	if !promoted {
+		logger.Info("execenv: another task published this conversation's session store first; keeping it", "store", storeDir)
+		return nil
+	}
+	logger.Info("execenv: migrated task-local hermes session db into conversation store",
+		"store", storeDir,
+		"files", len(family),
+	)
 	return nil
 }
 

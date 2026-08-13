@@ -5292,12 +5292,19 @@ func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, e
 // providers that key their sessions somewhere other than the cwd.
 //
 // Only Hermes does today: its transcripts live in `<HERMES_HOME>/state.db`,
-// which is the per-task overlay under envRoot. Two things can make that
-// reachable — the conversation's persistent session store was mounted into the
-// overlay (hermes_sessions.go), or this run reused the prior task's env root
-// and therefore its overlay. Neither means a fresh overlay with an empty
-// database, and forwarding a session id into that is what produced a
-// conversation restarting from zero every turn (GH #6806).
+// which is the per-task overlay under envRoot. Forwarding a session id into a
+// database that does not hold it is what produced a conversation restarting
+// from zero every turn (GH #6806), so the question has to be about the
+// database, not about the plumbing:
+//
+//   - With the conversation's session store mounted, the answer is whether that
+//     store actually holds a transcript. A mount onto an empty store is the
+//     normal shape of a first turn — and also of a store the GC reclaimed
+//     between turns, a switched Hermes profile, or a dangling link left by an
+//     older overlay. Reading "mounted" as "resumable" would forward a dead id
+//     into every one of those.
+//   - With no store, the transcript is the overlay's own task-local file, which
+//     survives exactly when this run reused the prior task's env root.
 //
 // Every other provider is keyed by cwd (or resolves its own store), so the
 // workdir comparison in gateResumeToReusedWorkdir remains the whole answer and
@@ -5306,7 +5313,10 @@ func sessionHomeReachable(provider string, env *execenv.Environment, envReused b
 	if provider != "hermes" {
 		return true
 	}
-	return env.HermesSessionStore != "" || envReused
+	if env.HermesSessionStore != "" {
+		return env.HermesSessionHistoryPresent
+	}
+	return envReused
 }
 
 // shouldReusePriorWorkdir keeps the local_directory lock invariant without

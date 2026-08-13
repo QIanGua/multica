@@ -59,8 +59,16 @@ func TestResolveHermesResumedSessionIDProvenanceMatchingIsALanding(t *testing.T)
 func TestResolveHermesResumedSessionIDSilentResponseKeepsRequested(t *testing.T) {
 	t.Parallel()
 
-	// A runtime that reports neither shape must not be read as "history lost"
-	// on every turn — keep the requested id and assume the resume landed.
+	// A runtime that reports neither shape (an older Hermes, or a custom ACP
+	// server) must not be read as "history lost" on every turn — that would
+	// staple a continuity notice onto every single turn it ever runs. Keep the
+	// requested id and assume the resume landed.
+	//
+	// This is the one case the backend genuinely cannot resolve, and it is why
+	// the daemon-side gate matters: sessionHomeReachable stops a dead id from
+	// reaching a store with no transcript in the first place, so this fallback
+	// only has to cover a store that DOES hold history and a runtime that will
+	// not say which session it used.
 	for _, response := range []string{`{}`, `{"models":{}}`, `not json`} {
 		id, landed := resolveHermesResumedSessionID("ses_old", json.RawMessage(response))
 		if id != "ses_old" || !landed {

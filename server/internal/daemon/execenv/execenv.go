@@ -273,9 +273,16 @@ type Environment struct {
 	// HermesSessionStore is the conversation's session store this task's
 	// state.db is actually linked to, or "" when the session database stayed
 	// task-local (no store to key on, or a host that could not create the
-	// link). The daemon reads it as the answer to "can a prior session id
-	// still resolve here?" — see gateResumeToReusedWorkdir.
+	// link).
 	HermesSessionStore string
+	// HermesSessionHistoryPresent reports that the mounted store actually holds
+	// a session database — a prior turn's transcript this task can resume.
+	// Mounting alone does not imply it: a conversation's first turn, a store the
+	// GC reclaimed between turns, a switched Hermes profile and an operator's
+	// `rm` all mount cleanly onto nothing. The daemon reads THIS, not the store
+	// path, as the answer to "can a prior session id still resolve here?" — see
+	// gateResumeToReusedWorkdir.
+	HermesSessionHistoryPresent bool
 	// QwenpawWorkspace is the path to the per-task QwenPaw workspace directory
 	// (set only for the qwenpaw provider). It is populated with the bound skills
 	// and their skill.json manifest with enabled: true, so the skills are
@@ -427,13 +434,14 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// Emptying an agent's own skill list is NOT a way to opt out of the overlay.
 	if params.Provider == "hermes" && len(params.Task.AgentSkills) > 0 {
 		hermesHome := filepath.Join(envRoot, "hermes-home")
-		sessionsMounted, err := prepareHermesHome(hermesHome, params.HermesSourceHome, params.HermesSourceMustExist, params.Task.AgentSkills, params.HermesEnv, params.HermesMemoryStore, params.HermesSessionStore, logger)
+		sessions, err := prepareHermesHome(hermesHome, params.HermesSourceHome, params.HermesSourceMustExist, params.Task.AgentSkills, params.HermesEnv, params.HermesMemoryStore, params.HermesSessionStore, logger)
 		if err != nil {
 			return nil, fmt.Errorf("execenv: prepare hermes-home: %w", err)
 		}
 		env.HermesHome = hermesHome
-		if sessionsMounted {
+		if sessions.Mounted {
 			env.HermesSessionStore = params.HermesSessionStore
+			env.HermesSessionHistoryPresent = sessions.HistoryPresent
 		}
 	}
 	if params.Provider == "qwenpaw" {
@@ -704,7 +712,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	if params.Provider == "hermes" && env.RootDir != "" {
 		hermesHome := filepath.Join(env.RootDir, "hermes-home")
 		if len(params.Task.AgentSkills) > 0 {
-			sessionsMounted, err := prepareHermesHome(hermesHome, params.HermesSourceHome, params.HermesSourceMustExist, params.Task.AgentSkills, params.HermesEnv, params.HermesMemoryStore, params.HermesSessionStore, logger)
+			sessions, err := prepareHermesHome(hermesHome, params.HermesSourceHome, params.HermesSourceMustExist, params.Task.AgentSkills, params.HermesEnv, params.HermesMemoryStore, params.HermesSessionStore, logger)
 			if err != nil {
 				// Fail closed: a half-built overlay must not run. Returning nil
 				// makes the daemon fall back to a fresh Prepare, whose error
@@ -715,12 +723,15 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 			}
 			env.HermesHome = hermesHome
 			env.HermesSessionStore = ""
-			if sessionsMounted {
+			env.HermesSessionHistoryPresent = false
+			if sessions.Mounted {
 				env.HermesSessionStore = params.HermesSessionStore
+				env.HermesSessionHistoryPresent = sessions.HistoryPresent
 			}
 		} else {
 			env.HermesHome = ""
 			env.HermesSessionStore = ""
+			env.HermesSessionHistoryPresent = false
 			if err := os.RemoveAll(hermesHome); err != nil {
 				logger.Warn("execenv: remove stale hermes-home failed", "error", err)
 			}
