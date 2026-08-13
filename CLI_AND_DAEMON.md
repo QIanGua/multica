@@ -101,7 +101,23 @@ The daemon is the local agent runtime. It detects available AI CLIs on your mach
 multica daemon start
 ```
 
-By default, the daemon runs in the background and logs to `~/.multica/daemon.log`.
+By default, the daemon runs in the background and writes its log into the state
+directory of the profile it was started with — **not always `~/.multica/`**:
+
+| Profile | State directory |
+| --- | --- |
+| Default (no `--profile`) | `~/.multica/` |
+| Named (`--profile <name>`) | `~/.multica/profiles/<name>/` |
+
+That directory holds `daemon.log` (the log), `daemon.pid` (the background
+daemon's PID), and `daemon.err.log` (raw crash output; near-empty on a healthy
+daemon, since normal logging goes to `daemon.log`).
+
+The Desktop app runs its own named profile, so on a machine that has ever run
+both, `~/.multica/daemon.log` and `~/.multica/profiles/<name>/daemon.log` both
+exist and both read as plausible logs — only one is being written to. Don't
+guess: `multica daemon logs` prints the absolute path it resolved (see
+[Logs](#logs)).
 
 To run in the foreground (useful for debugging):
 
@@ -158,7 +174,29 @@ Shows PID, uptime, detected agents, and watched workspaces.
 multica daemon logs              # Last 50 lines
 multica daemon logs -f           # Follow (tail -f)
 multica daemon logs -n 100       # Last 100 lines
+multica daemon logs --profile staging
 ```
+
+Every run first prints the absolute path it resolved, so you always know which
+profile's log you are looking at:
+
+```
+$ multica daemon logs -n 100
+Reading /Users/you/.multica/profiles/desktop-mbp/daemon.log (profile: desktop-mbp)
+...
+```
+
+That line goes to stderr, before the tail starts — so it also shows up under
+`-f`, and piping or redirecting the command still yields log content only:
+
+```bash
+multica daemon logs -n 500 | grep ERROR   # the path line is not in the pipe
+```
+
+Without `--profile`, the default profile's log is read. If it doesn't exist the
+command says so and names the path it looked for, which is the fastest way to
+find out that the daemon you care about is running on a different profile —
+`multica daemon status --profile <name>` confirms which one is live.
 
 ### Supported Agents
 
@@ -374,7 +412,7 @@ multica daemon start --profile staging
 multica daemon start
 ```
 
-Each profile gets its own config directory (`~/.multica/profiles/<name>/`), daemon state, health port, and workspace root.
+Each profile gets its own config directory (`~/.multica/profiles/<name>/`), daemon state, health port, and workspace root. Daemon state means that profile's own `daemon.log`, `daemon.err.log`, and `daemon.pid` live in that directory too — see [Start](#start) for the layout, and pass `--profile <name>` to `daemon status` / `daemon logs` to act on it.
 
 ## Workspaces
 
