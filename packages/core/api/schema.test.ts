@@ -676,6 +676,114 @@ describe("ApiClient schema fallback", () => {
         url: "",
       });
     });
+
+    it("parses workspace entitlements into camelCase without fabricating Free", async () => {
+      stubFetchJson({
+        workspace_id: "workspace-1",
+        plan: "pro",
+        status: "active",
+        seats: 4,
+        issue_window: null,
+        autopilot_runs: null,
+        current_period_end: "2026-09-13T00:00:00Z",
+        snapshot_expires_at: null,
+        version: 7,
+      });
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.getWorkspaceSubscriptionEntitlements(),
+      ).resolves.toEqual({
+        workspaceId: "workspace-1",
+        plan: "pro",
+        status: "active",
+        seats: 4,
+        issueWindow: null,
+        autopilotRuns: null,
+        currentPeriodEnd: "2026-09-13T00:00:00Z",
+        snapshotExpiresAt: null,
+        version: 7,
+      });
+
+      stubFetchJson({ plan: "free", seats: "unknown" });
+      await expect(client.getWorkspaceSubscriptionEntitlements()).resolves.toBeNull();
+    });
+
+    it("sends the Checkout idempotency key in the header and body", async () => {
+      stubFetchJson(
+        {
+          request_id: "request-1",
+          session_id: "cs_test_1",
+          url: "https://checkout.stripe.com/test-session",
+        },
+        201,
+      );
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.createWorkspaceSubscriptionCheckout({
+          interval: "year",
+          idempotencyKey: "checkout-intent-1",
+        }),
+      ).resolves.toEqual({
+        requestId: "request-1",
+        sessionId: "cs_test_1",
+        url: "https://checkout.stripe.com/test-session",
+      });
+
+      const fetchMock = vi.mocked(fetch);
+      const init = fetchMock.mock.calls[0]?.[1] as RequestInit & {
+        headers: Record<string, string>;
+      };
+      expect(init.headers["Idempotency-Key"]).toBe("checkout-intent-1");
+      expect(JSON.parse(String(init.body))).toEqual({
+        interval: "year",
+        idempotency_key: "checkout-intent-1",
+      });
+    });
+
+    it("rejects unreadable or non-HTTPS Stripe URLs at the schema boundary", async () => {
+      stubFetchJson(
+        {
+          request_id: "request-1",
+          session_id: "cs_test_1",
+          url: "javascript:alert(1)",
+        },
+        201,
+      );
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.createWorkspaceSubscriptionCheckout({
+          interval: "month",
+          idempotencyKey: "checkout-intent-1",
+        }),
+      ).resolves.toBeNull();
+
+      stubFetchJson({ url: 123 });
+      await expect(
+        client.createWorkspaceSubscriptionPortal("portal-intent-1"),
+      ).resolves.toBeNull();
+    });
+
+    it("parses seat reconciliation into camelCase", async () => {
+      stubFetchJson({
+        workspace_id: "workspace-1",
+        billed_seats: 5,
+        actual_seats: 4,
+        action: "scheduled_decrease",
+      });
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.reconcileWorkspaceSubscriptionSeats(),
+      ).resolves.toEqual({
+        workspaceId: "workspace-1",
+        billedSeats: 5,
+        actualSeats: 4,
+        action: "scheduled_decrease",
+      });
+    });
   });
 });
 

@@ -183,7 +183,8 @@
       "labels": "ラベル",
       "properties": "プロパティ",
       "quick_actions": "クイックアクション",
-      "plugins": "Plugins"
+    "plugins": "Plugins",
+    "billing": "請求とプラン"
     }
   },
   "plugins": {

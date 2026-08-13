@@ -183,7 +183,8 @@
       "labels": "레이블",
       "properties": "속성",
       "quick_actions": "퀵 액션",
-      "plugins": "Plugins"
+    "plugins": "Plugins",
+    "billing": "결제 및 요금제"
     }
   },
   "plugins": {

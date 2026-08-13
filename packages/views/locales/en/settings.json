@@ -183,7 +183,8 @@
       "labels": "Labels",
       "properties": "Properties",
       "quick_actions": "Quick Actions",
-      "plugins": "Plugins"
+    "plugins": "Plugins",
+    "billing": "Billing"
     }
   },
   "plugins": {

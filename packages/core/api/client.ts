@@ -185,6 +185,11 @@ import type {
   CreateBillingCheckoutSessionResponse,
   BillingCheckoutSessionStatus,
   CreateBillingPortalSessionResponse,
+  WorkspaceSubscriptionEntitlements,
+  CreateWorkspaceSubscriptionCheckoutRequest,
+  CreateWorkspaceSubscriptionCheckoutResponse,
+  WorkspaceSubscriptionSeatReconcileResult,
+  CreateWorkspaceSubscriptionPortalResponse,
 } from "../types";
 import type { OnboardingCompletionPath } from "../onboarding/types";
 import type {
@@ -287,6 +292,10 @@ import {
   CreateBillingCheckoutSessionResponseSchema,
   BillingCheckoutSessionStatusSchema,
   CreateBillingPortalSessionResponseSchema,
+  WorkspaceSubscriptionEntitlementsSchema,
+  CreateWorkspaceSubscriptionCheckoutResponseSchema,
+  WorkspaceSubscriptionSeatReconcileResultSchema,
+  CreateWorkspaceSubscriptionPortalResponseSchema,
   DingTalkInstallationSchema,
   DingTalkGroupRouteSchema,
   ListDingTalkGroupRoutesResponseSchema,
@@ -1553,6 +1562,86 @@ export class ApiClient {
       CreateBillingPortalSessionResponseSchema,
       EMPTY_CREATE_BILLING_PORTAL_SESSION_RESPONSE,
       { endpoint: "POST /api/cloud-billing/portal-sessions" },
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Workspace subscriptions — workspace identity is injected by the server
+  // from the authenticated request context. Callers never submit a workspace
+  // ID, amount, Price ID, or seat quantity.
+  // ---------------------------------------------------------------------
+
+  async getWorkspaceSubscriptionEntitlements(): Promise<
+    WorkspaceSubscriptionEntitlements | null
+  > {
+    const raw = await this.fetch<unknown>(
+      "/api/cloud-subscriptions/entitlements",
+    );
+    return parseWithFallback<WorkspaceSubscriptionEntitlements | null>(
+      raw,
+      WorkspaceSubscriptionEntitlementsSchema,
+      null,
+      { endpoint: "GET /api/cloud-subscriptions/entitlements" },
+    );
+  }
+
+  async createWorkspaceSubscriptionCheckout(
+    data: CreateWorkspaceSubscriptionCheckoutRequest,
+  ): Promise<CreateWorkspaceSubscriptionCheckoutResponse | null> {
+    const res = await this.fetchRaw(
+      "/api/cloud-subscriptions/checkout-sessions",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          interval: data.interval,
+          idempotency_key: data.idempotencyKey,
+          ...(data.customerEmail
+            ? { customer_email: data.customerEmail }
+            : {}),
+        }),
+        extraHeaders: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": data.idempotencyKey,
+        },
+      },
+    );
+    const raw = (await res.json()) as unknown;
+    return parseWithFallback<CreateWorkspaceSubscriptionCheckoutResponse | null>(
+      raw,
+      CreateWorkspaceSubscriptionCheckoutResponseSchema,
+      null,
+      { endpoint: "POST /api/cloud-subscriptions/checkout-sessions" },
+    );
+  }
+
+  async reconcileWorkspaceSubscriptionSeats(): Promise<
+    WorkspaceSubscriptionSeatReconcileResult | null
+  > {
+    const res = await this.fetchRaw("/api/cloud-subscriptions/seats/reconcile", {
+      method: "POST",
+    });
+    const raw = (await res.json()) as unknown;
+    return parseWithFallback<WorkspaceSubscriptionSeatReconcileResult | null>(
+      raw,
+      WorkspaceSubscriptionSeatReconcileResultSchema,
+      null,
+      { endpoint: "POST /api/cloud-subscriptions/seats/reconcile" },
+    );
+  }
+
+  async createWorkspaceSubscriptionPortal(
+    idempotencyKey: string,
+  ): Promise<CreateWorkspaceSubscriptionPortalResponse | null> {
+    const res = await this.fetchRaw("/api/cloud-subscriptions/portal-sessions", {
+      method: "POST",
+      extraHeaders: { "Idempotency-Key": idempotencyKey },
+    });
+    const raw = (await res.json()) as unknown;
+    return parseWithFallback<CreateWorkspaceSubscriptionPortalResponse | null>(
+      raw,
+      CreateWorkspaceSubscriptionPortalResponseSchema,
+      null,
+      { endpoint: "POST /api/cloud-subscriptions/portal-sessions" },
     );
   }
 

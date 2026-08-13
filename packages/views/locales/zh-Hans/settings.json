@@ -183,7 +183,8 @@
       "labels": "标签",
       "properties": "属性",
       "quick_actions": "快捷操作",
-      "plugins": "Plugins"
+    "plugins": "Plugins",
+    "billing": "账单与套餐"
     }
   },
   "plugins": {

@@ -180,3 +180,49 @@ export interface BillingCheckoutSessionStatus {
 export interface CreateBillingPortalSessionResponse {
   url: string;
 }
+
+// ---------------------------------------------------------------------------
+// Workspace subscriptions
+//
+// These types are consumed through /api/cloud-subscriptions/*. Unlike the
+// account-level wallet types above, fields are camelCase after the API schema
+// boundary and every query key is scoped by workspace ID.
+
+export type WorkspaceSubscriptionInterval = "month" | "year";
+
+export interface WorkspaceSubscriptionEntitlements {
+  workspaceId: string;
+  // Kept open for additive server plans. The UI handles unknown values with a
+  // generic label instead of mistaking them for Free.
+  plan: string;
+  status: string;
+  seats: number;
+  issueWindow: number | null;
+  autopilotRuns: number | null;
+  currentPeriodEnd: string | null;
+  snapshotExpiresAt: string | null;
+  version: number;
+}
+
+export interface CreateWorkspaceSubscriptionCheckoutRequest {
+  interval: WorkspaceSubscriptionInterval;
+  idempotencyKey: string;
+  customerEmail?: string;
+}
+
+export interface CreateWorkspaceSubscriptionCheckoutResponse {
+  requestId: string;
+  sessionId: string;
+  url: string;
+}
+
+export interface WorkspaceSubscriptionSeatReconcileResult {
+  workspaceId: string;
+  billedSeats: number;
+  actualSeats: number;
+  action: string;
+}
+
+export interface CreateWorkspaceSubscriptionPortalResponse {
+  url: string;
+}
