@@ -134,7 +134,8 @@
     "mode_badge_worktree": "Parallel",
     "mode_badge_worktree_tooltip": "Tasks run at the same time in their own git worktree and hand back a branch. Your working copy is untouched.",
     "toast_local_mode_updated": "Execution mode updated",
-    "toast_local_mode_update_failed": "Could not update the execution mode"
+    "toast_local_mode_update_failed": "Could not update the execution mode",
+    "mode_badge_in_place": "Direct"
   },
   "delete_dialog": {
     "title": "Delete project",

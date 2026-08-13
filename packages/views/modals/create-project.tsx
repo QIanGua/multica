@@ -845,17 +845,23 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
                                 type="button"
                                 size="sm"
                                 variant="ghost"
-                                className="h-6 flex-1 min-w-0 text-caption"
+                                // Sized to its (short) label so the wider
+                                // "Change directory…" beside it fits whole.
+                                className="h-6 shrink-0 text-caption"
                               >
                                 {effectiveLocalMode === "worktree" ? (
                                   <GitBranch className="size-3 shrink-0" />
                                 ) : (
                                   <Pencil className="size-3 shrink-0" />
                                 )}
+                                {/* Short labels: the panel is ~380px wide and
+                                    two buttons share it, so the full option
+                                    titles truncate to uselessness. The picker
+                                    below carries the full wording. */}
                                 <span className="truncate">
                                   {effectiveLocalMode === "worktree"
-                                    ? tProjects(($) => $.resources.mode_worktree_title)
-                                    : tProjects(($) => $.resources.mode_in_place_title)}
+                                    ? tProjects(($) => $.resources.mode_badge_worktree)
+                                    : tProjects(($) => $.resources.mode_badge_in_place)}
                                 </span>
                               </Button>
                             }

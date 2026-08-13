@@ -162,7 +162,8 @@ describe("CreateProjectModal — local directory execution mode", () => {
 
     await pickLocalDirectory(user);
 
-    expect(screen.getByRole("button", { name: /Edit this folder directly/i })).toBeInTheDocument();
+    // The compact button uses the short label; the picker carries the full title.
+    expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Change directory/i })).toBeInTheDocument();
   });
 
