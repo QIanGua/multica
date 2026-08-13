@@ -211,7 +211,15 @@ func (s *PluginService) InstallPluginRelease(ctx context.Context, workspaceID, a
 		if publication.Release.SourceKind != plugincontract.SourcePrivateDev {
 			return db.PluginInstallation{}, newPluginError(PluginErrorConflict, "Plugin is already installed", nil)
 		}
+		auditAction := "plugin_private_uploaded"
 		if existing.DesiredReleaseID != release.ID {
+			currentRelease, currentErr := q.GetPluginRelease(ctx, existing.DesiredReleaseID)
+			if currentErr != nil {
+				return db.PluginInstallation{}, fmt.Errorf("load installed Private Plugin release: %w", currentErr)
+			}
+			if !pluginbundled.IsNewerVersion(release.Version, currentRelease.Version) {
+				return db.PluginInstallation{}, newPluginError(PluginErrorConflict, "Target Private Plugin release is not newer than the installed release; use rollback for an older version", nil)
+			}
 			existing, err = q.SetPluginInstallationDesiredState(ctx, db.SetPluginInstallationDesiredStateParams{
 				Enabled:          existing.Enabled,
 				UpdatedBy:        actorID,
@@ -225,8 +233,9 @@ func (s *PluginService) InstallPluginRelease(ctx context.Context, workspaceID, a
 			if _, err := s.reconcileWorkspaceTx(ctx, q, workspaceID); err != nil {
 				return db.PluginInstallation{}, err
 			}
+			auditAction = "plugin_private_upgraded"
 		}
-		if err := createPluginAudit(ctx, q, workspaceID, actorID, "plugin_private_uploaded", identity, release, existing); err != nil {
+		if err := createPluginAudit(ctx, q, workspaceID, actorID, auditAction, identity, release, existing); err != nil {
 			return db.PluginInstallation{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -324,7 +333,7 @@ func ensurePluginRelease(ctx context.Context, q *db.Queries, workspaceID pgtype.
 		return db.PluginIdentity{}, db.PluginRelease{}, newPluginError(PluginErrorConflict, "Plugin publisher conflicts with the registered identity", nil)
 	}
 
-	release, err := q.GetPluginReleaseByVersion(ctx, db.GetPluginReleaseByVersionParams{
+	release, err := q.GetRegisteredPluginReleaseByVersion(ctx, db.GetRegisteredPluginReleaseByVersionParams{
 		PluginID: identity.ID,
 		Version:  manifest.Metadata.Version,
 	})
@@ -404,7 +413,12 @@ func ensurePluginRelease(ctx context.Context, q *db.Queries, workspaceID pgtype.
 	if err != nil {
 		return db.PluginIdentity{}, db.PluginRelease{}, fmt.Errorf("ensure plugin release: %w", err)
 	}
-	if release.ManifestDigest != releaseData.ManifestDigest || release.ArtifactDigest != releaseData.ArtifactDigest || release.ArchiveDigest != releaseData.ArchiveDigest {
+	if release.RevocationStatus != "active" {
+		return db.PluginIdentity{}, db.PluginRelease{}, newPluginError(PluginErrorConflict, "Plugin release has been revoked and cannot be installed", nil)
+	}
+	if release.ManifestDigest != releaseData.ManifestDigest ||
+		release.ArtifactDigest != releaseData.ArtifactDigest ||
+		(!privateRelease && release.ArchiveDigest != releaseData.ArchiveDigest) {
 		return db.PluginIdentity{}, db.PluginRelease{}, newPluginError(PluginErrorConflict, "Plugin release conflicts with immutable registry content", nil)
 	}
 	return identity, release, nil
@@ -601,10 +615,12 @@ func (s *PluginService) UninstallPlugin(ctx context.Context, workspaceID, instal
 	if _, err := s.reconcileWorkspaceTx(ctx, q, workspaceID); err != nil {
 		return err
 	}
+	auditAction := "plugin_uninstalled"
 	if installation.SourceKind == plugincontract.SourcePrivateDev {
-		if err := createPluginAudit(ctx, q, workspaceID, actorID, "plugin_private_uninstalled", identity, release, uninstalled); err != nil {
-			return err
-		}
+		auditAction = "plugin_private_uninstalled"
+	}
+	if err := createPluginAudit(ctx, q, workspaceID, actorID, auditAction, identity, release, uninstalled); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }

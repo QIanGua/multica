@@ -90,6 +90,10 @@ type pluginInstallationResponse struct {
 }
 
 func (h *Handler) pluginInstallationResponse(r *http.Request, installation db.PluginInstallation, health *db.PluginHealth) (pluginInstallationResponse, error) {
+	return h.pluginInstallationResponseWithReleases(r, installation, health, nil)
+}
+
+func (h *Handler) pluginInstallationResponseWithReleases(r *http.Request, installation db.PluginInstallation, health *db.PluginHealth, prefetchedReleases *[]db.PluginRelease) (pluginInstallationResponse, error) {
 	identity, err := h.Queries.GetPluginIdentity(r.Context(), installation.PluginID)
 	if err != nil {
 		return pluginInstallationResponse{}, err
@@ -128,9 +132,14 @@ func (h *Handler) pluginInstallationResponse(r *http.Request, installation db.Pl
 		ContributionInfo:  []pluginContributionResponse{},
 		Bindings:          []pluginBindingResponse{},
 	}
-	releases, err := h.Queries.ListPluginReleasesByPlugin(r.Context(), installation.PluginID)
-	if err != nil {
-		return pluginInstallationResponse{}, err
+	var releases []db.PluginRelease
+	if prefetchedReleases != nil {
+		releases = *prefetchedReleases
+	} else {
+		releases, err = h.Queries.ListPluginReleasesByPlugin(r.Context(), installation.PluginID)
+		if err != nil {
+			return pluginInstallationResponse{}, err
+		}
 	}
 	for _, release := range releases {
 		response.AvailableVersions = append(response.AvailableVersions, release.Version)
@@ -189,15 +198,6 @@ func (h *Handler) ListPlugins(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list Plugins")
 		return
 	}
-	if !h.privatePluginsV1Enabled(r.Context()) {
-		visible := installations[:0]
-		for _, installation := range installations {
-			if installation.SourceKind != plugincontract.SourcePrivateDev {
-				visible = append(visible, installation)
-			}
-		}
-		installations = visible
-	}
 	h.writePluginInstallations(w, r, workspaceID, installations)
 }
 
@@ -225,42 +225,35 @@ func (h *Handler) GetPrivatePluginStatus(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	pluginRef := chi.URLParam(r, "pluginRef")
-	installations, err := h.Queries.ListWorkspacePrivatePluginInstallations(r.Context(), workspaceID)
+	installation, err := h.Queries.GetWorkspacePrivatePluginInstallationByRef(r.Context(), db.GetWorkspacePrivatePluginInstallationByRefParams{
+		WorkspaceID: workspaceID,
+		PluginRef:   chi.URLParam(r, "pluginRef"),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "Private Plugin installation not found")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load Private Plugin")
 		return
 	}
-	for _, installation := range installations {
-		identity, identityErr := h.Queries.GetPluginIdentity(r.Context(), installation.PluginID)
-		if identityErr != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load Private Plugin")
-			return
-		}
-		if uuidToString(installation.ID) != pluginRef && identity.PluginKey != pluginRef {
-			continue
-		}
-		var health *db.PluginHealth
-		healthRows, healthErr := h.Queries.ListWorkspacePluginHealth(r.Context(), workspaceID)
-		if healthErr != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load Private Plugin")
-			return
-		}
-		for index := range healthRows {
-			if healthRows[index].InstallationID == installation.ID {
-				health = &healthRows[index]
-				break
-			}
-		}
-		response, responseErr := h.pluginInstallationResponse(r, installation, health)
-		if responseErr != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load Private Plugin")
-			return
-		}
-		writeJSON(w, http.StatusOK, response)
+	var health *db.PluginHealth
+	healthRow, healthErr := h.Queries.GetWorkspacePluginHealthByInstallation(r.Context(), db.GetWorkspacePluginHealthByInstallationParams{
+		WorkspaceID:    workspaceID,
+		InstallationID: installation.ID,
+	})
+	if healthErr == nil {
+		health = &healthRow
+	} else if !errors.Is(healthErr, pgx.ErrNoRows) {
+		writeError(w, http.StatusInternalServerError, "failed to load Private Plugin")
 		return
 	}
-	writeError(w, http.StatusNotFound, "Private Plugin installation not found")
+	response, responseErr := h.pluginInstallationResponse(r, installation, health)
+	if responseErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load Private Plugin")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) writePluginInstallations(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, installations []db.PluginInstallation) {
@@ -272,6 +265,16 @@ func (h *Handler) writePluginInstallations(w http.ResponseWriter, r *http.Reques
 			healthByInstallation[key] = health
 		}
 	}
+	releaseRows, err := h.Queries.ListWorkspacePluginReleases(r.Context(), workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load Plugin releases")
+		return
+	}
+	releasesByPlugin := make(map[string][]db.PluginRelease)
+	for _, release := range releaseRows {
+		key := uuidToString(release.PluginID)
+		releasesByPlugin[key] = append(releasesByPlugin[key], release)
+	}
 	responses := make([]pluginInstallationResponse, 0, len(installations))
 	for _, installation := range installations {
 		health, hasHealth := healthByInstallation[uuidToString(installation.ID)]
@@ -279,7 +282,8 @@ func (h *Handler) writePluginInstallations(w http.ResponseWriter, r *http.Reques
 		if hasHealth {
 			healthPtr = &health
 		}
-		response, err := h.pluginInstallationResponse(r, installation, healthPtr)
+		releases := releasesByPlugin[uuidToString(installation.PluginID)]
+		response, err := h.pluginInstallationResponseWithReleases(r, installation, healthPtr, &releases)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to load Plugin")
 			return
@@ -504,7 +508,7 @@ func (h *Handler) UpgradePlugin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID) {
+	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, false) {
 		return
 	}
 	var request pluginReleaseRequest
@@ -553,7 +557,7 @@ func (h *Handler) setPluginEnabled(w http.ResponseWriter, r *http.Request, enabl
 	if !ok {
 		return
 	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID) {
+	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, !enabled) {
 		return
 	}
 	request := pluginBindingRequest{ScopeType: "workspace", ScopeID: uuidToString(workspaceID)}
@@ -601,7 +605,7 @@ func (h *Handler) RollbackPlugin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID) {
+	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, false) {
 		return
 	}
 	var request struct {
@@ -636,7 +640,7 @@ func (h *Handler) UninstallPlugin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID) {
+	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, true) {
 		return
 	}
 	if err := h.PluginService.UninstallPlugin(r.Context(), workspaceID, installationID, actorID); err != nil {
@@ -646,13 +650,13 @@ func (h *Handler) UninstallPlugin(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *Handler) requirePluginInstallationFeature(w http.ResponseWriter, r *http.Request, workspaceID, installationID pgtype.UUID) bool {
+func (h *Handler) requirePluginInstallationFeature(w http.ResponseWriter, r *http.Request, workspaceID, installationID pgtype.UUID, allowPrivateTeardown bool) bool {
 	installation, err := h.Queries.GetPluginInstallation(r.Context(), installationID)
 	if err != nil || installation.WorkspaceID != workspaceID || installation.UninstalledAt.Valid {
 		writeError(w, http.StatusNotFound, "Plugin installation not found")
 		return false
 	}
-	if installation.SourceKind == plugincontract.SourcePrivateDev && !h.requirePrivatePluginsV1(w, r) {
+	if installation.SourceKind == plugincontract.SourcePrivateDev && !allowPrivateTeardown && !h.requirePrivatePluginsV1(w, r) {
 		return false
 	}
 	return true

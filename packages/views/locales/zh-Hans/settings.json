@@ -213,6 +213,7 @@
     "health": "健康状态：",
     "bindings": "已启用的作用范围",
     "unknown_agent": "未知智能体",
+    "unknown_member": "未知成员",
     "workspace_scope": "工作区",
     "agent_scope": "智能体",
     "binding_disabled": "Plugin 绑定已停用",

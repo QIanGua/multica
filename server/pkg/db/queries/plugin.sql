@@ -56,6 +56,10 @@ WHERE id = $1;
 
 -- name: GetPluginReleaseByVersion :one
 SELECT * FROM plugin_release
+WHERE plugin_id = $1 AND version = $2 AND revocation_status = 'active';
+
+-- name: GetRegisteredPluginReleaseByVersion :one
+SELECT * FROM plugin_release
 WHERE plugin_id = $1 AND version = $2;
 
 -- name: RevokePluginRelease :one
@@ -132,6 +136,15 @@ SELECT * FROM plugin_installation
 WHERE workspace_id = $1 AND uninstalled_at IS NULL
 ORDER BY installed_at, id;
 
+-- name: ListWorkspacePluginReleases :many
+SELECT release.*
+FROM plugin_release release
+JOIN plugin_installation installation ON installation.plugin_id = release.plugin_id
+WHERE installation.workspace_id = @workspace_id
+  AND installation.uninstalled_at IS NULL
+  AND release.revocation_status = 'active'
+ORDER BY release.plugin_id, release.published_at DESC, release.id DESC;
+
 -- name: ListWorkspacePrivatePluginInstallations :many
 SELECT installation.*
 FROM plugin_installation installation
@@ -141,6 +154,17 @@ WHERE installation.workspace_id = @workspace_id
   AND installation.source_kind = 'private_dev'
   AND installation.uninstalled_at IS NULL
 ORDER BY installation.installed_at, installation.id;
+
+-- name: GetWorkspacePrivatePluginInstallationByRef :one
+SELECT installation.*
+FROM plugin_installation installation
+JOIN plugin_identity identity ON identity.id = installation.plugin_id
+WHERE installation.workspace_id = @workspace_id
+  AND identity.owner_workspace_id = @workspace_id
+  AND installation.source_kind = 'private_dev'
+  AND installation.uninstalled_at IS NULL
+  AND (installation.id::text = @plugin_ref::text OR identity.plugin_key = @plugin_ref::text)
+LIMIT 1;
 
 -- name: GetWorkspacePrivatePluginUsage :one
 SELECT
@@ -479,3 +503,9 @@ WHERE task.id = @task_id
 SELECT * FROM plugin_health
 WHERE workspace_id = $1
 ORDER BY observed_at DESC, id DESC;
+
+-- name: GetWorkspacePluginHealthByInstallation :one
+SELECT * FROM plugin_health
+WHERE workspace_id = @workspace_id AND installation_id = @installation_id
+ORDER BY observed_at DESC, id DESC
+LIMIT 1;

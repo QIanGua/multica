@@ -1,22 +1,62 @@
 package service
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/testutil/plugintest"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
 )
+
+func repackPluginArchive(t *testing.T, archive []byte) []byte {
+	t.Helper()
+	reader, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatalf("open Plugin archive: %v", err)
+	}
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	if err := writer.SetComment("semantically equivalent test package"); err != nil {
+		t.Fatalf("set Plugin archive comment: %v", err)
+	}
+	for _, file := range reader.File {
+		source, openErr := file.Open()
+		if openErr != nil {
+			t.Fatalf("open Plugin archive entry %s: %v", file.Name, openErr)
+		}
+		header := file.FileHeader
+		destination, createErr := writer.CreateHeader(&header)
+		if createErr != nil {
+			source.Close() //nolint:errcheck
+			t.Fatalf("create Plugin archive entry %s: %v", file.Name, createErr)
+		}
+		if _, copyErr := io.Copy(destination, source); copyErr != nil {
+			source.Close() //nolint:errcheck
+			t.Fatalf("copy Plugin archive entry %s: %v", file.Name, copyErr)
+		}
+		if closeErr := source.Close(); closeErr != nil {
+			t.Fatalf("close Plugin archive entry %s: %v", file.Name, closeErr)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close Plugin archive: %v", err)
+	}
+	return output.Bytes()
+}
 
 func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	ctx := context.Background()
@@ -259,6 +299,22 @@ func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	if err != nil || idempotentInstallation.ID != privateInstallation.ID {
 		t.Fatalf("idempotent private upload: installation=%+v err=%v", idempotentInstallation, err)
 	}
+	repackedArchive := repackPluginArchive(t, privateArchiveV2)
+	if bytes.Equal(repackedArchive, privateArchiveV2) {
+		t.Fatal("repacked Private Plugin archive unexpectedly has identical bytes")
+	}
+	repackedInstallation, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, repackedArchive)
+	if err != nil || repackedInstallation.ID != privateInstallation.ID {
+		t.Fatalf("semantically equivalent private upload: installation=%+v err=%v", repackedInstallation, err)
+	}
+	if _, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, privateArchiveV1); err == nil {
+		t.Fatal("private upload silently downgraded the installed release")
+	} else {
+		var pluginErr *PluginError
+		if !errors.As(err, &pluginErr) || pluginErr.Kind != PluginErrorConflict || !strings.Contains(pluginErr.Message, "rollback") {
+			t.Fatalf("private downgrade error = %v", err)
+		}
+	}
 	if err := os.WriteFile(filepath.Join(privateV2SkillDir, "SKILL.md"), []byte(v2Skill+"\nConflicting content.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -296,6 +352,36 @@ func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, privateRollbackTaskID); err != nil {
 		t.Fatalf("complete private rollback task: %v", err)
+	}
+	privateV2Release, err := queries.GetPluginReleaseByVersion(ctx, db.GetPluginReleaseByVersionParams{
+		PluginID: privateInstallation.PluginID,
+		Version:  "0.2.0",
+	})
+	if err != nil {
+		t.Fatalf("load private v2 release: %v", err)
+	}
+	if _, err := queries.RevokePluginRelease(ctx, db.RevokePluginReleaseParams{
+		RevocationStatus: "revoked",
+		RevocationReason: pgtype.Text{String: "integration test", Valid: true},
+		ID:               privateV2Release.ID,
+	}); err != nil {
+		t.Fatalf("revoke private v2 release: %v", err)
+	}
+	if _, err := pluginService.RollbackPlugin(ctx, workspaceUUID, privateInstallation.ID, actorUUID, "0.2.0"); err == nil {
+		t.Fatal("rollback selected a revoked Private Plugin release")
+	} else {
+		var pluginErr *PluginError
+		if !errors.As(err, &pluginErr) || pluginErr.Kind != PluginErrorNotFound {
+			t.Fatalf("revoked rollback error = %v", err)
+		}
+	}
+	if _, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, privateArchiveV2); err == nil {
+		t.Fatal("private upload reactivated a revoked release")
+	} else {
+		var pluginErr *PluginError
+		if !errors.As(err, &pluginErr) || pluginErr.Kind != PluginErrorConflict || !strings.Contains(pluginErr.Message, "revoked") {
+			t.Fatalf("revoked private upload error = %v", err)
+		}
 	}
 
 	if err := pool.QueryRow(ctx, `

@@ -47,6 +47,7 @@ const data = vi.hoisted(() => ({
   },
   installed: { plugins: [] as Array<Record<string, unknown>> },
   agents: [{ id: "agent-1", name: "Reviewer", archived_at: null }],
+  members: [{ user_id: "member-1", name: "Alice", email: "alice@example.com", role: "admin" }],
   role: "owner" as "owner" | "admin" | "member",
 }));
 
@@ -55,6 +56,7 @@ vi.mock("@tanstack/react-query", () => ({
     const key = options.queryKey?.join(":") ?? "";
     if (key.includes("catalog")) return { data: data.catalog, isPending: false, isError: false };
     if (key.includes("installed")) return { data: data.installed, isPending: false, isError: false };
+    if (key.includes("members")) return { data: data.members, isPending: false, isError: false };
     return { data: data.agents, isPending: false, isError: false };
   },
 }));
@@ -72,6 +74,7 @@ vi.mock("@multica/core/plugins", () => ({
 
 vi.mock("@multica/core/workspace/queries", () => ({
   agentListOptions: () => ({ queryKey: ["agents"] }),
+  memberListOptions: () => ({ queryKey: ["members"] }),
 }));
 
 vi.mock("@multica/core/paths", () => ({
@@ -205,6 +208,8 @@ describe("PluginsTab", () => {
     expect(screen.getByText("Private")).toBeInTheDocument();
     expect(screen.getByText("Unverified")).toBeInTheDocument();
     expect(screen.getByText(/Private workspace upload/)).toBeInTheDocument();
+    expect(screen.getByText(/Uploaded by Alice/)).toBeInTheDocument();
+    expect(screen.queryByText(/member-1/)).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Uninstall" }));
     await waitFor(() => expect(mockUninstall).toHaveBeenCalledWith("private-installation-1"));
   });

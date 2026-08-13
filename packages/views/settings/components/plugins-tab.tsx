@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertCircle, CheckCircle2, Loader2, PackageCheck, ShieldCheck, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import { agentListOptions } from "@multica/core/workspace/queries";
+import { agentListOptions, memberListOptions } from "@multica/core/workspace/queries";
 import { useCurrentMember } from "@multica/core/permissions";
 import {
   comparePluginVersions,
@@ -51,6 +51,7 @@ export function PluginsTab() {
   const catalogQuery = useQuery(pluginCatalogOptions(wsId));
   const installationsQuery = useQuery(pluginInstallationsOptions(wsId));
   const agentsQuery = useQuery(agentListOptions(wsId));
+  const membersQuery = useQuery(memberListOptions(wsId));
   const installMutation = useInstallPlugin(wsId);
   const upgradeMutation = useUpgradePlugin(wsId);
   const enabledMutation = useSetPluginEnabled(wsId);
@@ -82,6 +83,7 @@ export function PluginsTab() {
   const privateInstallations = (installationsQuery.data?.plugins ?? [])
     .filter((installation) => installation.source_kind === "private_dev");
   const agents = (agentsQuery.data ?? []).filter((agent) => !agent.archived_at);
+  const members = membersQuery.data ?? [];
   const isMutating = installMutation.isPending || upgradeMutation.isPending || enabledMutation.isPending
     || rollbackMutation.isPending || uninstallMutation.isPending;
 
@@ -405,6 +407,7 @@ export function PluginsTab() {
         const selectedAgent = selectedAgents[installation.id] ?? agents[0]?.id ?? "";
         const state = installationState(installation);
         const activeBindings = installation.bindings.filter((binding) => binding.enabled === true);
+        const uploaderName = members.find((member) => member.user_id === installation.uploader_id)?.name;
         const rollbackVersion = [...installation.available_versions]
           .sort((left, right) => comparePluginVersions(right, left))
           .find((version) => comparePluginVersions(version, installation.desired_version) < 0);
@@ -456,7 +459,7 @@ export function PluginsTab() {
                     <div className="font-medium text-foreground">{t(($) => $.plugins.source)}</div>
                     <p className="mt-1 text-muted-foreground">
                       {t(($) => $.plugins.private_upload)}
-                      {installation.uploader_id ? ` · ${t(($) => $.plugins.uploaded_by)} ${installation.uploader_id}` : ""}
+                      {installation.uploader_id ? ` · ${t(($) => $.plugins.uploaded_by)} ${uploaderName ?? t(($) => $.plugins.unknown_member)}` : ""}
                     </p>
                   </div>
                 </div>

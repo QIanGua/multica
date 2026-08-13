@@ -213,6 +213,7 @@
     "health": "상태:",
     "bindings": "활성 범위",
     "unknown_agent": "알 수 없는 에이전트",
+    "unknown_member": "알 수 없는 멤버",
     "workspace_scope": "워크스페이스",
     "agent_scope": "에이전트",
     "binding_disabled": "Plugin 바인딩을 비활성화했습니다",

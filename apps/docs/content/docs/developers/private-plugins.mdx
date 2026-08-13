@@ -5,7 +5,7 @@ description: Build, validate, install, upgrade, roll back, and remove workspace-
 
 Private Skill Plugins let a workspace add declarative Agent guidance without publishing a new Multica release. V1 accepts static UTF-8 text for `agent.skill.v1`; it is not an npm, Node, Python, WASM, or native extension system, and Multica never runs package-manager or installation hooks from a Plugin.
 
-The feature is intended for internal and self-hosted dogfood. Both `plugins_v1` and `private_plugins_v1` must be enabled. If either flag is off, private discovery, upload, and mutation APIs fail closed. Already pinned Runs remain reproducible.
+The feature is intended for internal and self-hosted dogfood. Both `plugins_v1` and `private_plugins_v1` must be enabled to discover, upload, enable, upgrade, or roll back Private Plugins. If `private_plugins_v1` is turned off after installation, existing Private Plugins remain visible in the generic Installed list so administrators can disable or uninstall them safely. Already pinned Runs remain reproducible. Turning off the base `plugins_v1` flag disables all Plugin management APIs.
 
 ## Create a Plugin
 

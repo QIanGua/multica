@@ -213,6 +213,7 @@
     "health": "Health:",
     "bindings": "Enabled scopes",
     "unknown_agent": "Unknown agent",
+    "unknown_member": "Unknown member",
     "workspace_scope": "Workspace",
     "agent_scope": "Agent",
     "binding_disabled": "Plugin binding disabled",

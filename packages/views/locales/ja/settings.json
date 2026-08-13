@@ -213,6 +213,7 @@
     "health": "状態:",
     "bindings": "有効なスコープ",
     "unknown_agent": "不明なエージェント",
+    "unknown_member": "不明なメンバー",
     "workspace_scope": "ワークスペース",
     "agent_scope": "エージェント",
     "binding_disabled": "Plugin バインドを無効にしました",
