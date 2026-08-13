@@ -1,4 +1,4 @@
--- Add the private DeepSeek Harness runtime bridge as a first-party protocol
+-- Add the DeepSeek Harness runtime bridge as a first-party protocol
 -- family. NOT VALID preserves historical-row tolerance while enforcing the
 -- expanded whitelist for new rows.
 ALTER TABLE runtime_profile DROP CONSTRAINT IF EXISTS runtime_profile_protocol_family_check;

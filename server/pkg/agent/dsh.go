@@ -22,7 +22,7 @@ const (
 	dshTerminateGrace  = 2 * time.Second
 )
 
-// dshBackend drives the private Multica DSH bundle over its versioned JSONL
+// dshBackend drives the Multica DSH bundle over its versioned JSONL
 // stdio protocol. The adapter is intentionally independent of ACP: DSH owns
 // the agent loop, session store, model catalog, tools, and MCP clients, while
 // this package only translates those events into Multica's Backend contract.
