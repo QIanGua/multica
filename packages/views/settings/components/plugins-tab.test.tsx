@@ -10,6 +10,7 @@ const mockInstall = vi.hoisted(() => vi.fn());
 const mockSetEnabled = vi.hoisted(() => vi.fn());
 const mockUpgrade = vi.hoisted(() => vi.fn());
 const mockRollback = vi.hoisted(() => vi.fn());
+const mockUninstall = vi.hoisted(() => vi.fn());
 
 const data = vi.hoisted(() => ({
   catalog: {
@@ -66,6 +67,7 @@ vi.mock("@multica/core/plugins", () => ({
   useSetPluginEnabled: () => ({ mutateAsync: mockSetEnabled, isPending: false }),
   useUpgradePlugin: () => ({ mutateAsync: mockUpgrade, isPending: false }),
   useRollbackPlugin: () => ({ mutateAsync: mockRollback, isPending: false }),
+  useUninstallPlugin: () => ({ mutateAsync: mockUninstall, isPending: false }),
 }));
 
 vi.mock("@multica/core/workspace/queries", () => ({
@@ -99,6 +101,7 @@ describe("PluginsTab", () => {
     data.installed.plugins = [];
     mockInstall.mockResolvedValue({});
     mockSetEnabled.mockResolvedValue({});
+    mockUninstall.mockResolvedValue({});
   });
 
   it("renders the install review and keeps installation disabled by default", async () => {
@@ -159,5 +162,50 @@ describe("PluginsTab", () => {
     expect(screen.getByText("Read-only access")).toBeInTheDocument();
     expect(screen.getByText("review-readiness")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Install" })).toBeDisabled();
+  });
+
+  it("shows a private unverified installation outside the official catalog", async () => {
+    const user = userEvent.setup();
+    data.installed.plugins = [{
+      id: "private-installation-1",
+      plugin_key: "dev.acme.incident-guide",
+      display_name: "Incident Guide",
+      desired_version: "0.2.0",
+      active_version: "0.2.0",
+      enabled: false,
+      desired_generation: 2,
+      active_generation: 2,
+      lifecycle_status: "installed",
+      description: "Private incident response guidance.",
+      publisher: "acme.internal",
+      publisher_type: "private_dev",
+      trust_tier: "private_dev",
+      source_kind: "private_dev",
+      source_ref: "private://sha256:archive",
+      uploader_id: "member-1",
+      manifest_digest: "sha256:manifest",
+      archive_digest: "sha256:archive",
+      artifact_digest: "sha256:artifact",
+      signature_verified: false,
+      requested_capabilities: ["agent.skill.contribute"],
+      available_versions: ["0.2.0", "0.1.0"],
+      contributions: ["incident-guide"],
+      contribution_details: [{
+        key: "incident-guide",
+        type: "agent.skill.v1",
+        name: "Incident Guide",
+        description: "Guide incident response.",
+        entry_path: "skills/incident-guide/SKILL.md",
+        entry_digest: "sha256:entry",
+      }],
+      bindings: [],
+    }];
+    render(<PluginsTab />, { wrapper: Wrapper });
+
+    expect(screen.getByText("Private")).toBeInTheDocument();
+    expect(screen.getByText("Unverified")).toBeInTheDocument();
+    expect(screen.getByText(/Private workspace upload/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Uninstall" }));
+    await waitFor(() => expect(mockUninstall).toHaveBeenCalledWith("private-installation-1"));
   });
 });

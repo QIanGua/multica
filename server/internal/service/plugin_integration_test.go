@@ -2,8 +2,11 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/testutil/plugintest"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/plugincontract"
 )
 
 func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
@@ -31,7 +35,7 @@ func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	}
 
 	suffix := time.Now().UnixNano()
-	var userID, workspaceID, runtimeID, agentID, issueID string
+	var userID, workspaceID, isolationWorkspaceID, runtimeID, agentID, issueID string
 	if err := pool.QueryRow(ctx, `INSERT INTO "user" (name, email) VALUES ('Plugin E2E', $1) RETURNING id`, fmt.Sprintf("plugin-e2e-%d@multica.ai", suffix)).Scan(&userID); err != nil {
 		t.Fatal(err)
 	}
@@ -61,14 +65,27 @@ func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		cleanup := context.Background()
-		pool.Exec(cleanup, `DELETE FROM plugin_execution_manifest WHERE workspace_id = $1`, workspaceID)
+		cleanupPluginWorkspace := func(id string) {
+			pool.Exec(cleanup, `DELETE FROM plugin_execution_manifest WHERE workspace_id = $1`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_health WHERE workspace_id = $1`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_capability_snapshot WHERE workspace_id = $1`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_workspace_capability_state WHERE workspace_id = $1`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_binding WHERE installation_id IN (SELECT id FROM plugin_installation WHERE workspace_id = $1)`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_grant WHERE installation_id IN (SELECT id FROM plugin_installation WHERE workspace_id = $1)`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_installation WHERE workspace_id = $1`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_contribution WHERE release_id IN (SELECT id FROM plugin_release WHERE plugin_id IN (SELECT id FROM plugin_identity WHERE owner_workspace_id = $1))`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_artifact_file WHERE release_id IN (SELECT id FROM plugin_release WHERE plugin_id IN (SELECT id FROM plugin_identity WHERE owner_workspace_id = $1))`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_release WHERE plugin_id IN (SELECT id FROM plugin_identity WHERE owner_workspace_id = $1)`, id)
+			pool.Exec(cleanup, `DELETE FROM plugin_identity WHERE owner_workspace_id = $1`, id)
+			pool.Exec(cleanup, `DELETE FROM activity_log WHERE workspace_id = $1`, id)
+		}
+		cleanupPluginWorkspace(workspaceID)
+		if isolationWorkspaceID != "" {
+			cleanupPluginWorkspace(isolationWorkspaceID)
+			pool.Exec(cleanup, `DELETE FROM member WHERE workspace_id = $1`, isolationWorkspaceID)
+			pool.Exec(cleanup, `DELETE FROM workspace WHERE id = $1`, isolationWorkspaceID)
+		}
 		pool.Exec(cleanup, `DELETE FROM agent_task_queue WHERE agent_id = $1`, agentID)
-		pool.Exec(cleanup, `DELETE FROM plugin_health WHERE workspace_id = $1`, workspaceID)
-		pool.Exec(cleanup, `DELETE FROM plugin_capability_snapshot WHERE workspace_id = $1`, workspaceID)
-		pool.Exec(cleanup, `DELETE FROM plugin_workspace_capability_state WHERE workspace_id = $1`, workspaceID)
-		pool.Exec(cleanup, `DELETE FROM plugin_binding WHERE installation_id IN (SELECT id FROM plugin_installation WHERE workspace_id = $1)`, workspaceID)
-		pool.Exec(cleanup, `DELETE FROM plugin_grant WHERE installation_id IN (SELECT id FROM plugin_installation WHERE workspace_id = $1)`, workspaceID)
-		pool.Exec(cleanup, `DELETE FROM plugin_installation WHERE workspace_id = $1`, workspaceID)
 		pool.Exec(cleanup, `DELETE FROM issue WHERE id = $1`, issueID)
 		pool.Exec(cleanup, `DELETE FROM agent WHERE id = $1`, agentID)
 		pool.Exec(cleanup, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
@@ -165,7 +182,162 @@ func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	if err != nil || len(retryBundles) != 1 || retryManifest.SnapshotDigest != manifest.SnapshotDigest {
 		t.Fatalf("retry did not inherit pinned manifest: bundles=%d manifest=%+v err=%v", len(retryBundles), retryManifest, err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, retryTaskID); err != nil {
+		t.Fatalf("complete retry task: %v", err)
+	}
 	if _, err := pluginService.RollbackPlugin(ctx, workspaceUUID, installation.ID, actorUUID, "1.0.0"); err != nil {
 		t.Fatalf("rollback: %v", err)
+	}
+
+	privateSource := filepath.Join("..", "..", "..", "examples", "plugins", "incident-triage")
+	if _, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, []byte("not a Plugin archive")); err == nil {
+		t.Fatal("invalid private Plugin archive unexpectedly installed")
+	} else {
+		var pluginErr *PluginError
+		if !errors.As(err, &pluginErr) || pluginErr.Kind != PluginErrorInvalid {
+			t.Fatalf("invalid private Plugin error = %v", err)
+		}
+	}
+	privateArchiveV1, _, err := plugincontract.PackDirectory(privateSource)
+	if err != nil {
+		t.Fatalf("pack private Plugin v1: %v", err)
+	}
+	privateInstallation, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, privateArchiveV1)
+	if err != nil {
+		t.Fatalf("install private Plugin v1: %v", err)
+	}
+	if privateInstallation.Enabled || privateInstallation.SourceKind != plugincontract.SourcePrivateDev {
+		t.Fatalf("private install must be disabled and private: %+v", privateInstallation)
+	}
+	privateInstallation, err = pluginService.EnablePlugin(ctx, workspaceUUID, privateInstallation.ID, actorUUID, "agent", agentUUID)
+	if err != nil {
+		t.Fatalf("enable private Plugin: %v", err)
+	}
+	privateV1TaskID := createTask(nil)
+	privateV1Bundles, _, privateV1Manifest, err := taskService.LoadTaskPluginSkillBundles(ctx, util.MustParseUUID(privateV1TaskID))
+	if err != nil || len(privateV1Bundles) != 1 || privateV1Manifest == nil || !strings.Contains(privateV1Bundles[0].Content, "# Incident triage") {
+		t.Fatalf("private v1 Skill missing from real task: bundles=%d manifest=%+v err=%v", len(privateV1Bundles), privateV1Manifest, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, privateV1TaskID); err != nil {
+		t.Fatalf("complete private v1 task: %v", err)
+	}
+
+	privateV2Source := filepath.Join(t.TempDir(), "incident-triage")
+	privateV2SkillDir := filepath.Join(privateV2Source, "skills", "incident-triage")
+	if err := os.MkdirAll(privateV2SkillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes, err := os.ReadFile(filepath.Join(privateSource, plugincontract.ManifestFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var privateManifest plugincontract.Manifest
+	if err := json.Unmarshal(manifestBytes, &privateManifest); err != nil {
+		t.Fatal(err)
+	}
+	privateManifest.Metadata.Version = "0.2.0"
+	manifestBytes, err = json.MarshalIndent(privateManifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(privateV2Source, plugincontract.ManifestFilename), append(manifestBytes, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v2Skill := "---\nname: incident-triage\ndescription: Structure incident intake, severity assessment, evidence capture, and handoff.\n---\n\n# Incident triage v2\n\nUse the updated private workflow.\n"
+	if err := os.WriteFile(filepath.Join(privateV2SkillDir, "SKILL.md"), []byte(v2Skill), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	privateArchiveV2, _, err := plugincontract.PackDirectory(privateV2Source)
+	if err != nil {
+		t.Fatalf("pack private Plugin v2: %v", err)
+	}
+	privateInstallation, err = pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, privateArchiveV2)
+	if err != nil {
+		t.Fatalf("upgrade private Plugin: %v", err)
+	}
+	idempotentInstallation, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, privateArchiveV2)
+	if err != nil || idempotentInstallation.ID != privateInstallation.ID {
+		t.Fatalf("idempotent private upload: installation=%+v err=%v", idempotentInstallation, err)
+	}
+	if err := os.WriteFile(filepath.Join(privateV2SkillDir, "SKILL.md"), []byte(v2Skill+"\nConflicting content.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	conflictingArchive, _, err := plugincontract.PackDirectory(privateV2Source)
+	if err != nil {
+		t.Fatalf("pack conflicting private Plugin: %v", err)
+	}
+	if _, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, conflictingArchive); err == nil {
+		t.Fatal("changed content reused an immutable private Plugin version")
+	} else {
+		var pluginErr *PluginError
+		if !errors.As(err, &pluginErr) || pluginErr.Kind != PluginErrorConflict {
+			t.Fatalf("immutable private Plugin conflict error = %v", err)
+		}
+	}
+	privateV2TaskID := createTask(nil)
+	privateV2Bundles, _, _, err := taskService.LoadTaskPluginSkillBundles(ctx, util.MustParseUUID(privateV2TaskID))
+	if err != nil || len(privateV2Bundles) != 1 || !strings.Contains(privateV2Bundles[0].Content, "# Incident triage v2") {
+		t.Fatalf("private v2 Skill missing from new task: bundles=%d err=%v", len(privateV2Bundles), err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, privateV2TaskID); err != nil {
+		t.Fatalf("complete private v2 task: %v", err)
+	}
+	privateInstallation, err = pluginService.RollbackPlugin(ctx, workspaceUUID, privateInstallation.ID, actorUUID, "0.1.0")
+	if err != nil {
+		t.Fatalf("rollback private Plugin: %v", err)
+	}
+	if privateInstallation.SourceKind != plugincontract.SourcePrivateDev {
+		t.Fatalf("rollback changed source kind: %+v", privateInstallation)
+	}
+	privateRollbackTaskID := createTask(nil)
+	privateRollbackBundles, _, _, err := taskService.LoadTaskPluginSkillBundles(ctx, util.MustParseUUID(privateRollbackTaskID))
+	if err != nil || len(privateRollbackBundles) != 1 || strings.Contains(privateRollbackBundles[0].Content, "# Incident triage v2") {
+		t.Fatalf("private rollback did not restore v1 for new task: bundles=%d err=%v", len(privateRollbackBundles), err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, privateRollbackTaskID); err != nil {
+		t.Fatalf("complete private rollback task: %v", err)
+	}
+
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ('Plugin Isolation', $1, '', 'PI2') RETURNING id
+	`, fmt.Sprintf("plugin-isolation-%d", suffix)).Scan(&isolationWorkspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO member (workspace_id, user_id, role) VALUES ($1, $2, 'owner')`, isolationWorkspaceID, userID); err != nil {
+		t.Fatal(err)
+	}
+	isolationInstallation, err := pluginService.InstallPrivateArchive(ctx, util.MustParseUUID(isolationWorkspaceID), actorUUID, privateArchiveV1)
+	if err != nil {
+		t.Fatalf("install same private key in isolated workspace: %v", err)
+	}
+	if isolationInstallation.PluginID == privateInstallation.PluginID {
+		t.Fatal("private Plugin identity leaked across workspaces")
+	}
+	if _, err := pluginService.EnablePlugin(ctx, util.MustParseUUID(isolationWorkspaceID), privateInstallation.ID, actorUUID, "workspace", util.MustParseUUID(isolationWorkspaceID)); err == nil {
+		t.Fatal("cross-workspace installation mutation unexpectedly succeeded")
+	}
+
+	if err := pluginService.UninstallPlugin(ctx, workspaceUUID, privateInstallation.ID, actorUUID); err != nil {
+		t.Fatalf("uninstall private Plugin: %v", err)
+	}
+	historicalBundles, _, historicalManifest, err := taskService.LoadTaskPluginSkillBundles(ctx, util.MustParseUUID(privateV1TaskID))
+	if err != nil || len(historicalBundles) != 1 || historicalManifest.SnapshotDigest != privateV1Manifest.SnapshotDigest {
+		t.Fatalf("uninstall changed historical private task: bundles=%d manifest=%+v err=%v", len(historicalBundles), historicalManifest, err)
+	}
+	afterUninstallTaskID := createTask(nil)
+	afterUninstallBundles, _, _, err := taskService.LoadTaskPluginSkillBundles(ctx, util.MustParseUUID(afterUninstallTaskID))
+	if err != nil || len(afterUninstallBundles) != 0 {
+		t.Fatalf("uninstalled private Plugin leaked into new task: bundles=%d err=%v", len(afterUninstallBundles), err)
+	}
+	var auditCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM activity_log
+		WHERE workspace_id = $1 AND action LIKE 'plugin_private_%'
+	`, workspaceID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount < 5 {
+		t.Fatalf("private Plugin audit records = %d, want at least 5", auditCount)
 	}
 }
