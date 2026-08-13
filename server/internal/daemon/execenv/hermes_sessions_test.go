@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -612,6 +613,171 @@ func TestPrepareHermesHomeMigrationIntoSemanticallyEmptyStore(t *testing.T) {
 	}
 }
 
+// TestHermesSessionStorePublishSerializesCompetitors pins the publish
+// protocol's mutual exclusion with a deterministic interleaving. The first
+// publisher is parked inside the critical section — after its occupancy check,
+// before its remnant cleanup — which is exactly the window where an
+// unsynchronized competitor used to be able to publish a real transcript and
+// have it deleted as a remnant by the parked publisher's stale decision. With
+// the lock, the competitor cannot enter that window at all: it waits, its own
+// check sees the winner's database, and it reports a lost race without
+// touching anything.
+func TestHermesSessionStorePublishSerializesCompetitors(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "issue-1")
+	// The semantically-empty shape both publishers read as "no history".
+	mustWrite(t, filepath.Join(store, "state.db"), "")
+
+	mkStaging := func(label string) string {
+		staging, err := newHermesStoreStaging(store)
+		if err != nil {
+			t.Fatalf("staging for %s: %v", label, err)
+		}
+		mustWrite(t, filepath.Join(staging, "state.db"), label+" transcript")
+		mustWrite(t, filepath.Join(staging, "state.db-wal"), label+" tail")
+		return staging
+	}
+	firstStaging := mkStaging("first")
+	secondStaging := mkStaging("second")
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var parkedFirst atomic.Bool
+	stubHermesSessionPublishBarrier(t, func(string) {
+		entered <- struct{}{}
+		if parkedFirst.CompareAndSwap(false, true) {
+			<-release
+		}
+	})
+
+	type outcome struct {
+		label    string
+		promoted bool
+		err      error
+	}
+	results := make(chan outcome, 2)
+	publish := func(label, staging string) {
+		promoted, err := publishHermesSessionStaging(staging, store)
+		results <- outcome{label, promoted, err}
+	}
+
+	go publish("first", firstStaging)
+	<-entered // the first publisher is parked between its check and its cleanup
+	go publish("second", secondStaging)
+
+	close(release)
+	byLabel := map[string]outcome{}
+	for range 2 {
+		r := <-results
+		byLabel[r.label] = r
+	}
+	for _, r := range byLabel {
+		if r.err != nil {
+			t.Fatalf("publish %s: %v", r.label, r.err)
+		}
+	}
+	if !byLabel["first"].promoted || byLabel["second"].promoted {
+		t.Fatalf("promoted = first:%v second:%v, want the parked first publisher to win and the second to positively lose",
+			byLabel["first"].promoted, byLabel["second"].promoted)
+	}
+
+	// The loser never reached the destructive window: its occupancy check
+	// already saw the winner's published database.
+	select {
+	case <-entered:
+		t.Fatal("the losing publisher entered the check-to-cleanup window — the interleaving that deletes a freshly published transcript")
+	default:
+	}
+
+	// The winner's family is in the store byte-intact.
+	for name, want := range map[string]string{
+		"state.db":     "first transcript",
+		"state.db-wal": "first tail",
+	} {
+		got, err := os.ReadFile(filepath.Join(store, name))
+		if err != nil || string(got) != want {
+			t.Fatalf("store %s = %q (err %v), want the winner's %q untouched", name, got, err, want)
+		}
+	}
+	// The loser's staging was not consumed, so its caller still holds a
+	// complete copy of the source it will now yield with.
+	for _, name := range []string{"state.db", "state.db-wal"} {
+		if _, err := os.Stat(filepath.Join(secondStaging, name)); err != nil {
+			t.Fatalf("loser's staging %s was destroyed: %v", name, err)
+		}
+	}
+}
+
+// TestPrepareHermesHomeStoreCleanupHandlesUnexpectedEntryTypes covers the
+// state.db-named entries the cleanup must not treat as removable SQLite
+// remnants. A directory under a family name is content this code cannot
+// identify — the publish must fail closed with the source preserved rather
+// than delete it recursively. A symlink is a prior mount's store link: it is
+// unlinked (never followed), and its target must survive.
+func TestPrepareHermesHomeStoreCleanupHandlesUnexpectedEntryTypes(t *testing.T) {
+	requireSymlinks(t)
+
+	t.Run("directory under a family name fails closed", func(t *testing.T) {
+		sharedHome := t.TempDir()
+		store := filepath.Join(t.TempDir(), "issue-1")
+		skills := []SkillContextForEnv{{Name: "deploy", Content: "# Deploy"}}
+		hermesHome := filepath.Join(t.TempDir(), "hermes-home")
+
+		mustWrite(t, filepath.Join(store, "state.db"), "")
+		mustWrite(t, filepath.Join(store, "state.db-wal", "nested.txt"), "content this code cannot identify")
+
+		if _, err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", "", testLogger()); err != nil {
+			t.Fatalf("prepare pre-store task: %v", err)
+		}
+		mustWrite(t, filepath.Join(hermesHome, "state.db"), "transcript")
+
+		if _, err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", store, testLogger()); err == nil {
+			t.Fatal("prepare succeeded over a store entry it cannot identify, want fail closed")
+		}
+		if got, err := os.ReadFile(filepath.Join(store, "state.db-wal", "nested.txt")); err != nil || string(got) != "content this code cannot identify" {
+			t.Fatalf("unidentified store content = %q (err %v), want it untouched", got, err)
+		}
+		if got, err := os.ReadFile(filepath.Join(hermesHome, "state.db")); err != nil || string(got) != "transcript" {
+			t.Fatalf("source db = %q (err %v), want it preserved on a failed publish", got, err)
+		}
+	})
+
+	t.Run("symlink remnant is unlinked without touching its target", func(t *testing.T) {
+		sharedHome := t.TempDir()
+		store := filepath.Join(t.TempDir(), "issue-1")
+		skills := []SkillContextForEnv{{Name: "deploy", Content: "# Deploy"}}
+		hermesHome := filepath.Join(t.TempDir(), "hermes-home")
+
+		target := filepath.Join(t.TempDir(), "not-a-remnant.db")
+		mustWrite(t, target, "someone else's database")
+		mustWrite(t, filepath.Join(store, "state.db"), "")
+		if err := os.Symlink(target, filepath.Join(store, "state.db-shm")); err != nil {
+			t.Fatalf("plant symlink remnant: %v", err)
+		}
+
+		if _, err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", "", testLogger()); err != nil {
+			t.Fatalf("prepare pre-store task: %v", err)
+		}
+		mustWrite(t, filepath.Join(hermesHome, "state.db"), "transcript")
+
+		sessions, err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", store, testLogger())
+		if err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+		if !sessions.Mounted || !sessions.HistoryPresent {
+			t.Fatalf("mount = %+v, want mounted with history", sessions)
+		}
+		if got, err := os.ReadFile(filepath.Join(store, "state.db")); err != nil || string(got) != "transcript" {
+			t.Fatalf("store db = %q (err %v), want the migrated transcript", got, err)
+		}
+		if got, err := os.ReadFile(target); err != nil || string(got) != "someone else's database" {
+			t.Fatalf("symlink target = %q (err %v), want it untouched by the unlink", got, err)
+		}
+		if _, err := os.Lstat(filepath.Join(store, "state.db-shm")); !os.IsNotExist(err) {
+			t.Fatalf("symlink remnant still present (lstat err %v), want it unlinked", err)
+		}
+	})
+}
+
 // stubHermesSessionLink swaps the symlink primitive for the duration of a test
 // and returns a restore func, so a test can assert both the failure and the
 // recovery in one run.
@@ -640,6 +806,23 @@ func stubHermesSessionCopy(t *testing.T, fn func(src, dst string) error) (restor
 	restore = func() {
 		if !restored {
 			hermesSessionCopy = prev
+			restored = true
+		}
+	}
+	t.Cleanup(restore)
+	return restore
+}
+
+// stubHermesSessionPublishBarrier swaps the publish barrier for the duration
+// of a test, same contract as stubHermesSessionLink.
+func stubHermesSessionPublishBarrier(t *testing.T, fn func(storeDir string)) (restore func()) {
+	t.Helper()
+	prev := hermesSessionPublishBarrier
+	hermesSessionPublishBarrier = fn
+	restored := false
+	restore = func() {
+		if !restored {
+			hermesSessionPublishBarrier = prev
 			restored = true
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/cli"
@@ -295,9 +296,21 @@ func migrateHermesTaskSessionDB(hermesHome, storeDir string, logger *slog.Logger
 // A store that cannot be cleared is NOT reported as a lost race: the shared
 // promote fails closed, the migration returns the error, and the caller keeps
 // the source database.
+//
+// The check, the cleanup and the promote hold hermesSessionPublishMu as one
+// step. Deciding the remnants are nothing and then deleting them by path name
+// is only sound while nothing can replace them in between: without the lock, a
+// competitor could publish a real transcript after this caller's check, and the
+// cleanup would delete the winner's database as a remnant — after the winner
+// already reported success and discarded its source.
 func publishHermesSessionStaging(staging, storeDir string) (bool, error) {
+	hermesSessionPublishMu.Lock()
+	defer hermesSessionPublishMu.Unlock()
 	if hermesStoreHasSessionDB(storeDir) {
 		return false, nil // a competitor published a real transcript first
+	}
+	if hermesSessionPublishBarrier != nil {
+		hermesSessionPublishBarrier(storeDir)
 	}
 	if err := removeHermesSessionDBFamily(storeDir); err != nil {
 		return false, err
@@ -305,11 +318,37 @@ func publishHermesSessionStaging(staging, storeDir string) (bool, error) {
 	return promoteHermesStoreStaging(staging, storeDir, hermesStoreHasSessionDB)
 }
 
+// hermesSessionPublishMu serializes every session-store publish in this
+// process. In-process mutual exclusion is the real thing here, not an
+// approximation: the daemon is the store tree's only writer — tasks, the
+// migration and even the GC's reservation guard (Daemon.activeStores) all live
+// in one process — so two publishers can only ever be two goroutines of this
+// daemon. One process-wide mutex rather than a per-store map because a publish
+// happens at most once per conversation (the first mount that finds a
+// task-local database) and its critical section is a stat, a few unlinks and a
+// rename; contention is not a factor worth bookkeeping for.
+var hermesSessionPublishMu sync.Mutex
+
+// hermesSessionPublishBarrier, when non-nil, runs inside the locked region
+// between the occupancy check and the remnant cleanup — the exact window the
+// lock exists to close. Tests park a publisher here to prove a competitor
+// cannot interleave a publish into that window. Always nil in production.
+var hermesSessionPublishBarrier func(storeDir string)
+
 // removeHermesSessionDBFamily clears a directory's state.db family. Called
 // once the database is either safely in the store or deliberately being
 // replaced by the link; leaving a stale `-wal` next to the link would be
 // dead weight SQLite never reads (it derives the sidecar paths from the
 // resolved store path) and a confusing thing to find in a task directory.
+//
+// Only entries this code can identify are removed, and never recursively: a
+// regular file is SQLite's, and a symlink is a prior mount's store link (left
+// when the store path changed under a live overlay, e.g. a profile switch
+// mid-conversation) — os.Remove unlinks it without touching its target. A
+// directory or any other irregular type under a state.db name is not a
+// database remnant this code recognises, and deleting content it cannot
+// identify is exactly the failure this file exists to prevent, so it fails
+// closed and the caller keeps its source.
 func removeHermesSessionDBFamily(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -320,7 +359,10 @@ func removeHermesSessionDBFamily(dir string) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		if err := os.RemoveAll(path); err != nil {
+		if t := entry.Type(); !t.IsRegular() && t&os.ModeSymlink == 0 {
+			return fmt.Errorf("refusing to remove hermes session state %s: unexpected %s under a state.db name", path, t)
+		}
+		if err := os.Remove(path); err != nil {
 			return fmt.Errorf("remove task-local hermes session state %s: %w", path, err)
 		}
 	}
