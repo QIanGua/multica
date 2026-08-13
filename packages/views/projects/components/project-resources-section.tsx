@@ -238,7 +238,15 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
       setModeDialog({
         path,
         daemonId: localDaemonId,
-        mode: "in_place",
+        // Same preselection rule as the create-project flow: a git repo this
+        // daemon can actually run worktree mode on starts on parallel, anything
+        // else starts on direct. Only the PRESELECTION differs by folder — the
+        // user still confirms, and existing resources keep whatever they have.
+        mode:
+          validation.is_git_repo === true &&
+          localWorktreeSupported(cliVersionForDaemon(localDaemonId))
+            ? "worktree"
+            : "in_place",
         isGitRepo: validation.is_git_repo,
         label: fallbackLabel,
       });

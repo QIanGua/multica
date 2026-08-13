@@ -192,7 +192,11 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
   // Execution mode is chosen here rather than after creation: it decides
   // whether tasks edit this folder or hand back a branch, which is part of
   // what the user is setting up, not a setting to discover later.
-  const [localMode, setLocalMode] = useState<LocalDirectoryExecutionMode>("in_place");
+  //
+  // null means "the user has not picked one" — distinct from an explicit
+  // in_place. Only then does the folder-derived preselection apply, so an
+  // explicit choice is never overridden by a later folder change.
+  const [localMode, setLocalMode] = useState<LocalDirectoryExecutionMode | null>(null);
   // undefined = could not check (older desktop build); the daemon re-checks
   // authoritatively, so unknown stays permissive.
   const [localIsGitRepo, setLocalIsGitRepo] = useState<boolean | undefined>(undefined);
@@ -215,11 +219,25 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
       : !localWorktreeSupported(localDaemonCliVersion)
         ? ("daemon_outdated" as const)
         : undefined;
+  // Preselection, not a default behavior change: when the folder is a git repo
+  // and the runtime can actually run worktree mode, parallel is the better fit,
+  // so it starts selected — visibly, in a control the user can flip in one
+  // click before creating anything. A plain folder starts on direct.
+  //
+  // `localIsGitRepo === undefined` (an older desktop build that doesn't report
+  // it) preselects direct. The asymmetry is deliberate: permissive about what
+  // the user MAY choose, conservative about what we choose FOR them.
+  const preselectedLocalMode: LocalDirectoryExecutionMode =
+    localIsGitRepo === true && worktreeUnavailableReason === undefined
+      ? "worktree"
+      : "in_place";
   // Never submit a mode the picker would have blocked — the folder can change
   // after a mode was chosen (pick a git repo, choose worktree, then pick a
   // plain folder), and the stale choice would fail at task time.
   const effectiveLocalMode: LocalDirectoryExecutionMode =
-    worktreeUnavailableReason !== undefined ? "in_place" : localMode;
+    worktreeUnavailableReason !== undefined
+      ? "in_place"
+      : (localMode ?? preselectedLocalMode);
 
   const handleSourceModeChange = (mode: "repos" | "local") => {
     setSourceMode(mode);
@@ -260,7 +278,7 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
     setSelectedLocalLabel(null);
     setLocalPickError(null);
     setLocalIsGitRepo(undefined);
-    setLocalMode("in_place");
+    setLocalMode(null);
   };
 
   // Sync field changes to draft store
