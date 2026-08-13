@@ -437,6 +437,29 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		return nil, fmt.Errorf("execenv: write context files: %w", err)
 	}
 
+	// From here on the sidecar tree — including the daemon task marker — is on
+	// disk, but the manifest that records it is not written until the end of
+	// Prepare. Roll back from the in-memory manifest on every failure in
+	// between: the caller gets no Environment on those paths, so the teardown
+	// defers that normally undo this tree are never registered, and the files
+	// would stay behind with no record of what to remove (MUL-6132).
+	//
+	// In place only. Worktree mode discards the whole worktree on failure just
+	// above, and a cloud envRoot is wiped wholesale by the GC — only the
+	// local_directory flow writes into a directory that outlives the task and
+	// belongs to the user, where a leftover marker disables every multica
+	// command in that directory tree until someone removes it by hand.
+	if params.LocalWorkDir != "" {
+		defer func() {
+			if prepareSucceeded {
+				return
+			}
+			if err := rollBackPreparedSidecars(*manifest); err != nil && logger != nil {
+				logger.Warn("execenv: roll back sidecars after failed prepare", "work_dir", workDir, "error", err)
+			}
+		}()
+	}
+
 	// Persist managed-env provenance for non-local issue envs at Prepare time
 	// (not on completion, where .gc_meta.json is written). A same-issue
 	// follow-up can be claimed the instant the prior task completes — before
@@ -531,6 +554,16 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	}
 
 	if err := writeSidecarManifest(envRoot, manifest); err != nil {
+		// In place the manifest is the ONLY record of what we wrote into the
+		// user's own directory, so losing it strands the sidecar tree there
+		// permanently — no crash required, a disk or permission hiccup is
+		// enough (MUL-6132). Fail so the rollback registered above removes the
+		// tree now, while we still hold the in-memory manifest. Elsewhere the
+		// manifest is a convenience the GC can do without, so a warning stays
+		// the right response.
+		if params.LocalWorkDir != "" {
+			return nil, fmt.Errorf("execenv: write sidecar manifest: %w", err)
+		}
 		logger.Warn("execenv: write sidecar manifest failed (non-fatal)", "error", err)
 	}
 

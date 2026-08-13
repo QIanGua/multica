@@ -284,6 +284,20 @@ func CleanupSidecars(envRoot string) error {
 		return fmt.Errorf("parse sidecar manifest %s: %w", manifestPath, err)
 	}
 
+	return rollBackManifest(m, manifestPath)
+}
+
+// rollBackManifest removes everything m records, then removes manifestPath
+// itself when it is non-empty. It is the shared body of CleanupSidecars (which
+// reads m back from disk after the task ran) and rollBackPreparedSidecars
+// (which passes the in-memory manifest of a Prepare that never finished, and
+// has no manifest file to delete because Prepare failed before writing one).
+//
+// Splitting it this way is what lets the failed-Prepare path reuse the exact
+// deletion semantics documented on CleanupSidecars — ENOENT and non-empty
+// directories tolerated, real I/O errors surfaced — instead of growing a second,
+// subtly different rollback that would drift from it.
+func rollBackManifest(m sidecarManifest, manifestPath string) error {
 	var firstErr error
 	captureErr := func(err error) {
 		if firstErr == nil {
@@ -334,11 +348,31 @@ func CleanupSidecars(envRoot string) error {
 		}
 	}
 
-	if err := os.Remove(manifestPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		captureErr(fmt.Errorf("remove manifest %s: %w", manifestPath, err))
+	if manifestPath != "" {
+		if err := os.Remove(manifestPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			captureErr(fmt.Errorf("remove manifest %s: %w", manifestPath, err))
+		}
 	}
 
 	return firstErr
+}
+
+// rollBackPreparedSidecars undoes the sidecar writes of a Prepare that failed
+// before it could persist the manifest, using the in-memory manifest Prepare
+// was still filling in.
+//
+// This is the only rollback available on that path. Prepare writes the daemon
+// task marker and the rest of the sidecar tree into the workdir early, but only
+// persists the manifest at the very end; every error return in between leaves
+// that tree on disk with no on-disk record of it, and the caller never receives
+// an Environment, so no teardown defer downstream knows there is anything to
+// clean (MUL-6132). For a local_directory task the workdir is the user's own
+// repository, so "left on disk" means a marker that disables every multica
+// command in that directory tree until someone deletes it by hand.
+//
+// There is no manifest file to remove, so manifestPath is empty.
+func rollBackPreparedSidecars(m sidecarManifest) error {
+	return rollBackManifest(m, "")
 }
 
 // removeReusedManagedSkillDirs force-removes the skill directories the prior
