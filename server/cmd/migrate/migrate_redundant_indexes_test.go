@@ -142,11 +142,7 @@ func TestRedundantIndexMigrationsPreserveCoveringQueryPlansAndRollback(t *testin
 
 func openTestPoolWithSearchPath(t *testing.T, schema string) *pgxpool.Pool {
 	t.Helper()
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://multica:multica@localhost:5432/multica?sslmode=disable"
-	}
-	config, err := pgxpool.ParseConfig(dbURL)
+	config, err := pgxpool.ParseConfig(testDatabaseURL())
 	if err != nil {
 		t.Fatalf("parse test database URL: %v", err)
 	}
@@ -306,21 +302,7 @@ func assertPlanUsesIndex(t *testing.T, pool *pgxpool.Pool, query, want string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatalf("acquire plan connection: %v", err)
-	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, "SET enable_seqscan = off"); err != nil {
-		t.Fatalf("disable sequential scans: %v", err)
-	}
-	defer func() {
-		if _, err := conn.Exec(context.Background(), "SET enable_seqscan = DEFAULT"); err != nil {
-			t.Logf("restore enable_seqscan: %v", err)
-		}
-	}()
-
-	rows, err := conn.Query(ctx, "EXPLAIN (COSTS OFF) "+query)
+	rows, err := pool.Query(ctx, "EXPLAIN (COSTS OFF) "+query)
 	if err != nil {
 		t.Fatalf("explain query: %v", err)
 	}

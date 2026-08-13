@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,16 +64,44 @@ func TestConcurrentIndexCleanupsMatchTheirMigrations(t *testing.T) {
 		}
 	}
 
-	// Every MUL-6108 drop has a CREATE INDEX CONCURRENTLY rollback and must
-	// therefore participate in down-direction INVALID-index cleanup.
-	for _, version := range []string{
-		"300_drop_redundant_issue_workspace_number_index",
-		"301_drop_redundant_sys_cron_job_plan_index",
-		"302_drop_redundant_channel_chat_session_binding_index",
-		"303_drop_redundant_lark_chat_session_binding_index",
-	} {
-		if _, ok := concurrentDownIndexCleanups[version]; !ok {
-			t.Errorf("%s: missing from concurrentDownIndexCleanups", version)
+}
+
+// TestEveryConcurrentDownBuildHasCleanup works in the opposite direction from
+// TestConcurrentIndexCleanupsMatchTheirMigrations: every rollback migration
+// that builds an index concurrently must be registered. This prevents a new or
+// historical down migration from silently missing retry cleanup.
+func TestEveryConcurrentDownBuildHasCleanup(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.down.sql"))
+	if err != nil {
+		t.Fatalf("glob down migrations: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no down migrations found")
+	}
+
+	for _, path := range paths {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("%s: read: %v", path, err)
+			continue
+		}
+		matches := concurrentIndexNamePattern.FindAllSubmatch(stripSQLLineComments(body), -1)
+		if len(matches) == 0 {
+			continue
+		}
+		version := strings.TrimSuffix(filepath.Base(path), ".down.sql")
+		if len(matches) != 1 {
+			t.Errorf("%s: has %d concurrent index builds; cleanup registration supports exactly one", version, len(matches))
+			continue
+		}
+		indexName := string(matches[0][1])
+		registered, ok := concurrentDownIndexCleanups[version]
+		if !ok {
+			t.Errorf("%s: builds %q concurrently on rollback but has no down cleanup", version, indexName)
+			continue
+		}
+		if registered != indexName {
+			t.Errorf("%s: down cleanup registers %q, migration builds %q", version, registered, indexName)
 		}
 	}
 }

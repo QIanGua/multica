@@ -66,15 +66,3 @@ WHERE NOT a.indisunique
   -- this guard, unrelated expression indexes can be reported as duplicates.
   AND COALESCE(a.exprs, '') = COALESCE(b.exprs, '')
 ORDER BY a.tblname, a.idxname, b.idxname;
-
--- Capture the exact storage that the first batch will reclaim before rollout.
-SELECT
-    index_name,
-    pg_size_pretty(COALESCE(pg_relation_size(to_regclass(index_name)), 0)) AS size,
-    COALESCE(pg_relation_size(to_regclass(index_name)), 0) AS size_bytes
-FROM unnest(ARRAY[
-    'idx_issue_workspace_number',
-    'idx_sys_cron_exec_job_plan',
-    'idx_channel_chat_session_binding_session',
-    'idx_lark_chat_session_binding_session'
-]) AS index_name;

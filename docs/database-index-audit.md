@@ -1,7 +1,7 @@
 # Database index audit
 
 This report captures the MUL-6108 baseline generated from PostgreSQL 17.10 at
-`d467cc906` after migrations 001–299. Re-run
+the branch base `254a02a79` after migrations 001–299. Re-run
 `scripts/audit-redundant-indexes.sql` against a freshly migrated isolated
 database before acting on it; prefix coverage is a candidate signal, not a drop
 decision.
@@ -81,6 +81,8 @@ The isolated regression fixture records the structural before/after comparison:
 
 Disk reclaimed in an environment is the sum of `pg_relation_size` for the four
 dropped indexes; it depends on row count and value distribution. The migration
-test also measures this sum on its seeded fixture before the drops and verifies
-that all four relations disappear afterward. Production should record the same
-query before rollout rather than extrapolating a synthetic byte count.
+test measures this sum on its seeded fixture before the drops and verifies that
+all four relations disappear afterward. Production should record those sizes
+before rollout rather than extrapolating a synthetic byte count; the reusable
+audit script intentionally does not hardcode a batch that disappears after the
+cleanup lands.

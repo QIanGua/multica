@@ -63,7 +63,7 @@ type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) error
 // CREATE INDEX CONCURRENTLY. Every entry gets an invalid-index cleanup hook, so
 // an interrupted build cannot be mistaken for success on retry.
 //
-// The mapping is data rather than seven hand-written hook registrations so a
+// The mapping is data rather than individual hand-written hook registrations so a
 // test can check each entry against the index its migration file actually
 // creates — a typo here would be invisible at runtime, because a hook that names
 // a nonexistent index is a silent no-op.
@@ -102,12 +102,17 @@ var concurrentIndexCleanups = map[string]string{
 	"299_agent_task_plugin_manifest_index":                 "idx_agent_task_plugin_execution_manifest",
 }
 
-// concurrentDownIndexCleanups covers migrations whose down direction rebuilds
-// an index with CREATE INDEX CONCURRENTLY IF NOT EXISTS. An interrupted
-// rollback can leave an INVALID relation behind; without a direction-specific
-// cleanup, the next rollback would treat that relation as success and remove
-// the migration version while leaving no usable restored index.
+// concurrentDownIndexCleanups covers every migration whose down direction
+// rebuilds an index with CREATE INDEX CONCURRENTLY. An interrupted rollback
+// can leave an INVALID relation behind. IF NOT EXISTS would then silently skip
+// the retry, while a bare CREATE would stay wedged on "already exists"; both
+// cases need direction-specific cleanup before the rollback can retry safely.
 var concurrentDownIndexCleanups = map[string]string{
+	"144_drop_agent_task_queue_chat_pending_v1":             "idx_agent_task_queue_chat_pending",
+	"171_drop_legacy_label_namespace_index":                 "issue_label_workspace_name_lower_idx",
+	"256_drop_agent_task_queue_chat_pending_v2":             "idx_agent_task_queue_chat_pending_v2",
+	"258_drop_pending_issue_agent_v1":                       "idx_one_pending_task_per_issue_agent",
+	"262_drop_agent_task_queue_terminal_completed_at_v1":    "idx_agent_task_queue_terminal_completed_at",
 	"300_drop_redundant_issue_workspace_number_index":       "idx_issue_workspace_number",
 	"301_drop_redundant_sys_cron_job_plan_index":            "idx_sys_cron_exec_job_plan",
 	"302_drop_redundant_channel_chat_session_binding_index": "idx_channel_chat_session_binding_session",
