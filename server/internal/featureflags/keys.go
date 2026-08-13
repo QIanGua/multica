@@ -7,6 +7,11 @@ import (
 )
 
 const (
+	// BillingWorkspaceSubscriptions gates the workspace-scoped entitlement,
+	// Stripe Checkout, seat reconcile, and Billing Portal proxy surface. It is
+	// deliberately off by default so the main repository can ship before the
+	// managed cloud enables its matching billing.subscriptions capability.
+	BillingWorkspaceSubscriptions = "billing_workspace_subscriptions"
 	// ComposioMCPApps gates the Composio app management UI and — together with
 	// the MUL-3963 permission_mode / invocation_targets access model it depends
 	// on — the aligned Private / Public-to picker in the agent create flow.
@@ -31,7 +36,12 @@ const (
 )
 
 var frontendPublicFlags = []string{
+	BillingWorkspaceSubscriptions,
 	ComposioMCPApps,
+}
+
+func BillingWorkspaceSubscriptionsEnabled(ctx context.Context, flags *featureflag.Service) bool {
+	return flags.IsEnabled(ctx, BillingWorkspaceSubscriptions, false)
 }
 
 func ComposioMCPAppsEnabled(ctx context.Context, flags *featureflag.Service) bool {
