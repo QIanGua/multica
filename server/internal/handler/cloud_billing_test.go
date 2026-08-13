@@ -394,6 +394,37 @@ func TestCreateCloudWorkspaceSubscriptionCheckoutInjectsAuthoritativeWorkspace(t
 	}
 }
 
+func TestCreateCloudWorkspaceSubscriptionCheckoutAcceptsHeaderIdempotencyKey(t *testing.T) {
+	withFeatureFlag(t, testHandler, featureflags.BillingWorkspaceSubscriptions, true)
+	proxy := &fakeCloudRuntimeProxy{
+		enabled: true,
+		resp: &cloudruntime.Response{
+			StatusCode: http.StatusCreated,
+			Body:       []byte(`{"url":"https://checkout.stripe.test/session"}`),
+		},
+	}
+	useCloudRuntimeProxy(t, proxy)
+
+	req := withCloudSubscriptionWorkspace(
+		newRequest(http.MethodPost, "/api/cloud-subscriptions/checkout-sessions", map[string]any{"interval": "month"}),
+		"admin",
+	)
+	req.Header.Set(idempotencyKeyHeader, "checkout-header-only")
+	w := httptest.NewRecorder()
+	testHandler.CreateCloudWorkspaceSubscriptionCheckout(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var body cloudSubscriptionCheckoutUpstreamRequest
+	if err := json.Unmarshal(proxy.req.Body, &body); err != nil {
+		t.Fatalf("decode upstream body: %v", err)
+	}
+	if body.IdempotencyKey != "checkout-header-only" {
+		t.Fatalf("upstream body idempotency_key = %q", body.IdempotencyKey)
+	}
+}
+
 func TestCloudWorkspaceSubscriptionWritesRequireManagerRole(t *testing.T) {
 	withFeatureFlag(t, testHandler, featureflags.BillingWorkspaceSubscriptions, true)
 	proxy := &fakeCloudRuntimeProxy{enabled: true}
@@ -411,6 +442,98 @@ func TestCloudWorkspaceSubscriptionWritesRequireManagerRole(t *testing.T) {
 	}
 	if proxy.called {
 		t.Fatal("upstream must not be called for a non-manager member")
+	}
+}
+
+func TestCloudWorkspaceSubscriptionsRejectMachineActorsAtHandler(t *testing.T) {
+	withFeatureFlag(t, testHandler, featureflags.BillingWorkspaceSubscriptions, true)
+
+	for _, actorSource := range []string{"task_token", "cloud_pat"} {
+		t.Run(actorSource, func(t *testing.T) {
+			proxy := &fakeCloudRuntimeProxy{enabled: true}
+			useCloudRuntimeProxy(t, proxy)
+
+			req := withCloudSubscriptionWorkspace(
+				newRequest(http.MethodPost, "/api/cloud-subscriptions/portal-sessions", nil),
+				"owner",
+			)
+			req.Header.Set("X-Actor-Source", actorSource)
+			req.Header.Set(idempotencyKeyHeader, "portal-request-1")
+			w := httptest.NewRecorder()
+			testHandler.CreateCloudWorkspaceSubscriptionPortal(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			if proxy.called {
+				t.Fatal("upstream must not be called for a machine actor")
+			}
+		})
+	}
+}
+
+func TestCloudWorkspaceSubscriptionMutationsValidateLocally(t *testing.T) {
+	withFeatureFlag(t, testHandler, featureflags.BillingWorkspaceSubscriptions, true)
+
+	cases := []struct {
+		name      string
+		path      string
+		body      any
+		header    string
+		wantError string
+		invoke    func(http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:      "checkout missing idempotency key",
+			path:      "/api/cloud-subscriptions/checkout-sessions",
+			body:      map[string]any{"interval": "month"},
+			wantError: "Idempotency-Key or idempotency_key is required",
+			invoke:    testHandler.CreateCloudWorkspaceSubscriptionCheckout,
+		},
+		{
+			name:      "checkout invalid interval",
+			path:      "/api/cloud-subscriptions/checkout-sessions",
+			body:      map[string]any{"interval": "weekly", "idempotency_key": "checkout-request-1"},
+			wantError: "interval must be month or year",
+			invoke:    testHandler.CreateCloudWorkspaceSubscriptionCheckout,
+		},
+		{
+			name:      "portal missing idempotency key",
+			path:      "/api/cloud-subscriptions/portal-sessions",
+			wantError: "Idempotency-Key or idempotency_key is required",
+			invoke:    testHandler.CreateCloudWorkspaceSubscriptionPortal,
+		},
+		{
+			name:      "portal oversized idempotency key",
+			path:      "/api/cloud-subscriptions/portal-sessions",
+			header:    strings.Repeat("a", maxCloudSubscriptionIdempotencyKeyLength+1),
+			wantError: "idempotency key must be at most 255 bytes",
+			invoke:    testHandler.CreateCloudWorkspaceSubscriptionPortal,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy := &fakeCloudRuntimeProxy{enabled: true}
+			useCloudRuntimeProxy(t, proxy)
+
+			req := withCloudSubscriptionWorkspace(newRequest(http.MethodPost, tc.path, tc.body), "owner")
+			if tc.header != "" {
+				req.Header.Set(idempotencyKeyHeader, tc.header)
+			}
+			w := httptest.NewRecorder()
+			tc.invoke(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), tc.wantError) {
+				t.Fatalf("body = %s, want error containing %q", w.Body.String(), tc.wantError)
+			}
+			if proxy.called {
+				t.Fatal("upstream must not be called for a locally invalid request")
+			}
+		})
 	}
 }
 

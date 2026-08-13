@@ -47,6 +47,7 @@ const maxStripeWebhookBodySize = 1 << 20 // 1 MiB
 const stripeSignatureHeader = "Stripe-Signature"
 
 const idempotencyKeyHeader = "Idempotency-Key"
+const maxCloudSubscriptionIdempotencyKeyLength = 255
 
 type cloudSubscriptionCheckoutRequest struct {
 	Interval       string `json:"interval"`
@@ -54,6 +55,8 @@ type cloudSubscriptionCheckoutRequest struct {
 	CustomerEmail  string `json:"customer_email,omitempty"`
 }
 
+// This is an intentional allowlist: additive cloud fields are not forwarded
+// until the main repository explicitly reviews and adds them here.
 type cloudSubscriptionCheckoutUpstreamRequest struct {
 	WorkspaceID    string `json:"workspace_id"`
 	Interval       string `json:"interval"`
@@ -66,6 +69,10 @@ type cloudSubscriptionCheckoutUpstreamRequest struct {
 // the check here makes a future route refactor fail closed instead of exposing
 // a workspace billing write without its tenant/role guard.
 func (h *Handler) requireCloudSubscriptionWorkspace(w http.ResponseWriter, r *http.Request, roles ...string) (string, string, bool) {
+	if isMachineCredentialActor(r) {
+		writeError(w, http.StatusForbidden, "this endpoint is only available to human actors")
+		return "", "", false
+	}
 	if !featureflags.BillingWorkspaceSubscriptionsEnabled(r.Context(), h.FeatureFlags) {
 		writeError(w, http.StatusServiceUnavailable, "workspace subscriptions are not enabled")
 		return "", "", false
@@ -122,6 +129,22 @@ func cloudSubscriptionIdempotencyHeaders(r *http.Request) http.Header {
 	return http.Header{idempotencyKeyHeader: []string{key}}
 }
 
+func requireCloudSubscriptionIdempotencyKey(w http.ResponseWriter, r *http.Request, bodyKey string) (string, bool) {
+	key := strings.TrimSpace(bodyKey)
+	if key == "" {
+		key = strings.TrimSpace(r.Header.Get(idempotencyKeyHeader))
+	}
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key or idempotency_key is required")
+		return "", false
+	}
+	if len(key) > maxCloudSubscriptionIdempotencyKeyLength {
+		writeError(w, http.StatusBadRequest, "idempotency key must be at most 255 bytes")
+		return "", false
+	}
+	return key, true
+}
+
 // GetCloudWorkspaceEntitlements forwards the active workspace to cloud's
 // resolved entitlement endpoint. Any workspace member may read this snapshot;
 // cloud independently verifies the stamped X-User-ID against its read-only
@@ -151,10 +174,18 @@ func (h *Handler) CreateCloudWorkspaceSubscriptionCheckout(w http.ResponseWriter
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if in.Interval != "month" && in.Interval != "year" {
+		writeError(w, http.StatusBadRequest, "interval must be month or year")
+		return
+	}
+	idempotencyKey, ok := requireCloudSubscriptionIdempotencyKey(w, r, in.IdempotencyKey)
+	if !ok {
+		return
+	}
 	upstreamBody, err := json.Marshal(cloudSubscriptionCheckoutUpstreamRequest{
 		WorkspaceID:    workspaceID,
 		Interval:       in.Interval,
-		IdempotencyKey: in.IdempotencyKey,
+		IdempotencyKey: idempotencyKey,
 		CustomerEmail:  in.CustomerEmail,
 	})
 	if err != nil {
@@ -178,6 +209,9 @@ func (h *Handler) ReconcileCloudWorkspaceSubscriptionSeats(w http.ResponseWriter
 func (h *Handler) CreateCloudWorkspaceSubscriptionPortal(w http.ResponseWriter, r *http.Request) {
 	workspaceID, userID, ok := h.requireCloudSubscriptionWorkspace(w, r, "owner", "admin")
 	if !ok {
+		return
+	}
+	if _, ok := requireCloudSubscriptionIdempotencyKey(w, r, ""); !ok {
 		return
 	}
 	h.proxyCloudSubscription(w, r, http.MethodPost, "/api/v1/subscriptions/"+workspaceID+"/portal-sessions", userID, nil, cloudSubscriptionIdempotencyHeaders(r))
