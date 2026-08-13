@@ -133,7 +133,8 @@
     "mode_badge_worktree": "并行",
     "mode_badge_worktree_tooltip": "任务在各自的 git worktree 中同时运行，并以分支形式交付结果。你的工作区不会被改动。",
     "toast_local_mode_updated": "已更新执行方式",
-    "toast_local_mode_update_failed": "无法更新执行方式"
+    "toast_local_mode_update_failed": "无法更新执行方式",
+    "mode_badge_in_place": "原地"
   },
   "delete_dialog": {
     "title": "删除项目",
