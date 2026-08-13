@@ -73,6 +73,12 @@
     "date_dash": "—"
   },
   "return_page": {
-    "redirecting": "ワークスペースの請求ページに戻ります…"
+    "redirecting": "ワークスペースの請求ページに戻ります…",
+    "load_failed_title": "ワークスペースを読み込めませんでした",
+    "load_failed_description": "請求の変更は保存されました。ワークスペース一覧を読み込めなかったため、該当の請求ページへ戻せませんでした。",
+    "workspace_missing_title": "このワークスペースは利用できません",
+    "workspace_missing_description": "請求の変更は保存されましたが、このワークスペースが削除されたかアクセス権が変更されたため、請求設定を開けません。",
+    "retry": "再試行",
+    "go_to_app": "Multica を開く"
   }
 }

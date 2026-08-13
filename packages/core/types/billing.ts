@@ -225,11 +225,11 @@ export interface WorkspaceSubscriptionSummary {
   cancelAtPeriodEnd: boolean;
   graceUntil: string | null;
   /**
-   * Reports only that a Stripe customer exists for this workspace. It is NOT a
-   * permission: Billing Portal still requires owner/admin, so a caller must
-   * gate the control on the member's role as well.
+   * Whether a local Stripe customer exists for this workspace. It is a fact,
+   * NOT a permission: Billing Portal still requires owner/admin, so a caller
+   * must gate that control on the member's role as well.
    */
-  canOpenPortal: boolean;
+  hasStripeCustomer: boolean;
 }
 
 /** Display-safe subset of a configured Stripe Price. IDs stay server-side. */

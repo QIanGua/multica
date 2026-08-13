@@ -73,6 +73,12 @@
     "date_dash": "—"
   },
   "return_page": {
-    "redirecting": "正在返回工作区账单页…"
+    "redirecting": "正在返回工作区账单页…",
+    "load_failed_title": "无法加载你的工作区",
+    "load_failed_description": "账单变更已保存。只是暂时无法加载工作区列表，因此没法把你送回对应的账单页。",
+    "workspace_missing_title": "该工作区对你已不可用",
+    "workspace_missing_description": "账单变更已保存，但该工作区已被删除或你的访问权限发生变化，因此无法打开它的账单设置。",
+    "retry": "重试",
+    "go_to_app": "前往 Multica"
   }
 }

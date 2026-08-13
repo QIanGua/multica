@@ -1564,10 +1564,14 @@ export class ApiClient {
 
   // ---------------------------------------------------------------------
   // Workspace subscriptions — the server resolves the workspace from the
-  // authenticated request context, so no caller names one. Every method
-  // returns null rather than a placeholder when the response does not match
-  // the contract: an older cloud, a 503, or a malformed body must surface as
-  // "unavailable" and never as a downgrade to Free.
+  // authenticated request context, so no caller names one.
+  //
+  // Two distinct failure paths, both of which a caller must render as
+  // "unavailable" and neither of which may look like Free:
+  //
+  //   - non-2xx (older cloud without the route, 403, 503) throws ApiError from
+  //     `fetch`, so a React Query caller sees `isError`;
+  //   - a 2xx body that does not match the contract returns null here.
   // ---------------------------------------------------------------------
 
   async getWorkspaceSubscriptionEntitlements(): Promise<WorkspaceSubscriptionEntitlements | null> {

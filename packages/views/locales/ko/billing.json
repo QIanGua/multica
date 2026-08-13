@@ -73,6 +73,12 @@
     "date_dash": "—"
   },
   "return_page": {
-    "redirecting": "워크스페이스 결제 페이지로 돌아갑니다…"
+    "redirecting": "워크스페이스 결제 페이지로 돌아갑니다…",
+    "load_failed_title": "워크스페이스를 불러올 수 없습니다",
+    "load_failed_description": "결제 변경은 저장되었습니다. 워크스페이스 목록을 불러오지 못해 해당 결제 페이지로 돌려보내지 못했습니다.",
+    "workspace_missing_title": "이 워크스페이스를 사용할 수 없습니다",
+    "workspace_missing_description": "결제 변경은 저장되었지만 이 워크스페이스가 삭제되었거나 접근 권한이 변경되어 결제 설정을 열 수 없습니다.",
+    "retry": "다시 시도",
+    "go_to_app": "Multica로 이동"
   }
 }

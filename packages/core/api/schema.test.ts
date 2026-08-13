@@ -731,7 +731,7 @@ describe("workspace subscription contract", () => {
       pending_seat_quantity: 3,
       cancel_at_period_end: true,
       grace_until: "2026-09-08T00:00:00Z",
-      can_open_portal: true,
+      has_stripe_customer: true,
     });
     const client = new ApiClient("https://api.example.test");
     const summary = await client.getWorkspaceSubscriptionSummary();
@@ -744,7 +744,7 @@ describe("workspace subscription contract", () => {
     expect(summary?.pendingSeatQuantity).toBe(3);
     expect(summary?.cancelAtPeriodEnd).toBe(true);
     expect(summary?.graceUntil).toBe("2026-09-08T00:00:00Z");
-    expect(summary?.canOpenPortal).toBe(true);
+    expect(summary?.hasStripeCustomer).toBe(true);
   });
 
   it("keeps a paid summary readable when optional fields are absent", async () => {
@@ -762,7 +762,7 @@ describe("workspace subscription contract", () => {
     expect(summary?.graceUntil).toBeNull();
     // Absent means "no Stripe customer known", which is the safe reading: the
     // caller hides Portal rather than offering a control that would 404.
-    expect(summary?.canOpenPortal).toBe(false);
+    expect(summary?.hasStripeCustomer).toBe(false);
   });
 
   it("preserves unknown plans and statuses instead of coercing them", async () => {
@@ -783,10 +783,22 @@ describe("workspace subscription contract", () => {
     expect(await client.getWorkspaceSubscriptionSummary()).toBeNull();
   });
 
-  it("returns null for an older cloud that does not serve summary", async () => {
-    // 404/503 bodies parse as JSON but do not match the contract. The absence
-    // of a snapshot must not be mistaken for a Free workspace.
-    stubFetchJson({ error: "not found" }, 200);
+  it("throws ApiError for a non-2xx summary so the caller reports unavailable", async () => {
+    // An older cloud without the route, a 403, or a 503 never reaches schema
+    // parsing: fetch rejects first and a React Query caller sees isError. What
+    // matters for both paths is the same — no snapshot is produced, so nothing
+    // can be mistaken for a Free workspace.
+    for (const status of [404, 503]) {
+      stubFetchJson({ error: "unavailable" }, status);
+      const client = new ApiClient("https://api.example.test");
+      await expect(client.getWorkspaceSubscriptionSummary()).rejects.toThrow();
+    }
+  });
+
+  it("returns null for a 2xx body that does not match the contract", async () => {
+    // The other half of the contract: a response that arrives successfully but
+    // does not conform degrades to null rather than throwing into React.
+    stubFetchJson({ unexpected: "shape" });
     const client = new ApiClient("https://api.example.test");
     expect(await client.getWorkspaceSubscriptionSummary()).toBeNull();
   });
@@ -822,11 +834,21 @@ describe("workspace subscription contract", () => {
   });
 
   it("rejects a prices response whose interval does not match its slot", async () => {
+    const client = new ApiClient("https://api.example.test");
+
+    // An interval outside the contract.
     stubFetchJson({
       month: { currency: "usd", unit_amount: 2000, interval: "month", interval_count: 1 },
       year: { currency: "usd", unit_amount: 20000, interval: "week", interval_count: 1 },
     });
-    const client = new ApiClient("https://api.example.test");
+    expect(await client.getWorkspaceSubscriptionPrices()).toBeNull();
+
+    // Valid intervals in the wrong slots. Accepting this would let the UI quote
+    // a yearly amount as the monthly price.
+    stubFetchJson({
+      month: { currency: "usd", unit_amount: 20000, interval: "year", interval_count: 1 },
+      year: { currency: "usd", unit_amount: 2000, interval: "month", interval_count: 1 },
+    });
     expect(await client.getWorkspaceSubscriptionPrices()).toBeNull();
   });
 });

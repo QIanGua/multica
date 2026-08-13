@@ -2184,7 +2184,7 @@ export const WorkspaceSubscriptionSummarySchema = z
     pending_seat_quantity: z.number().int().nonnegative().nullable().optional(),
     cancel_at_period_end: z.boolean().optional(),
     grace_until: z.string().nullable().optional(),
-    can_open_portal: z.boolean().optional(),
+    has_stripe_customer: z.boolean().optional(),
   })
   .loose()
   .transform(
@@ -2196,33 +2196,41 @@ export const WorkspaceSubscriptionSummarySchema = z
       pendingSeatQuantity: value.pending_seat_quantity ?? null,
       cancelAtPeriodEnd: value.cancel_at_period_end ?? false,
       graceUntil: value.grace_until ?? null,
-      canOpenPortal: value.can_open_portal ?? false,
+      hasStripeCustomer: value.has_stripe_customer ?? false,
     }),
   );
 
-const WorkspaceSubscriptionPriceSchema = z
-  .object({
-    currency: z.string().min(1),
-    // Reject 0 and negatives: a free or malformed Price must read as
-    // "price unavailable", not as a real amount shown next to a purchase button.
-    unit_amount: z.number().int().positive(),
-    interval: WorkspaceSubscriptionIntervalSchema,
-    interval_count: z.number().int().positive(),
-  })
-  .loose()
-  .transform(
-    (value): WorkspaceSubscriptionPrice => ({
-      currency: value.currency,
-      unitAmount: value.unit_amount,
-      interval: value.interval,
-      intervalCount: value.interval_count,
-    }),
-  );
+const WorkspaceSubscriptionPriceSchema = (
+  expected: "month" | "year",
+) =>
+  z
+    .object({
+      currency: z.string().min(1),
+      // Reject 0 and negatives: a free or malformed Price must read as
+      // "price unavailable", not as a real amount shown next to a purchase
+      // button.
+      unit_amount: z.number().int().positive(),
+      // Pinned to the slot it arrived in. Cloud validates this too, but a
+      // schema that accepted a yearly Price under `month` would let the UI
+      // quote a yearly amount as a monthly one — the schema is an independent
+      // boundary, so it checks the correspondence itself.
+      interval: z.literal(expected),
+      interval_count: z.number().int().positive(),
+    })
+    .loose()
+    .transform(
+      (value): WorkspaceSubscriptionPrice => ({
+        currency: value.currency,
+        unitAmount: value.unit_amount,
+        interval: value.interval,
+        intervalCount: value.interval_count,
+      }),
+    );
 
 export const WorkspaceSubscriptionPricesSchema = z
   .object({
-    month: WorkspaceSubscriptionPriceSchema,
-    year: WorkspaceSubscriptionPriceSchema,
+    month: WorkspaceSubscriptionPriceSchema("month"),
+    year: WorkspaceSubscriptionPriceSchema("year"),
   })
   .loose()
   .transform(

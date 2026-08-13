@@ -73,6 +73,12 @@
     "date_dash": "—"
   },
   "return_page": {
-    "redirecting": "Returning you to workspace billing…"
+    "redirecting": "Returning you to workspace billing…",
+    "load_failed_title": "Could not load your workspaces",
+    "load_failed_description": "Your billing change was saved. We just could not load your workspace list to send you back to the right billing page.",
+    "workspace_missing_title": "That workspace is no longer available to you",
+    "workspace_missing_description": "Your billing change was saved, but this workspace was removed or your access to it changed, so we cannot open its billing settings.",
+    "retry": "Try again",
+    "go_to_app": "Go to Multica"
   }
 }
