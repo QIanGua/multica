@@ -284,6 +284,32 @@ describe("TabBar merged-tab chrome", () => {
     }
   });
 
+  // A flare overhangs the neighbouring tab by 9px, so the backing above may only
+  // cover the arc and the canvas fill: left over the notch it prints a square of
+  // strip colour on top of whatever the neighbour draws there, which is how the
+  // hover pill lost its corner to a dark bite (MUL-6160). The notch is therefore
+  // masked out of the flare entirely, and the mask has to close before the arc's
+  // anti-aliasing starts (r - 1.2) or the arc loses the backing it needs.
+  it("punches the notch out rather than filling it with strip colour", () => {
+    const { getByLabelText } = render(<TabBar />);
+    const flares = getByLabelText("Issues")
+      .closest("[data-tab-frame]")
+      ?.querySelectorAll<HTMLElement>('[style*="radial-gradient"]');
+
+    expect(flares).toHaveLength(2);
+    for (const flare of flares ?? []) {
+      const corner = /circle at top (left|right), transparent 8\.8px/.exec(
+        flare.style.backgroundImage,
+      )?.[1];
+      const mask = flare.style.maskImage;
+
+      expect(corner).toBeDefined();
+      expect(mask).toContain(`radial-gradient(circle at top ${corner}, transparent 8.4px`);
+      expect(mask).toMatch(/ 8\.8px\)$/);
+      expect(flare.style.getPropertyValue("-webkit-mask-image")).toBe(mask);
+    }
+  });
+
   it("draws the merged cap only on the active tab", () => {
     const { getByLabelText } = render(<TabBar />);
     expect(
