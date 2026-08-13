@@ -46,10 +46,18 @@ describe("isRuntimeUsableForUser", () => {
     ).toBe(true);
   });
 
-  it("refuses an ownerless private runtime", () => {
+  it("refuses an ownerless runtime whatever its visibility", () => {
+    // No owner means no task token at claim time (MUL-3292), so a bind here
+    // could only produce agents that fail the moment they run.
     expect(isRuntimeUsableForUser(makeRuntime({ owner_id: null }), OTHER)).toBe(
       false,
     );
+    expect(
+      isRuntimeUsableForUser(
+        makeRuntime({ owner_id: null, visibility: "public" }),
+        OTHER,
+      ),
+    ).toBe(false);
   });
 
   it("allows everything while the viewer is unknown, so a loading session never hides the user's own runtime", () => {
