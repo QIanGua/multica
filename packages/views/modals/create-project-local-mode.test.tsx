@@ -9,6 +9,9 @@ import { renderWithI18n } from "../test/i18n";
 // Runtime list drives the worktree version gate. Each test sets the reported
 // CLI version before rendering.
 let runtimeCliVersion = "9.9.9";
+// Whether the fake runtime advertises worktree support. This — not the version
+// string — is what the gate reads now (MUL-5707).
+let runtimeAdvertisesWorktree = true;
 // What the desktop validator reports for the picked folder.
 let pickedIsGitRepo: boolean | undefined = true;
 
@@ -34,7 +37,15 @@ vi.mock("@tanstack/react-query", () => ({
     const key = options?.queryKey?.[0];
     if (key === "members" || key === "agents") return { data: [] };
     return {
-      data: [{ daemon_id: "daemon-1", metadata: { cli_version: runtimeCliVersion } }],
+      data: [
+        {
+          daemon_id: "daemon-1",
+          metadata: {
+            cli_version: runtimeCliVersion,
+            ...(runtimeAdvertisesWorktree ? { capabilities: ["local-worktree-v1"] } : {}),
+          },
+        },
+      ],
     };
   },
   // runtimeListOptions builds its descriptor with this; the mocked useQuery
@@ -151,6 +162,7 @@ describe("CreateProjectModal — local directory execution mode", () => {
   beforeEach(() => {
     createProjectMock.mockClear();
     runtimeCliVersion = "9.9.9";
+    runtimeAdvertisesWorktree = true;
     pickedIsGitRepo = true;
   });
 
@@ -183,8 +195,8 @@ describe("CreateProjectModal — local directory execution mode", () => {
 
   // A runtime that cannot run the mode must not be preselected into it, or the
   // create call would be rejected by the server's version gate.
-  it("preselects direct when the daemon is too old, even for a git repository", async () => {
-    runtimeCliVersion = "0.1.0";
+  it("preselects direct when the daemon does not support it, even for a git repository", async () => {
+    runtimeAdvertisesWorktree = false;
     const user = userEvent.setup();
     renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
 
@@ -242,8 +254,8 @@ describe("CreateProjectModal — local directory execution mode", () => {
   // The server refuses to save a worktree resource below the version floor, and
   // here that rejection would fail the whole project creation — so the option
   // has to be blocked before submit, not after.
-  it("blocks parallel mode when the daemon is too old", async () => {
-    runtimeCliVersion = "0.1.0";
+  it("blocks parallel mode when the daemon does not support it", async () => {
+    runtimeAdvertisesWorktree = false;
     const user = userEvent.setup();
     renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
 

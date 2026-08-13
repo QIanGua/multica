@@ -69,7 +69,7 @@ import {
 import { useLocalDaemonStatus } from "../platform/use-local-daemon-status";
 import {
   MIN_LOCAL_WORKTREE_CLI_VERSION,
-  localWorktreeSupported,
+  daemonSupportsLocalWorktree,
   readRuntimeCliVersion,
   runtimeListOptions,
 } from "@multica/core/runtimes";
@@ -213,10 +213,17 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
         .map((rt) => readRuntimeCliVersion(rt.metadata))
         .find((v) => v && v.length > 0) ?? "")
     : "";
+  // Capability, not version: a dev-built daemon reports a git-describe string
+  // that the version floor exempts, so the version check passed for a binary
+  // with no worktree implementation (MUL-5707).
+  const localDaemonSupportsWorktree = daemonSupportsLocalWorktree(
+    runtimes,
+    daemonStatus.daemonId,
+  );
   const worktreeUnavailableReason =
     localIsGitRepo === false
       ? ("not_git" as const)
-      : !localWorktreeSupported(localDaemonCliVersion)
+      : !localDaemonSupportsWorktree
         ? ("daemon_outdated" as const)
         : undefined;
   // Preselection, not a default behavior change: when the folder is a git repo
