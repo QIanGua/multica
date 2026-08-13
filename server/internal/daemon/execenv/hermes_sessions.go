@@ -185,7 +185,7 @@ func mountHermesSessionDB(hermesHome, storeDir string, logger *slog.Logger) (her
 	if err := migrateHermesTaskSessionDB(hermesHome, storeDir, logger); err != nil {
 		return hermesSessionMount{}, err
 	}
-	if err := removeHermesTaskSessionDB(hermesHome); err != nil {
+	if err := removeHermesSessionDBFamily(hermesHome); err != nil {
 		return hermesSessionMount{}, err
 	}
 	// Publish the link. Fails closed: the database is already safe in the store
@@ -263,7 +263,7 @@ func migrateHermesTaskSessionDB(hermesHome, storeDir string, logger *slog.Logger
 		}
 	}
 
-	promoted, err := promoteHermesStoreStaging(staging, storeDir)
+	promoted, err := publishHermesSessionStaging(staging, storeDir)
 	if err != nil {
 		return err
 	}
@@ -278,21 +278,48 @@ func migrateHermesTaskSessionDB(hermesHome, storeDir string, logger *slog.Logger
 	return nil
 }
 
-// removeHermesTaskSessionDB clears the overlay's own state.db family. Called
+// publishHermesSessionStaging publishes a fully-copied staging dir as the
+// conversation's store, reporting whether this caller won.
+//
+// It exists because "occupied" means something different here than it does for
+// the memory store. A session store can hold state.db family remnants that
+// carry no transcript at all — a zero-length database from an `open` that never
+// wrote a page, or journal sidecars orphaned by a killed task — and the
+// migration above has already decided those are not history. The generic
+// publish would disagree: it reads any entry as a competitor's published state,
+// report a lost race, and the caller would then delete a source database that
+// was never carried over. So the remnants are cleared first (they are, by the
+// definition this file uses everywhere, nothing), and the occupancy question is
+// answered with the same predicate the migration asked.
+//
+// A store that cannot be cleared is NOT reported as a lost race: the shared
+// promote fails closed, the migration returns the error, and the caller keeps
+// the source database.
+func publishHermesSessionStaging(staging, storeDir string) (bool, error) {
+	if hermesStoreHasSessionDB(storeDir) {
+		return false, nil // a competitor published a real transcript first
+	}
+	if err := removeHermesSessionDBFamily(storeDir); err != nil {
+		return false, err
+	}
+	return promoteHermesStoreStaging(staging, storeDir, hermesStoreHasSessionDB)
+}
+
+// removeHermesSessionDBFamily clears a directory's state.db family. Called
 // once the database is either safely in the store or deliberately being
 // replaced by the link; leaving a stale `-wal` next to the link would be
 // dead weight SQLite never reads (it derives the sidecar paths from the
 // resolved store path) and a confusing thing to find in a task directory.
-func removeHermesTaskSessionDB(hermesHome string) error {
-	entries, err := os.ReadDir(hermesHome)
+func removeHermesSessionDBFamily(dir string) error {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return fmt.Errorf("read overlay home %s: %w", hermesHome, err)
+		return fmt.Errorf("read %s: %w", dir, err)
 	}
 	for _, entry := range entries {
 		if !isHermesTaskLocalStateEntry(entry.Name()) {
 			continue
 		}
-		path := filepath.Join(hermesHome, entry.Name())
+		path := filepath.Join(dir, entry.Name())
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("remove task-local hermes session state %s: %w", path, err)
 		}

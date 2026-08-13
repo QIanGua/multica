@@ -505,6 +505,113 @@ func TestPrepareHermesHomeMountedEmptyStoreReportsNoHistory(t *testing.T) {
 	}
 }
 
+// TestPrepareHermesHomeMigrationIntoSemanticallyEmptyStore covers the store
+// that holds state.db family remnants but no transcript — a zero-length
+// database from an `open` that never wrote a page, or orphan sidecars left by a
+// killed task. The migration reads those as "no history" and proceeds; the
+// publish step must agree, because the caller deletes the source the moment the
+// migration reports success. Disagreeing means the source database and its
+// un-checkpointed tail are deleted in favour of a database with nothing in it.
+func TestPrepareHermesHomeMigrationIntoSemanticallyEmptyStore(t *testing.T) {
+	requireSymlinks(t)
+
+	tests := []struct {
+		name     string
+		remnants map[string]string
+		// wantMoved expects the source transcript to end up in the store;
+		// wantFailClosed expects the migration to refuse instead — either is
+		// acceptable, silently dropping the source is not.
+		wantMoved      bool
+		wantFailClosed bool
+	}{
+		{
+			name:      "zero-length database",
+			remnants:  map[string]string{"state.db": ""},
+			wantMoved: true,
+		},
+		{
+			name:      "orphan sidecars, no database",
+			remnants:  map[string]string{"state.db-wal": "orphan tail", "state.db-shm": "orphan index"},
+			wantMoved: true,
+		},
+		{
+			// The one case that must NOT be overwritten: a real transcript
+			// published by a concurrent task of the same conversation.
+			name:      "real database is never overwritten",
+			remnants:  map[string]string{"state.db": "the winner's transcript"},
+			wantMoved: false,
+		},
+		{
+			// Something in the store that is neither history nor a clearable
+			// remnant. There is no safe publish here, so the migration must
+			// fail rather than report a lost race and let the caller delete the
+			// source.
+			name:           "unclearable store fails closed",
+			remnants:       map[string]string{"state.db": "", "stray.txt": "not ours"},
+			wantFailClosed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sharedHome := t.TempDir()
+			store := filepath.Join(t.TempDir(), "issue-1")
+			skills := []SkillContextForEnv{{Name: "deploy", Content: "# Deploy"}}
+			hermesHome := filepath.Join(t.TempDir(), "hermes-home")
+
+			for name, content := range tt.remnants {
+				mustWrite(t, filepath.Join(store, name), content)
+			}
+
+			if _, err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", "", testLogger()); err != nil {
+				t.Fatalf("prepare pre-store task: %v", err)
+			}
+			mustWrite(t, filepath.Join(hermesHome, "state.db"), "transcript")
+			mustWrite(t, filepath.Join(hermesHome, "state.db-wal"), "uncheckpointed tail")
+
+			sessions, err := prepareHermesHome(hermesHome, sharedHome, false, skills, nil, "", store, testLogger())
+			if err != nil {
+				if !tt.wantFailClosed {
+					t.Fatalf("prepare: %v", err)
+				}
+				// Failing closed is only acceptable with the source intact.
+				for _, name := range []string{"state.db", "state.db-wal"} {
+					got, statErr := os.ReadFile(filepath.Join(hermesHome, name))
+					if statErr != nil {
+						t.Fatalf("prepare failed (%v) AND dropped the source %s: %v", err, name, statErr)
+					}
+					if len(got) == 0 {
+						t.Fatalf("source %s was emptied by a failed migration", name)
+					}
+				}
+				return
+			}
+			if tt.wantFailClosed {
+				t.Fatal("prepare succeeded on a store it cannot safely publish into, want an error")
+			}
+			if !sessions.Mounted || !sessions.HistoryPresent {
+				t.Fatalf("mount = %+v, want mounted with history", sessions)
+			}
+
+			got, err := os.ReadFile(filepath.Join(store, "state.db"))
+			if err != nil {
+				t.Fatalf("read store db: %v", err)
+			}
+			if tt.wantMoved {
+				if string(got) != "transcript" {
+					t.Fatalf("store db = %q, want the migrated transcript — the source was dropped for an empty store", got)
+				}
+				wal, err := os.ReadFile(filepath.Join(store, "state.db-wal"))
+				if err != nil || string(wal) != "uncheckpointed tail" {
+					t.Fatalf("store wal = %q (err %v), want the migrated tail", wal, err)
+				}
+			} else if string(got) != "the winner's transcript" {
+				t.Fatalf("store db = %q, want the pre-existing transcript left untouched", got)
+			}
+		})
+	}
+}
+
 // stubHermesSessionLink swaps the symlink primitive for the duration of a test
 // and returns a restore func, so a test can assert both the failure and the
 // recovery in one run.

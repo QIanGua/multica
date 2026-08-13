@@ -416,7 +416,7 @@ func TestPromoteHermesMemoryStagingClassifiesRemoveFailures(t *testing.T) {
 		staging := filepath.Join(parent, ".default.migrating-x")
 		mustWrite(t, filepath.Join(staging, "MEMORY.md"), "loser")
 
-		promoted, err := promoteHermesStoreStaging(staging, storeDir)
+		promoted, err := promoteHermesStoreStaging(staging, storeDir, hermesStorePopulated)
 		if err != nil {
 			t.Fatalf("a populated store should be a lost race, not an error: %v", err)
 		}
@@ -448,7 +448,7 @@ func TestPromoteHermesMemoryStagingClassifiesRemoveFailures(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
 
-		promoted, err := promoteHermesStoreStaging(staging, storeDir)
+		promoted, err := promoteHermesStoreStaging(staging, storeDir, hermesStorePopulated)
 		if promoted {
 			t.Fatalf("promote reported success against an unremovable store")
 		}

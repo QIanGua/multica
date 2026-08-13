@@ -238,7 +238,7 @@ func migrateHermesTaskMemories(taskDir, storeDir string, logger *slog.Logger) er
 		}
 	}
 
-	promoted, err := promoteHermesStoreStaging(staging, storeDir)
+	promoted, err := promoteHermesStoreStaging(staging, storeDir, hermesStorePopulated)
 	if err != nil {
 		return err
 	}
@@ -282,18 +282,27 @@ func newHermesStoreStaging(storeDir string) (string, error) {
 // (false, nil), so a permission error, a read-only filesystem or a Windows
 // sharing violation must fail closed instead of passing for "someone else
 // published".
-func promoteHermesStoreStaging(staging, storeDir string) (bool, error) {
+//
+// published answers "did a competitor already publish real state here?" and is
+// the caller's to define, because the two stores disagree about what an
+// occupied directory looks like: any entry at all means memory, while a session
+// store can hold a zero-length database or orphan journal sidecars that carry no
+// transcript. Sharing one definition let a session migration read the store as
+// empty, copy into staging, then read it as occupied at publish time and report
+// a lost race — after which the caller deleted a source database that had never
+// been carried over.
+func promoteHermesStoreStaging(staging, storeDir string, published func(string) bool) (bool, error) {
 	if err := os.Remove(storeDir); err != nil && !os.IsNotExist(err) {
-		if hermesStorePopulated(storeDir) {
-			return false, nil // non-empty: another task published first
+		if published(storeDir) {
+			return false, nil // another task published first
 		}
-		return false, fmt.Errorf("clear empty hermes memory store %s before publishing: %w", storeDir, err)
+		return false, fmt.Errorf("clear empty hermes store %s before publishing: %w", storeDir, err)
 	}
 	if err := os.Rename(staging, storeDir); err != nil {
-		if hermesStorePopulated(storeDir) {
+		if published(storeDir) {
 			return false, nil // lost a narrow race between the remove and the rename
 		}
-		return false, fmt.Errorf("publish hermes memory store %s: %w", storeDir, err)
+		return false, fmt.Errorf("publish hermes store %s: %w", storeDir, err)
 	}
 	return true, nil
 }
