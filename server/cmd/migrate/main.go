@@ -16,16 +16,16 @@ import (
 	"github.com/multica-ai/multica/server/internal/taskusagebackfill"
 )
 
-// preMigrationHook runs work that must happen before a specific
-// migration is applied during `migrate up`. Hooks are idempotent and
+// preMigrationHook runs work that must happen before a specific migration is
+// applied in the direction whose hook map selected it. Hooks are idempotent and
 // must not depend on the migration loop's session-pinned advisory lock
 // — they run on the pool, not on the loop's pinned conn, so they can
 // safely acquire other session-level locks (e.g. advisory lock 4246
 // for the task_usage hourly rollup).
 //
-// Returning an error aborts the migration run. The corresponding
-// migration is NOT recorded in schema_migrations, so the next run will
-// retry the hook + migration.
+// Returning an error aborts the migration run. The corresponding migration is
+// not added to (up) or removed from (down) schema_migrations, so the next run
+// retries the hook + migration.
 type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) error
 
 // preMigrationHooks wires migration version → hook. The version key is
@@ -102,6 +102,18 @@ var concurrentIndexCleanups = map[string]string{
 	"299_agent_task_plugin_manifest_index":                 "idx_agent_task_plugin_execution_manifest",
 }
 
+// concurrentDownIndexCleanups covers migrations whose down direction rebuilds
+// an index with CREATE INDEX CONCURRENTLY IF NOT EXISTS. An interrupted
+// rollback can leave an INVALID relation behind; without a direction-specific
+// cleanup, the next rollback would treat that relation as success and remove
+// the migration version while leaving no usable restored index.
+var concurrentDownIndexCleanups = map[string]string{
+	"300_drop_redundant_issue_workspace_number_index":       "idx_issue_workspace_number",
+	"301_drop_redundant_sys_cron_job_plan_index":            "idx_sys_cron_exec_job_plan",
+	"302_drop_redundant_channel_chat_session_binding_index": "idx_channel_chat_session_binding_session",
+	"303_drop_redundant_lark_chat_session_binding_index":    "idx_lark_chat_session_binding_session",
+}
+
 var preMigrationHooks = func() map[string]preMigrationHook {
 	hooks := map[string]preMigrationHook{
 		"103_drop_legacy_daily_rollups":                         runTaskUsageHourlyHook,
@@ -112,6 +124,25 @@ var preMigrationHooks = func() map[string]preMigrationHook {
 	}
 	return hooks
 }()
+
+var preRollbackHooks = func() map[string]preMigrationHook {
+	hooks := make(map[string]preMigrationHook, len(concurrentDownIndexCleanups))
+	for version, index := range concurrentDownIndexCleanups {
+		hooks[version] = cleanupInvalidConcurrentIndexHook(index)
+	}
+	return hooks
+}()
+
+func hooksForDirection(direction string) map[string]preMigrationHook {
+	switch direction {
+	case "up":
+		return preMigrationHooks
+	case "down":
+		return preRollbackHooks
+	default:
+		return nil
+	}
+}
 
 // cleanupInvalidConcurrentIndexHook removes an INVALID index left by an
 // interrupted or failed CREATE INDEX CONCURRENTLY before the migration retries.
@@ -225,7 +256,8 @@ type runOptions struct {
 	// receives the pool (not the loop's pinned conn) so it can take
 	// its own session-level locks. nil or missing entries mean "no
 	// hook" and the migration runs straight through. Production main()
-	// passes preMigrationHooks; tests leave this nil.
+	// passes the direction-specific hook map; tests leave this nil unless they
+	// exercise a hook.
 	Hooks map[string]preMigrationHook
 }
 
@@ -270,7 +302,7 @@ func main() {
 	if err := runMigrations(ctx, pool, runOptions{
 		Direction: direction,
 		Files:     files,
-		Hooks:     preMigrationHooks,
+		Hooks:     hooksForDirection(direction),
 	}); err != nil {
 		slog.Error("migration run failed", "error", err)
 		os.Exit(1)
@@ -388,12 +420,10 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		// colliding with migrationAdvisoryLockKey. Hook failures
 		// abort the run before schema_migrations is updated, so the
 		// same version retries cleanly on the next invocation.
-		if opts.Direction == "up" {
-			if hook, ok := opts.Hooks[version]; ok && hook != nil {
-				slog.Info("running pre-migration hook", "version", version)
-				if err := hook(ctx, pool); err != nil {
-					return fmt.Errorf("pre-migration hook for %q: %w", version, err)
-				}
+		if hook, ok := opts.Hooks[version]; ok && hook != nil {
+			slog.Info("running pre-migration hook", "version", version, "direction", opts.Direction)
+			if err := hook(ctx, pool); err != nil {
+				return fmt.Errorf("pre-migration hook for %q (%s): %w", version, opts.Direction, err)
 			}
 		}
 

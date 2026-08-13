@@ -36,8 +36,56 @@ func stripSQLLineComments(body []byte) []byte {
 // leftover as success and the index stays unusable. Nothing at runtime would
 // report that, so the names are checked against the migration files here.
 func TestConcurrentIndexCleanupsMatchTheirMigrations(t *testing.T) {
-	for version, indexName := range concurrentIndexCleanups {
-		path := filepath.Join("..", "..", "migrations", version+".up.sql")
+	assertConcurrentIndexCleanupsMatchTheirMigrations(
+		t,
+		concurrentIndexCleanups,
+		preMigrationHooks,
+		"up",
+	)
+	assertConcurrentIndexCleanupsMatchTheirMigrations(
+		t,
+		concurrentDownIndexCleanups,
+		preRollbackHooks,
+		"down",
+	)
+
+	// The MUL-5999 batch specifically: every one of these builds an index the
+	// new teardown queries depend on, so none of them may lose its hook.
+	for _, version := range []string{
+		"273_agent_task_queue_runtime_id_index",
+		"274_task_token_workspace_id_index",
+		"275_task_token_agent_id_index",
+		"276_chat_draft_restore_task_id_index",
+		"277_autopilot_run_task_id_index",
+	} {
+		if _, ok := concurrentIndexCleanups[version]; !ok {
+			t.Errorf("%s: missing from concurrentIndexCleanups", version)
+		}
+	}
+
+	// Every MUL-6108 drop has a CREATE INDEX CONCURRENTLY rollback and must
+	// therefore participate in down-direction INVALID-index cleanup.
+	for _, version := range []string{
+		"300_drop_redundant_issue_workspace_number_index",
+		"301_drop_redundant_sys_cron_job_plan_index",
+		"302_drop_redundant_channel_chat_session_binding_index",
+		"303_drop_redundant_lark_chat_session_binding_index",
+	} {
+		if _, ok := concurrentDownIndexCleanups[version]; !ok {
+			t.Errorf("%s: missing from concurrentDownIndexCleanups", version)
+		}
+	}
+}
+
+func assertConcurrentIndexCleanupsMatchTheirMigrations(
+	t *testing.T,
+	cleanups map[string]string,
+	hooks map[string]preMigrationHook,
+	direction string,
+) {
+	t.Helper()
+	for version, indexName := range cleanups {
+		path := filepath.Join("..", "..", "migrations", version+"."+direction+".sql")
 		body, err := os.ReadFile(path)
 		if err != nil {
 			t.Errorf("%s: read migration: %v", version, err)
@@ -53,22 +101,8 @@ func TestConcurrentIndexCleanupsMatchTheirMigrations(t *testing.T) {
 		if got := string(match[1]); got != indexName {
 			t.Errorf("%s: hook cleans %q but the migration builds %q", version, indexName, got)
 		}
-		if preMigrationHooks[version] == nil {
+		if hooks[version] == nil {
 			t.Errorf("%s: no pre-migration hook registered", version)
-		}
-	}
-
-	// The MUL-5999 batch specifically: every one of these builds an index the
-	// new teardown queries depend on, so none of them may lose its hook.
-	for _, version := range []string{
-		"273_agent_task_queue_runtime_id_index",
-		"274_task_token_workspace_id_index",
-		"275_task_token_agent_id_index",
-		"276_chat_draft_restore_task_id_index",
-		"277_autopilot_run_task_id_index",
-	} {
-		if _, ok := concurrentIndexCleanups[version]; !ok {
-			t.Errorf("%s: missing from concurrentIndexCleanups", version)
 		}
 	}
 }
