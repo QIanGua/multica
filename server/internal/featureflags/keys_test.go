@@ -54,6 +54,21 @@ func TestPrivatePluginsV1DefaultsOff(t *testing.T) {
 	}
 }
 
+func TestRemoteMCPPluginsV1RequiresBaseFlag(t *testing.T) {
+	provider := featureflag.NewStaticProvider()
+	flags := featureflag.NewService(provider)
+	ctx := context.Background()
+
+	provider.Set(RemoteMCPPluginsV1, featureflag.Rule{Default: true})
+	if RemoteMCPPluginsV1Enabled(ctx, flags) {
+		t.Fatal("remote_mcp_plugins_v1 must stay off while plugins_v1 is off")
+	}
+	provider.Set(PluginsV1, featureflag.Rule{Default: true})
+	if !RemoteMCPPluginsV1Enabled(ctx, flags) {
+		t.Fatal("remote_mcp_plugins_v1 must be on when both flags are on")
+	}
+}
+
 func TestPrivatePluginsV1RequiresBothFlags(t *testing.T) {
 	provider := featureflag.NewStaticProvider()
 	flags := featureflag.NewService(provider)

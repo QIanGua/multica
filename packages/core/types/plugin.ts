@@ -33,6 +33,45 @@ export interface PluginInstallation {
   contributions: string[];
   contribution_details: PluginCatalogContribution[];
   bindings: PluginBinding[];
+  remote_mcp: PluginRemoteMCPConfig[];
+}
+
+export interface RemoteMCPTool {
+  name: string;
+  description?: string;
+  input_schema: Record<string, unknown>;
+  schema_digest: string;
+  risk?: "read" | "write" | string;
+}
+
+export interface PluginRemoteMCPConfig {
+  contribution_key: string;
+  config_revision?: number;
+  endpoint_domain?: string;
+  credential_state: "missing" | "configured" | "revoked" | "not_required" | string;
+  credential_hint?: string;
+  failure_policy?: "required" | "optional" | string;
+  approved_tools: RemoteMCPTool[];
+  schema_digest?: string;
+  reviewed: boolean;
+}
+
+export interface RemoteMCPConfigRequest {
+  endpoint: string;
+  public_config: Record<string, unknown>;
+  auth_type: "none" | "bearer" | "header";
+  auth_header?: string;
+  credential?: string;
+  failure_policy: "required" | "optional";
+}
+
+export interface RemoteMCPDiscoveryResponse {
+  ok?: boolean;
+  config_revision: number;
+  credential_state?: string;
+  reviewed?: boolean;
+  discovered_tools: RemoteMCPTool[];
+  discovered_schema_digest: string;
 }
 
 export interface PluginCatalogContribution {

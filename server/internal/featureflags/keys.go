@@ -26,6 +26,10 @@ const (
 	// PrivatePluginsV1 independently gates workspace-uploaded, unsigned Skill
 	// Plugins. It is effective only while the base PluginsV1 contract is also on.
 	PrivatePluginsV1 = "private_plugins_v1"
+	// RemoteMCPPluginsV1 gates configuration, review, binding, and activation
+	// of tool.remote-mcp.v1 contributions. Safe teardown remains available
+	// through the base Plugin endpoints when this flag is disabled.
+	RemoteMCPPluginsV1 = "remote_mcp_plugins_v1"
 	// agentBuilderCompat is no longer a release flag. Keep publishing the key
 	// as enabled so installed desktop clients that still gate the AI creation
 	// entry on this config decision receive the permanently enabled behavior.
@@ -48,6 +52,7 @@ var frontendPublicFlags = []string{
 	ComposioMCPApps,
 	PluginsV1,
 	PrivatePluginsV1,
+	RemoteMCPPluginsV1,
 }
 
 func BillingWorkspaceSubscriptionsEnabled(ctx context.Context, flags *featureflag.Service) bool {
@@ -64,6 +69,10 @@ func PluginsV1Enabled(ctx context.Context, flags *featureflag.Service) bool {
 
 func PrivatePluginsV1Enabled(ctx context.Context, flags *featureflag.Service) bool {
 	return PluginsV1Enabled(ctx, flags) && flags.IsEnabled(ctx, PrivatePluginsV1, false)
+}
+
+func RemoteMCPPluginsV1Enabled(ctx context.Context, flags *featureflag.Service) bool {
+	return PluginsV1Enabled(ctx, flags) && flags.IsEnabled(ctx, RemoteMCPPluginsV1, false)
 }
 
 func EvaluateFrontendPublicFlags(ctx context.Context, flags *featureflag.Service) map[string]bool {

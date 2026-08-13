@@ -18,9 +18,12 @@ const (
 
 	ContributionAgentSkillV1       = "agent.skill.v1"
 	CapabilityAgentSkillContribute = "agent.skill.contribute"
+	ContributionRemoteMCPV1        = "tool.remote-mcp.v1"
+	CapabilityRemoteMCPConnect     = "tool.remote-mcp.connect"
 
 	DaemonFeatureExecutionManifestV1 = "execution-manifest-v1"
 	DaemonFeatureAgentSkillV1        = "agent-skill-v1"
+	DaemonFeatureRemoteMCPV1         = "remote-mcp-v1"
 
 	ManifestFilename = "multica.plugin.json"
 	MaxManifestSize  = 1 << 20
@@ -56,7 +59,8 @@ type Compatibility struct {
 }
 
 type ManifestContributions struct {
-	AgentSkills []AgentSkillContribution `json:"agent_skills"`
+	AgentSkills []AgentSkillContribution `json:"agent_skills,omitempty"`
+	RemoteMCP   []RemoteMCPContribution  `json:"remote_mcp,omitempty"`
 }
 
 type AgentSkillContribution struct {
@@ -64,6 +68,31 @@ type AgentSkillContribution struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Entry       string `json:"entry"`
+}
+
+// RemoteMCPContribution is a declarative request to connect an installation to
+// a remote MCP server. The package never contains an endpoint or credential:
+// those are workspace-owned, revisioned installation configuration. ToolIntent
+// is the maximum publisher-declared tool surface an administrator may approve.
+type RemoteMCPContribution struct {
+	Key                 string                  `json:"key"`
+	Name                string                  `json:"name"`
+	Description         string                  `json:"description"`
+	Transport           string                  `json:"transport"`
+	ProtocolVersions    []string                `json:"protocol_versions"`
+	EndpointPolicy      RemoteMCPEndpointPolicy `json:"endpoint_policy"`
+	ToolIntent          []RemoteMCPToolIntent   `json:"tool_intent"`
+	ConfigurationSchema json.RawMessage         `json:"configuration_schema,omitempty"`
+}
+
+type RemoteMCPEndpointPolicy struct {
+	AllowedHosts []string `json:"allowed_hosts,omitempty"`
+}
+
+type RemoteMCPToolIntent struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Risk        string `json:"risk"`
 }
 
 // ParseManifest decodes a strict V1 manifest and returns the canonical bytes
@@ -139,25 +168,44 @@ func (m Manifest) Validate() error {
 	if err != nil {
 		return err
 	}
-	if len(capabilities) != 1 || !capabilities[CapabilityAgentSkillContribute] {
-		return fmt.Errorf("requested_capabilities must contain only %q in V1", CapabilityAgentSkillContribute)
+	wantedCapabilities := map[string]bool{}
+	if len(m.Contributes.AgentSkills) > 0 {
+		wantedCapabilities[CapabilityAgentSkillContribute] = true
+	}
+	if len(m.Contributes.RemoteMCP) > 0 {
+		wantedCapabilities[CapabilityRemoteMCPConnect] = true
+	}
+	if len(wantedCapabilities) == 0 {
+		return fmt.Errorf("contributes must contain at least one agent_skills or remote_mcp contribution")
+	}
+	if len(capabilities) != len(wantedCapabilities) {
+		return fmt.Errorf("requested_capabilities must exactly match declared capabilities %q", declaredCapabilityNames(wantedCapabilities))
+	}
+	for capability := range capabilities {
+		if !wantedCapabilities[capability] {
+			return fmt.Errorf("requested_capabilities contains unsupported capability %q", capability)
+		}
 	}
 
 	features, err := uniqueStrings("compatibility.required_daemon_features", m.Compatibility.RequiredDaemonFeatures)
 	if err != nil {
 		return err
 	}
-	for _, required := range []string{DaemonFeatureExecutionManifestV1, DaemonFeatureAgentSkillV1} {
+	requiredFeatures := []string{DaemonFeatureExecutionManifestV1}
+	if len(m.Contributes.AgentSkills) > 0 {
+		requiredFeatures = append(requiredFeatures, DaemonFeatureAgentSkillV1)
+	}
+	if len(m.Contributes.RemoteMCP) > 0 {
+		requiredFeatures = append(requiredFeatures, DaemonFeatureRemoteMCPV1)
+	}
+	for _, required := range requiredFeatures {
 		if !features[required] {
 			return fmt.Errorf("compatibility.required_daemon_features must include %q", required)
 		}
 	}
 
-	if len(m.Contributes.AgentSkills) == 0 {
-		return fmt.Errorf("contributes.agent_skills must contain at least one contribution")
-	}
-	keys := make(map[string]bool, len(m.Contributes.AgentSkills))
-	names := make(map[string]bool, len(m.Contributes.AgentSkills))
+	keys := make(map[string]bool, len(m.Contributes.AgentSkills)+len(m.Contributes.RemoteMCP))
+	names := make(map[string]bool, len(m.Contributes.AgentSkills)+len(m.Contributes.RemoteMCP))
 	for index, skill := range m.Contributes.AgentSkills {
 		field := fmt.Sprintf("contributes.agent_skills[%d]", index)
 		if !contributionKeyPattern.MatchString(skill.Key) {
@@ -186,8 +234,101 @@ func (m Manifest) Validate() error {
 			return fmt.Errorf("%s.entry must be %q", field, wantEntry)
 		}
 	}
+	for index, remote := range m.Contributes.RemoteMCP {
+		field := fmt.Sprintf("contributes.remote_mcp[%d]", index)
+		if err := validateContributionIdentity(field, remote.Key, remote.Name, remote.Description, keys, names); err != nil {
+			return err
+		}
+		if remote.Transport != "streamable-http" {
+			return fmt.Errorf("%s.transport must be %q", field, "streamable-http")
+		}
+		versions, err := uniqueStrings(field+".protocol_versions", remote.ProtocolVersions)
+		if err != nil {
+			return err
+		}
+		if len(versions) == 0 {
+			return fmt.Errorf("%s.protocol_versions must not be empty", field)
+		}
+		for version := range versions {
+			if version != "2025-03-26" && version != "2024-11-05" {
+				return fmt.Errorf("%s.protocol_versions contains unsupported version %q", field, version)
+			}
+		}
+		allowedHosts, err := uniqueStrings(field+".endpoint_policy.allowed_hosts", remote.EndpointPolicy.AllowedHosts)
+		if err != nil {
+			return err
+		}
+		for host := range allowedHosts {
+			if strings.ContainsAny(host, "/:@?#") || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") || strings.ToLower(host) != host {
+				return fmt.Errorf("%s.endpoint_policy.allowed_hosts contains invalid host %q", field, host)
+			}
+		}
+		if len(remote.ToolIntent) == 0 {
+			return fmt.Errorf("%s.tool_intent must not be empty", field)
+		}
+		toolNames := make(map[string]bool, len(remote.ToolIntent))
+		for toolIndex, tool := range remote.ToolIntent {
+			toolField := fmt.Sprintf("%s.tool_intent[%d]", field, toolIndex)
+			if !contributionKeyPattern.MatchString(tool.Name) && !regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.:-]{0,127}$`).MatchString(tool.Name) {
+				return fmt.Errorf("%s.name is invalid", toolField)
+			}
+			if toolNames[tool.Name] {
+				return fmt.Errorf("%s contains duplicate tool name %q", field+".tool_intent", tool.Name)
+			}
+			toolNames[tool.Name] = true
+			if tool.Description != "" {
+				if err := validateDisplayText(toolField+".description", tool.Description, 2000); err != nil {
+					return err
+				}
+			}
+			if tool.Risk != "read" && tool.Risk != "write" {
+				return fmt.Errorf("%s.risk must be read or write", toolField)
+			}
+		}
+		if len(remote.ConfigurationSchema) > 0 {
+			var schema map[string]any
+			if err := json.Unmarshal(remote.ConfigurationSchema, &schema); err != nil {
+				return fmt.Errorf("%s.configuration_schema must be a JSON object: %w", field, err)
+			}
+			if schemaType, _ := schema["type"].(string); schemaType != "object" {
+				return fmt.Errorf("%s.configuration_schema.type must be object", field)
+			}
+		}
+	}
 
 	return nil
+}
+
+func declaredCapabilityNames(capabilities map[string]bool) []string {
+	names := make([]string, 0, len(capabilities))
+	for _, capability := range []string{CapabilityAgentSkillContribute, CapabilityRemoteMCPConnect} {
+		if capabilities[capability] {
+			names = append(names, capability)
+		}
+	}
+	return names
+}
+
+func validateContributionIdentity(field, key, name, description string, keys, names map[string]bool) error {
+	if !contributionKeyPattern.MatchString(key) {
+		return fmt.Errorf("%s.key is invalid", field)
+	}
+	if strings.HasPrefix(key, "multica-") {
+		return fmt.Errorf("%s.key uses the reserved multica- namespace", field)
+	}
+	if keys[key] {
+		return fmt.Errorf("duplicate contribution key %q", key)
+	}
+	keys[key] = true
+	if err := validateDisplayText(field+".name", name, 160); err != nil {
+		return err
+	}
+	nameKey := strings.ToLower(name)
+	if names[nameKey] {
+		return fmt.Errorf("duplicate contribution name %q", name)
+	}
+	names[nameKey] = true
+	return validateDisplayText(field+".description", description, 2000)
 }
 
 func validatePluginKey(key string) error {

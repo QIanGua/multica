@@ -65,6 +65,19 @@ func TestValidateArtifactAcceptsReferencePlugin(t *testing.T) {
 	}
 }
 
+func TestValidateArtifactAcceptsRemoteMCPOnlyPlugin(t *testing.T) {
+	archive := buildArchive(t, []zipFixtureFile{{
+		name: ManifestFilename, content: manifestJSON(t, validRemoteMCPManifest()),
+	}})
+	artifact, err := ValidateArtifact(archive)
+	if err != nil {
+		t.Fatalf("ValidateArtifact: %v", err)
+	}
+	if len(artifact.Files) != 1 || len(artifact.Manifest.Contributes.RemoteMCP) != 1 {
+		t.Fatalf("remote-only artifact files = %d, contributions = %d", len(artifact.Files), len(artifact.Manifest.Contributes.RemoteMCP))
+	}
+}
+
 func TestArtifactDigestIgnoresZipEntryOrder(t *testing.T) {
 	files := referenceArchiveFiles(t)
 	reversed := []zipFixtureFile{files[2], files[1], files[0]}

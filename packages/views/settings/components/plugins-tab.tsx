@@ -10,17 +10,28 @@ import {
   comparePluginVersions,
   pluginCatalogOptions,
   pluginInstallationsOptions,
+  useApprovePluginRemoteMCPTools,
+  useConfigurePluginRemoteMCP,
   useInstallPlugin,
+  useRevokePluginRemoteMCPCredential,
   useRollbackPlugin,
   useSetPluginEnabled,
+  useTestPluginRemoteMCP,
   useUninstallPlugin,
   useUpgradePlugin,
 } from "@multica/core/plugins";
 import { useCurrentWorkspace } from "@multica/core/paths";
-import type { PluginCatalogRelease, PluginInstallation } from "@multica/core/types";
+import type {
+  PluginCatalogRelease,
+  PluginInstallation,
+  PluginRemoteMCPConfig,
+  RemoteMCPDiscoveryResponse,
+} from "@multica/core/types";
 import { Alert, AlertDescription, AlertTitle } from "@multica/ui/components/ui/alert";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
+import { Checkbox } from "@multica/ui/components/ui/checkbox";
+import { Input } from "@multica/ui/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -29,10 +40,261 @@ import {
   SelectValue,
 } from "@multica/ui/components/ui/select";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
+import { Textarea } from "@multica/ui/components/ui/textarea";
 import { useT } from "../../i18n";
 import { SettingsCard, SettingsSection, SettingsTab } from "./settings-layout";
 
 type BindingScope = "workspace" | "agent";
+
+type RemoteMCPAuthType = "none" | "bearer" | "header";
+
+function RemoteMCPConfiguration({
+  wsId,
+  installationId,
+  config,
+  canManage,
+}: {
+  wsId: string;
+  installationId: string;
+  config: PluginRemoteMCPConfig;
+  canManage: boolean;
+}) {
+  const { t } = useT("settings");
+  const configureMutation = useConfigurePluginRemoteMCP(wsId);
+  const testMutation = useTestPluginRemoteMCP(wsId);
+  const approveMutation = useApprovePluginRemoteMCPTools(wsId);
+  const revokeMutation = useRevokePluginRemoteMCPCredential(wsId);
+  const [endpoint, setEndpoint] = useState("");
+  const [authType, setAuthType] = useState<RemoteMCPAuthType>("none");
+  const [authHeader, setAuthHeader] = useState("Authorization");
+  const [credential, setCredential] = useState("");
+  const [publicConfig, setPublicConfig] = useState("{}");
+  const [failurePolicy, setFailurePolicy] = useState<"required" | "optional">("required");
+  const [discovery, setDiscovery] = useState<RemoteMCPDiscoveryResponse | null>(null);
+  const [approvedTools, setApprovedTools] = useState<string[]>([]);
+  const isPending = configureMutation.isPending || testMutation.isPending
+    || approveMutation.isPending || revokeMutation.isPending;
+
+  const reportError = (error: unknown) => {
+    toast.error(error instanceof Error ? error.message : t(($) => $.plugins.action_failed));
+  };
+  const rememberDiscovery = (result: RemoteMCPDiscoveryResponse) => {
+    setDiscovery(result);
+    setApprovedTools(result.discovered_tools.map((tool) => tool.name));
+  };
+  const credentialStateLabel = config.credential_state === "configured"
+    ? t(($) => $.plugins.remote_mcp.credential_states.configured)
+    : config.credential_state === "revoked"
+      ? t(($) => $.plugins.remote_mcp.credential_states.revoked)
+      : config.credential_state === "not_required"
+        ? t(($) => $.plugins.remote_mcp.credential_states.not_required)
+        : t(($) => $.plugins.remote_mcp.credential_states.missing);
+  const configure = async () => {
+    let parsedPublicConfig: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(publicConfig);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+      parsedPublicConfig = parsed as Record<string, unknown>;
+    } catch {
+      toast.error(t(($) => $.plugins.remote_mcp.invalid_public_config));
+      return;
+    }
+    try {
+      const result = await configureMutation.mutateAsync({
+        installationId,
+        contributionKey: config.contribution_key,
+        request: {
+          endpoint: endpoint.trim(),
+          public_config: parsedPublicConfig,
+          auth_type: authType,
+          auth_header: authType === "header" ? authHeader.trim() : undefined,
+          credential: authType === "none" ? undefined : credential,
+          failure_policy: failurePolicy,
+        },
+      });
+      setCredential("");
+      rememberDiscovery(result);
+      toast.success(t(($) => $.plugins.remote_mcp.configured_success));
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  return (
+    <div className="space-y-4 rounded-xl border border-surface-border bg-muted/30 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <div className="text-body font-medium">{t(($) => $.plugins.remote_mcp.title)} · {config.contribution_key}</div>
+          <div className="mt-1 flex flex-wrap items-center gap-2 text-caption text-muted-foreground">
+            {config.endpoint_domain ? <span>{config.endpoint_domain}</span> : null}
+            <Badge variant={config.credential_state === "revoked" || config.credential_state === "missing" ? "destructive" : "secondary"}>
+              {credentialStateLabel}
+            </Badge>
+            <Badge variant={config.reviewed ? "default" : "secondary"}>
+              {config.reviewed ? t(($) => $.plugins.remote_mcp.reviewed) : t(($) => $.plugins.remote_mcp.pending_review)}
+            </Badge>
+            {config.credential_hint ? <span>{config.credential_hint}</span> : null}
+          </div>
+        </div>
+        {config.credential_state !== "not_required" ? (
+          <Button
+            size="xs"
+            variant="ghost"
+            disabled={!canManage || isPending || config.credential_state !== "configured"}
+            onClick={() => revokeMutation.mutateAsync({ installationId, contributionKey: config.contribution_key })
+              .then(() => toast.success(t(($) => $.plugins.remote_mcp.revoked_success)))
+              .catch(reportError)}
+          >
+            {t(($) => $.plugins.remote_mcp.revoke)}
+          </Button>
+        ) : null}
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="space-y-1 text-caption sm:col-span-2">
+          <span className="font-medium">{t(($) => $.plugins.remote_mcp.endpoint)}</span>
+          <Input
+            value={endpoint}
+            onChange={(event) => setEndpoint(event.target.value)}
+            placeholder={t(($) => $.plugins.remote_mcp.endpoint_placeholder)}
+            disabled={!canManage || isPending}
+          />
+        </label>
+        <label className="space-y-1 text-caption">
+          <span className="font-medium">{t(($) => $.plugins.remote_mcp.auth)}</span>
+          <Select
+            items={(["none", "bearer", "header"] as const).map((value) => ({
+              value,
+              label: t(($) => $.plugins.remote_mcp.auth_types[value]),
+            }))}
+            value={authType}
+            onValueChange={(value) => value && setAuthType(value as RemoteMCPAuthType)}
+            disabled={!canManage || isPending}
+          >
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">{t(($) => $.plugins.remote_mcp.auth_types.none)}</SelectItem>
+              <SelectItem value="bearer">{t(($) => $.plugins.remote_mcp.auth_types.bearer)}</SelectItem>
+              <SelectItem value="header">{t(($) => $.plugins.remote_mcp.auth_types.header)}</SelectItem>
+            </SelectContent>
+          </Select>
+        </label>
+        <label className="space-y-1 text-caption">
+          <span className="font-medium">{t(($) => $.plugins.remote_mcp.failure_policy)}</span>
+          <Select
+            items={(["required", "optional"] as const).map((value) => ({
+              value,
+              label: t(($) => $.plugins.remote_mcp.failure_policies[value]),
+            }))}
+            value={failurePolicy}
+            onValueChange={(value) => value && setFailurePolicy(value as "required" | "optional")}
+            disabled={!canManage || isPending}
+          >
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="required">{t(($) => $.plugins.remote_mcp.failure_policies.required)}</SelectItem>
+              <SelectItem value="optional">{t(($) => $.plugins.remote_mcp.failure_policies.optional)}</SelectItem>
+            </SelectContent>
+          </Select>
+        </label>
+        {authType === "header" ? (
+          <label className="space-y-1 text-caption">
+            <span className="font-medium">{t(($) => $.plugins.remote_mcp.header_name)}</span>
+            <Input value={authHeader} onChange={(event) => setAuthHeader(event.target.value)} disabled={!canManage || isPending} />
+          </label>
+        ) : null}
+        {authType !== "none" ? (
+          <label className="space-y-1 text-caption">
+            <span className="font-medium">{t(($) => $.plugins.remote_mcp.credential)}</span>
+            <Input
+              type="password"
+              autoComplete="new-password"
+              value={credential}
+              onChange={(event) => setCredential(event.target.value)}
+              disabled={!canManage || isPending}
+            />
+          </label>
+        ) : null}
+        <label className="space-y-1 text-caption sm:col-span-2">
+          <span className="font-medium">{t(($) => $.plugins.remote_mcp.public_config)}</span>
+          <Textarea
+            className="font-mono"
+            value={publicConfig}
+            onChange={(event) => setPublicConfig(event.target.value)}
+            disabled={!canManage || isPending}
+          />
+        </label>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <Button
+          size="sm"
+          disabled={!canManage || isPending || endpoint.trim() === "" || (authType !== "none" && credential === "")}
+          onClick={configure}
+        >
+          {configureMutation.isPending ? <Loader2 className="animate-spin" /> : null}
+          {t(($) => $.plugins.remote_mcp.configure_and_discover)}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={!canManage || isPending || !config.config_revision}
+          onClick={() => testMutation.mutateAsync({ installationId, contributionKey: config.contribution_key })
+            .then((result) => {
+              rememberDiscovery(result);
+              toast.success(t(($) => $.plugins.remote_mcp.test_success));
+            }).catch(reportError)}
+        >
+          {testMutation.isPending ? <Loader2 className="animate-spin" /> : null}
+          {t(($) => $.plugins.remote_mcp.test)}
+        </Button>
+      </div>
+
+      {discovery ? (
+        <div className="space-y-3 border-t border-surface-border pt-3">
+          <div className="text-caption font-medium">{t(($) => $.plugins.remote_mcp.discovery)}</div>
+          {discovery.discovered_tools.length > 0 ? discovery.discovered_tools.map((tool) => (
+            <label key={tool.name} className="flex items-start gap-2 rounded-lg bg-background px-3 py-2 text-caption">
+              <Checkbox
+                checked={approvedTools.includes(tool.name)}
+                disabled={!canManage || isPending}
+                onCheckedChange={() => setApprovedTools((current) => current.includes(tool.name)
+                  ? current.filter((name) => name !== tool.name)
+                  : [...current, tool.name])}
+              />
+              <span className="min-w-0">
+                <span className="font-medium">{tool.name}</span>
+                <Badge className="ml-2" variant={tool.risk === "write" ? "destructive" : "secondary"}>
+                  {tool.risk === "write" ? t(($) => $.plugins.remote_mcp.write) : t(($) => $.plugins.remote_mcp.read)}
+                </Badge>
+                {tool.description ? <span className="mt-0.5 block text-muted-foreground">{tool.description}</span> : null}
+              </span>
+            </label>
+          )) : <p className="text-caption text-muted-foreground">{t(($) => $.plugins.remote_mcp.no_tools)}</p>}
+          <Button
+            size="sm"
+            disabled={!canManage || isPending || approvedTools.length === 0}
+            onClick={() => approveMutation.mutateAsync({
+              installationId,
+              contributionKey: config.contribution_key,
+              tools: approvedTools,
+            }).then(() => {
+              setDiscovery(null);
+              toast.success(t(($) => $.plugins.remote_mcp.approved_success));
+            }).catch(reportError)}
+          >
+            {approveMutation.isPending ? <Loader2 className="animate-spin" /> : <ShieldCheck />}
+            {t(($) => $.plugins.remote_mcp.approve)}
+          </Button>
+        </div>
+      ) : config.approved_tools.length > 0 ? (
+        <div className="text-caption text-muted-foreground">
+          {t(($) => $.plugins.remote_mcp.approved_tools)}: {config.approved_tools.map((tool) => tool.name).join(", ")}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 function installationState(installation: PluginInstallation): "disabled" | "activating" | "healthy" | "degraded" | "failed" {
   if (installation.enabled !== true) return "disabled";
@@ -273,6 +535,16 @@ export function PluginsTab() {
                       <span>{t(($) => $.plugins.health)} {installation.health_state || installation.lifecycle_status}</span>
                     </div>
 
+                    {installation.remote_mcp.map((config) => (
+                      <RemoteMCPConfiguration
+                        key={config.contribution_key}
+                        wsId={wsId}
+                        installationId={installation.id}
+                        config={config}
+                        canManage={canManage}
+                      />
+                    ))}
+
                     {activeBindings.length > 0 ? (
                       <div className="space-y-2">
                         <div className="text-caption font-medium">{t(($) => $.plugins.bindings)}</div>
@@ -470,6 +742,16 @@ export function PluginsTab() {
                     <span>·</span>
                     <span>{t(($) => $.plugins.health)} {installation.health_state || installation.lifecycle_status}</span>
                   </div>
+
+                  {installation.remote_mcp.map((config) => (
+                    <RemoteMCPConfiguration
+                      key={config.contribution_key}
+                      wsId={wsId}
+                      installationId={installation.id}
+                      config={config}
+                      canManage={canManage}
+                    />
+                  ))}
 
                   {activeBindings.length > 0 ? (
                     <div className="space-y-2">

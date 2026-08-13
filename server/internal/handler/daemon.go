@@ -1780,6 +1780,26 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		return resp, deliveredCommentIDs, 0, 0, &claimBuildFailure{status: http.StatusInternalServerError, message: "pinned plugin contributions are unavailable"}
 	}
 	resp.PluginExecutionManifest = pluginManifest
+	remoteConnections, remoteDiagnostics, remoteErr := h.PluginService.ResolveTaskRemoteMCPConnections(r.Context(), task.ID)
+	if remoteErr != nil {
+		slog.Error("daemon claim: resolve pinned Remote MCP contribution failed", "task_id", uuidToString(task.ID), "error", remoteErr)
+		return resp, deliveredCommentIDs, 0, 0, &claimBuildFailure{status: http.StatusConflict, message: "required Remote MCP contribution is unavailable"}
+	}
+	if pluginManifest != nil && len(remoteDiagnostics) > 0 {
+		pluginManifest.Diagnostics = append(pluginManifest.Diagnostics, remoteDiagnostics...)
+	}
+	if len(remoteConnections) > 0 && !requestHasClientCapability(r, protocol.DaemonCapabilityRemoteMCPV1) {
+		for _, connection := range remoteConnections {
+			if connection.FailurePolicy == "required" {
+				return resp, deliveredCommentIDs, 0, 0, &claimBuildFailure{status: http.StatusConflict, message: "runtime does not support this task's required Remote MCP contribution"}
+			}
+		}
+		if pluginManifest != nil {
+			pluginManifest.Diagnostics = append(pluginManifest.Diagnostics, "optional Remote MCP contributions omitted because the runtime is incompatible")
+		}
+		remoteConnections = nil
+	}
+	resp.RemoteMCPConnections = remoteConnections
 	if len(pluginSkillRefs) > 0 && (!requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1) ||
 		!requestHasClientCapability(r, protocol.DaemonCapabilityExecutionManifestV1) ||
 		!requestHasClientCapability(r, protocol.DaemonCapabilityAgentSkillV1)) {

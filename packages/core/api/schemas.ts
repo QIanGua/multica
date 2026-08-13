@@ -78,6 +78,35 @@ export const PluginBindingSchema = z.object({
   revision: z.number().default(0),
 }).loose();
 
+export const RemoteMCPToolSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  input_schema: z.record(z.string(), z.unknown()).default({}),
+  schema_digest: z.string().default(""),
+  risk: z.string().optional(),
+});
+
+export const PluginRemoteMCPConfigSchema = z.object({
+  contribution_key: z.string(),
+  config_revision: z.number().optional(),
+  endpoint_domain: z.string().optional(),
+  credential_state: z.string().default("missing"),
+  credential_hint: z.string().optional(),
+  failure_policy: z.string().optional(),
+  approved_tools: z.array(RemoteMCPToolSchema).default([]),
+  schema_digest: z.string().optional(),
+  reviewed: z.boolean().default(false),
+});
+
+export const RemoteMCPDiscoveryResponseSchema = z.object({
+  ok: z.boolean().optional(),
+  config_revision: z.number().default(0),
+  credential_state: z.string().optional(),
+  reviewed: z.boolean().optional(),
+  discovered_tools: z.array(RemoteMCPToolSchema).default([]),
+  discovered_schema_digest: z.string().default(""),
+});
+
 export const PluginInstallationSchema = z.object({
   id: z.string(),
   plugin_key: z.string().default(""),
@@ -113,6 +142,7 @@ export const PluginInstallationSchema = z.object({
     entry_digest: z.string().default(""),
   }).loose()).default([]),
   bindings: z.array(PluginBindingSchema).default([]),
+  remote_mcp: z.array(PluginRemoteMCPConfigSchema).default([]),
 }).loose();
 
 export const EMPTY_PLUGIN_INSTALLATION: PluginInstallation = {
@@ -138,6 +168,7 @@ export const EMPTY_PLUGIN_INSTALLATION: PluginInstallation = {
   contributions: [],
   contribution_details: [],
   bindings: [],
+  remote_mcp: [],
 };
 
 export const PluginInstallationListResponseSchema = z.object({

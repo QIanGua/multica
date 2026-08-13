@@ -1012,6 +1012,26 @@ type PluginInstallation struct {
 	UninstalledAt     pgtype.Timestamptz `json:"uninstalled_at"`
 }
 
+type PluginInstallationConfig struct {
+	ID             pgtype.UUID        `json:"id"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	InstallationID pgtype.UUID        `json:"installation_id"`
+	ContributionID pgtype.UUID        `json:"contribution_id"`
+	Revision       int64              `json:"revision"`
+	Endpoint       string             `json:"endpoint"`
+	PublicConfig   []byte             `json:"public_config"`
+	AuthType       string             `json:"auth_type"`
+	AuthHeader     string             `json:"auth_header"`
+	SecretRef      pgtype.UUID        `json:"secret_ref"`
+	ApprovedTools  []byte             `json:"approved_tools"`
+	SchemaDigest   pgtype.Text        `json:"schema_digest"`
+	FailurePolicy  string             `json:"failure_policy"`
+	ReviewedBy     pgtype.UUID        `json:"reviewed_by"`
+	ReviewedAt     pgtype.Timestamptz `json:"reviewed_at"`
+	CreatedBy      pgtype.UUID        `json:"created_by"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type PluginRelease struct {
 	ID               pgtype.UUID        `json:"id"`
 	PluginID         pgtype.UUID        `json:"plugin_id"`
@@ -1030,6 +1050,20 @@ type PluginRelease struct {
 	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
 	RevocationReason pgtype.Text        `json:"revocation_reason"`
 	PublishedAt      pgtype.Timestamptz `json:"published_at"`
+}
+
+type PluginRemoteMcpSecret struct {
+	ID             pgtype.UUID        `json:"id"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	InstallationID pgtype.UUID        `json:"installation_id"`
+	ContributionID pgtype.UUID        `json:"contribution_id"`
+	Version        int64              `json:"version"`
+	Ciphertext     []byte             `json:"ciphertext"`
+	Hint           string             `json:"hint"`
+	Status         string             `json:"status"`
+	CreatedBy      pgtype.UUID        `json:"created_by"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
 }
 
 type PluginWorkspaceCapabilityState struct {

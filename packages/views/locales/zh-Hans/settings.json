@@ -248,6 +248,47 @@
       "host_api": "Host API",
       "publisher": "发布者与签名身份",
       "none": "无"
+    },
+    "remote_mcp": {
+      "title": "Remote MCP 连接",
+      "endpoint": "HTTPS 端点",
+      "endpoint_placeholder": "https://mcp.example.com/mcp",
+      "auth": "身份验证",
+      "auth_types": {
+        "none": "无",
+        "bearer": "Bearer 令牌",
+        "header": "自定义请求头"
+      },
+      "header_name": "请求头名称",
+      "credential": "凭证（加密存储）",
+      "public_config": "公开配置（JSON 对象）",
+      "invalid_public_config": "公开配置必须是有效的 JSON 对象",
+      "failure_policy": "失败策略",
+      "failure_policies": {
+        "required": "必需 — 停止任务",
+        "optional": "可选 — 不使用工具并继续"
+      },
+      "configure_and_discover": "保存并发现工具",
+      "test": "测试连接",
+      "approve": "批准所选工具",
+      "revoke": "吊销凭证",
+      "credential_states": {
+        "configured": "已配置凭证",
+        "revoked": "凭证已吊销",
+        "missing": "缺少凭证",
+        "not_required": "无需凭证"
+      },
+      "reviewed": "工具已批准",
+      "pending_review": "需要批准",
+      "approved_tools": "已批准的工具",
+      "no_tools": "服务器未公布任何工具。",
+      "discovery": "已发现的工具 — 请明确审核访问权限",
+      "read": "读取",
+      "write": "写入",
+      "configured_success": "连接已保存；请审核已发现的工具",
+      "test_success": "连接测试成功",
+      "approved_success": "工具访问权限已批准",
+      "revoked_success": "凭证已吊销，Plugin 已禁用"
     }
   },
   "properties": {

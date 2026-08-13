@@ -50,6 +50,7 @@ import {
   EMPTY_PLUGIN_CATALOG,
   PluginCatalogResponseSchema,
   PluginInstallationSchema,
+  RemoteMCPDiscoveryResponseSchema,
 } from "./schemas";
 import { IssueViewSchema, IssueViewListSchema } from "./schemas";
 import { parseWithFallback } from "./schema";
@@ -1386,6 +1387,40 @@ describe("Plugin catalog schemas", () => {
     expect(parsed.trust_tier).toBe("");
     expect(parsed.signature_verified).toBe(false);
     expect(parsed.contribution_details).toEqual([]);
+    expect(parsed.remote_mcp).toEqual([]);
+  });
+
+  it("parses Remote MCP status without accepting secret-shaped response fields", () => {
+    const parsed = PluginInstallationSchema.parse({
+      id: "installation-1",
+      remote_mcp: [{
+        contribution_key: "search",
+        credential_state: "configured",
+        credential_hint: "••••1234",
+        credential: "must-not-be-modeled",
+        approved_tools: [{
+          name: "search.read",
+          input_schema: { type: "object" },
+          schema_digest: "sha256:fixture",
+          risk: "read",
+        }],
+        reviewed: true,
+      }],
+    });
+    expect(parsed.remote_mcp[0]?.credential_state).toBe("configured");
+    expect(parsed.remote_mcp[0]?.approved_tools[0]?.name).toBe("search.read");
+    expect(parsed.remote_mcp[0]).not.toHaveProperty("credential");
+  });
+
+  it("defaults a malformed Remote MCP discovery response without inventing tools", () => {
+    const fallback = { config_revision: 0, discovered_tools: [], discovered_schema_digest: "" };
+    const parsed = parseWithFallback(
+      { config_revision: "bad", discovered_tools: { name: "search" } },
+      RemoteMCPDiscoveryResponseSchema,
+      fallback,
+      { endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{key}/test" },
+    );
+    expect(parsed).toEqual(fallback);
   });
 
   it("degrades a malformed catalog response to unsupported and empty", () => {

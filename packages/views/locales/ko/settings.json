@@ -248,6 +248,47 @@
       "host_api": "Host API",
       "publisher": "게시자 및 서명 ID",
       "none": "없음"
+    },
+    "remote_mcp": {
+      "title": "Remote MCP 연결",
+      "endpoint": "HTTPS 엔드포인트",
+      "endpoint_placeholder": "https://mcp.example.com/mcp",
+      "auth": "인증",
+      "auth_types": {
+        "none": "없음",
+        "bearer": "Bearer 토큰",
+        "header": "사용자 지정 헤더"
+      },
+      "header_name": "헤더 이름",
+      "credential": "인증 정보(암호화 저장)",
+      "public_config": "공개 설정(JSON 객체)",
+      "invalid_public_config": "공개 설정은 유효한 JSON 객체여야 합니다",
+      "failure_policy": "실패 정책",
+      "failure_policies": {
+        "required": "필수 — 태스크 중지",
+        "optional": "선택 — 도구 없이 계속"
+      },
+      "configure_and_discover": "저장하고 도구 검색",
+      "test": "연결 테스트",
+      "approve": "선택한 도구 승인",
+      "revoke": "인증 정보 폐기",
+      "credential_states": {
+        "configured": "인증 정보 설정됨",
+        "revoked": "인증 정보 폐기됨",
+        "missing": "인증 정보 없음",
+        "not_required": "인증 정보 필요 없음"
+      },
+      "reviewed": "도구 승인됨",
+      "pending_review": "승인 필요",
+      "approved_tools": "승인된 도구",
+      "no_tools": "서버에서 알린 도구가 없습니다.",
+      "discovery": "검색된 도구 — 접근 권한을 명시적으로 검토하세요",
+      "read": "읽기",
+      "write": "쓰기",
+      "configured_success": "연결을 저장했습니다. 검색된 도구를 검토하세요",
+      "test_success": "연결 테스트에 성공했습니다",
+      "approved_success": "도구 접근을 승인했습니다",
+      "revoked_success": "인증 정보를 폐기하고 Plugin을 비활성화했습니다"
     }
   },
   "properties": {

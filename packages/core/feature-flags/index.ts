@@ -21,6 +21,7 @@ export {
   COMPOSIO_MCP_APPS_FLAG,
   PLUGINS_V1_FLAG,
   PRIVATE_PLUGINS_V1_FLAG,
+  REMOTE_MCP_PLUGINS_V1_FLAG,
 } from "./keys";
 export {
   FeatureFlagsProvider,

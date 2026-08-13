@@ -87,6 +87,10 @@ export type {
   PluginInstallationListResponse,
   PluginReleaseRequest,
   PluginBindingRequest,
+  PluginRemoteMCPConfig,
+  RemoteMCPConfigRequest,
+  RemoteMCPDiscoveryResponse,
+  RemoteMCPTool,
 } from "./plugin";
 export type { InboxItem, InboxSeverity, InboxItemType, InboxWorkspaceUnread } from "./inbox";
 export type { NotificationGroupKey, NotificationGroupValue, NotificationPreferences, NotificationPreferenceResponse } from "./notification-preference";

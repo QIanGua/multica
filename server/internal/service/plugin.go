@@ -18,9 +18,10 @@ import (
 )
 
 type PluginService struct {
-	Queries        *db.Queries
-	TxStarter      TxStarter
-	BundledCatalog *pluginbundled.Catalog
+	Queries          *db.Queries
+	TxStarter        TxStarter
+	BundledCatalog   *pluginbundled.Catalog
+	RemoteMCPSecrets RemoteMCPSecretBox
 }
 
 const (
@@ -480,6 +481,11 @@ func (s *PluginService) setPluginBinding(ctx context.Context, workspaceID, insta
 	if err != nil {
 		return db.PluginInstallation{}, err
 	}
+	if enabled {
+		if err := validateRemoteMCPInstallationReady(ctx, q, workspaceID, installation, release); err != nil {
+			return db.PluginInstallation{}, err
+		}
+	}
 	if scopeType == "workspace" && scopeID != workspaceID {
 		return db.PluginInstallation{}, newPluginError(PluginErrorNotFound, "Plugin binding target not found", nil)
 	}
@@ -535,6 +541,47 @@ func (s *PluginService) setPluginBinding(ctx context.Context, workspaceID, insta
 		return db.PluginInstallation{}, err
 	}
 	return s.Queries.GetPluginInstallation(ctx, installationID)
+}
+
+func validateRemoteMCPInstallationReady(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID, installation db.PluginInstallation, release db.PluginRelease) error {
+	contributions, err := q.ListPluginContributionsByRelease(ctx, release.ID)
+	if err != nil {
+		return err
+	}
+	configs, err := q.ListLatestPluginInstallationConfigs(ctx, db.ListLatestPluginInstallationConfigsParams{
+		WorkspaceID: workspaceID, InstallationID: installation.ID,
+	})
+	if err != nil {
+		return err
+	}
+	byContribution := make(map[string]db.PluginInstallationConfig, len(configs))
+	for _, config := range configs {
+		byContribution[util.UUIDToString(config.ContributionID)] = config
+	}
+	for _, contribution := range contributions {
+		if contribution.Type != plugincontract.ContributionRemoteMCPV1 {
+			continue
+		}
+		config, ok := byContribution[util.UUIDToString(contribution.ID)]
+		var approved []pluginruntime.RemoteMCPTool
+		if ok {
+			_ = json.Unmarshal(config.ApprovedTools, &approved)
+		}
+		if !ok || !config.ReviewedAt.Valid || len(approved) == 0 || !config.SchemaDigest.Valid {
+			return newPluginError(PluginErrorConflict, "Remote MCP configuration and tool review must be complete before enabling", nil)
+		}
+		if config.AuthType != "none" {
+			if !config.SecretRef.Valid {
+				return newPluginError(PluginErrorConflict, "Remote MCP credential must be configured before enabling", nil)
+			}
+			if _, err := q.GetActivePluginRemoteMCPSecret(ctx, db.GetActivePluginRemoteMCPSecretParams{
+				ID: config.SecretRef, WorkspaceID: workspaceID, InstallationID: installation.ID, ContributionID: contribution.ID,
+			}); err != nil {
+				return newPluginError(PluginErrorConflict, "Remote MCP credential must be configured before enabling", nil)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *PluginService) RollbackPlugin(ctx context.Context, workspaceID, installationID, actorID pgtype.UUID, version string) (db.PluginInstallation, error) {
@@ -694,13 +741,6 @@ func (s *PluginService) reconcileWorkspaceTx(ctx context.Context, q *db.Queries,
 		if err := json.Unmarshal(row.RequiredDaemonFeatures, &features); err != nil {
 			return db.PluginCapabilitySnapshot{}, fmt.Errorf("decode daemon features: %w", err)
 		}
-		bundleManifest := skillbundle.BuildManifest(skillbundle.Skill{
-			ID:          "plugin:" + util.UUIDToString(row.ContributionID),
-			Source:      skillbundle.SourcePlugin,
-			Name:        row.ContributionKey,
-			Description: row.Description,
-			Content:     row.EntryContent,
-		})
 		base := pluginruntime.CompiledEntry{
 			PluginID:               util.UUIDToString(row.PluginID),
 			PluginKey:              row.PluginKey,
@@ -720,9 +760,56 @@ func (s *PluginService) reconcileWorkspaceTx(ctx context.Context, q *db.Queries,
 			EntryDigest:            row.EntryDigest,
 			RequiredDaemonFeatures: features,
 			Ordinal:                row.Ordinal,
-			SkillBundleHash:        bundleManifest.Hash,
-			SkillSizeBytes:         bundleManifest.SizeBytes,
-			SkillFileCount:         bundleManifest.FileCount,
+		}
+		switch row.ContributionType {
+		case plugincontract.ContributionAgentSkillV1:
+			bundleManifest := skillbundle.BuildManifest(skillbundle.Skill{
+				ID:          "plugin:" + util.UUIDToString(row.ContributionID),
+				Source:      skillbundle.SourcePlugin,
+				Name:        row.ContributionKey,
+				Description: row.Description,
+				Content:     row.EntryContent,
+			})
+			base.SkillBundleHash = bundleManifest.Hash
+			base.SkillSizeBytes = bundleManifest.SizeBytes
+			base.SkillFileCount = bundleManifest.FileCount
+		case plugincontract.ContributionRemoteMCPV1:
+			if !row.ConfigID.Valid || !row.ConfigRevision.Valid || !row.Endpoint.Valid || !row.AuthType.Valid || !row.FailurePolicy.Valid || !row.SchemaDigest.Valid {
+				return db.PluginCapabilitySnapshot{}, fmt.Errorf("remote MCP contribution %s has incomplete reviewed configuration", row.ContributionKey)
+			}
+			var tools []pluginruntime.RemoteMCPTool
+			if err := json.Unmarshal(row.ApprovedTools, &tools); err != nil || len(tools) == 0 {
+				return db.PluginCapabilitySnapshot{}, fmt.Errorf("remote MCP contribution %s has invalid approved tools", row.ContributionKey)
+			}
+			base.ConfigID = util.UUIDToString(row.ConfigID)
+			base.ConfigRevision = row.ConfigRevision.Int64
+			base.Endpoint = row.Endpoint.String
+			base.PublicConfig = append(json.RawMessage(nil), row.PublicConfig...)
+			base.SecretRef = util.UUIDToString(row.SecretRef)
+			base.AuthType = row.AuthType.String
+			base.AuthHeader = row.AuthHeader.String
+			base.ApprovedTools = tools
+			base.ToolSchemaDigest = row.SchemaDigest.String
+			base.FailurePolicy = row.FailurePolicy.String
+			var manifest plugincontract.Manifest
+			if err := json.Unmarshal([]byte(row.EntryContent), &manifest); err != nil {
+				return db.PluginCapabilitySnapshot{}, fmt.Errorf("remote MCP contribution %s has invalid manifest entry", row.ContributionKey)
+			}
+			foundDeclaration := false
+			for _, declaration := range manifest.Contributes.RemoteMCP {
+				if declaration.Key == row.ContributionKey {
+					base.Transport = declaration.Transport
+					base.ProtocolVersions = append([]string(nil), declaration.ProtocolVersions...)
+					base.EndpointAllowedHosts = append([]string(nil), declaration.EndpointPolicy.AllowedHosts...)
+					foundDeclaration = true
+					break
+				}
+			}
+			if !foundDeclaration {
+				return db.PluginCapabilitySnapshot{}, fmt.Errorf("remote MCP contribution %s is absent from its manifest entry", row.ContributionKey)
+			}
+		default:
+			return db.PluginCapabilitySnapshot{}, fmt.Errorf("unsupported plugin contribution type %q", row.ContributionType)
 		}
 
 		var workspaceBinding *db.ListPluginCompilationContributionsRow

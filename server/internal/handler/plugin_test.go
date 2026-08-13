@@ -379,3 +379,18 @@ func TestPrivatePluginHTTPUploadListAndUninstall(t *testing.T) {
 		t.Fatalf("uninstalled private status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestResolveTaskRemoteMCPCredentialRejectsNonDaemonAuth(t *testing.T) {
+	h := &Handler{}
+	recorder := httptest.NewRecorder()
+	request := pluginHandlerRequest(http.MethodGet, "/api/daemon/tasks/task-id/remote-mcp/contribution-id/credential", nil, map[string]string{
+		"taskId":         "task-id",
+		"contributionId": "contribution-id",
+	})
+
+	h.ResolveTaskRemoteMCPCredential(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}

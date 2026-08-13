@@ -4902,6 +4902,7 @@ type PluginExecutionManifestData struct {
 	ComposerVersion      string                        `json:"composer_version"`
 	SchemaVersion        int32                         `json:"schema_version"`
 	OrderedContributions []pluginruntime.CompiledEntry `json:"ordered_contributions"`
+	Diagnostics          []string                      `json:"diagnostics,omitempty"`
 }
 
 // LoadTaskPluginSkillBundles resolves only the immutable artifact files named
@@ -4934,7 +4935,14 @@ func (s *TaskService) LoadTaskPluginSkillBundles(ctx context.Context, taskID pgt
 	}
 
 	skills := make([]AgentSkillData, 0, len(entries))
+	skillEntries := make([]pluginruntime.CompiledEntry, 0, len(entries))
 	for _, entry := range entries {
+		if entry.ContributionType == plugincontract.ContributionRemoteMCPV1 {
+			if entry.ConfigID == "" || entry.ConfigRevision <= 0 || entry.Endpoint == "" || len(entry.ApprovedTools) == 0 || entry.ToolSchemaDigest == "" {
+				return nil, nil, nil, fmt.Errorf("execution manifest contains invalid remote MCP contribution")
+			}
+			continue
+		}
 		if entry.ContributionType != plugincontract.ContributionAgentSkillV1 || entry.ArtifactFileID == "" {
 			return nil, nil, nil, fmt.Errorf("execution manifest contains unsupported plugin contribution")
 		}
@@ -4957,10 +4965,11 @@ func (s *TaskService) LoadTaskPluginSkillBundles(ctx context.Context, taskID pgt
 			Description: entry.Description,
 			Content:     artifact.Content,
 		})
+		skillEntries = append(skillEntries, entry)
 	}
 	bundles, refs := BuildAgentSkillBundles(skills)
 	for i := range refs {
-		if refs[i].Hash != entries[i].SkillBundleHash || refs[i].SizeBytes != entries[i].SkillSizeBytes || refs[i].FileCount != entries[i].SkillFileCount {
+		if refs[i].Hash != skillEntries[i].SkillBundleHash || refs[i].SizeBytes != skillEntries[i].SkillSizeBytes || refs[i].FileCount != skillEntries[i].SkillFileCount {
 			return nil, nil, nil, fmt.Errorf("pinned plugin skill bundle failed manifest validation")
 		}
 	}

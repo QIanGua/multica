@@ -1,3 +1,4 @@
 export const COMPOSIO_MCP_APPS_FLAG = "composio_mcp_apps";
 export const PLUGINS_V1_FLAG = "plugins_v1";
 export const PRIVATE_PLUGINS_V1_FLAG = "private_plugins_v1";
+export const REMOTE_MCP_PLUGINS_V1_FLAG = "remote_mcp_plugins_v1";

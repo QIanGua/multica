@@ -144,6 +144,8 @@ import type {
   PluginInstallation,
   PluginInstallationListResponse,
   PluginReleaseRequest,
+  RemoteMCPConfigRequest,
+  RemoteMCPDiscoveryResponse,
   GitHubPullRequest,
   ListGitHubInstallationsResponse,
   ListGitHubRepositoriesResponse,
@@ -368,6 +370,7 @@ import {
   PluginCatalogResponseSchema,
   PluginInstallationListResponseSchema,
   PluginInstallationSchema,
+  RemoteMCPDiscoveryResponseSchema,
   type IssueView,
   type IssueViewPreference,
   type CreateIssueViewRequest,
@@ -2267,6 +2270,39 @@ export class ApiClient {
 
   async uninstallPlugin(workspaceId: string, installationId: string): Promise<void> {
     await this.fetch(`/api/workspaces/${workspaceId}/plugins/${installationId}`, {
+      method: "DELETE",
+    });
+  }
+
+  async configurePluginRemoteMCP(workspaceId: string, installationId: string, contributionKey: string, request: RemoteMCPConfigRequest): Promise<RemoteMCPDiscoveryResponse> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/${installationId}/remote-mcp/${encodeURIComponent(contributionKey)}/config`, {
+      method: "PUT",
+      body: JSON.stringify(request),
+    });
+    return parseWithFallback(raw, RemoteMCPDiscoveryResponseSchema, { config_revision: 0, discovered_tools: [], discovered_schema_digest: "" }, {
+      endpoint: "PUT /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{contributionKey}/config",
+    });
+  }
+
+  async testPluginRemoteMCP(workspaceId: string, installationId: string, contributionKey: string): Promise<RemoteMCPDiscoveryResponse> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/${installationId}/remote-mcp/${encodeURIComponent(contributionKey)}/test`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    return parseWithFallback(raw, RemoteMCPDiscoveryResponseSchema, { config_revision: 0, discovered_tools: [], discovered_schema_digest: "" }, {
+      endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{contributionKey}/test",
+    });
+  }
+
+  async approvePluginRemoteMCPTools(workspaceId: string, installationId: string, contributionKey: string, tools: string[]): Promise<void> {
+    await this.fetch(`/api/workspaces/${workspaceId}/plugins/${installationId}/remote-mcp/${encodeURIComponent(contributionKey)}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ tools }),
+    });
+  }
+
+  async revokePluginRemoteMCPCredential(workspaceId: string, installationId: string, contributionKey: string): Promise<void> {
+    await this.fetch(`/api/workspaces/${workspaceId}/plugins/${installationId}/remote-mcp/${encodeURIComponent(contributionKey)}/credential`, {
       method: "DELETE",
     });
   }
