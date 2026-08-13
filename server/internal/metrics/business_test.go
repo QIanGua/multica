@@ -164,6 +164,23 @@ func TestBusinessMetricsRegistryExposesAllFamilies(t *testing.T) {
 	}
 }
 
+func TestBusinessMetricsRuntimeGC(t *testing.T) {
+	m := NewBusinessMetrics()
+	m.RecordRuntimeGCDeleted()
+	m.RecordRuntimeGCFailed()
+	m.SetRuntimeGCBlocked(3)
+
+	if got := testutil.ToFloat64(m.runtimeGCDeleted); got != 1 {
+		t.Fatalf("runtime GC deleted = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.runtimeGCFailed); got != 1 {
+		t.Fatalf("runtime GC failed = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.runtimeGCBlocked); got != 3 {
+		t.Fatalf("runtime GC blocked = %v, want 3", got)
+	}
+}
+
 func exerciseEvent(m *BusinessMetrics, name string, props map[string]any) {
 	if props == nil {
 		props = map[string]any{}
