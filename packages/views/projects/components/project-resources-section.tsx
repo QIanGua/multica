@@ -29,9 +29,9 @@ import type {
 } from "@multica/core/types";
 import {
   MIN_LOCAL_WORKTREE_CLI_VERSION,
-  localWorktreeSupported,
   readRuntimeCliVersion,
   runtimeListOptions,
+  runtimeSupportsLocalWorktree,
 } from "@multica/core/runtimes";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
@@ -140,6 +140,15 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
   // be changed from the web app or from a different device. Using the local
   // daemon here would report "too old" for every resource whenever the viewer
   // is not on that machine.
+  // Capability, not version: see runtimeSupportsLocalWorktree. Any runtime on
+  // the machine advertising it is enough — they are the same binary, and a
+  // sibling row may simply not have re-registered yet.
+  const daemonSupportsWorktree = (daemonId: string | null): boolean => {
+    if (!daemonId) return false;
+    return runtimes.some(
+      (rt) => rt.daemon_id === daemonId && runtimeSupportsLocalWorktree(rt.metadata),
+    );
+  };
   const cliVersionForDaemon = (daemonId: string | null): string => {
     if (!daemonId) return "";
     return (
@@ -244,7 +253,7 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
         // user still confirms, and existing resources keep whatever they have.
         mode:
           validation.is_git_repo === true &&
-          localWorktreeSupported(cliVersionForDaemon(localDaemonId))
+          daemonSupportsWorktree(localDaemonId)
             ? "worktree"
             : "in_place",
         isGitRepo: validation.is_git_repo,
@@ -531,7 +540,7 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
           value={modeDialog.mode}
           unavailableReason={worktreeUnavailableReason(
             modeDialog.isGitRepo,
-            localWorktreeSupported(cliVersionForDaemon(modeDialog.daemonId)),
+            daemonSupportsWorktree(modeDialog.daemonId),
           )}
           currentVersion={cliVersionForDaemon(modeDialog.daemonId)}
           minVersion={MIN_LOCAL_WORKTREE_CLI_VERSION}

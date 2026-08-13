@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 func localDirRef(t *testing.T, path, daemonID, mode string) json.RawMessage {
@@ -45,27 +46,27 @@ func TestWorktreeClaimBlockReason(t *testing.T) {
 		ResourceRef: localDirRef(t, "/Users/dev/game", daemon, "worktree"),
 	}}
 
-	t.Run("blocks a runtime below the floor", func(t *testing.T) {
-		reason := worktreeClaimBlockReason(worktreeRes, runtimeWithVersion(daemon, "0.4.10"))
+	t.Run("blocks a runtime that does not advertise the capability", func(t *testing.T) {
+		reason := worktreeClaimBlockReason(worktreeRes, runtimeWithVersion(daemon, "0.4.10"), false)
 		if reason == "" {
 			t.Fatal("an outdated runtime was allowed to claim a worktree task")
 		}
-		if !strings.Contains(reason, "/Users/dev/game") || !strings.Contains(reason, "0.4.10") {
-			t.Errorf("reason should name the directory and the version, got: %q", reason)
+		if !strings.Contains(reason, "/Users/dev/game") || !strings.Contains(reason, "Update the Multica app") {
+			t.Errorf("reason should name the directory and tell the user to update, got: %q", reason)
 		}
 	})
 
-	t.Run("blocks a runtime reporting no version at all", func(t *testing.T) {
+	t.Run("blocks a runtime that advertises nothing at all", func(t *testing.T) {
 		// Fail closed: "no version" is what a daemon far older than the field
 		// looks like, which is exactly the dangerous case.
-		if worktreeClaimBlockReason(worktreeRes, runtimeWithVersion(daemon, "")) == "" {
-			t.Error("a runtime with no reported version was allowed to claim")
+		if worktreeClaimBlockReason(worktreeRes, runtimeWithVersion(daemon, ""), false) == "" {
+			t.Error("a runtime advertising nothing was allowed to claim")
 		}
 	})
 
-	t.Run("allows a runtime at or above the floor", func(t *testing.T) {
-		if reason := worktreeClaimBlockReason(worktreeRes, runtimeWithVersion(daemon, "9.9.9")); reason != "" {
-			t.Errorf("a new enough runtime was blocked: %q", reason)
+	t.Run("allows a runtime that advertises the capability", func(t *testing.T) {
+		if reason := worktreeClaimBlockReason(worktreeRes, runtimeWithVersion(daemon, "9.9.9"), true); reason != "" {
+			t.Errorf("a capable runtime was blocked: %q", reason)
 		}
 	})
 
@@ -75,8 +76,8 @@ func TestWorktreeClaimBlockReason(t *testing.T) {
 				ID: "r1", ResourceType: "local_directory",
 				ResourceRef: localDirRef(t, "/Users/dev/game", daemon, mode),
 			}}
-			if reason := worktreeClaimBlockReason(res, runtimeWithVersion(daemon, "0.1.0")); reason != "" {
-				t.Errorf("mode %q blocked an old daemon that can run it fine: %q", mode, reason)
+			if reason := worktreeClaimBlockReason(res, runtimeWithVersion(daemon, "0.1.0"), false); reason != "" {
+				t.Errorf("mode %q blocked a daemon that can run it fine: %q", mode, reason)
 			}
 		}
 	})
@@ -88,7 +89,7 @@ func TestWorktreeClaimBlockReason(t *testing.T) {
 			ID: "r1", ResourceType: "local_directory",
 			ResourceRef: localDirRef(t, "/Users/dev/game", "daemon-b", "worktree"),
 		}}
-		if reason := worktreeClaimBlockReason(other, runtimeWithVersion(daemon, "0.1.0")); reason != "" {
+		if reason := worktreeClaimBlockReason(other, runtimeWithVersion(daemon, "0.1.0"), false); reason != "" {
 			t.Errorf("another machine's resource blocked this claim: %q", reason)
 		}
 	})
@@ -98,13 +99,13 @@ func TestWorktreeClaimBlockReason(t *testing.T) {
 			ID: "r1", ResourceType: "github_repo",
 			ResourceRef: json.RawMessage(`{"url":"https://github.com/a/b"}`),
 		}}
-		if reason := worktreeClaimBlockReason(repo, runtimeWithVersion(daemon, "0.1.0")); reason != "" {
+		if reason := worktreeClaimBlockReason(repo, runtimeWithVersion(daemon, "0.1.0"), false); reason != "" {
 			t.Errorf("github_repo resource blocked a claim: %q", reason)
 		}
 	})
 
 	t.Run("ignores a runtime with no daemon id", func(t *testing.T) {
-		if reason := worktreeClaimBlockReason(worktreeRes, runtimeWithVersion("", "0.1.0")); reason != "" {
+		if reason := worktreeClaimBlockReason(worktreeRes, runtimeWithVersion("", "0.1.0"), false); reason != "" {
 			t.Errorf("cloud runtime blocked: %q", reason)
 		}
 	})
@@ -114,7 +115,7 @@ func TestWorktreeClaimBlockReason(t *testing.T) {
 			ID: "r1", ResourceType: "local_directory",
 			ResourceRef: json.RawMessage(`{"local_path": 42}`),
 		}}
-		if reason := worktreeClaimBlockReason(bad, runtimeWithVersion(daemon, "0.1.0")); reason != "" {
+		if reason := worktreeClaimBlockReason(bad, runtimeWithVersion(daemon, "0.1.0"), false); reason != "" {
 			t.Errorf("malformed ref produced a block: %q", reason)
 		}
 	})
@@ -619,8 +620,10 @@ func TestClaimTask_WorktreeGateSingular(t *testing.T) {
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 for a too-old runtime, got %d: %s", w.Code, w.Body.String())
 	}
-	if body := w.Body.String(); !strings.Contains(body, "/Users/dev/wtgate") || !strings.Contains(body, "0.4.10") {
-		t.Errorf("422 body should carry the actionable reason, got: %s", body)
+	if body := w.Body.String(); !strings.Contains(body, "/Users/dev/wtgate") ||
+		!strings.Contains(body, "does not support parallel") ||
+		!strings.Contains(body, "Update the Multica app") {
+		t.Errorf("422 body should name the directory and tell the user to update, got: %s", body)
 	}
 	assertWorktreeGateCancelled(t, ctx, taskID)
 }
@@ -654,18 +657,21 @@ func TestClaimTask_WorktreeGateBatch(t *testing.T) {
 }
 
 // TestClaimTask_WorktreeGateAllowsCurrentRuntime is the control: the same
-// fixture with a new-enough runtime claims normally, proving the gate blocks
-// on version — not on worktree resources in general.
+// fixture with a daemon that ADVERTISES worktree support claims normally,
+// proving the gate blocks on the missing capability — not on worktree
+// resources in general. Note the deliberately ancient version string: the gate
+// must not consult it at all.
 func TestClaimTask_WorktreeGateAllowsCurrentRuntime(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
 	const daemonID = "wtgate-ok-daemon"
-	runtimeID, taskID := seedWorktreeGateClaimFixture(t, ctx, "WT gate ok", daemonID, "9.9.9")
+	runtimeID, taskID := seedWorktreeGateClaimFixture(t, ctx, "WT gate ok", daemonID, "0.0.1")
 
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, daemonID)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityLocalWorktreeV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	testHandler.ClaimTaskByRuntime(w, req)
 
@@ -776,5 +782,68 @@ func TestClaimTask_WorktreeGateCancelFailureRequeuesBatch(t *testing.T) {
 	}
 	if status != "queued" {
 		t.Errorf("status = %q, want queued after the batch gate's cancel failed", status)
+	}
+}
+
+// The bug this gate was rebuilt for: a dev-built daemon reports a git-describe
+// version that the version floor deliberately exempts, so the old version-based
+// gate waved through a binary with no worktree implementation and two tasks ran
+// in the user's own directory (MUL-5707). The capability signal is immune to
+// how the version string happens to be spelled.
+func TestWorktreeClaimGateIgnoresVersionStrings(t *testing.T) {
+	const daemon = "daemon-a"
+	res := []ProjectResourceData{{
+		ID: "r1", ResourceType: "local_directory",
+		ResourceRef: localDirRef(t, "/Users/dev/game", daemon, "worktree"),
+	}}
+
+	// Every one of these is a version string that the old floor check would
+	// have ALLOWED. Without the capability, all must now be blocked.
+	for _, version := range []string{
+		"v0.4.21-24-gcd3c0bb89", // the exact dev-describe build that got through
+		"0.4.24",                // at the floor
+		"9.9.9",                 // far above it
+		"",                      // none reported
+	} {
+		if worktreeClaimBlockReason(res, runtimeWithVersion(daemon, version), false) == "" {
+			t.Errorf("version %q was allowed to claim without advertising the capability", version)
+		}
+	}
+
+	// And the converse: a capable daemon runs regardless of how old its version
+	// string looks, so the gate can never strand a runtime that actually works.
+	for _, version := range []string{"v0.4.21-24-gcd3c0bb89", "0.0.1", ""} {
+		if reason := worktreeClaimBlockReason(res, runtimeWithVersion(daemon, version), true); reason != "" {
+			t.Errorf("version %q blocked a capable runtime: %q", version, reason)
+		}
+	}
+}
+
+// The stored-capability read backs the save-time gate and the UI, which cannot
+// see the live request. Absent metadata is an older daemon: fail closed.
+func TestRuntimeHasCapability(t *testing.T) {
+	withCaps := func(caps ...string) []byte {
+		raw, err := json.Marshal(map[string]any{"capabilities": caps})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return raw
+	}
+
+	if !runtimeHasCapability(withCaps("skill-bundles-v1", "local-worktree-v1"), "local-worktree-v1") {
+		t.Error("advertised capability not detected")
+	}
+	if runtimeHasCapability(withCaps("skill-bundles-v1"), "local-worktree-v1") {
+		t.Error("unadvertised capability reported as present")
+	}
+	for _, metadata := range [][]byte{
+		nil,
+		[]byte(`{}`),
+		[]byte(`{"cli_version":"9.9.9"}`), // an old daemon: version, no capabilities
+		[]byte(`not json`),
+	} {
+		if runtimeHasCapability(metadata, "local-worktree-v1") {
+			t.Errorf("metadata %q reported the capability as present", string(metadata))
+		}
 	}
 }

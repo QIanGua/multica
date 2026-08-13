@@ -168,3 +168,29 @@ export const MIN_LOCAL_WORKTREE_CLI_VERSION = "0.4.24";
 export function localWorktreeSupported(detected: string | undefined | null): boolean {
   return meetsMinCliVersion(detected, MIN_LOCAL_WORKTREE_CLI_VERSION);
 }
+
+/**
+ * Capability a daemon advertises when it implements worktree mode for
+ * local_directory resources. Mirrors `DaemonCapabilityLocalWorktreeV1` in
+ * `server/pkg/protocol/messages.go`.
+ */
+export const LOCAL_WORKTREE_CAPABILITY = "local-worktree-v1";
+
+/**
+ * Whether a runtime advertised worktree support at registration.
+ *
+ * This replaces a version comparison on purpose. A daemon without the
+ * implementation does not merely lose concurrency — it ignores `execution_mode`
+ * and edits the user's working copy, which is what the mode exists to prevent.
+ * Version strings could not answer that: a dev build reports a git-describe
+ * string that `meetsMinCliVersion` deliberately exempts, so a daemon with no
+ * worktree code at all passed the check (MUL-5707).
+ *
+ * Absent metadata (an older daemon that never sent the header) is `false` —
+ * this must fail closed, and the server enforces the same thing at claim time.
+ */
+export function runtimeSupportsLocalWorktree(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== "object") return false;
+  const caps = (metadata as { capabilities?: unknown }).capabilities;
+  return Array.isArray(caps) && caps.includes(LOCAL_WORKTREE_CAPABILITY);
+}
