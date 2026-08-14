@@ -291,7 +291,7 @@ func checkOpenclawVersion(ctx context.Context, execPath string) error {
 	hideAgentWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("openclaw --version failed: %w", err)
+		return fmt.Errorf("openclaw --version failed: %w", ExplainExecError(err))
 	}
 	detected, ok := parseOpenclawVersion(string(out))
 	if !ok {

@@ -7334,6 +7334,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 
 	session, err := backend.Execute(agentCtx, prompt, opts)
 	if err != nil {
+		// One provider-agnostic boundary for launches: every backend's
+		// cmd.Start() failure arrives here, so diagnosing ENOEXEC at this point
+		// covers claude, opencode and any CLI added later without a wrap in
+		// each backend (MUL-6164).
+		err = agent.ExplainExecError(err)
 		taskLog.Debug("backend execute returned error", "error", err)
 		return agent.Result{}, 0, err
 	}
