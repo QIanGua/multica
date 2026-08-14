@@ -12,8 +12,26 @@ const mocks = vi.hoisted(() => ({
   portal: vi.fn(),
   reconcile: vi.fn(),
   refetch: vi.fn(),
+  refetchPrices: vi.fn(),
   openExternal: vi.fn(),
   role: "owner" as "owner" | "admin" | "member",
+  workspaceId: "workspace-1",
+  prices: null as {
+    month: {
+      currency: string;
+      unitAmount: number;
+      interval: "month";
+      intervalCount: number;
+    };
+    year: {
+      currency: string;
+      unitAmount: number;
+      interval: "year";
+      intervalCount: number;
+    };
+  } | null,
+  pricesPending: false,
+  pricesError: false,
   entitlements: {
     workspaceId: "workspace-1",
     plan: "free",
@@ -35,6 +53,9 @@ vi.mock("@multica/core/billing", () => ({
   workspaceSubscriptionEntitlementsOptions: (wsId: string) => ({
     queryKey: ["workspace-subscriptions", wsId, "entitlements"],
   }),
+  workspaceSubscriptionPricesOptions: (wsId: string) => ({
+    queryKey: ["workspace-subscriptions", wsId, "prices"],
+  }),
   useCreateWorkspaceSubscriptionCheckout: () => ({
     mutateAsync: mocks.checkout,
     isPending: false,
@@ -51,7 +72,7 @@ vi.mock("@multica/core/billing", () => ({
 
 vi.mock("@multica/core/paths", () => ({
   useCurrentWorkspace: () => ({
-    id: "workspace-1",
+    id: mocks.workspaceId,
     slug: "acme",
     name: "Acme",
   }),
@@ -78,13 +99,30 @@ vi.mock("../../navigation", () => ({
 
 vi.mock("../../platform", () => ({ openExternal: mocks.openExternal }));
 
-import { BillingTab } from "./billing-tab";
+import { BillingTab, formatStripeMinorAmount } from "./billing-tab";
 
 describe("BillingTab", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     navigationState.search = "tab=billing";
     mocks.role = "owner";
+    mocks.workspaceId = "workspace-1";
+    mocks.prices = {
+      month: {
+        currency: "usd",
+        unitAmount: 1000,
+        interval: "month",
+        intervalCount: 1,
+      },
+      year: {
+        currency: "usd",
+        unitAmount: 9600,
+        interval: "year",
+        intervalCount: 1,
+      },
+    };
+    mocks.pricesPending = false;
+    mocks.pricesError = false;
     Object.assign(mocks.entitlements, {
       plan: "free",
       status: "inactive",
@@ -95,11 +133,22 @@ describe("BillingTab", () => {
       snapshotExpiresAt: null,
       version: 0,
     });
-    mocks.useQuery.mockReturnValue({
-      data: mocks.entitlements,
-      isPending: false,
-      isError: false,
-      refetch: mocks.refetch,
+    mocks.useQuery.mockImplementation((options: unknown) => {
+      const queryKey = (options as { queryKey?: readonly unknown[] }).queryKey;
+      if (queryKey?.[queryKey.length - 1] === "prices") {
+        return {
+          data: mocks.prices,
+          isPending: mocks.pricesPending,
+          isError: mocks.pricesError,
+          refetch: mocks.refetchPrices,
+        };
+      }
+      return {
+        data: mocks.entitlements,
+        isPending: false,
+        isError: false,
+        refetch: mocks.refetch,
+      };
     });
     mocks.checkout.mockResolvedValue({
       requestId: "request-1",
@@ -129,16 +178,98 @@ describe("BillingTab", () => {
     expect(mocks.useQuery).not.toHaveBeenCalled();
   });
 
-  it("shows an honest Free plan without inventing prices or usage totals", () => {
+  it("shows server prices and keeps the selected interval in sync", async () => {
+    const user = userEvent.setup();
     renderWithI18n(<BillingTab />);
 
     expect(screen.getByRole("heading", { name: "Billing" })).toBeInTheDocument();
     expect(screen.getByText("1,000")).toBeInTheDocument();
     expect(screen.getByText("100 / month")).toBeInTheDocument();
+    expect(screen.getByText("$10.00 per human seat")).toBeInTheDocument();
     expect(
-      screen.getByText(/Stripe Checkout shows the authoritative per-seat price/),
+      screen.getByText("Estimated monthly total: $30.00"),
     ).toBeInTheDocument();
-    expect(screen.queryByText("$10")).not.toBeInTheDocument();
+    expect(mocks.useQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        queryKey: ["workspace-subscriptions", "workspace-1", "prices"],
+      }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Yearly" }));
+
+    expect(screen.getByText("$96.00 per human seat")).toBeInTheDocument();
+    expect(
+      screen.getByText("Estimated yearly total: $288.00"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Estimated monthly total: $30.00"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("formats Stripe minor units for decimal, zero-decimal, and special currencies", () => {
+    expect(formatStripeMinorAmount(1234, "usd", "en-US")).toBe("$12.34");
+    expect(formatStripeMinorAmount(1234, "jpy", "en-US")).toBe("¥1,234");
+    expect(
+      formatStripeMinorAmount(1234, "bhd", "en-US")?.replace(/\s/g, " "),
+    ).toBe("BHD 1.234");
+    expect(
+      formatStripeMinorAmount(500, "ugx", "en-US")?.replace(/\s/g, " "),
+    ).toBe("UGX 5");
+  });
+
+  it("shows a local price skeleton without blocking Checkout while prices load", () => {
+    mocks.prices = null;
+    mocks.pricesPending = true;
+
+    renderWithI18n(<BillingTab />);
+
+    expect(
+      screen.getByLabelText("Loading subscription prices"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Upgrade to Pro" }),
+    ).toBeEnabled();
+  });
+
+  it.each([
+    ["query error", true],
+    ["malformed response", false],
+  ])(
+    "falls back safely after a prices %s without blocking Checkout",
+    async (_case, isError) => {
+      const user = userEvent.setup();
+      mocks.prices = null;
+      mocks.pricesError = isError;
+
+      renderWithI18n(<BillingTab />);
+
+      expect(
+        screen.getByText(
+          /Stripe Checkout shows the authoritative per-seat price/,
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/\$0/)).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+      await user.click(
+        screen.getByRole("button", { name: "Continue to Stripe" }),
+      );
+
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledOnce());
+    },
+  );
+
+  it("uses workspace-scoped price query keys after a workspace switch", () => {
+    const { rerender } = renderWithI18n(<BillingTab />);
+
+    mocks.workspaceId = "workspace-2";
+    rerender(<BillingTab />);
+
+    expect(mocks.useQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        queryKey: ["workspace-subscriptions", "workspace-2", "prices"],
+      }),
+    );
   });
 
   it("creates Checkout with a client idempotency key and opens Stripe externally", async () => {
@@ -157,6 +288,7 @@ describe("BillingTab", () => {
     };
     expect(request.interval).toBe("month");
     expect(request.idempotencyKey).toMatch(/^workspace-checkout-workspace-1-/);
+    expect(Object.keys(request).sort()).toEqual(["idempotencyKey", "interval"]);
     expect(mocks.openExternal).toHaveBeenCalledWith(
       "https://checkout.stripe.com/test-session",
       { webTarget: "same-tab" },
@@ -281,6 +413,7 @@ describe("BillingTab", () => {
 
     expect(screen.getByText("Read-only billing access")).toBeInTheDocument();
     expect(screen.getAllByText("3 members")).toHaveLength(2);
+    expect(screen.getByText("$10.00 per human seat")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Upgrade to Pro" }),
     ).not.toBeInTheDocument();

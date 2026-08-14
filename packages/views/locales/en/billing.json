@@ -146,6 +146,10 @@
       "yearly": "Yearly",
       "pro_for_team_one": "Pro for {{count}} human seat",
       "pro_for_team_other": "Pro for {{count}} human seats",
+      "price_loading": "Loading subscription prices",
+      "unit_price": "{{price}} per human seat",
+      "estimated_monthly_total": "Estimated monthly total: {{price}}",
+      "estimated_yearly_total": "Estimated yearly total: {{price}}",
       "price_at_checkout": "The server re-counts human members before purchase. Stripe Checkout shows the authoritative per-seat price and total before you pay."
     },
     "management": {

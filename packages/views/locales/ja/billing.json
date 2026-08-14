@@ -144,6 +144,10 @@
       "monthly": "月払い",
       "yearly": "年払い",
       "pro_for_team_other": "{{count}}席で Pro を利用",
+      "price_loading": "サブスクリプション価格を読み込んでいます",
+      "unit_price": "1席あたり {{price}}",
+      "estimated_monthly_total": "月払いの見積合計：{{price}}",
+      "estimated_yearly_total": "年払いの見積合計：{{price}}",
       "price_at_checkout": "購入前にサーバーがユーザーメンバーを再集計します。お支払い前に Stripe Checkout で正式な席単価と合計金額を確認できます。"
     },
     "management": {
