@@ -293,9 +293,10 @@ type ProjectResourceData struct {
 // while sharing the canonical JSON shape with the runtime app metadata package.
 type ConnectedAppData = runtimeapps.ConnectedApp
 
-// ActiveSiblingRunData is bounded claim-time context about another
-// non-terminal issue task for the same agent. It lets the daemon warn a newly
-// claimed run before it repeats code or PR work already underway elsewhere.
+// ActiveSiblingRunData is bounded claim-time context about another in-flight
+// issue task for the same agent. Queued tasks are intentionally absent because
+// they cannot coordinate yet. It lets the daemon warn a newly claimed run
+// before it repeats code or PR work already underway elsewhere.
 type ActiveSiblingRunData struct {
 	TaskID          string `json:"task_id"`
 	IssueID         string `json:"issue_id"`

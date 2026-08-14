@@ -55,7 +55,8 @@ type ProjectResourceData struct {
 type ConnectedAppData = runtimeapps.ConnectedApp
 
 // ActiveSiblingRunData mirrors the claim-time warning context returned by the
-// server for another non-terminal issue task owned by this agent.
+// server for another in-flight issue task owned by this agent. Queued tasks are
+// intentionally excluded from this context.
 type ActiveSiblingRunData struct {
 	TaskID          string `json:"task_id"`
 	IssueID         string `json:"issue_id"`

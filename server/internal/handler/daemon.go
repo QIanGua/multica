@@ -2711,11 +2711,12 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		}
 	}
 
-	// Surface a bounded snapshot of the same agent's other non-terminal issue
-	// tasks. This is advisory context, not a queue gate: cross-issue parallelism
-	// and serial handoffs remain valid, while the prompt can stop an unaware
-	// second run from opening a duplicate PR. Scope the query to the already-
-	// validated runtime workspace so corrupt cross-tenant task links never leak.
+	// Surface a bounded snapshot of the same agent's other in-flight issue
+	// tasks. Queued tasks cannot coordinate yet and are intentionally omitted.
+	// This is advisory context, not a queue gate: cross-issue parallelism and
+	// serial handoffs remain valid, while the prompt can stop an unaware second
+	// run from opening a duplicate PR. Scope the query to the already-validated
+	// runtime workspace so corrupt cross-tenant task links never leak.
 	if siblings, err := h.Queries.ListActiveSiblingIssueTasks(r.Context(), db.ListActiveSiblingIssueTasksParams{
 		AgentID:     task.AgentID,
 		TaskID:      task.ID,

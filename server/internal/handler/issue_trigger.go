@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -28,7 +29,14 @@ func (h *Handler) issueTriggerWriteProbe(r *http.Request, actorType, actorID str
 			return h.isAgentRunningOnIssue(r, actorType, issue)
 		},
 		SuppressActiveSelfAssignment: func(agentID pgtype.UUID) bool {
-			return h.shouldSuppressActiveSelfAssignment(r.Context(), actorType, actorID, issue.ID, agentID)
+			suppress := h.shouldSuppressActiveSelfAssignment(r.Context(), actorType, actorID, issue.ID, agentID)
+			if suppress {
+				slog.Info("suppressing duplicate self-assignment enqueue",
+					"issue_id", uuidToString(issue.ID),
+					"agent_id", uuidToString(agentID),
+				)
+			}
+			return suppress
 		},
 	}
 }

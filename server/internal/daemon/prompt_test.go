@@ -1010,7 +1010,7 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 		"MUL-6000",
 		"task-existing",
 		"multica issue comment list issue-target --roots-only --summary --compact --output json",
-		"multica issue run-messages task-existing --issue issue-source",
+		"multica issue run-messages task-existing",
 		"--no-start",
 	} {
 		if !strings.Contains(out, want) {
@@ -1019,6 +1019,25 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 	}
 	if strings.Contains(out, "multica issue runs") {
 		t.Errorf("prompt must not direct overlap checks to the target issue's run list\n--- output ---\n%s", out)
+	}
+	if strings.Contains(out, "run-messages task-existing --issue") {
+		t.Errorf("prompt must not resolve the issue when the task id is already complete\n--- output ---\n%s", out)
+	}
+}
+
+func TestBuildPromptOmitsActiveSiblingRunsForChatTask(t *testing.T) {
+	task := Task{
+		ChatSessionID: "chat-1",
+		ActiveSiblingRuns: []ActiveSiblingRunData{{
+			TaskID:          "task-existing",
+			IssueID:         "issue-source",
+			IssueIdentifier: "MUL-6000",
+			Status:          "running",
+		}},
+	}
+	out := BuildPrompt(task, "claude")
+	if strings.Contains(out, "Active sibling runs") || strings.Contains(out, "task-existing") {
+		t.Errorf("chat prompt must not include issue sibling guidance\n--- output ---\n%s", out)
 	}
 }
 

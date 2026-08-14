@@ -3450,6 +3450,26 @@ func TestAssignIssueToSelfWithActiveTargetRunDoesNotDuplicate(t *testing.T) {
 	}
 }
 
+func TestShouldSuppressActiveSelfAssignmentFailsClosedOnLookupError(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	const agentID = "1c331d0b-94fd-412a-a7cc-6a209add00a1"
+	const issueID = "34c44eb2-bd85-455f-b47c-f39cc7b0b913"
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if !testHandler.shouldSuppressActiveSelfAssignment(
+		ctx,
+		"agent",
+		agentID,
+		parseUUID(issueID),
+		parseUUID(agentID),
+	) {
+		t.Fatal("lookup failure must fail closed and suppress duplicate enqueue")
+	}
+}
+
 // TestAssignDifferentIssueToSelfStillEnqueues locks in the intentional
 // cross-issue handoff behavior: an agent working on I1 may assign fresh I2 to
 // itself, and I2 still gets a queued run.
