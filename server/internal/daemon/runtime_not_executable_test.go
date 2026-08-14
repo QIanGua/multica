@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -217,5 +218,92 @@ func TestDetectBuiltinRuntimes_HealthyProbeClearsPendingVerdict(t *testing.T) {
 	broken = true
 	if _, demotable, _ := d.detectBuiltinRuntimes(context.Background()); len(demotable) != 0 {
 		t.Errorf("a fresh failure demoted immediately (%v): the healthy probe should have reset the clock", demotable)
+	}
+}
+
+// The verdict has to survive the server losing it.
+//
+// A register whose REQUEST is still in flight across the verdict is upserted
+// after it, and that upsert overwrites the runtime row's metadata wholesale —
+// including the reason the demotion just stored. The local hold correctly
+// refuses the response, but if the cleanup that takes the revived row offline
+// again sends no reason, the server is left with a bare "offline". Every
+// admission path then reads that as "the machine will come back" and goes right
+// back to queueing, which is the behaviour this change exists to remove
+// (MUL-6164).
+func TestDeregisterRevivedRuntimes_ReattachesTheUnusableReason(t *testing.T) {
+	stubConfirmWindow(t, 0)
+	// Stable ids before the first registration: the interleave only exists when
+	// the stale response names the same row the demotion took offline.
+	fx := newVersionRefreshFixtureWith(t, func(fx *batchFixture) { fx.enableStableRuntimeIDs() })
+	d := fx.daemon
+	runtimeID := fx.runtimeIDFor("ws-1", "codex")
+	if runtimeID == "" {
+		t.Fatal("fixture did not expose a stable runtime id")
+	}
+
+	// Hold ONE register inside the server handler, before it upserts. That is
+	// the request the verdict has to survive; every later register passes
+	// straight through.
+	var once sync.Once
+	reached, release := make(chan struct{}), make(chan struct{})
+	fx.setRegisterGate(func(string) {
+		once.Do(func() {
+			close(reached)
+			<-release
+		})
+	})
+
+	inFlight := []map[string]string{{"name": "Codex", "type": "codex", "version": "9.9.9", "status": "online"}}
+	respCh := make(chan *RegisterResponse, 1)
+	go func() {
+		resp, err := d.registerBuiltinRuntimesForWorkspaceLocked(context.Background(), "ws-1", inFlight)
+		if err != nil {
+			respCh <- nil
+			return
+		}
+		respCh <- resp
+	}()
+	<-reached
+
+	// While it is held: the CLI breaks and the verdict lands, reason and all.
+	fx.setProbeErr(func(path string, _ int) error {
+		enoexec := &fs.PathError{Op: "fork/exec", Path: path, Err: syscall.ENOEXEC}
+		return fmt.Errorf("detect version for %s: %w", path, agent.ExplainExecError(enoexec))
+	})
+	d.refreshAgentVersions(context.Background()) // first sighting
+	d.refreshAgentVersions(context.Background()) // confirmed: demote
+	if _, ok := fx.runtimeOfflineReason(runtimeID); !ok {
+		t.Fatal("demotion did not record a reason on the runtime row (precondition)")
+	}
+
+	// The held register now upserts, wiping the reason and putting the row back
+	// online — the loss this test exists for.
+	close(release)
+	staleResp := <-respCh
+	if staleResp == nil {
+		t.Fatal("in-flight register failed")
+	}
+	if _, ok := fx.runtimeOfflineReason(runtimeID); ok {
+		t.Fatal("precondition: the late upsert should have cleared the stored reason")
+	}
+
+	_, revived, ok := d.mergeBuiltinRegisterResponse("ws-1", staleResp)
+	if !ok {
+		t.Fatal("merge of the late register response failed")
+	}
+	if len(revived.ids) == 0 {
+		t.Fatal("late response was rejected locally but named no row to take offline again")
+	}
+
+	d.deregisterRevivedRuntimes(context.Background(), "ws-1", revived)
+
+	reason, ok := fx.runtimeOfflineReason(runtimeID)
+	if !ok {
+		t.Fatal("the revived row went offline with no reason: admission would treat an unusable CLI as a " +
+			"sleeping machine and queue for it again")
+	}
+	if reason.Code != RuntimeOfflineCodeNotExecutable {
+		t.Errorf("re-attached reason = %q, want %q", reason.Code, RuntimeOfflineCodeNotExecutable)
 	}
 }

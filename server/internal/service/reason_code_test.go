@@ -98,6 +98,19 @@ func TestRuntimeUnusableNotice(t *testing.T) {
 	if !strings.Contains(withRepair, "Mika") || !strings.Contains(withRepair, "cd '/pkg' && node install.cjs") {
 		t.Errorf("notice must name the agent and the repair command:\n%s", withRepair)
 	}
+	// The fence is labelled with the shell the command was written for: a
+	// Windows repair shown as bash is how a user ends up pasting `cd 'C:\...'`
+	// into PowerShell.
+	if !strings.Contains(withRepair, "```bash") {
+		t.Errorf("a bash repair must be fenced as bash:\n%s", withRepair)
+	}
+	windows := RuntimeUnusableNotice("Mika", AgentVerdict{
+		Repair: &RuntimeRepair{Command: "Set-Location 'C:\\pkg'\nnode install.cjs", Shell: "powershell"},
+	})
+	if !strings.Contains(windows, "```powershell") {
+		t.Errorf("a PowerShell repair must be fenced as powershell:\n%s", windows)
+	}
+
 	withoutRepair := RuntimeUnusableNotice("Mika", AgentVerdict{})
 	if strings.Contains(withoutRepair, "```") {
 		t.Errorf("no repair command is known, so none may be shown:\n%s", withoutRepair)

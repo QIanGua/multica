@@ -1969,8 +1969,13 @@ func (h *Handler) triggerTasksForComment(ctx context.Context, issue db.Issue, co
 }
 
 // noteBlockedRuntimeTargets leaves one system comment per agent refused for an
-// unusable runtime. Deduped by agent so a comment naming both @Agent and the
-// squad it leads produces a single notice.
+// unusable runtime, whoever authored the trigger — see noteRuntimeUnusable for
+// why a human author gets one too. Deduped by agent so a comment naming both
+// @Agent and the squad it leads produces a single notice.
+//
+// Called from the trigger path only. The resolver that produced these targets
+// also runs for the composer preview, where writing a comment would be a side
+// effect of typing.
 func (h *Handler) noteBlockedRuntimeTargets(ctx context.Context, issue db.Issue, targets []commentMentionTarget) {
 	var noted map[string]struct{}
 	for _, t := range targets {
@@ -3032,8 +3037,9 @@ func (h *Handler) resolveMentionedAgentCommentTriggers(ctx context.Context, issu
 		addTarget(commentMentionTarget{TargetType: targetType, TargetID: targetID, Status: DispatchBlocked, ReasonCode: reason})
 	}
 	// blockUnusableTarget is blockTarget for the one verdict that also needs a
-	// durable trace: the chip and toast only reach a person watching the
-	// response, and an agent-authored mention has nobody watching.
+	// durable trace. Every author gets it, including a human: the chip and toast
+	// carry the reason code but not the repair command, and an agent-authored
+	// mention has nobody watching a response at all.
 	blockUnusableTarget := func(targetType, targetID string, agent db.Agent, verdict service.AgentVerdict) {
 		notice := &blockedRuntimeNotice{agent: agent, verdict: verdict}
 		if verdict.Reason != ReasonRuntimeUnusable {

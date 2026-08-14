@@ -13,13 +13,12 @@ import (
 // noteRuntimeUnusable records, on the issue itself, that a trigger was refused
 // because the target's agent CLI cannot run on its machine.
 //
-// The interactive surfaces (composer chip, post-send toast) already carry the
-// dispatch reason code back to whoever was typing. Nothing carries it for the
-// triggers that arrive without a person watching a response: an issue assigned
-// to the agent, or another agent @mentioning it. Those are exactly the cases
-// where a refusal with no trace reads as "Multica silently ignored me", which
-// is the failure this whole change exists to remove (MUL-6164) — so they get a
-// durable comment naming the agent, the cause, and the command that fixes it.
+// Written for EVERY author, not only the unattended ones. The composer chip and
+// the post-send toast do reach whoever was typing, but they carry the reason
+// code alone — the repair command is too long for a chip and too important to
+// put in something that disappears. An agent-authored @mention has nobody
+// watching a response at all. So both get the same durable record, and the
+// transient surfaces stay a preview of it rather than the only copy (MUL-6164).
 //
 // Best-effort by construction: the refusal already happened and is correct
 // whether or not this note lands, so a failure here is logged, never returned.

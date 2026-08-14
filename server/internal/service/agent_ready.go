@@ -59,6 +59,11 @@ func (v AgentVerdict) Blocked() bool { return v.Availability == AgentBlocked }
 type RuntimeRepair struct {
 	Package string `json:"package,omitempty"`
 	Command string `json:"command,omitempty"`
+	// Shell is the interpreter Command is written for, as reported by the
+	// machine that must run it ("bash", "powershell"). Rendered as the code
+	// block's language so a Windows user is not handed POSIX syntax in a bash
+	// fence. Empty from a daemon too old to report it.
+	Shell string `json:"shell,omitempty"`
 }
 
 // runtimeOfflineReason is the daemon's structured explanation, stored on the
@@ -172,9 +177,9 @@ func RuntimeUnusableNotice(agentName string, verdict AgentVerdict) string {
 		return fmt.Sprintf(
 			"%s could not start: its CLI is installed but cannot be executed on that machine, so this trigger was not queued.\n\n"+
 				"Usually the package's postinstall was blocked (npm 12 allowScripts, pnpm 10 approve-builds, `--ignore-scripts`, `--omit=optional`) and the bin entry is still a placeholder. On that machine, run:\n\n"+
-				"```bash\n%s\n```\n\n"+
+				"```%s\n%s\n```\n\n"+
 				"The runtime comes back on its own within a couple of minutes; trigger the agent again after that.",
-			name, verdict.Repair.Command,
+			name, repairFenceLanguage(verdict.Repair.Shell), verdict.Repair.Command,
 		)
 	}
 	return fmt.Sprintf(
@@ -182,4 +187,14 @@ func RuntimeUnusableNotice(agentName string, verdict AgentVerdict) string {
 			"Reinstall the agent CLI on that machine with install scripts enabled; the runtime comes back on its own within a couple of minutes.",
 		name,
 	)
+}
+
+// repairFenceLanguage labels the code block with the shell the command was
+// written for. A daemon too old to report one predates the Windows rendering
+// entirely, so its command is POSIX by construction.
+func repairFenceLanguage(shell string) string {
+	if shell == "powershell" {
+		return "powershell"
+	}
+	return "bash"
 }

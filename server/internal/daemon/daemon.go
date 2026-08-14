@@ -1484,12 +1484,12 @@ func (d *Daemon) applyRegisterResponseInPlace(workspaceID string, resp *Register
 // ID rotation is still handled: when the response returns a different ID for a
 // built-in provider the workspace already had, that specific old ID is replaced
 // rather than accumulating a duplicate heartbeat.
-func (d *Daemon) mergeBuiltinRegisterResponse(workspaceID string, resp *RegisterResponse) (newIDs, rejectedIDs []string, ok bool) {
+func (d *Daemon) mergeBuiltinRegisterResponse(workspaceID string, resp *RegisterResponse) (newIDs []string, revived revivedRuntimes, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	ws, exists := d.workspaces[workspaceID]
 	if !exists {
-		return nil, nil, false
+		return nil, revivedRuntimes{}, false
 	}
 
 	// Index the workspace's current built-in runtimes by provider so a rotated
@@ -1516,7 +1516,7 @@ func (d *Daemon) mergeBuiltinRegisterResponse(workspaceID string, resp *Register
 		// guard in applyRegisterResponseInPlace. The caller deregisters the row
 		// the server upserted back.
 		if d.providerDemotedLocked(rt.Provider) {
-			rejectedIDs = append(rejectedIDs, rt.ID)
+			revived.add(d, rt.ID, rt.Provider)
 			continue
 		}
 		d.runtimeIndex[rt.ID] = rt
@@ -1549,7 +1549,7 @@ func (d *Daemon) mergeBuiltinRegisterResponse(workspaceID string, resp *Register
 	if len(resp.Settings) > 0 {
 		ws.settings = resp.Settings
 	}
-	return newIDs, rejectedIDs, true
+	return newIDs, revived, true
 }
 
 // providerDemotedLocked reports whether provider is currently held below the
@@ -1561,11 +1561,73 @@ func (d *Daemon) providerDemotedLocked(provider string) bool {
 	return demoted
 }
 
+// demotedOfflineReasonLocked returns the structured cause recorded for a
+// demoted provider, or nil when the verdict carries none (below-minimum) or the
+// provider is not demoted. Callers must hold d.mu.
+func (d *Daemon) demotedOfflineReasonLocked(provider string) *RuntimeOfflineReason {
+	record, demoted := d.demotedProviders[provider]
+	if !demoted {
+		return nil
+	}
+	return record.offline
+}
+
+// revivedRuntimes are the rows a register response brought back for a provider
+// the daemon has already condemned: the ids to take offline again, and the
+// cause to re-attach per row because that register's upsert just overwrote it.
+type revivedRuntimes struct {
+	ids     []string
+	reasons map[string]RuntimeOfflineReason
+}
+
+// reasonsFor narrows the causes to the rows actually being deregistered. The
+// caller re-checks tracking first — a row that came back legitimately in the
+// meantime is dropped from the list — and sending a cause for a row we are no
+// longer taking offline would attach it to a healthy runtime.
+func (r revivedRuntimes) reasonsFor(runtimeIDs []string) map[string]RuntimeOfflineReason {
+	if len(r.reasons) == 0 {
+		return nil
+	}
+	out := make(map[string]RuntimeOfflineReason, len(runtimeIDs))
+	for _, id := range runtimeIDs {
+		if reason, ok := r.reasons[id]; ok {
+			out[id] = reason
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// add records one revived row. Callers must hold d.mu (it reads the demotion
+// record), and it is a no-op for a provider with no structured cause — those
+// rows still need deregistering, they just have nothing to re-attach.
+func (r *revivedRuntimes) add(d *Daemon, runtimeID, provider string) {
+	r.ids = append(r.ids, runtimeID)
+	reason := d.demotedOfflineReasonLocked(provider)
+	if reason == nil {
+		return
+	}
+	if r.reasons == nil {
+		r.reasons = make(map[string]RuntimeOfflineReason, 1)
+	}
+	r.reasons[runtimeID] = *reason
+}
+
 // demotionRecord is a confirmed verdict about the binary on disk: the evidence
 // that produced it (the rejected version, or why the CLI could not be run),
 // plus the demotionSeq tick that establishes when it was reached.
+//
+// offline is the structured half, kept because the server can lose it. A
+// register sent before the verdict still upserts the runtime row, and that
+// upsert overwrites metadata wholesale — so the reason this daemon just stored
+// is gone, and the cleanup that takes the revived row offline again has to
+// re-attach it. Without that the server ends up "offline, no reason", which
+// downgrades the refusal back to "wait for the machine" (MUL-6164).
 type demotionRecord struct {
 	evidence string
+	offline  *RuntimeOfflineReason
 	seq      uint64
 }
 
@@ -1582,7 +1644,11 @@ func (d *Daemon) markProvidersDemotedLocked(providers map[string]runtimeVerdict)
 	// probe round that snapshotted the counter before this call.
 	d.demotionSeq++
 	for provider, verdict := range providers {
-		d.demotedProviders[provider] = demotionRecord{evidence: verdict.reason, seq: d.demotionSeq}
+		d.demotedProviders[provider] = demotionRecord{
+			evidence: verdict.reason,
+			offline:  verdict.offline,
+			seq:      d.demotionSeq,
+		}
 	}
 }
 
@@ -3594,10 +3660,10 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 			// below-minimum must not be the way that provider comes back.
 			d.mu.Lock()
 			runtimeIDs = make([]string, 0, len(resp.Runtimes))
-			var revivedIDs []string
+			var revived revivedRuntimes
 			for _, rt := range resp.Runtimes {
 				if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
-					revivedIDs = append(revivedIDs, rt.ID)
+					revived.add(d, rt.ID, rt.Provider)
 					continue
 				}
 				runtimeIDs = append(runtimeIDs, rt.ID)
@@ -3636,7 +3702,7 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 			// them offline before anything else touches this workspace — and never
 			// RecoverOrphans them below: that reports tasks for a runtime the
 			// daemon does not track and will never claim for.
-			d.deregisterRevivedRuntimes(ctx, id, revivedIDs)
+			d.deregisterRevivedRuntimes(ctx, id, revived)
 			return nil
 		})
 		if err != nil {

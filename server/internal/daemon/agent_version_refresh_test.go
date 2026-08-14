@@ -1126,7 +1126,7 @@ func TestDemoteBelowMinimumRuntimes_LateRegisterResponseCannotReviveTheProvider(
 	deregsBefore := fx.deregisteredCount()
 
 	// The older register's response finally lands.
-	newIDs, rejectedIDs, ok := d.mergeBuiltinRegisterResponse("ws-1", staleResp)
+	newIDs, revived, ok := d.mergeBuiltinRegisterResponse("ws-1", staleResp)
 	if !ok {
 		t.Fatal("merge of the late register response failed")
 	}
@@ -1140,11 +1140,11 @@ func TestDemoteBelowMinimumRuntimes_LateRegisterResponseCannotReviveTheProvider(
 	// Local rejection is only half the fix: the server upserted that row back to
 	// online, so it would keep listing the runtime and routing work to a daemon
 	// that no longer tracks it — those tasks sit unclaimed until the stale sweep.
-	if len(rejectedIDs) == 0 {
+	if len(revived.ids) == 0 {
 		t.Fatal("late response was rejected locally but reported no runtime ID to deregister, so the " +
 			"server would still believe the runtime is online")
 	}
-	d.deregisterRevivedRuntimes(context.Background(), "ws-1", rejectedIDs)
+	d.deregisterRevivedRuntimes(context.Background(), "ws-1", revived)
 	if got := fx.deregisteredCount(); got <= deregsBefore {
 		t.Errorf("deregister calls %d -> %d; the revived server row was never taken offline", deregsBefore, got)
 	}
