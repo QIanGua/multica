@@ -58,11 +58,18 @@ import { McpServerDialog } from "./mcp-server-dialog";
 export function McpConfigTab({
   agent,
   runtime,
+  canEdit = true,
   onSave,
   onDirtyChange,
 }: {
   agent: Agent;
   runtime: AgentRuntime | null;
+  /**
+   * Whether this viewer may change the agent. A member without it can still
+   * read the inventory — it carries no credential material — but every write
+   * affordance is hidden rather than left to 403 on click.
+   */
+  canEdit?: boolean;
   onSave: (updates: { mcp_config: unknown | null }) => Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;
 }) {
@@ -273,7 +280,7 @@ export function McpConfigTab({
               {t(($) => $.tab_body.mcp_config.workspace_hint)}
             </p>
           </div>
-          {availableServers.length > 0 && (
+          {canEdit && availableServers.length > 0 && (
             <McpWorkspaceServerPicker
               servers={availableServers}
               disabled={addServer.isPending}
@@ -293,6 +300,7 @@ export function McpConfigTab({
                 key={server.id}
                 server={server}
                 overridden={managedNames.has(server.name)}
+                canEdit={canEdit}
                 busy={setServerEnabled.isPending || removeServer.isPending}
                 onToggle={(enabled) => void handleToggleWorkspaceServer(server.id, enabled)}
                 onRemove={() => void handleRemoveWorkspaceServer(server.id)}
@@ -445,12 +453,14 @@ type McpServerView = {
 function McpWorkspaceServerRow({
   server,
   overridden,
+  canEdit,
   busy,
   onToggle,
   onRemove,
 }: {
   server: WorkspaceMcpServer;
   overridden: boolean;
+  canEdit: boolean;
   busy: boolean;
   onToggle: (enabled: boolean) => void;
   onRemove: () => void;
@@ -473,25 +483,34 @@ function McpWorkspaceServerRow({
           {server.transport || "unknown"}
         </p>
       </div>
-      <Switch
-        checked={enabled}
-        disabled={busy}
-        onCheckedChange={onToggle}
-        aria-label={t(($) => $.tab_body.mcp_config.workspace_toggle_aria, {
-          name: server.name,
-        })}
-      />
-      <Button
-        variant="ghost"
-        size="icon"
-        disabled={busy}
-        onClick={onRemove}
-        aria-label={t(($) => $.tab_body.mcp_config.workspace_remove_aria, {
-          name: server.name,
-        })}
-      >
-        <Trash2 className="h-4 w-4" aria-hidden="true" />
-      </Button>
+      {canEdit && (
+        <>
+          <Switch
+            checked={enabled}
+            disabled={busy}
+            onCheckedChange={onToggle}
+            aria-label={t(($) => $.tab_body.mcp_config.workspace_toggle_aria, {
+              name: server.name,
+            })}
+          />
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled={busy}
+            onClick={onRemove}
+            aria-label={t(($) => $.tab_body.mcp_config.workspace_remove_aria, {
+              name: server.name,
+            })}
+          >
+            <Trash2 className="h-4 w-4" aria-hidden="true" />
+          </Button>
+        </>
+      )}
+      {!canEdit && !enabled && (
+        <Badge variant="secondary">
+          {t(($) => $.tab_body.mcp_config.workspace_disabled_badge)}
+        </Badge>
+      )}
     </li>
   );
 }

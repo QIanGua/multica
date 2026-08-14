@@ -518,6 +518,7 @@
       "workspace_loading": "正在加载已分配的服务…",
       "dialog_name_locked": "这里不能改名——改名会新增一个服务并把原来的留在那里。请改用移除后重新添加。",
       "workspace_overridden_badge": "已覆盖",
+      "workspace_disabled_badge": "已禁用",
       "runtime_title": "从运行时继承",
       "runtime_hint": "自动从 {{runtime}} 发现，并在 task 启动时于本机完成合并。URL、Header、命令和环境变量等敏感值不会离开本机。",
       "refresh_action": "刷新",

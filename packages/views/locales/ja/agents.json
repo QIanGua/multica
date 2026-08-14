@@ -411,6 +411,7 @@
       "workspace_loading": "割り当て済みサーバーを読み込み中…",
       "dialog_name_locked": "ここでは名前を変更できません。変更すると別のサーバーが追加され、元のサーバーが残ります。削除してから追加し直してください。",
       "workspace_overridden_badge": "上書き",
+      "workspace_disabled_badge": "無効",
       "runtime_title": "ランタイムから継承",
       "runtime_hint": "{{runtime}} から自動検出し、作業開始時にローカルで統合します。URL、ヘッダー、コマンド、環境変数はマシン外に送信されません。",
       "refresh_action": "更新",

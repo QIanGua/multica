@@ -31,9 +31,16 @@ type WorkspaceMcpServerResponse struct {
 	UpdatedAt   string `json:"updated_at"`
 }
 
-// mcpTransportOf classifies a server entry for display. Mirrors the
-// front-end's mcpTransport (mcp-config-model.ts) so the same entry is
-// labelled identically wherever it is listed.
+// mcpTransportOf classifies a server entry for display, and — because the
+// client uses it to decide whether the guided form may edit an entry — it must
+// not be lossy about an explicit `type`.
+//
+// An unrecognised explicit type is returned VERBATIM rather than inferred from
+// the presence of a `url`. Reporting `{"type":"websocket","url":"wss://…"}` as
+// "http" would tell the settings UI the form can express it, and saving from
+// that form rewrites the entry to `type: "http"` — silently changing the
+// protocol. Only an entry with NO explicit type is inferred from command / url,
+// which is lossless because the form writes that same shape back.
 func mcpTransportOf(entry json.RawMessage) string {
 	var e struct {
 		Type    string          `json:"type"`
@@ -43,13 +50,16 @@ func mcpTransportOf(entry json.RawMessage) string {
 	if err := json.Unmarshal(entry, &e); err != nil {
 		return "unknown"
 	}
-	switch strings.ToLower(strings.TrimSpace(e.Type)) {
-	case "local", "stdio":
-		return "stdio"
-	case "sse":
-		return "sse"
-	case "remote", "http", "streamable-http":
-		return "http"
+	if declared := strings.ToLower(strings.TrimSpace(e.Type)); declared != "" {
+		switch declared {
+		case "local", "stdio":
+			return "stdio"
+		case "remote", "http", "streamable-http":
+			return "http"
+		}
+		// `sse` and anything a newer client invents land here unchanged. The
+		// response schema keeps transport a free string for exactly this.
+		return declared
 	}
 	if len(e.Command) > 0 {
 		return "stdio"
@@ -150,7 +160,23 @@ func (h *Handler) CreateWorkspaceMcpServer(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	server, err := h.Queries.CreateWorkspaceMcpServer(r.Context(), db.CreateWorkspaceMcpServerParams{
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create the MCP server")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+
+	// Join the workspace teardown fence (#5219): this table has no FK, so
+	// without the shared lock a create committing after DeleteWorkspace swept
+	// would leave a row pointing at a workspace that no longer exists.
+	if _, err := qtx.LockWorkspaceForChatSessionCreate(r.Context(), idUUID); err != nil {
+		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+
+	server, err := qtx.CreateWorkspaceMcpServer(r.Context(), db.CreateWorkspaceMcpServerParams{
 		WorkspaceID: idUUID,
 		Name:        name,
 		Config:      append([]byte(nil), req.Config...),
@@ -162,6 +188,10 @@ func (h *Handler) CreateWorkspaceMcpServer(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		slog.Warn("create workspace mcp server failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
+		writeError(w, http.StatusInternalServerError, "failed to create the MCP server")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create the MCP server")
 		return
 	}
@@ -247,6 +277,19 @@ func (h *Handler) DeleteWorkspaceMcpServer(w http.ResponseWriter, r *http.Reques
 	}
 	defer tx.Rollback(r.Context())
 	qtx := h.Queries.WithTx(tx)
+
+	// Exclusive row lock first: an assignment writer holds this row FOR SHARE
+	// while it inserts, so taking it here means a concurrent add either lands
+	// before this transaction (and is swept below) or waits and then finds the
+	// server gone. Without it the add could insert after the sweep, leaving a
+	// binding to a server that no longer exists.
+	if _, err := qtx.LockWorkspaceMcpServerForUpdate(r.Context(), db.LockWorkspaceMcpServerForUpdateParams{
+		ID:          serverUUID,
+		WorkspaceID: idUUID,
+	}); err != nil {
+		writeError(w, http.StatusNotFound, "MCP server not found")
+		return
+	}
 
 	rows, err := qtx.DeleteWorkspaceMcpServer(r.Context(), db.DeleteWorkspaceMcpServerParams{
 		ID:          serverUUID,
@@ -348,20 +391,41 @@ func (h *Handler) AddAgentMcpServer(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Scope check: the server has to belong to this agent's workspace, or an
-	// id from another workspace would bind across the tenant boundary.
-	if _, err := h.Queries.GetWorkspaceMcpServer(r.Context(), db.GetWorkspaceMcpServerParams{
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to add the MCP server")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+
+	// Same fence as every other workspace-scoped insert (#5219): the binding
+	// has no FK, so a write committing after DeleteWorkspace swept would
+	// outlive the agent and the server it names.
+	if _, err := qtx.LockWorkspaceForChatSessionCreate(r.Context(), agent.WorkspaceID); err != nil {
+		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+	// Scope check AND the delete protocol in one statement: the row must
+	// belong to this agent's workspace — an id from another workspace would
+	// bind across the tenant boundary — and holding it FOR SHARE serializes
+	// this insert against DeleteWorkspaceMcpServer's sweep.
+	if _, err := qtx.LockWorkspaceMcpServerForShare(r.Context(), db.LockWorkspaceMcpServerForShareParams{
 		ID:          serverUUID,
 		WorkspaceID: agent.WorkspaceID,
 	}); err != nil {
 		writeError(w, http.StatusNotFound, "MCP server not found in this workspace")
 		return
 	}
-	if err := h.Queries.AddAgentMcpServer(r.Context(), db.AddAgentMcpServerParams{
+	if err := qtx.AddAgentMcpServer(r.Context(), db.AddAgentMcpServerParams{
 		AgentID:  agent.ID,
 		ServerID: serverUUID,
 	}); err != nil {
 		slog.Warn("add agent mcp server failed", append(logger.RequestAttrs(r), "error", err, "agent_id", uuidToString(agent.ID))...)
+		writeError(w, http.StatusInternalServerError, "failed to add the MCP server")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to add the MCP server")
 		return
 	}

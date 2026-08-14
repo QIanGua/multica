@@ -6,6 +6,23 @@ SELECT * FROM workspace_mcp_server
 WHERE workspace_id = $1
 ORDER BY name ASC;
 
+-- name: LockWorkspaceMcpServerForShare :one
+-- Taken by the assignment writer before it inserts. A shared row lock
+-- conflicts with the exclusive lock DeleteWorkspaceMcpServer takes, so an
+-- assignment can never land in the window between that delete sweeping the
+-- bindings and committing — the junction has no FK to catch the orphan.
+SELECT id FROM workspace_mcp_server
+WHERE id = $1 AND workspace_id = $2
+FOR SHARE;
+
+-- name: LockWorkspaceMcpServerForUpdate :one
+-- The delete half of the same protocol: take the row exclusively first, so a
+-- concurrent assignment either lands before this transaction (and is swept) or
+-- waits and then finds the server gone.
+SELECT id FROM workspace_mcp_server
+WHERE id = $1 AND workspace_id = $2
+FOR UPDATE;
+
 -- name: GetWorkspaceMcpServer :one
 SELECT * FROM workspace_mcp_server
 WHERE id = $1 AND workspace_id = $2;
@@ -67,4 +84,3 @@ WHERE agent_id = $1 AND server_id = $2;
 -- name: RemoveAgentMcpServer :execrows
 DELETE FROM agent_mcp_server
 WHERE agent_id = $1 AND server_id = $2;
-

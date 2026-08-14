@@ -427,6 +427,29 @@ describe("McpConfigTab workspace servers", () => {
     expect(await screen.findByText("Overridden")).toBeInTheDocument();
   });
 
+  // A member without edit rights can still read what the agent runs with —
+  // the inventory carries no credential material — but every write affordance
+  // is hidden rather than left to 403 on click.
+  it("hides the assignment controls from a viewer who cannot edit", async () => {
+    workspaceMcp.assigned = [wsServer({ enabled: true })];
+    workspaceMcp.library = [wsServer({ id: "srv-9", name: "pickable" })];
+    render(
+      <TestShell>
+        <McpConfigTab
+          agent={baseAgent}
+          runtime={null}
+          canEdit={false}
+          onSave={vi.fn()}
+        />
+      </TestShell>,
+    );
+
+    expect(await screen.findByText("shared-linear")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Add from workspace/ })).toBeNull();
+    expect(screen.queryByRole("switch")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Remove shared-linear/i })).toBeNull();
+  });
+
   it("points at workspace Settings when the library is empty", async () => {
     renderTab({ mcp_config: null });
 

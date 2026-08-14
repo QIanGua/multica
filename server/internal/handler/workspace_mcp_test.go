@@ -296,3 +296,40 @@ func TestParseMcpDocument_NamesSpanBothContainers(t *testing.T) {
 		t.Fatalf("names = %v, want %v", names, want)
 	}
 }
+
+// mcpTransportOf feeds the client's "can the guided form edit this?" guard, so
+// it must never launder an unknown protocol into a known one. Reporting
+// {"type":"websocket","url":"wss://…"} as http would let the settings form
+// open and rewrite the entry to type:"http" on save — the exact failure the
+// front-end guard exists to prevent.
+func TestMcpTransportOf(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+		want  string
+	}{
+		{name: "explicit stdio", entry: `{"type":"stdio","command":"x"}`, want: "stdio"},
+		{name: "explicit local", entry: `{"type":"local","command":"x"}`, want: "stdio"},
+		{name: "explicit http", entry: `{"type":"http","url":"https://x"}`, want: "http"},
+		{name: "explicit streamable-http", entry: `{"type":"streamable-http","url":"https://x"}`, want: "http"},
+		{name: "explicit sse", entry: `{"type":"sse","url":"https://x"}`, want: "sse"},
+		// The regression: an unknown type with a url must NOT become http.
+		{name: "unknown type with url", entry: `{"type":"websocket","url":"wss://x"}`, want: "websocket"},
+		{name: "unknown type with command", entry: `{"type":"grpc","command":"x"}`, want: "grpc"},
+		{name: "unknown type is normalized to lower case", entry: `{"type":"WebSocket","url":"wss://x"}`, want: "websocket"},
+		// Inference only when nothing was declared — that is lossless, because
+		// the form writes the same shape back.
+		{name: "inferred stdio", entry: `{"command":"x"}`, want: "stdio"},
+		{name: "inferred http", entry: `{"url":"https://x"}`, want: "http"},
+		{name: "nothing to go on", entry: `{}`, want: "unknown"},
+		{name: "malformed", entry: `not json`, want: "unknown"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mcpTransportOf(json.RawMessage(tc.entry)); got != tc.want {
+				t.Fatalf("mcpTransportOf(%s) = %q, want %q", tc.entry, got, tc.want)
+			}
+		})
+	}
+}

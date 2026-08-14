@@ -529,6 +529,7 @@
       "workspace_loading": "Loading assigned servers…",
       "dialog_name_locked": "The name cannot be changed here — renaming would add a second server and leave this one behind. Remove and re-add it instead.",
       "workspace_overridden_badge": "Overridden",
+      "workspace_disabled_badge": "Disabled",
       "runtime_title": "Inherited from runtime",
       "runtime_hint": "Discovered automatically from {{runtime}} and merged at task launch. URLs, headers, commands, and environment variables never leave the machine.",
       "refresh_action": "Refresh",
