@@ -1009,12 +1009,16 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 		"Active sibling runs",
 		"MUL-6000",
 		"task-existing",
-		"multica issue runs",
+		"multica issue comment list issue-target --roots-only --summary --compact --output json",
+		"multica issue run-messages task-existing --issue issue-source",
 		"--no-start",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("prompt missing %q\n--- output ---\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "multica issue runs") {
+		t.Errorf("prompt must not direct overlap checks to the target issue's run list\n--- output ---\n%s", out)
 	}
 }
 

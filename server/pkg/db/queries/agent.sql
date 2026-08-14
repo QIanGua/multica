@@ -278,9 +278,11 @@ WHERE agent_id = $1
 ORDER BY created_at DESC;
 
 -- name: ListActiveSiblingIssueTasks :many
--- Claim-time context for agents that can work concurrently. Bounded so one
--- heavily-used agent cannot inflate every claim payload; issue-bound rows only
--- because those are the runs the agent can inspect with `multica issue runs`.
+-- Claim-time context for agents that can work concurrently. Only tasks already
+-- handed to a runtime can coordinate with the new claim; queued work is omitted
+-- so the warning stays high-signal. Bounded so one heavily-used agent cannot
+-- inflate every claim payload; issue-bound rows carry a concrete run-messages
+-- lookup target.
 SELECT
     atq.id AS task_id,
     i.id AS issue_id,
@@ -296,13 +298,12 @@ JOIN workspace w ON w.id = i.workspace_id
 WHERE atq.agent_id = @agent_id
   AND atq.id <> @task_id
   AND i.workspace_id = @workspace_id
-  AND atq.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+  AND atq.status IN ('dispatched', 'running', 'waiting_local_directory')
 ORDER BY
     CASE atq.status
         WHEN 'running' THEN 0
         WHEN 'waiting_local_directory' THEN 1
-        WHEN 'dispatched' THEN 2
-        ELSE 3
+        ELSE 2
     END,
     atq.created_at DESC
 LIMIT 5;

@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -59,24 +58,15 @@ func (h *Handler) issueTriggerPreviewProbe(r *http.Request, actorType, actorID, 
 // busy anywhere: cross-issue self handoffs are a supported workflow and must
 // still enqueue when the target has no active run. Query errors fail closed
 // against the external enqueue side effect while leaving the ownership write
-// itself intact.
+// itself intact. The API still returns success for that ownership write; only
+// the server log exposes the failed advisory lookup, because enqueue is the
+// optional side effect and suppressing it is safer than risking duplicate work.
 func (h *Handler) shouldSuppressActiveSelfAssignment(ctx context.Context, actorType, actorID string, issueID, targetAgentID pgtype.UUID) bool {
 	if actorType != "agent" || actorID == "" || actorID != uuidToString(targetAgentID) {
 		return false
 	}
-	active, err := h.Queries.HasActiveTaskForIssueAndAgent(ctx, db.HasActiveTaskForIssueAndAgentParams{
-		IssueID: issueID,
-		AgentID: targetAgentID,
-	})
-	if err != nil {
-		slog.Error("self-assignment active-task check failed; suppressing duplicate enqueue",
-			"issue_id", uuidToString(issueID),
-			"agent_id", actorID,
-			"error", err,
-		)
-		return true
-	}
-	return active
+	active, err := h.hasActiveTaskForIssueAndAgent(ctx, issueID, targetAgentID)
+	return active || err != nil
 }
 
 // dispatchIssueRun executes the enqueue side effect for a decision produced by

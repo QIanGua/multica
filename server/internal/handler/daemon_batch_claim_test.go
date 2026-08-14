@@ -117,6 +117,20 @@ func TestClaimTasksByRuntime_IncludesActiveSiblingRun(t *testing.T) {
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, targetIssueID) })
 	queuedID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, targetIssueID)
 
+	// A queued task cannot coordinate yet and must not dilute the warning. Seed
+	// it after the target so the deterministic claim order still picks queuedID.
+	var queuedSiblingIssueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'queued sibling', 'todo', 'none', $2, 'member',
+			(SELECT COALESCE(MAX(number), 82649) + 1 FROM issue WHERE workspace_id = $1), 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&queuedSiblingIssueID); err != nil {
+		t.Fatalf("create queued sibling issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, queuedSiblingIssueID) })
+	seedQueuedIssueTask(t, ctx, agentID, runtimeID, queuedSiblingIssueID)
+
 	w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 1)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())

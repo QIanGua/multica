@@ -145,6 +145,12 @@ func (s *IssueService) WillEnqueueRun(ctx context.Context, in IssueTriggerInput,
 		}, true
 
 	case "squad":
+		// Pair-scoped self-assignment suppression intentionally applies only to
+		// direct agent ownership. Assigning a squad changes execution context
+		// (leader briefing, roles, and member routing), so even when the acting
+		// agent is that squad's leader it is an intentional group handoff rather
+		// than a redundant direct self-claim. The status path below still uses
+		// the leader's pending-task guard.
 		squad, err := s.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
 			ID:          issue.AssigneeID,
 			WorkspaceID: issue.WorkspaceID,

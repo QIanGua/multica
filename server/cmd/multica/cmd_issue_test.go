@@ -2834,6 +2834,13 @@ func newIssueAssignTestCmd() *cobra.Command {
 	return cmd
 }
 
+func newIssueStatusTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "status"}
+	cmd.Flags().Bool("no-start", false, "")
+	cmd.Flags().String("output", "table", "")
+	return cmd
+}
+
 func newIssueListTestCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "list"}
 	cmd.Flags().String("output", "table", "")
@@ -2917,6 +2924,39 @@ func TestRunIssueUpdateNoStartSendsSuppressRun(t *testing.T) {
 	_ = cmd.Flags().Set("no-start", "true")
 	if err := runIssueUpdate(cmd, []string{"MUL-1"}); err != nil {
 		t.Fatalf("runIssueUpdate: %v", err)
+	}
+	if got := body["suppress_run"]; got != true {
+		t.Fatalf("suppress_run = %#v, want true", got)
+	}
+}
+
+func TestRunIssueStatusNoStartSendsSuppressRun(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/issues/MUL-1":
+			json.NewEncoder(w).Encode(map[string]any{"id": "issue-1", "identifier": "MUL-1", "status": "backlog"})
+		case r.Method == http.MethodPut && r.URL.Path == "/api/issues/issue-1":
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"id": "issue-1", "identifier": "MUL-1", "status": "in_progress"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	setCLITestServerEnv(t, srv.URL)
+	t.Setenv("MULTICA_TASK_CONFIG_ROOT", t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "mat_test-token")
+
+	cmd := newIssueStatusTestCmd()
+	_ = cmd.Flags().Set("no-start", "true")
+	if err := runIssueStatus(cmd, []string{"MUL-1", "in_progress"}); err != nil {
+		t.Fatalf("runIssueStatus: %v", err)
+	}
+	if got := body["status"]; got != "in_progress" {
+		t.Fatalf("status = %#v, want in_progress", got)
 	}
 	if got := body["suppress_run"]; got != true {
 		t.Fatalf("suppress_run = %#v, want true", got)

@@ -1085,7 +1085,7 @@ func TestInjectRuntimeConfigAvailableCommandsCoreOnly(t *testing.T) {
 		"--description-file <path>",
 		"--parent \"\"",
 		"multica repo checkout <url>",
-		"multica issue status <id> <status>",
+		"multica issue status <id> <status> [--no-start]",
 		"multica issue comment add <issue-id>",
 		"multica issue comment add --help",
 	} {

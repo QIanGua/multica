@@ -76,7 +76,7 @@ const (
 // Returns "" when none of the blocks apply.
 func perTurnContextBlocks(task Task) string {
 	var b strings.Builder
-	b.WriteString(buildActiveSiblingRunsBlock(task.ActiveSiblingRuns))
+	b.WriteString(buildActiveSiblingRunsBlock(task.IssueID, task.ActiveSiblingRuns))
 	if task.PriorSessionResumeUnavailable {
 		b.WriteString(sessionContinuityNoticeFor(task))
 	}
@@ -85,13 +85,17 @@ func perTurnContextBlocks(task Task) string {
 	return b.String()
 }
 
-func buildActiveSiblingRunsBlock(runs []ActiveSiblingRunData) string {
+func buildActiveSiblingRunsBlock(currentIssueID string, runs []ActiveSiblingRunData) string {
 	if len(runs) == 0 {
 		return ""
 	}
 	var b strings.Builder
 	b.WriteString("## Active sibling runs\n\n")
-	b.WriteString("This agent has other non-terminal issue tasks. They may be intentional, but before starting overlapping code or PR work, inspect the relevant issue with `multica issue runs <issue-id>` and, when needed, `multica issue run-messages <task-id> --issue <issue-id>`. If another run assigned this issue, coordinate with that work instead of independently opening a second PR. If you only need to claim ownership without starting another run, use `multica issue assign <issue-id> --to-id <agent-id> --no-start`.\n\n")
+	b.WriteString("This agent has other in-flight issue tasks. They may be intentional, but before starting overlapping code or PR work, check for a claim or handoff in the current target issue's comment history")
+	if currentIssueID != "" {
+		fmt.Fprintf(&b, " with `multica issue comment list %s --roots-only --summary --compact --output json`", currentIssueID)
+	}
+	b.WriteString(", then inspect any relevant sibling task with the concrete `run-messages` command below. If another run assigned this issue, coordinate with that work instead of independently opening a second PR. If you only need to claim ownership or change status for work already underway, use `--no-start` on `multica issue assign`, `multica issue update`, or `multica issue status`.\n\n")
 	for _, run := range runs {
 		issueLabel := run.IssueIdentifier
 		if issueLabel == "" {
@@ -107,7 +111,7 @@ func buildActiveSiblingRunsBlock(runs []ActiveSiblingRunData) string {
 		if title != "" {
 			fmt.Fprintf(&b, ": %s", title)
 		}
-		b.WriteString("\n")
+		fmt.Fprintf(&b, "; inspect: `multica issue run-messages %s --issue %s`\n", run.TaskID, run.IssueID)
 	}
 	b.WriteString("\n")
 	return b.String()

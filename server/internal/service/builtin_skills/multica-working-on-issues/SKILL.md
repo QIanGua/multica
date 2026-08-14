@@ -212,14 +212,19 @@ effect explicitly:
 multica issue assign <issue-id> --to-id <agent-id> --no-start
 # Or when assignment is part of a wider update:
 multica issue update <issue-id> --assignee-id <agent-id> --no-start
+# Keep a status change in the same ownership-only flow from starting a run:
+multica issue status <issue-id> in_progress --no-start
 ```
 
-Before self-assigning, use `multica issue runs <issue-id>` and any `## Active
-sibling runs` block in the task prompt to check for work already underway. The
-server also suppresses a trusted self-assignment when the exact target
-`(issue, agent)` pair already has a non-terminal task. It deliberately does not
-block a same-agent handoff to a fresh issue: cross-issue serial and batch
-workflows keep their existing start behavior.
+Before self-assigning, inspect the target issue's comment history for an existing
+claim, then use the concrete `run-messages` commands in any `## Active sibling
+runs` block to inspect work already underway. Apply `--no-start` to every
+assignment or status change that belongs to that ownership-only flow; suppressing
+the assignment alone does not suppress a later status update. The server also
+suppresses a trusted self-assignment when the exact target `(issue, agent)` pair
+already has a non-terminal task. It deliberately does not block a same-agent
+handoff to a fresh issue: cross-issue serial and batch workflows keep their
+existing start behavior.
 
 ## Sub-issues: `todo` starts work now, `backlog` parks it
 
