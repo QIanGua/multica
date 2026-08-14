@@ -76,11 +76,40 @@ const (
 // Returns "" when none of the blocks apply.
 func perTurnContextBlocks(task Task) string {
 	var b strings.Builder
+	b.WriteString(buildActiveSiblingRunsBlock(task.ActiveSiblingRuns))
 	if task.PriorSessionResumeUnavailable {
 		b.WriteString(sessionContinuityNoticeFor(task))
 	}
 	b.WriteString(execenv.BuildTaskInitiatorBlock(task.InitiatorType, task.InitiatorName, task.InitiatorEmail))
 	b.WriteString(execenv.BuildConnectedAppsBlock(task.ConnectedApps))
+	return b.String()
+}
+
+func buildActiveSiblingRunsBlock(runs []ActiveSiblingRunData) string {
+	if len(runs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Active sibling runs\n\n")
+	b.WriteString("This agent has other non-terminal issue tasks. They may be intentional, but before starting overlapping code or PR work, inspect the relevant issue with `multica issue runs <issue-id>` and, when needed, `multica issue run-messages <task-id> --issue <issue-id>`. If another run assigned this issue, coordinate with that work instead of independently opening a second PR. If you only need to claim ownership without starting another run, use `multica issue assign <issue-id> --to-id <agent-id> --no-start`.\n\n")
+	for _, run := range runs {
+		issueLabel := run.IssueIdentifier
+		if issueLabel == "" {
+			issueLabel = run.IssueID
+		}
+		fmt.Fprintf(&b, "- %s — task `%s`, status `%s`", issueLabel, run.TaskID, run.Status)
+		if run.StartedAt != "" {
+			fmt.Fprintf(&b, ", started %s", run.StartedAt)
+		} else if run.CreatedAt != "" {
+			fmt.Fprintf(&b, ", created %s", run.CreatedAt)
+		}
+		title := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(run.IssueTitle))
+		if title != "" {
+			fmt.Fprintf(&b, ": %s", title)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 	return b.String()
 }
 

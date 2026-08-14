@@ -992,6 +992,32 @@ func TestBuildPromptDefaultScansRootsFirst(t *testing.T) {
 	}
 }
 
+func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
+	task := Task{
+		IssueID: "issue-target",
+		ActiveSiblingRuns: []ActiveSiblingRunData{{
+			TaskID:          "task-existing",
+			IssueID:         "issue-source",
+			IssueIdentifier: "MUL-6000",
+			IssueTitle:      "Existing work",
+			Status:          "running",
+			StartedAt:       "2026-08-14T03:00:00Z",
+		}},
+	}
+	out := BuildPrompt(task, "claude")
+	for _, want := range []string{
+		"Active sibling runs",
+		"MUL-6000",
+		"task-existing",
+		"multica issue runs",
+		"--no-start",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("prompt missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
 // TestBuildPromptNonSquadLeaderNoRule verifies that non-squad-leader agents
 // do NOT get the squad leader no_action rule injected.
 func TestBuildPromptNonSquadLeaderNoRule(t *testing.T) {

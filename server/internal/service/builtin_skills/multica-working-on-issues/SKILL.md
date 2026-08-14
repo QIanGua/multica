@@ -202,6 +202,25 @@ on it. These are the contracts, not advice:
   `todo` when no active task / retry remains — that is the main server-owned
   status write on the agent-run path.
 
+## Claim ownership without duplicating a run
+
+Assigning an active issue to an agent normally starts a run. When an agent is
+already doing the work and only needs to record ownership, suppress that side
+effect explicitly:
+
+```bash
+multica issue assign <issue-id> --to-id <agent-id> --no-start
+# Or when assignment is part of a wider update:
+multica issue update <issue-id> --assignee-id <agent-id> --no-start
+```
+
+Before self-assigning, use `multica issue runs <issue-id>` and any `## Active
+sibling runs` block in the task prompt to check for work already underway. The
+server also suppresses a trusted self-assignment when the exact target
+`(issue, agent)` pair already has a non-terminal task. It deliberately does not
+block a same-agent handoff to a fresh issue: cross-issue serial and batch
+workflows keep their existing start behavior.
+
 ## Sub-issues: `todo` starts work now, `backlog` parks it
 
 On an agent-assigned issue, create status decides whether the assignee fires
