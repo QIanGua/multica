@@ -419,16 +419,19 @@ describe("McpConfigTab effective set", () => {
     expect(screen.queryByText("Overridden by Multica")).toBeNull();
   });
 
-  // Same transport hazard on the agent side, reached through the saved config
-  // rather than a summary: the form emits `type: "http"`, so an SSE entry must
-  // not be editable through it.
-  it("edits an agent's SSE server through JSON, not the form", async () => {
+  // Same transport hazard on the agent side, reached through the SAVED config
+  // rather than a summary: the form emits `type: "http"`, so neither entry may
+  // be editable through it.
+  //
+  // `websocket` is the one that catches using mcpTransport() for this: that
+  // display classifier buckets any entry with a `url` as http, so the unknown
+  // type would look form-editable and be rewritten on save.
+  it.each([
+    ["sse", { type: "sse", url: "https://sse.example" }],
+    ["websocket", { type: "websocket", url: "wss://example.test" }],
+  ])("edits an agent's %s server through JSON, not the form", async (_label, entry) => {
     const user = userEvent.setup();
-    renderTab({
-      mcp_config: {
-        mcpServers: { streamy: { type: "sse", url: "https://sse.example" } },
-      },
-    });
+    renderTab({ mcp_config: { mcpServers: { streamy: entry } } });
 
     await user.click(
       screen.getByRole("button", { name: /edit mcp server streamy/i }),
@@ -440,6 +443,26 @@ describe("McpConfigTab effective set", () => {
     );
     expect(screen.getByRole("tab", { name: "Form" })).toHaveAttribute(
       "aria-disabled",
+      "true",
+    );
+  });
+
+  // The common shapes must stay on the form — this guard is about entries the
+  // form would CHANGE, not a general retreat to the JSON editor.
+  it.each([
+    ["stdio", { command: "uvx" }],
+    ["typed http", { type: "http", url: "https://mcp.example" }],
+    ["untyped url", { url: "https://mcp.example" }],
+  ])("keeps editing a %s server on the form", async (_label, entry) => {
+    const user = userEvent.setup();
+    renderTab({ mcp_config: { mcpServers: { normal: entry } } });
+
+    await user.click(
+      screen.getByRole("button", { name: /edit mcp server normal/i }),
+    );
+
+    expect(screen.getByRole("tab", { name: "Form" })).toHaveAttribute(
+      "aria-selected",
       "true",
     );
   });

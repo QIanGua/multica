@@ -111,9 +111,40 @@ function recordFromPairs(pairs: KeyValue[]): Record<string, string> | undefined 
  * tomorrow — must therefore never be routed through the form, or editing it
  * would silently change its protocol and can break the server outright.
  * Those entries take the JSON path, which round-trips whatever is typed.
+ *
+ * This one classifies a NON-secret summary transport, which the server emits
+ * from a closed set (stdio / http / sse / unknown).
  */
 function formCanExpressTransport(transport: string): boolean {
   return transport === "stdio" || transport === "http";
+}
+
+/** The `type` values `configFromForm` can write back without changing them. */
+const FORM_EXPRESSIBLE_TYPES = new Set([
+  "local",
+  "stdio",
+  "remote",
+  "http",
+  "streamable-http",
+]);
+
+/**
+ * Whether the form can round-trip a SAVED entry.
+ *
+ * Deliberately does not reuse `mcpTransport`: that is a lossy DISPLAY
+ * classifier — it reports "http" for any entry carrying a `url`, whatever its
+ * `type` — so `{"type":"websocket","url":"wss://…"}` would look form-editable
+ * and be rewritten to `type: "http"` on save. Safety decisions need the
+ * explicit value, not the display bucket.
+ */
+function formCanExpressConfig(config: Record<string, unknown>): boolean {
+  const type =
+    typeof config.type === "string" ? config.type.trim().toLowerCase() : "";
+  if (type !== "") return FORM_EXPRESSIBLE_TYPES.has(type);
+  // No explicit type: the form infers stdio from `command` and http from
+  // `url`, and writes that same shape back. With neither there is nothing for
+  // it to express, so leave the entry to the JSON editor.
+  return config.command !== undefined || config.url !== undefined;
 }
 
 function configFromForm(form: McpFormState): Record<string, unknown> {
@@ -156,11 +187,11 @@ function parseServerJson(text: string):
  */
 function formSupportsServer(server: ManagedMcpServer): boolean {
   if (server.container === "mcp") return false;
-  const transport =
-    Object.keys(server.config).length > 0
-      ? mcpTransport(server.config)
-      : server.transport;
-  return formCanExpressTransport(transport);
+  // With a saved entry in hand, judge the entry itself; the summary transport
+  // is only a fallback for callers that could not read one back.
+  return Object.keys(server.config).length > 0
+    ? formCanExpressConfig(server.config)
+    : formCanExpressTransport(server.transport);
 }
 
 export function McpServerDialog({
