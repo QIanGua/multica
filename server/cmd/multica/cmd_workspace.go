@@ -105,8 +105,8 @@ var workspaceMcpCmd = &cobra.Command{
 	Long: "Manages the MCP servers shared by every agent in the workspace. An " +
 		"agent that has no mcp_config of its own inherits them; an agent with " +
 		"its own config merges on top, winning on server-name collisions; an " +
-		"agent whose mcp_config declares no servers (the explicit 'this agent " +
-		"runs with zero MCP' state) inherits nothing.\n\n" +
+		"agent whose mcp_config declares no servers inherits none of them (its " +
+		"runtime's own local servers still apply).\n\n" +
 		"The stored configuration is write-only: reads return the server names " +
 		"and transports, never the urls, commands, headers, or env. Use 'add' / " +
 		"'remove' to change one server without holding the whole document.",
@@ -624,7 +624,7 @@ func runWorkspaceMcpGet(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
-	var resp map[string]any
+	var resp workspaceMcpInventory
 	if err := client.GetJSON(ctx, "/api/workspaces/"+wsID+"/mcp-config", &resp); err != nil {
 		return fmt.Errorf("get workspace mcp config: %w", err)
 	}
@@ -657,7 +657,7 @@ func runWorkspaceMcpSet(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
-	var resp map[string]any
+	var resp workspaceMcpInventory
 	body := map[string]any{"mcp_config": mcpConfig}
 	if err := client.PutJSON(ctx, "/api/workspaces/"+wsID+"/mcp-config", body, &resp); err != nil {
 		return fmt.Errorf("set workspace mcp config: %w", err)
@@ -695,7 +695,7 @@ func runWorkspaceMcpAdd(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
-	var resp map[string]any
+	var resp workspaceMcpInventory
 	path := "/api/workspaces/" + wsID + "/mcp-config/servers/" + url.PathEscape(serverName)
 	if err := client.PutJSON(ctx, path, entry, &resp); err != nil {
 		return fmt.Errorf("add workspace mcp server: %w", err)
@@ -725,7 +725,7 @@ func runWorkspaceMcpRemove(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
-	var resp map[string]any
+	var resp workspaceMcpInventory
 	path := "/api/workspaces/" + wsID + "/mcp-config/servers/" + url.PathEscape(serverName)
 	if err := client.DeleteJSONResponse(ctx, path, &resp); err != nil {
 		return fmt.Errorf("remove workspace mcp server: %w", err)
@@ -734,32 +734,44 @@ func runWorkspaceMcpRemove(cmd *cobra.Command, args []string) error {
 	return printWorkspaceMcpConfig(cmd, resp)
 }
 
+// workspaceMcpInventory is the CLI's half of the write-only boundary. Decoding
+// into named fields — rather than a map[string]any that gets re-encoded — means
+// a server that regressed to returning the stored document, or a `url` /
+// `headers` inside a server entry, cannot reach stdout through ANY output
+// format. Fields not declared here are dropped by encoding/json.
+type workspaceMcpInventory struct {
+	WorkspaceID string                     `json:"workspace_id"`
+	Servers     []workspaceMcpInventoryRow `json:"servers"`
+	ServerCount int                        `json:"server_count"`
+}
+
+type workspaceMcpInventoryRow struct {
+	Name      string `json:"name"`
+	Transport string `json:"transport"`
+	Enabled   bool   `json:"enabled"`
+}
+
 // printWorkspaceMcpConfig renders the shared MCP server inventory returned by
 // every workspace-mcp command. There is no document to print in either format:
-// the API never returns the stored configuration, so what a token would sit in
-// — urls, commands, headers, env — simply is not in this payload.
-func printWorkspaceMcpConfig(cmd *cobra.Command, resp map[string]any) error {
+// the API never returns the stored configuration, and the type above is what
+// guarantees this command cannot print one even if the API changed its mind.
+func printWorkspaceMcpConfig(cmd *cobra.Command, resp workspaceMcpInventory) error {
 	output, _ := cmd.Flags().GetString("output")
 	if output != "table" {
 		return cli.PrintJSON(os.Stdout, resp)
 	}
 
-	servers, _ := resp["servers"].([]any)
-	if len(servers) == 0 {
+	if len(resp.Servers) == 0 {
 		fmt.Fprintln(os.Stdout, "no MCP servers shared by this workspace")
 		return nil
 	}
-	rows := make([][]string, 0, len(servers))
-	for _, raw := range servers {
-		server, _ := raw.(map[string]any)
-		if server == nil {
-			continue
-		}
+	rows := make([][]string, 0, len(resp.Servers))
+	for _, server := range resp.Servers {
 		status := "enabled"
-		if enabled, ok := server["enabled"].(bool); ok && !enabled {
+		if !server.Enabled {
 			status = "disabled"
 		}
-		rows = append(rows, []string{strVal(server, "name"), strVal(server, "transport"), status})
+		rows = append(rows, []string{server.Name, server.Transport, status})
 	}
 	cli.PrintTable(os.Stdout, []string{"NAME", "TRANSPORT", "STATUS"}, rows)
 	return nil

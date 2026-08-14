@@ -103,36 +103,101 @@ func TestRunWorkspaceMcpGetEmptyInventory(t *testing.T) {
 	}
 }
 
-// The default output is JSON, and a backend that ever regressed to returning
-// the document must not have it printed straight to a terminal. Renderers only
-// read the inventory fields, so nothing else reaches stdout.
-func TestRunWorkspaceMcpGetTableOutputNeverPrintsSecrets(t *testing.T) {
+// poisonedInventoryResponse is what a regressed (or hostile) server would send:
+// the correct inventory PLUS the stored document at the top level and secret
+// fields inside a server entry. Nothing from it may reach stdout, in ANY output
+// format — the CLI decodes into a named struct precisely so it cannot.
+func poisonedInventoryResponse() map[string]any {
+	resp := inventoryResponse()
+	resp["servers"] = []map[string]any{{
+		"name":      "linear",
+		"transport": "http",
+		"enabled":   true,
+		// Secret material smuggled inside the safe summary.
+		"url":     "https://mcp.example/sk-live-url-leak",
+		"headers": map[string]any{"Authorization": "Bearer sk-live-header-leak"},
+		"env":     map[string]any{"TOKEN": "sk-live-env-leak"},
+	}}
+	resp["server_count"] = 1
+	// Secret material smuggled at the top level.
+	resp["mcp_config"] = map[string]any{
+		"mcpServers": map[string]any{
+			"linear": map[string]any{"headers": map[string]any{"Authorization": "Bearer sk-live-doc-leak"}},
+		},
+	}
+	return resp
+}
+
+var workspaceMcpLeakMarkers = []string{
+	"sk-live-url-leak",
+	"sk-live-header-leak",
+	"sk-live-env-leak",
+	"sk-live-doc-leak",
+	"mcp_config",
+	"headers",
+}
+
+func TestRunWorkspaceMcpGetNeverPrintsSecrets(t *testing.T) {
+	// Both output modes, because the JSON one is the DEFAULT: a renderer that
+	// echoed the decoded response would leak there first.
+	for _, output := range []string{"json", "table"} {
+		t.Run(output, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("MULTICA_TOKEN", "test-token")
+			t.Setenv("MULTICA_WORKSPACE_ID", testWorkspaceMcpID)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(poisonedInventoryResponse())
+			}))
+			defer srv.Close()
+			t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+			cmd := newWorkspaceMcpTestCmd("get")
+			_ = cmd.Flags().Set("output", output)
+			out, err := captureStdout(t, func() error { return runWorkspaceMcpGet(cmd, nil) })
+			if err != nil {
+				t.Fatalf("runWorkspaceMcpGet: %v", err)
+			}
+
+			for _, marker := range workspaceMcpLeakMarkers {
+				if strings.Contains(out, marker) {
+					t.Fatalf("%s output leaked %q: %q", output, marker, out)
+				}
+			}
+			// The safe inventory still renders.
+			if !strings.Contains(out, "linear") {
+				t.Fatalf("%s output dropped the server name: %q", output, out)
+			}
+		})
+	}
+}
+
+// The write paths render the same inventory, so they need the same guard —
+// the response to a write is where a server is most likely to echo back what
+// it just stored.
+func TestRunWorkspaceMcpWritesNeverPrintSecrets(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MULTICA_TOKEN", "test-token")
 	t.Setenv("MULTICA_WORKSPACE_ID", testWorkspaceMcpID)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := inventoryResponse("linear")
-		// Simulate a hostile / regressed server that includes the document.
-		resp["mcp_config"] = map[string]any{
-			"mcpServers": map[string]any{
-				"linear": map[string]any{"headers": map[string]any{"Authorization": "Bearer sk-live-leak"}},
-			},
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(poisonedInventoryResponse())
 	}))
 	defer srv.Close()
 	t.Setenv("MULTICA_SERVER_URL", srv.URL)
 
-	cmd := newWorkspaceMcpTestCmd("get")
-	_ = cmd.Flags().Set("output", "table")
-	out, err := captureStdout(t, func() error { return runWorkspaceMcpGet(cmd, nil) })
+	cmd := newWorkspaceMcpTestCmd("add")
+	_ = cmd.Flags().Set("server-config", `{"url":"https://mcp.example"}`)
+	out, err := captureStdout(t, func() error { return runWorkspaceMcpAdd(cmd, []string{"linear"}) })
 	if err != nil {
-		t.Fatalf("runWorkspaceMcpGet: %v", err)
+		t.Fatalf("runWorkspaceMcpAdd: %v", err)
 	}
-	if strings.Contains(out, "sk-live-leak") {
-		t.Fatalf("table output printed credential material: %q", out)
+	for _, marker := range workspaceMcpLeakMarkers {
+		if strings.Contains(out, marker) {
+			t.Fatalf("add output leaked %q: %q", marker, out)
+		}
 	}
 }
 

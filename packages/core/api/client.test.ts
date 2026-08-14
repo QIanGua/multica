@@ -2095,6 +2095,37 @@ describe("ApiClient workspace MCP configuration", () => {
     expect(result.servers[0]).toMatchObject({ name: "linear", transport: "http" });
   });
 
+  // The write-only boundary is enforced on the client too: a server that
+  // regressed to returning the document, or a `url` / `headers` inside a
+  // server entry, must not land in the parsed object or the query cache.
+  it("strips secret-bearing fields the server should never have sent", async () => {
+    stubJSON({
+      workspace_id: "ws-1",
+      mcp_config: {
+        mcpServers: { linear: { headers: { Authorization: "Bearer sk-live-doc" } } },
+      },
+      servers: [{
+        name: "linear",
+        transport: "http",
+        enabled: true,
+        url: "https://mcp.example/sk-live-url",
+        headers: { Authorization: "Bearer sk-live-header" },
+        env: { TOKEN: "sk-live-env" },
+      }],
+      server_count: 1,
+    });
+
+    const result = await new ApiClient("https://api.example.test")
+      .getWorkspaceMcpConfig("ws-1");
+
+    expect(JSON.stringify(result)).not.toContain("sk-live");
+    expect(result).toEqual({
+      workspace_id: "ws-1",
+      servers: [{ name: "linear", transport: "http", enabled: true }],
+      server_count: 1,
+    });
+  });
+
   it("falls back safely when the inventory response is malformed", async () => {
     stubJSON({ workspace_id: 42, servers: "not-an-array" });
 

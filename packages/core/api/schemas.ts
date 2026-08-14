@@ -2569,23 +2569,29 @@ export const EMPTY_SKILL: Skill = {
 };
 
 /**
- * Read shape of the workspace's shared MCP configuration. Deliberately has no
- * document field: the server never returns the stored configuration, so a
- * lenient schema here cannot accidentally admit credential material into the
- * client. `transport` stays a plain string (not an enum) so an unknown value
- * from a newer backend still parses — the UI has a default branch for it.
+ * Read shape of the workspace's shared MCP configuration.
+ *
+ * These two are the ONLY schemas in this file that must not be `.loose()`.
+ * Everywhere else, keeping unknown fields is forward-compatibility; here it
+ * would be a hole in the write-only boundary — a server that regressed to
+ * returning the document (or a server entry's `url` / `headers`) would have it
+ * land in the parsed object and in the query cache. zod strips unknown keys by
+ * default, so the client only ever holds the safe inventory.
+ *
+ * `transport` stays a plain string (not an enum) so an unknown value from a
+ * newer backend still parses — the UI has a default branch for it.
  */
 export const WorkspaceMcpServerSchema = z.object({
   name: z.string().default(""),
   transport: z.string().default("unknown"),
   enabled: z.boolean().default(true),
-}).loose();
+});
 
 export const WorkspaceMcpConfigSchema = z.object({
   workspace_id: z.string().default(""),
   servers: z.array(WorkspaceMcpServerSchema).default([]),
   server_count: z.number().default(0),
-}).loose();
+});
 
 export const EMPTY_WORKSPACE_MCP_CONFIG: WorkspaceMcpConfig = {
   workspace_id: "",
