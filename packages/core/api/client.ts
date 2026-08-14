@@ -50,6 +50,7 @@ import type {
   IssueReaction,
   Workspace,
   WorkspaceRepo,
+  WorkspaceMcpConfig,
   MemberWithUser,
   User,
   Skill,
@@ -371,10 +372,12 @@ import {
   EMPTY_ISSUE_VIEW_PREFERENCE,
   EMPTY_PLUGIN_CATALOG,
   EMPTY_PLUGIN_INSTALLATION,
+  EMPTY_WORKSPACE_MCP_CONFIG,
   EMPTY_PLUGIN_INSTALLATION_LIST,
   PluginCatalogResponseSchema,
   PluginInstallationListResponseSchema,
   PluginInstallationSchema,
+  WorkspaceMcpConfigSchema,
   type IssueView,
   type IssueViewPreference,
   type CreateIssueViewRequest,
@@ -2283,6 +2286,48 @@ export class ApiClient {
     }
     return parseWithFallback(raw, PluginInstallationListResponseSchema, EMPTY_PLUGIN_INSTALLATION_LIST, {
       endpoint: "GET /api/workspaces/{id}/plugins",
+    });
+  }
+
+  /**
+   * Lists the MCP servers the workspace shares with every agent. The response
+   * carries names and transports only — the stored configuration is
+   * write-only server-side, so there is nothing here to redact.
+   */
+  async getWorkspaceMcpConfig(workspaceId: string): Promise<WorkspaceMcpConfig> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/mcp-config`);
+    return parseWithFallback(raw, WorkspaceMcpConfigSchema, EMPTY_WORKSPACE_MCP_CONFIG, {
+      endpoint: "GET /api/workspaces/{id}/mcp-config",
+    });
+  }
+
+  /**
+   * Adds or replaces ONE shared MCP server. Per-server rather than a whole
+   * document write because the client can never read the document back, so a
+   * read-modify-write is impossible; the server merges under a row lock.
+   */
+  async upsertWorkspaceMcpServer(
+    workspaceId: string,
+    name: string,
+    entry: Record<string, unknown>,
+  ): Promise<WorkspaceMcpConfig> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/mcp-config/servers/${encodeURIComponent(name)}`,
+      { method: "PUT", body: JSON.stringify(entry) },
+    );
+    return parseWithFallback(raw, WorkspaceMcpConfigSchema, EMPTY_WORKSPACE_MCP_CONFIG, {
+      endpoint: "PUT /api/workspaces/{id}/mcp-config/servers/{name}",
+    });
+  }
+
+  /** Removes one shared MCP server; removing the last one clears the layer. */
+  async deleteWorkspaceMcpServer(workspaceId: string, name: string): Promise<WorkspaceMcpConfig> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/mcp-config/servers/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    );
+    return parseWithFallback(raw, WorkspaceMcpConfigSchema, EMPTY_WORKSPACE_MCP_CONFIG, {
+      endpoint: "DELETE /api/workspaces/{id}/mcp-config/servers/{name}",
     });
   }
 

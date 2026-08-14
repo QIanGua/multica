@@ -14,6 +14,19 @@ import { McpConfigTab } from "./mcp-config-tab";
 const TEST_RESOURCES = { en: { common: enCommon, agents: enAgents } };
 
 const mockRuntimeCapabilities = vi.hoisted(() => vi.fn());
+const workspaceMcp = vi.hoisted(() => ({
+  data: { workspace_id: "ws-1", servers: [] as Array<Record<string, unknown>>, server_count: 0 },
+}));
+
+// The inherited section reads the workspace's shared servers. Stubbing the
+// query options keeps this a pure render test — the real one would hit fetch.
+vi.mock("@multica/core/workspace/queries", () => ({
+  workspaceMcpConfigOptions: (wsId: string) => ({
+    queryKey: ["workspaces", wsId, "mcp-config"],
+    queryFn: () => Promise.resolve(workspaceMcp.data),
+    enabled: wsId !== "",
+  }),
+}));
 
 // The tab reads discovery through runtimeCapabilitiesOptions; existing tests
 // render with runtime={null} so the query stays disabled and never fires.
@@ -112,7 +125,10 @@ const onlineRuntime: AgentRuntime = {
 };
 
 describe("McpConfigTab", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workspaceMcp.data = { workspace_id: "ws-1", servers: [], server_count: 0 };
+  });
 
   it("renders redacted managed MCP without exposing add or edit controls", () => {
     renderTab({ mcp_config: null, mcp_config_redacted: true });
@@ -295,6 +311,64 @@ describe("McpConfigTab", () => {
       await screen.findByText(
         "Couldn't discover runtime MCP servers. Try again.",
       ),
+    ).toBeInTheDocument();
+  });
+});
+
+// The workspace layer (GH #6062) is what an agent runs with on top of its own
+// servers, so the tab has to make it visible — including which shared servers
+// this agent overrides, and when it inherits nothing at all.
+describe("McpConfigTab workspace inheritance", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workspaceMcp.data = { workspace_id: "ws-1", servers: [], server_count: 0 };
+  });
+
+  it("lists the servers inherited from the workspace", async () => {
+    workspaceMcp.data = {
+      workspace_id: "ws-1",
+      servers: [{ name: "shared-linear", transport: "http", enabled: true }],
+      server_count: 1,
+    };
+    renderTab({ mcp_config: null });
+
+    expect(await screen.findByText("shared-linear")).toBeInTheDocument();
+    expect(screen.getByText(/Inherited from workspace/)).toBeInTheDocument();
+  });
+
+  it("marks a shared server the agent overrides by name", async () => {
+    workspaceMcp.data = {
+      workspace_id: "ws-1",
+      servers: [{ name: "linear", transport: "http", enabled: true }],
+      server_count: 1,
+    };
+    renderTab({
+      mcp_config: { mcpServers: { linear: { url: "https://agent.example" } } },
+    });
+
+    expect(await screen.findByText("Overridden")).toBeInTheDocument();
+  });
+
+  it("says an agent with a managed-but-empty config inherits nothing", async () => {
+    workspaceMcp.data = {
+      workspace_id: "ws-1",
+      servers: [{ name: "shared-linear", transport: "http", enabled: true }],
+      server_count: 1,
+    };
+    renderTab({ mcp_config: {} });
+
+    expect(
+      await screen.findByText(/runs with zero MCP servers/),
+    ).toBeInTheDocument();
+    // The shared server must NOT be listed as inherited: this agent opted out.
+    expect(screen.queryByText("shared-linear")).toBeNull();
+  });
+
+  it("renders an empty state when the workspace shares nothing", async () => {
+    renderTab({ mcp_config: null });
+
+    expect(
+      await screen.findByText(/workspace shares no MCP servers/),
     ).toBeInTheDocument();
   });
 });

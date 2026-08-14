@@ -2068,3 +2068,79 @@ describe("ApiClient refreshSkill response schema", () => {
     });
   });
 });
+
+describe("ApiClient workspace MCP configuration", () => {
+  function stubJSON(body: unknown) {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("parses the shared server inventory", async () => {
+    stubJSON({
+      workspace_id: "ws-1",
+      servers: [{ name: "linear", transport: "http", enabled: true }],
+      server_count: 1,
+    });
+
+    const result = await new ApiClient("https://api.example.test")
+      .getWorkspaceMcpConfig("ws-1");
+
+    expect(result.server_count).toBe(1);
+    expect(result.servers[0]).toMatchObject({ name: "linear", transport: "http" });
+  });
+
+  it("falls back safely when the inventory response is malformed", async () => {
+    stubJSON({ workspace_id: 42, servers: "not-an-array" });
+
+    const result = await new ApiClient("https://api.example.test")
+      .getWorkspaceMcpConfig("ws-1");
+
+    expect(result).toEqual({ workspace_id: "", servers: [], server_count: 0 });
+  });
+
+  it("keeps an unknown transport rather than dropping the server", async () => {
+    // Enum drift from a newer backend must degrade, not disappear: the row
+    // still renders and the UI's default branch labels it.
+    stubJSON({
+      workspace_id: "ws-1",
+      servers: [{ name: "future", transport: "websocket", enabled: true }],
+      server_count: 1,
+    });
+
+    const result = await new ApiClient("https://api.example.test")
+      .getWorkspaceMcpConfig("ws-1");
+
+    expect(result.servers).toHaveLength(1);
+    expect(result.servers[0]?.transport).toBe("websocket");
+  });
+
+  it("PUTs a single server entry to the per-server endpoint", async () => {
+    const fetchMock = stubJSON({ workspace_id: "ws-1", servers: [], server_count: 0 });
+
+    await new ApiClient("https://api.example.test")
+      .upsertWorkspaceMcpServer("ws-1", "my server", { url: "https://mcp.example" });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    // The name is a path segment, so it has to be encoded.
+    expect(url).toContain("/api/workspaces/ws-1/mcp-config/servers/my%20server");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(String(init.body))).toEqual({ url: "https://mcp.example" });
+  });
+
+  it("DELETEs one server by name", async () => {
+    const fetchMock = stubJSON({ workspace_id: "ws-1", servers: [], server_count: 0 });
+
+    await new ApiClient("https://api.example.test")
+      .deleteWorkspaceMcpServer("ws-1", "linear");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/api/workspaces/ws-1/mcp-config/servers/linear");
+    expect(init.method).toBe("DELETE");
+  });
+});

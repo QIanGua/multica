@@ -163,6 +163,28 @@
       "start_date": "开始日期"
     }
   },
+  "mcp": {
+    "title": "MCP",
+    "description": "与本工作区所有 agent 共享的 MCP 服务，不必在每个 agent 上重复录入同一批配置。",
+    "servers_title": "共享服务",
+    "write_only_note": "没有自己 MCP 配置的 agent 会继承这些服务；有自己配置的 agent 在其之上合并，同名时以 agent 自己的为准。已保存的配置是只写的——url、命令、header 和环境变量不会再次展示，因此编辑一个服务等于整条替换它的配置。",
+    "add_server": "添加服务",
+    "edit_server": "编辑服务",
+    "remove_server": "移除服务",
+    "empty_title": "还没有共享的 MCP 服务",
+    "empty_description": "在这里添加服务后，工作区内所有 agent 会在下一个任务开始时继承它——除非该 agent 已明确退出。",
+    "disabled_badge": "已禁用",
+    "admin_only_note": "只有工作区 owner 和 admin 可以修改共享的 MCP 服务。",
+    "delete_title": "移除共享服务？",
+    "delete_description": "{{name}} 将在本工作区 agent 的下一个任务起不再共享。自己定义了同名服务的 agent 不受影响。",
+    "delete_confirm": "移除",
+    "cancel": "取消",
+    "added_toast": "已添加共享 MCP 服务",
+    "updated_toast": "已更新共享 MCP 服务",
+    "removed_toast": "已移除共享 MCP 服务",
+    "save_failed_toast": "共享 MCP 服务保存失败",
+    "remove_failed_toast": "共享 MCP 服务移除失败"
+  },
   "page": {
     "title": "设置",
     "my_account": "我的账号",
@@ -185,6 +207,7 @@
       "properties": "属性",
       "quick_actions": "快捷操作",
     "plugins": "Plugins",
+    "mcp": "MCP",
     "billing": "账单与套餐"
     }
   },

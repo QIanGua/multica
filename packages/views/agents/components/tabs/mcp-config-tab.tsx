@@ -17,6 +17,7 @@ import {
   runtimeCapabilitiesOptions,
   runtimeDisplayLabel,
 } from "@multica/core/runtimes";
+import { workspaceMcpConfigOptions } from "@multica/core/workspace/queries";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -56,6 +57,12 @@ export function McpConfigTab({
       ? runtime.id
       : null;
   const runtimeQuery = useQuery(runtimeCapabilitiesOptions(runtimeId));
+  // What this agent inherits from the workspace (GH #6062). Read-only here:
+  // the shared set is edited in workspace Settings, and the API returns names
+  // and transports only — never the shared credentials.
+  const workspaceMcpQuery = useQuery(
+    workspaceMcpConfigOptions(agent.workspace_id ?? ""),
+  );
   const redacted = agent.mcp_config_redacted === true;
   const managedServers = useMemo(
     () => listManagedMcpServers(agent.mcp_config),
@@ -65,6 +72,15 @@ export function McpConfigTab({
     () => new Set(managedServers.map((server) => server.name)),
     [managedServers],
   );
+  const workspaceServers = workspaceMcpQuery.data?.servers ?? [];
+  // The resolution contract's opt-out: an agent whose saved configuration
+  // declares NO servers runs with zero MCP and inherits nothing. `null` /
+  // absent means "not configured at the agent layer", which DOES inherit —
+  // so key this off a present-but-empty document, not off an empty list.
+  const optedOutOfWorkspace =
+    agent.mcp_config !== null &&
+    agent.mcp_config !== undefined &&
+    managedServers.length === 0;
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ManagedMcpServer | null>(
     null,
@@ -182,6 +198,38 @@ export function McpConfigTab({
           />
         ) : (
           <McpNotice text={t(($) => $.tab_body.mcp_config.managed_empty)} />
+        )}
+      </section>
+
+      <section className="space-y-3">
+        <div>
+          <h3 className="text-body font-medium">
+            {t(($) => $.tab_body.mcp_config.workspace_title)}
+          </h3>
+          <p className="mt-1 max-w-2xl text-caption leading-5 text-muted-foreground">
+            {t(($) => $.tab_body.mcp_config.workspace_hint)}
+          </p>
+        </div>
+        {optedOutOfWorkspace ? (
+          <McpNotice text={t(($) => $.tab_body.mcp_config.workspace_opted_out)} />
+        ) : workspaceMcpQuery.isLoading ? (
+          <McpNotice
+            loading
+            text={t(($) => $.tab_body.mcp_config.workspace_loading)}
+          />
+        ) : workspaceServers.length === 0 ? (
+          <McpNotice text={t(($) => $.tab_body.mcp_config.workspace_empty)} />
+        ) : (
+          <McpServerList
+            servers={workspaceServers.map((server) => ({
+              name: server.name,
+              transport: server.transport || "unknown",
+              enabled: server.enabled,
+              overridden: managedNames.has(server.name),
+            }))}
+            disabledLabel={t(($) => $.tab_body.mcp_config.workspace_disabled_badge)}
+            overriddenLabel={t(($) => $.tab_body.mcp_config.workspace_overridden_badge)}
+          />
         )}
       </section>
 

@@ -70,6 +70,7 @@ import type {
   TimelineEntry,
   User,
   WebhookDelivery,
+  WorkspaceMcpConfig,
 } from "../types";
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
@@ -2565,4 +2566,29 @@ export const EMPTY_SKILL: Skill = {
   created_at: "",
   updated_at: "",
   files: [],
+};
+
+/**
+ * Read shape of the workspace's shared MCP configuration. Deliberately has no
+ * document field: the server never returns the stored configuration, so a
+ * lenient schema here cannot accidentally admit credential material into the
+ * client. `transport` stays a plain string (not an enum) so an unknown value
+ * from a newer backend still parses — the UI has a default branch for it.
+ */
+export const WorkspaceMcpServerSchema = z.object({
+  name: z.string().default(""),
+  transport: z.string().default("unknown"),
+  enabled: z.boolean().default(true),
+}).loose();
+
+export const WorkspaceMcpConfigSchema = z.object({
+  workspace_id: z.string().default(""),
+  servers: z.array(WorkspaceMcpServerSchema).default([]),
+  server_count: z.number().default(0),
+}).loose();
+
+export const EMPTY_WORKSPACE_MCP_CONFIG: WorkspaceMcpConfig = {
+  workspace_id: "",
+  servers: [],
+  server_count: 0,
 };
