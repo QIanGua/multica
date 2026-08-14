@@ -207,6 +207,9 @@ describe("BillingTab", () => {
     expect(
       screen.queryByText("Estimated monthly total: $30.00"),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry" }),
+    ).not.toBeInTheDocument();
   });
 
   it("formats Stripe minor units for decimal, zero-decimal, and special currencies", () => {
@@ -229,6 +232,21 @@ describe("BillingTab", () => {
 
     renderWithI18n(<BillingTab />);
 
+    expect(
+      screen.getByRole("status", { name: "Loading subscription prices" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Upgrade to Pro" }),
+    ).toBeEnabled();
+  });
+
+  it("announces a price-only retry without blocking Checkout", () => {
+    mocks.prices = null;
+    mocks.pricesFetching = true;
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
     expect(
       screen.getByRole("status", { name: "Loading subscription prices" }),
     ).toBeInTheDocument();
@@ -300,6 +318,9 @@ describe("BillingTab", () => {
     expect(
       screen.getByText(/Stripe Checkout shows the authoritative per-seat price/),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry" }),
+    ).not.toBeInTheDocument();
   });
 
   it("creates Checkout with a client idempotency key and opens Stripe externally", async () => {
