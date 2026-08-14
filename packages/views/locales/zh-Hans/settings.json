@@ -1,7 +1,7 @@
 {
   "quick_actions": {
     "title": "快捷操作",
-    "description": "与本工作区所有智能体共享的 MCP 服务，不必在每个智能体上重复录入同一批配置。",
+    "description": "预先配置好执行的 Agent 和提示词，之后在任意任务侧边栏一键触发。",
     "add": "新建快捷操作",
     "search_placeholder": "搜索快捷操作",
     "loading": "正在加载快捷操作…",
@@ -44,7 +44,7 @@
     "prompt_hint": "原样发送。Agent 本来就能看到这个任务。",
     "template_not_supported": "暂不支持变量，请删除 {{token}}。Agent 本来就能读到这个任务。",
     "delete_title": "删除这条快捷操作？",
-    "delete_description": "{{name}} 将在本工作区智能体的下一个任务起不再共享。自己定义了同名服务的智能体不受影响。"
+    "delete_description": "它会从所有任务侧边栏消失，历史运行记录仍保留在执行日志中。如果以后可能还要用，建议改为归档。"
   },
   "auto_save": {
     "saving": "正在保存…",
