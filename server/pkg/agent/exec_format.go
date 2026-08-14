@@ -33,12 +33,26 @@ import (
 // The executable path is read back out of the error instead of being passed
 // in, so this stays one provider-agnostic call per boundary rather than a wrap
 // inside every backend.
+//
+// Applying it twice to the same error is a no-op. Boundaries nest — a backend's
+// preflight error travels out through the daemon's launch boundary — and a
+// diagnosis printed twice is worse than the bare errno it replaced.
 func ExplainExecError(err error) error {
 	if err == nil || !errors.Is(err, syscall.ENOEXEC) {
 		return err
 	}
-	return fmt.Errorf("%w: %s", err, execFormatDiagnosis(execPathFromError(err)))
+	var explained explainedExecError
+	if errors.As(err, &explained) {
+		return err
+	}
+	return explainedExecError{fmt.Errorf("%w: %s", err, execFormatDiagnosis(execPathFromError(err)))}
 }
+
+// explainedExecError marks an error that already carries the diagnosis, so an
+// outer boundary can recognise its own work through any number of %w wraps.
+type explainedExecError struct{ error }
+
+func (e explainedExecError) Unwrap() error { return e.error }
 
 // execPathFromError recovers the executable path the OS refused to run.
 // os/exec reports a failed launch as *fs.PathError (fork/exec) and a failed
@@ -119,5 +133,12 @@ func npmPackagePostinstall(execPath string) (name, command string, ok bool) {
 	if name == "" {
 		name = filepath.Base(root)
 	}
-	return name, fmt.Sprintf("cd '%s' && %s", root, script), true
+	return name, fmt.Sprintf("cd %s && %s", shellQuote(root), script), true
+}
+
+// shellQuote makes an arbitrary path safe to paste into a POSIX shell. The
+// repair command is meant to be copied and run verbatim, so a path holding a
+// quote or a space has to survive the round trip intact.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

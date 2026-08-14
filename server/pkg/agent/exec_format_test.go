@@ -2,6 +2,7 @@ package agent
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -94,6 +95,50 @@ func TestExplainExecErrorFallsBackWithoutManifest(t *testing.T) {
 	}
 	if strings.Contains(msg, "cd '") {
 		t.Errorf("no manifest means no concrete repair command to offer:\n%s", msg)
+	}
+}
+
+// Boundaries nest: a backend preflight that already explained the error hands
+// it to the daemon's launch boundary, which explains errors too. The second
+// pass must not append a second copy of the same paragraph.
+func TestExplainExecErrorIsIdempotentAcrossNestedBoundaries(t *testing.T) {
+	_, execPath := writePlaceholderPackage(t, "@anthropic-ai/claude-code", "node install.cjs")
+
+	inner := ExplainExecError(enoexecError(execPath))
+	// The inner boundary wraps with %w on its way out, exactly as a backend
+	// does before returning to the daemon.
+	wrapped := fmt.Errorf("openclaw --version failed: %w", inner)
+	outer := ExplainExecError(wrapped)
+
+	if got := strings.Count(outer.Error(), "is not a runnable executable on"); got != 1 {
+		t.Errorf("diagnosis should appear exactly once, got %d:\n%s", got, outer.Error())
+	}
+	if outer.Error() != wrapped.Error() {
+		t.Errorf("re-explaining must leave the message untouched:\n got %s\nwant %s", outer.Error(), wrapped.Error())
+	}
+	if !errors.Is(outer, syscall.ENOEXEC) {
+		t.Errorf("ENOEXEC must survive both passes, got %v", outer)
+	}
+}
+
+func TestExplainExecErrorQuotesPathsForTheShell(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "it's a dir")
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	manifest := `{"name":"pkg","scripts":{"postinstall":"node install.cjs"}}`
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	msg := ExplainExecError(enoexecError(filepath.Join(binDir, "cli"))).Error()
+
+	// A single quote inside the path has to be closed, escaped, and reopened,
+	// or the command the user pastes runs against a different directory.
+	want := `cd '` + strings.ReplaceAll(root, "'", `'\''`) + `' && node install.cjs`
+	if !strings.Contains(msg, want) {
+		t.Errorf("repair command is not shell-safe, want %q in:\n%s", want, msg)
 	}
 }
 
