@@ -253,12 +253,13 @@ resolved on top of it at claim time, so what an agent actually runs with is:
 | --- | --- |
 | `null` (unset) | the workspace's servers |
 | declares ≥1 server | workspace servers **plus** its own; the agent wins on a name collision |
-| declares no server (`{}` or `{"mcpServers":{}}`) | nothing — the explicit "this agent runs with zero MCP" state also opts out of the workspace layer |
+| declares no server (`{}` or `{"mcpServers":{}}`) | none of the workspace's — the "no managed servers of my own" state also opts out of the workspace layer. The agent's RUNTIME-local servers still apply: the daemon merges runtime servers under whatever the claim carries |
 
 Two consequences worth knowing before writing an agent's config: an agent that
 should keep its own private server does NOT need to re-list the shared ones
-(they merge), and a config that declares no servers is the only way to give an
-agent no MCP at all once the workspace shares servers.
+(they merge), and a config that declares no servers is the only way to keep the
+workspace's servers away from an agent. That is not the same as "no MCP at all"
+— the runtime's own local servers are merged by the daemon either way.
 
 The merge also normalizes: an agent that stored its servers under the legacy
 top-level `mcp` container gets them folded into `mcpServers` in the resolved
