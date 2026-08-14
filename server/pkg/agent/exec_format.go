@@ -90,6 +90,31 @@ func execPathFromError(err error) string {
 // daemon can observe after the fact.
 const blockedPostinstallCauses = "npm 12 allowScripts, pnpm 10 approve-builds, --ignore-scripts, --omit=optional"
 
+// ExecFormatRepair is the machine-readable half of the diagnosis: which npm
+// package owns the unrunnable entry point, and the command that reinstalls its
+// native binary.
+//
+// The daemon reports this to the server when it takes a runtime offline, so the
+// UI can tell a user why their agent stopped and what to run — clients localize
+// the sentence around it, and only the daemon can know the path, so neither can
+// produce this pair alone. Empty Command means the layout was not recognised
+// and there is nothing more specific to offer than "reinstall the CLI".
+type ExecFormatRepair struct {
+	Package string `json:"package,omitempty"`
+	Command string `json:"command,omitempty"`
+}
+
+// ExecFormatRepairFor returns the repair for an executable the OS refuses to
+// run, or false when execPath is not an npm bin entry whose package declares a
+// postinstall.
+func ExecFormatRepairFor(execPath string) (ExecFormatRepair, bool) {
+	pkg, command, ok := npmPackagePostinstall(execPath)
+	if !ok {
+		return ExecFormatRepair{}, false
+	}
+	return ExecFormatRepair{Package: pkg, Command: command}, true
+}
+
 func execFormatDiagnosis(execPath string) string {
 	target := execPath
 	if target == "" {

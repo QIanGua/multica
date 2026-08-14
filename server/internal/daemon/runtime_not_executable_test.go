@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -35,12 +37,29 @@ func stubConfirmWindow(t *testing.T, window time.Duration) {
 	notExecutableConfirmWindow = window
 }
 
+// npmPackagedCLI stages the layout an npm-installed agent CLI has — a bin entry
+// under a package whose manifest declares the postinstall that was supposed to
+// replace it — so the daemon can derive a real repair command from it.
+func npmPackagedCLI(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "claude-code")
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	manifest := `{"name":"@anthropic-ai/claude-code","scripts":{"postinstall":"node install.cjs"}}`
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	return filepath.Join(root, "bin", "claude.exe")
+}
+
 func notExecutableDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	stubProbeRetry(t, time.Millisecond, time.Millisecond)
-	stubNotExecutableProbe(t, "/fake/claude")
+	execPath := npmPackagedCLI(t)
+	stubNotExecutableProbe(t, execPath)
 	d := freshDaemon("")
-	d.cfg.Agents = map[string]AgentEntry{"claude": {Path: "/fake/claude", Command: "claude"}}
+	d.cfg.Agents = map[string]AgentEntry{"claude": {Path: execPath, Command: "claude"}}
 	return d
 }
 
@@ -68,16 +87,24 @@ func TestDetectBuiltinRuntimes_NotExecutableDemotesOnlyAfterConfirmation(t *test
 	if _, ok := unavailable["claude"]; ok {
 		t.Errorf("second sighting = %v, want claude condemned, not held again", unavailable)
 	}
-	reason, ok := demotable["claude"]
+	verdict, ok := demotable["claude"]
 	if !ok {
 		t.Fatalf("second sighting did not condemn claude: %v", demotable)
 	}
 	// The reason is what /health shows and what the demotion logs, so it has to
 	// carry the repair instructions, not just the errno.
 	for _, want := range []string{"not executable", "postinstall"} {
-		if !strings.Contains(reason, want) {
-			t.Errorf("reason is missing %q, so the user still cannot act on it:\n%s", want, reason)
+		if !strings.Contains(verdict.reason, want) {
+			t.Errorf("reason is missing %q, so the user still cannot act on it:\n%s", want, verdict.reason)
 		}
+	}
+	// And the structured half the server stores: without a code the admission
+	// paths cannot tell this apart from a sleeping laptop.
+	if verdict.offline == nil || verdict.offline.Code != RuntimeOfflineCodeNotExecutable {
+		t.Fatalf("verdict carries no offline reason for the server: %+v", verdict.offline)
+	}
+	if verdict.offline.Repair == nil || !strings.Contains(verdict.offline.Repair.Command, "install.cjs") {
+		t.Errorf("offline reason lost the repair command: %+v", verdict.offline.Repair)
 	}
 }
 

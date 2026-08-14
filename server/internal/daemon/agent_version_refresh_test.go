@@ -375,7 +375,7 @@ func TestDemoteBelowMinimumRuntimes_DoesNotRaceTheHealthHandler(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 100; i++ {
-		d.demoteUnusableRuntimes(context.Background(), map[string]string{"codex": "0.0.1"})
+		d.demoteUnusableRuntimes(context.Background(), map[string]runtimeVerdict{"codex": {reason: "below minimum supported version: 0.0.1"}})
 	}
 	<-done
 
@@ -1316,7 +1316,7 @@ func TestClearProviderDemotions_KeepsHoldWhenEvidencePredatesTheVerdict(t *testi
 	sampledAfter := d.demotionSeqSnapshot()
 
 	d.mu.Lock()
-	d.markProvidersDemotedLocked(map[string]string{"codex": "0.0.1"})
+	d.markProvidersDemotedLocked(map[string]runtimeVerdict{"codex": {reason: "below minimum supported version: 0.0.1"}})
 	d.mu.Unlock()
 
 	d.clearProviderDemotions([]string{"codex"}, sampledAfter)
@@ -1369,7 +1369,7 @@ func TestDetectBuiltinRuntimes_StaleOKRoundDoesNotReleaseANewerHold(t *testing.T
 
 	// The downgrade is confirmed while that round is still in flight.
 	d.mu.Lock()
-	d.markProvidersDemotedLocked(map[string]string{"codex": "0.0.1"})
+	d.markProvidersDemotedLocked(map[string]runtimeVerdict{"codex": {reason: "below minimum supported version: 0.0.1"}})
 	d.mu.Unlock()
 
 	close(release)

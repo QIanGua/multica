@@ -890,10 +890,28 @@ func (h *Handler) GetDaemonWorkspaceRepos(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, workspaceReposResponse(workspaceID, ws.Repos, ws.Settings))
 }
 
+// setRuntimeOffline flips a runtime offline, recording the daemon's reason when
+// it sent one. An absent or unusable reason falls back to the plain offline
+// write: a malformed payload must never cost the caller the state change it
+// actually asked for.
+func (h *Handler) setRuntimeOffline(ctx context.Context, runtimeID pgtype.UUID, reason json.RawMessage) error {
+	if len(reason) > 0 && json.Valid(reason) {
+		return h.Queries.SetAgentRuntimeOfflineWithReason(ctx, db.SetAgentRuntimeOfflineWithReasonParams{
+			ID:            runtimeID,
+			OfflineReason: reason,
+		})
+	}
+	return h.Queries.SetAgentRuntimeOffline(ctx, runtimeID)
+}
+
 // DaemonDeregister marks runtimes as offline when the daemon shuts down.
 func (h *Handler) DaemonDeregister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RuntimeIDs []string `json:"runtime_ids"`
+		// OfflineReasons is optional and keyed by runtime id. Present only for
+		// causes the user must repair — a daemon shutting down sends none, so an
+		// older daemon simply keeps today's behaviour (MUL-6164).
+		OfflineReasons map[string]json.RawMessage `json:"offline_reasons"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -926,7 +944,7 @@ func (h *Handler) DaemonDeregister(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if err := h.Queries.SetAgentRuntimeOffline(r.Context(), rt.ID); err != nil {
+		if err := h.setRuntimeOffline(r.Context(), rt.ID, req.OfflineReasons[rid]); err != nil {
 			slog.Warn("deregister: failed to set offline", "runtime_id", rid, "error", err)
 			continue
 		}

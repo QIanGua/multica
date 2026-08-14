@@ -376,7 +376,7 @@ func (d *Daemon) refreshAgentVersions(ctx context.Context) {
 //
 // causes maps each condemned provider to the evidence against it, which is
 // already user-visible in skipped_agents and is what the log below reports.
-func (d *Daemon) demoteUnusableRuntimes(ctx context.Context, causes map[string]string) {
+func (d *Daemon) demoteUnusableRuntimes(ctx context.Context, causes map[string]runtimeVerdict) {
 	// Serialize with task claiming the way the restart paths do: the barrier
 	// only sets when no claim is in flight and no task is running, so a
 	// runtime is never deregistered under a task that is still executing —
@@ -398,6 +398,7 @@ func (d *Daemon) demoteUnusableRuntimes(ctx context.Context, causes map[string]s
 	// workspace's register lock — see deregisterDroppedRuntimes.
 	demotedByWorkspace := make(map[string][]string)
 	demotedProviders := make(map[string]string)
+	offlineReasons := make(map[string]RuntimeOfflineReason)
 	for workspaceID, ws := range d.workspaces {
 		// A fresh array, not ws.runtimeIDs[:0]: the health handler copies this
 		// slice header under d.mu and serializes it after releasing the lock
@@ -418,7 +419,13 @@ func (d *Daemon) demoteUnusableRuntimes(ctx context.Context, causes map[string]s
 			delete(d.runtimeIndex, rid)
 			demoted = append(demoted, rid)
 			demotedByWorkspace[workspaceID] = append(demotedByWorkspace[workspaceID], rid)
-			demotedProviders[rt.Provider] = cause
+			demotedProviders[rt.Provider] = cause.reason
+			// Carried to the server per runtime row: a client asking "why is my
+			// agent offline" reads it from there, and only this side knows both
+			// the verdict and the repair command (MUL-6164).
+			if cause.offline != nil {
+				offlineReasons[rid] = *cause.offline
+			}
 			// The runtime is gone, so the record of what was registered for it
 			// goes too. When the provider recovers, converge re-registers it and
 			// the record is re-seeded — first sighting is converge's job, not a
@@ -453,7 +460,7 @@ func (d *Daemon) demoteUnusableRuntimes(ctx context.Context, causes map[string]s
 	for _, workspaceID := range workspaceIDs {
 		_ = d.withWorkspaceRegisterLock(workspaceID, func() error {
 			d.deregisterDroppedRuntimes(ctx, workspaceID, demotedByWorkspace[workspaceID],
-				"agent CLI unusable")
+				"agent CLI unusable", offlineReasons)
 			return nil
 		})
 	}
@@ -484,7 +491,7 @@ func (d *Daemon) deregisterRevivedRuntimes(ctx context.Context, workspaceID stri
 	}
 	d.logger.Warn("register response revived a below-minimum runtime; taking it offline again",
 		"workspace_id", workspaceID, "runtime_ids", runtimeIDs)
-	if err := d.client.Deregister(ctx, runtimeIDs); err != nil {
+	if err := d.client.Deregister(ctx, runtimeIDs, nil); err != nil {
 		d.logger.Warn("deregister of revived below-minimum runtimes failed",
 			"workspace_id", workspaceID, "runtime_ids", runtimeIDs, "error", err)
 	}
@@ -503,12 +510,12 @@ func (d *Daemon) deregisterRevivedRuntimes(ctx context.Context, workspaceID stri
 //
 // Best-effort: the daemon has already stopped heartbeating these rows, so the
 // server's stale-heartbeat sweep is the backstop if the call fails.
-func (d *Daemon) deregisterDroppedRuntimes(ctx context.Context, workspaceID string, runtimeIDs []string, reason string) {
+func (d *Daemon) deregisterDroppedRuntimes(ctx context.Context, workspaceID string, runtimeIDs []string, reason string, offlineReasons map[string]RuntimeOfflineReason) {
 	runtimeIDs = d.untrackedRuntimeIDs(runtimeIDs)
 	if len(runtimeIDs) == 0 {
 		return
 	}
-	if err := d.client.Deregister(ctx, runtimeIDs); err != nil {
+	if err := d.client.Deregister(ctx, runtimeIDs, offlineReasons); err != nil {
 		d.logger.Warn("deregister of dropped runtimes failed",
 			"workspace_id", workspaceID, "runtime_ids", runtimeIDs, "reason", reason, "error", err)
 	}
