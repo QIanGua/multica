@@ -419,6 +419,31 @@ describe("McpConfigTab effective set", () => {
     expect(screen.queryByText("Overridden by Multica")).toBeNull();
   });
 
+  // Same transport hazard on the agent side, reached through the saved config
+  // rather than a summary: the form emits `type: "http"`, so an SSE entry must
+  // not be editable through it.
+  it("edits an agent's SSE server through JSON, not the form", async () => {
+    const user = userEvent.setup();
+    renderTab({
+      mcp_config: {
+        mcpServers: { streamy: { type: "sse", url: "https://sse.example" } },
+      },
+    });
+
+    await user.click(
+      screen.getByRole("button", { name: /edit mcp server streamy/i }),
+    );
+
+    expect(screen.getByRole("tab", { name: "JSON" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "Form" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
   it("says inheritance cannot be determined when mcp_config is redacted", async () => {
     workspaceMcp.data = {
       workspace_id: "ws-1",

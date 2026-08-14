@@ -245,8 +245,9 @@ Provider support is not uniform: Qwen Code accepts a managed `mcp_config` throug
 #### Workspace-level MCP servers
 
 A workspace can share one MCP document with every agent in it — from workspace
-Settings → MCP in the UI, or `multica workspace mcp get|list-only`, `set`,
-`add`, `remove` (owner/admin to write). The agent's own `mcp_config` is
+Settings → MCP in the UI, or on the CLI with `multica workspace mcp get` (lists
+the servers; the document itself is never returned) plus `set` / `add` /
+`remove`, which require owner or admin. The agent's own `mcp_config` is
 resolved on top of it at claim time, so what an agent actually runs with is:
 
 | Agent `mcp_config` | Effective set |

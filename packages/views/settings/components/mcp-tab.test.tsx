@@ -154,6 +154,36 @@ describe("McpTab", () => {
     expect(screen.getByLabelText("Command")).toBeInTheDocument();
   });
 
+  // Regression: the guided form only speaks stdio/http and REWRITES the entry
+  // on save (`type: "http"`), so editing an SSE server through it would change
+  // its protocol and can break the server. The server returns `sse`, so this is
+  // reachable, not hypothetical — those entries take the JSON path instead.
+  it.each(["sse", "websocket"])(
+    "edits a %s server through JSON, never the transport-rewriting form",
+    async (transport) => {
+      const user = userEvent.setup();
+      data.config = {
+        workspace_id: "workspace-1",
+        servers: [{ name: "streamy", transport, enabled: true }],
+        server_count: 1,
+      };
+      render(<McpTab />, { wrapper: Wrapper });
+
+      await user.click(screen.getByRole("button", { name: "Edit server" }));
+
+      expect(screen.getByRole("tab", { name: "JSON" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      // Not merely unselected: switching to the form would rewrite the entry.
+      expect(screen.getByRole("tab", { name: "Form" })).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+      expect(screen.queryByLabelText("Server URL")).toBeNull();
+    },
+  );
+
   it("removes a server after confirmation", async () => {
     const user = userEvent.setup();
     render(<McpTab />, { wrapper: Wrapper });

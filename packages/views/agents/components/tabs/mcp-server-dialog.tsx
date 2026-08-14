@@ -104,6 +104,18 @@ function recordFromPairs(pairs: KeyValue[]): Record<string, string> | undefined 
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
+/**
+ * The guided form can only express two transports, and saving from it REWRITES
+ * the entry (`configFromForm` emits `type: "http"` for anything non-stdio). An
+ * entry on any other transport — `sse` today, whatever a newer backend reports
+ * tomorrow — must therefore never be routed through the form, or editing it
+ * would silently change its protocol and can break the server outright.
+ * Those entries take the JSON path, which round-trips whatever is typed.
+ */
+function formCanExpressTransport(transport: string): boolean {
+  return transport === "stdio" || transport === "http";
+}
+
 function configFromForm(form: McpFormState): Record<string, unknown> {
   const config = { ...form.extras };
   if (form.transport === "stdio") {
@@ -134,6 +146,21 @@ function parseServerJson(text: string):
       error: error instanceof Error ? error.message : "invalid JSON",
     };
   }
+}
+
+/**
+ * Whether the guided form can edit this entry without changing it. The legacy
+ * `mcp` container is provider-native and must round-trip verbatim; so is any
+ * entry whose transport the form cannot express. When the caller could not read
+ * the saved config back, the safe summary's transport is the only signal.
+ */
+function formSupportsServer(server: ManagedMcpServer): boolean {
+  if (server.container === "mcp") return false;
+  const transport =
+    Object.keys(server.config).length > 0
+      ? mcpTransport(server.config)
+      : server.transport;
+  return formCanExpressTransport(transport);
 }
 
 export function McpServerDialog({
@@ -179,8 +206,12 @@ export function McpServerDialog({
           : { ...emptyForm(), transport: server.transport === "stdio" ? "stdio" : "http" },
     );
     setJsonText(JSON.stringify(config, null, 2));
-    setMode(server?.container === "mcp" ? "json" : "form");
+    setMode(server && !formSupportsServer(server) ? "json" : "form");
   }, [open, server]);
+
+  // The form is unavailable — not merely unselected — for entries it cannot
+  // represent, so switching to it cannot rewrite them either.
+  const formAvailable = !server || formSupportsServer(server);
 
   const jsonResult = useMemo(() => parseServerJson(jsonText), [jsonText]);
   const trimmedName = name.trim();
@@ -291,7 +322,7 @@ export function McpServerDialog({
 
         <Tabs value={mode} onValueChange={handleModeChange}>
           <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="form" disabled={server?.container === "mcp"}>
+            <TabsTrigger value="form" disabled={!formAvailable}>
               {t(($) => $.tab_body.mcp_config.dialog_form_tab)}
             </TabsTrigger>
             <TabsTrigger value="json">
