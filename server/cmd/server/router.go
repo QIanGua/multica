@@ -59,6 +59,7 @@ var corsAllowedHeaders = []string{
 	"Accept",
 	"Authorization",
 	"Content-Type",
+	"Idempotency-Key",
 	"X-Workspace-ID",
 	"X-Workspace-Slug",
 	"X-Request-ID",
