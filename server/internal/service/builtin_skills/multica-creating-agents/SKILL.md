@@ -242,6 +242,24 @@ Two ways `mcp_config` differs from `custom_env`:
 
 Provider support is not uniform: Qwen Code accepts a managed `mcp_config` through a daemon-owned 0600 temporary JSON file passed with `--mcp-config`; it is removed when the run exits. Leave the field unset (`null`) to inherit Qwen Code native settings.
 
+#### Workspace-level MCP servers
+
+A workspace can share one MCP document with every agent in it
+(`multica workspace mcp get|set`, owner/admin to write). The agent's own
+`mcp_config` is resolved on top of it at claim time, so what an agent actually
+runs with is:
+
+| Agent `mcp_config` | Effective set |
+| --- | --- |
+| `null` (unset) | the workspace's servers |
+| declares ≥1 server | workspace servers **plus** its own; the agent wins on a name collision |
+| declares no server (`{}`) | nothing — the explicit "this agent runs with zero MCP" state also opts out of the workspace layer |
+
+Two consequences worth knowing before writing an agent's config: an agent that
+should keep its own private server does NOT need to re-list the shared ones
+(they merge), and `{}` is the only way to give an agent no MCP at all once the
+workspace shares servers.
+
 ## Skill binding
 
 Creating an agent does NOT bind any workspace skill — binding is a separate

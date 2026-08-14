@@ -281,6 +281,7 @@ The tables below cover every current top-level command, grouped the way the CLI 
 | | `runs <id>` | View run history | |
 | | `trigger-add/trigger-update/trigger-delete/trigger-rotate-url` | Manage schedule and webhook triggers | |
 | `workspace` | `list/get/create/update/switch` | Manage workspaces; `switch` sets the current profile's default workspace | |
+| | `mcp get/set` | Read or replace the MCP servers shared by every agent in the workspace | `set` is owner/admin and replaces the whole document; `--mcp-config-file` / `--mcp-config-stdin` keep tokens out of shell history; `--mcp-config null` clears it |
 | | `member list/invite <email>` | View members, send invites | `invite`: `--role` (member or admin, default member) |
 | `repo` | `list/add/remove/checkout` | Manage workspace repositories and check them out locally | `--url` (repeatable); `checkout`: `--ref` |
 | `skill` | `list/get/create/update/delete` | Manage skills | |
