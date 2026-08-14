@@ -297,8 +297,21 @@ CLI 配置文件包含可代表你访问 Multica 的令牌。不要提交到仓�
 | `update` | — | 更新 CLI 到最新版本 | |
 | `version` | — | 查看版本信息 | `--output`（`text` 或 `json`） |
 
+## 在其他编码智能体里操作 Multica
+
+如果你的工作大多发生在 Codex、Claude Code 或 Cursor 里，可以直接在那里操作 Multica，
+不必切回终端。[Multica CLI skill](https://github.com/multica-ai/multica-cli)
+会教这些智能体安全地使用本页的命令：低成本地读 issue 和评论线程、通过文件写评论，
+以及正确处理 mention、状态变更和指派带来的副作用。
+
+它完全通过你已认证的 CLI 运行，本身不授予任何权限 —— 权限仍然只来自你的登录、
+所选 profile 和 workspace。要求 CLI 版本不低于 v0.4.26。该仓库的 README 说明了
+Claude Code 插件市场、Codex skill 安装器、Cursor 以及其他任何加载 Markdown 指令的
+工具的安装方式。
+
 ## 接下来
 
+- [Multica CLI skill](https://github.com/multica-ai/multica-cli) — 在 Codex、Claude Code 或 Cursor 里操作 Multica。
 - [认证与令牌](/auth-tokens) — PAT 的创建、续期和吊销。
 - [故障排查](/troubleshooting) — 命令报错和任务不开始的排查路径。
 - [创建和配置智能体](/agents-create) — `agent create` 各字段的完整语义。
