@@ -1812,7 +1812,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		if wsMcpConfig, err := h.Queries.GetWorkspaceMcpConfig(r.Context(), agent.WorkspaceID); err != nil {
 			slog.Warn("daemon claim: load workspace mcp_config failed; using agent mcp_config",
 				"task_id", uuidToString(task.ID), "workspace_id", uuidToString(agent.WorkspaceID), "error", err)
-		} else if resolved, err := resolveWorkspaceMcpConfig(json.RawMessage(wsMcpConfig), mcpConfig); err != nil {
+		} else if resolved, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsMcpConfig), mcpConfig); err != nil {
 			slog.Warn("daemon claim: resolve workspace mcp_config failed; falling back to agent mcp_config",
 				"task_id", uuidToString(task.ID), "workspace_id", uuidToString(agent.WorkspaceID), "error", err)
 		} else {

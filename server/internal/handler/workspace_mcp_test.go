@@ -78,11 +78,14 @@ func TestResolveWorkspaceMcpConfig(t *testing.T) {
 			},
 		},
 		{
-			name:      "an agent name in the legacy container still shadows the shared one",
+			// The legacy entry both shadows the shared one AND survives, now
+			// folded into the canonical container the daemon actually reads.
+			name:      "an agent name in the legacy container shadows the shared one and survives",
 			workspace: wsDoc,
 			agent:     `{"mcp":{"linear":{"url":"https://legacy-linear.example"}}}`,
 			wantServers: map[string]string{
 				"shared": "https://shared.example",
+				"linear": "https://legacy-linear.example",
 			},
 		},
 		{
@@ -109,9 +112,9 @@ func TestResolveWorkspaceMcpConfig(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveWorkspaceMcpConfig(json.RawMessage(tc.workspace), json.RawMessage(tc.agent))
+			got, err := ResolveWorkspaceMcpConfig(json.RawMessage(tc.workspace), json.RawMessage(tc.agent))
 			if err != nil {
-				t.Fatalf("resolveWorkspaceMcpConfig: unexpected error: %v", err)
+				t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
 			}
 			if tc.wantNil {
 				if got != nil {
@@ -145,9 +148,9 @@ func TestResolveWorkspaceMcpConfig_ZeroServerAgentOptsOut(t *testing.T) {
 
 	for _, agentCfg := range []string{`{}`, `{"mcpServers":{}}`, `{"mcp":{}}`} {
 		t.Run(agentCfg, func(t *testing.T) {
-			got, err := resolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+			got, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
 			if err != nil {
-				t.Fatalf("resolveWorkspaceMcpConfig: unexpected error: %v", err)
+				t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
 			}
 			if servers := decodeServers(t, got); len(servers) != 0 {
 				t.Fatalf("opted-out agent inherited %v", serverNames(servers))
@@ -162,30 +165,50 @@ func TestResolveWorkspaceMcpConfig_ZeroServerAgentOptsOut(t *testing.T) {
 	}
 }
 
-// The agent document owns the result's shape: anything it carries besides
-// `mcpServers` — a legacy `mcp` container, runtime-specific keys — has to
-// survive the merge untouched.
-func TestResolveWorkspaceMcpConfig_PreservesAgentTopLevelKeys(t *testing.T) {
+// The agent's servers must survive whichever container they were stored in,
+// and the result must be normalized onto `mcpServers`. This is the case that
+// regressed OpenCode agents: the daemon's runtime merge only falls back to the
+// legacy `mcp` container when `mcpServers` is absent, so leaving the agent's
+// entries behind in `mcp` while writing shared ones into `mcpServers` made the
+// daemon read the shared set and drop the agent's own servers entirely.
+func TestResolveWorkspaceMcpConfig_FoldsLegacyContainerIntoCanonical(t *testing.T) {
 	const wsDoc = `{"mcpServers":{"shared":{"url":"https://shared.example"}}}`
 	const agentCfg = `{"mcp":{"legacy":{"command":"legacy-server"}},"inputs":[{"id":"token"}]}`
 
-	got, err := resolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+	got, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
 	if err != nil {
-		t.Fatalf("resolveWorkspaceMcpConfig: unexpected error: %v", err)
+		t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
 	}
 	var doc map[string]any
 	if err := json.Unmarshal(got, &doc); err != nil {
 		t.Fatalf("unmarshal merged document: %v", err)
 	}
-	legacy, _ := doc["mcp"].(map[string]any)
-	if _, ok := legacy["legacy"]; !ok {
-		t.Errorf("merge dropped the agent's legacy mcp container: %s", got)
+	if _, ok := doc["mcp"]; ok {
+		t.Errorf("legacy container must be consumed, not left beside mcpServers: %s", got)
 	}
 	if _, ok := doc["inputs"]; !ok {
 		t.Errorf("merge dropped the agent's non-server top-level key: %s", got)
 	}
-	if servers := decodeServers(t, got); len(servers) != 1 || servers["shared"] == nil {
-		t.Errorf("expected the shared server to be folded in, got %v", serverNames(servers))
+	servers := decodeServers(t, got)
+	if len(servers) != 2 || servers["shared"] == nil || servers["legacy"] == nil {
+		t.Fatalf("effective server set = %v, want shared + legacy", serverNames(servers))
+	}
+}
+
+// A name present in BOTH containers resolves to the canonical entry — the
+// precedence the agent settings UI already displays.
+func TestResolveWorkspaceMcpConfig_CanonicalContainerWinsOverLegacy(t *testing.T) {
+	const wsDoc = `{"mcpServers":{"shared":{"url":"https://shared.example"}}}`
+	const agentCfg = `{"mcpServers":{"dup":{"url":"https://canonical.example"}},"mcp":{"dup":{"url":"https://legacy.example"}}}`
+
+	got, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+	if err != nil {
+		t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
+	}
+	servers := decodeServers(t, got)
+	dup, _ := servers["dup"].(map[string]any)
+	if dup["url"] != "https://canonical.example" {
+		t.Fatalf("dup url = %v, want the canonical container to win", dup["url"])
 	}
 }
 
@@ -196,7 +219,7 @@ func TestResolveWorkspaceMcpConfig_MalformedWorkspaceKeepsAgentConfig(t *testing
 
 	for _, wsDoc := range []string{`{"mcpServers":[]}`, `not json`, `{"mcpServers":{"broken":"not-an-object"}}`} {
 		t.Run(wsDoc, func(t *testing.T) {
-			got, err := resolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+			got, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
 			if err == nil {
 				t.Fatalf("expected an error for workspace document %s", wsDoc)
 			}
@@ -214,9 +237,9 @@ func TestResolveWorkspaceMcpConfig_ComposesWithTaskOverlay(t *testing.T) {
 	const agentCfg = `{"mcpServers":{"private":{"url":"https://private.example"}}}`
 	const overlay = `{"mcpServers":{"composio":{"url":"https://session-composio.example"}}}`
 
-	resolved, err := resolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+	resolved, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
 	if err != nil {
-		t.Fatalf("resolveWorkspaceMcpConfig: unexpected error: %v", err)
+		t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
 	}
 	merged, err := mergeMCPOverlay(resolved, json.RawMessage(overlay))
 	if err != nil {

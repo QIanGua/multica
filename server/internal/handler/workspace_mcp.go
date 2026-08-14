@@ -15,7 +15,7 @@ import (
 // `mcpServers` is ever written.
 var mcpServerContainers = [...]string{"mcpServers", "mcp"}
 
-// resolveWorkspaceMcpConfig layers the workspace's shared MCP document UNDER
+// ResolveWorkspaceMcpConfig layers the workspace's shared MCP document UNDER
 // an agent's own mcp_config and returns the agent's effective configuration.
 // It runs before the per-task overlay (mergeMCPOverlay), so the full
 // precedence chain on a claim is:
@@ -46,16 +46,22 @@ var mcpServerContainers = [...]string{"mcpServers", "mcp"}
 //     empty workspace document can never flip inheriting agents into the
 //     managed-empty mode that suppresses their runtime's own MCP servers.
 //
-// Shape: the AGENT document owns the result's top-level keys — its legacy
-// `mcp` container and any runtime-specific keys survive untouched, and shared
-// servers are folded into `mcpServers`. A workspace server is skipped when the
-// agent already declares that name in EITHER container, so merging can never
-// produce the same server twice under two spellings.
+// Shape: the AGENT document owns the result's top-level keys, and the merged
+// result is NORMALIZED onto the canonical `mcpServers` container. Normalizing
+// is mandatory, not cosmetic: the daemon's own runtime merge only falls back
+// to the legacy top-level `mcp` container when `mcpServers` is ABSENT
+// (`internal/daemon/runtime_mcp.go`), so writing shared servers into
+// `mcpServers` while leaving an agent's legacy entries beside them would make
+// the daemon read the shared set and silently drop that agent's own servers.
+// Folding both containers into one is what keeps a legacy OpenCode agent
+// running with everything it had. A workspace server is skipped when the agent
+// declares that name in EITHER container, so the merge can never produce the
+// same server twice.
 //
 // Failure mode matches mergeMCPOverlay: on malformed input the agent config is
 // returned unchanged along with the error. A bad shared document must never
 // take away servers an agent runs with today.
-func resolveWorkspaceMcpConfig(workspaceMcpConfig, agentMcpConfig json.RawMessage) (json.RawMessage, error) {
+func ResolveWorkspaceMcpConfig(workspaceMcpConfig, agentMcpConfig json.RawMessage) (json.RawMessage, error) {
 	if !hasManagedJSON(workspaceMcpConfig) {
 		return passthroughAgentMcpConfig(agentMcpConfig), nil
 	}
@@ -94,12 +100,8 @@ func resolveWorkspaceMcpConfig(workspaceMcpConfig, agentMcpConfig json.RawMessag
 	if err != nil {
 		return passthroughAgentMcpConfig(agentMcpConfig), fmt.Errorf("resolve workspace mcp_config: workspace mcpServers: %w", err)
 	}
-	agentOwn, err := unmarshalServerMap(agentDoc["mcpServers"])
-	if err != nil {
-		return passthroughAgentMcpConfig(agentMcpConfig), fmt.Errorf("resolve workspace mcp_config: agent mcpServers: %w", err)
-	}
 
-	merged := make(map[string]json.RawMessage, len(shared)+len(agentOwn))
+	merged := make(map[string]json.RawMessage, len(shared)+len(agentServers))
 	for name, server := range shared {
 		// The agent may declare this name in the legacy container instead;
 		// agentServers spans both, so this check covers each spelling.
@@ -108,13 +110,25 @@ func resolveWorkspaceMcpConfig(workspaceMcpConfig, agentMcpConfig json.RawMessag
 		}
 		merged[name] = server
 	}
-	for name, server := range agentOwn {
-		merged[name] = server
+	// Fold the agent's own entries in, legacy container first so a name
+	// present in both resolves to the canonical one — the precedence the
+	// agent settings UI already shows (mcp-config-model.ts reads `mcpServers`
+	// before `mcp`).
+	for _, container := range [...]string{"mcp", "mcpServers"} {
+		own, err := unmarshalServerMap(agentDoc[container])
+		if err != nil {
+			return passthroughAgentMcpConfig(agentMcpConfig), fmt.Errorf("resolve workspace mcp_config: agent %s: %w", container, err)
+		}
+		for name, server := range own {
+			merged[name] = server
+		}
 	}
 
 	out := make(map[string]json.RawMessage, len(agentDoc)+1)
 	for k, v := range agentDoc {
-		if k == "mcpServers" {
+		// Both containers are consumed into the canonical map above; leaving
+		// the legacy key behind would hand the daemon a second, stale copy.
+		if k == "mcpServers" || k == "mcp" {
 			continue
 		}
 		out[k] = v
