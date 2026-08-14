@@ -140,12 +140,19 @@ export function McpServerDialog({
   open,
   server,
   existingNames,
+  lockName = false,
   onOpenChange,
   onSave,
 }: {
   open: boolean;
   server: ManagedMcpServer | null;
   existingNames: Set<string>;
+  /**
+   * Pins the name while editing. Callers whose backend has no atomic rename
+   * must set this: letting the field change would turn "save" into "create a
+   * second server" and silently leave the original behind.
+   */
+  lockName?: boolean;
   onOpenChange: (open: boolean) => void;
   onSave: (name: string, config: Record<string, unknown>) => Promise<void>;
 }) {
@@ -160,7 +167,17 @@ export function McpServerDialog({
     if (!open) return;
     const config = server?.config ?? {};
     setName(server?.name ?? "");
-    setForm(server ? formFromConfig(config) : emptyForm());
+    // A caller that cannot read the saved entry back (the workspace layer is
+    // write-only) passes an empty config with the transport from the safe
+    // summary. Seeding from `formFromConfig({})` there would open an http form
+    // for a known stdio server, so take the transport from the summary.
+    setForm(
+      !server
+        ? emptyForm()
+        : Object.keys(config).length > 0
+          ? formFromConfig(config)
+          : { ...emptyForm(), transport: server.transport === "stdio" ? "stdio" : "http" },
+    );
     setJsonText(JSON.stringify(config, null, 2));
     setMode(server?.container === "mcp" ? "json" : "form");
   }, [open, server]);
@@ -261,7 +278,15 @@ export function McpServerDialog({
             onChange={(event) => setName(event.target.value)}
             placeholder={t(($) => $.tab_body.mcp_config.dialog_name_placeholder)}
             aria-invalid={nameError !== null || undefined}
+            readOnly={lockName}
+            aria-readonly={lockName || undefined}
+            className={lockName ? "text-muted-foreground" : undefined}
           />
+          {lockName ? (
+            <p className="text-caption text-muted-foreground">
+              {t(($) => $.tab_body.mcp_config.dialog_name_locked)}
+            </p>
+          ) : null}
         </div>
 
         <Tabs value={mode} onValueChange={handleModeChange}>

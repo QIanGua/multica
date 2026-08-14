@@ -110,6 +110,50 @@ describe("McpTab", () => {
     expect(call.entry).not.toHaveProperty("mcpServers");
   });
 
+  // Regression: the shared dialog lets the name be edited, and the API has no
+  // atomic rename. Without pinning the name, "editing" linear to linear-v2
+  // would create a second server, leave linear behind, and still toast
+  // "updated".
+  it("pins the name while editing so a rename cannot orphan the original", async () => {
+    const user = userEvent.setup();
+    render(<McpTab />, { wrapper: Wrapper });
+
+    await user.click(screen.getAllByRole("button", { name: "Edit server" })[0]!);
+
+    const nameInput = screen.getByLabelText("Name") as HTMLInputElement;
+    expect(nameInput.value).toBe("linear");
+    expect(nameInput).toHaveAttribute("readonly");
+
+    // Even if something did change the field, the upsert targets the entry
+    // that was opened.
+    await user.type(screen.getByLabelText("Server URL"), "https://linear-v2.example");
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() =>
+      expect(mockUpsert).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "linear" }),
+      ),
+    );
+    expect(mockUpsert).toHaveBeenCalledTimes(1);
+  });
+
+  // The saved entry cannot be read back, but the safe summary still knows the
+  // transport — so the empty form must open on the right one instead of
+  // defaulting a stdio server to HTTP.
+  it("opens the edit form on the server's own transport", async () => {
+    const user = userEvent.setup();
+    render(<McpTab />, { wrapper: Wrapper });
+
+    // Row 1 is the stdio server.
+    await user.click(screen.getAllByRole("button", { name: "Edit server" })[1]!);
+
+    expect(screen.getByRole("button", { name: "STDIO" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByLabelText("Command")).toBeInTheDocument();
+  });
+
   it("removes a server after confirmation", async () => {
     const user = userEvent.setup();
     render(<McpTab />, { wrapper: Wrapper });

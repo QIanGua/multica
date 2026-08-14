@@ -62,19 +62,22 @@ export function McpTab() {
   );
 
   const [editorOpen, setEditorOpen] = useState(false);
-  const [editingName, setEditingName] = useState<string | null>(null);
+  const [editingServer, setEditingServer] = useState<WorkspaceMcpServer | null>(
+    null,
+  );
   const [deletingName, setDeletingName] = useState<string | null>(null);
 
   // The dialog is shared with the agent MCP tab, which hands it the saved
   // entry to prefill. Here there is nothing to prefill — an edit always
-  // starts from an empty form and REPLACES the entry.
-  const dialogServer: ManagedMcpServer | null = editingName
+  // starts from an empty form and REPLACES the entry. The transport still
+  // comes from the safe summary so the form opens on the right one.
+  const dialogServer: ManagedMcpServer | null = editingServer
     ? {
-        name: editingName,
+        name: editingServer.name,
         config: {},
         container: "mcpServers",
-        transport: "unknown",
-        enabled: true,
+        transport: editingServer.transport,
+        enabled: editingServer.enabled,
       }
     : null;
 
@@ -82,10 +85,14 @@ export function McpTab() {
     name: string,
     config: Record<string, unknown>,
   ) => {
+    // The name is pinned while editing (see lockName below), so an edit can
+    // only ever replace the entry it opened — never create a second one and
+    // leave the original behind while reporting "updated".
+    const targetName = editingServer ? editingServer.name : name;
     try {
-      await upsertServer.mutateAsync({ name, entry: config });
+      await upsertServer.mutateAsync({ name: targetName, entry: config });
       toast.success(
-        editingName
+        editingServer
           ? t(($) => $.mcp.updated_toast)
           : t(($) => $.mcp.added_toast),
       );
@@ -127,7 +134,7 @@ export function McpTab() {
             <Button
               size="sm"
               onClick={() => {
-                setEditingName(null);
+                setEditingServer(null);
                 setEditorOpen(true);
               }}
             >
@@ -160,7 +167,7 @@ export function McpTab() {
                   server={server}
                   canManage={canManage}
                   onEdit={() => {
-                    setEditingName(server.name);
+                    setEditingServer(server);
                     setEditorOpen(true);
                   }}
                   onDelete={() => setDeletingName(server.name)}
@@ -180,6 +187,9 @@ export function McpTab() {
         open={editorOpen}
         server={dialogServer}
         existingNames={existingNames}
+        // No atomic rename exists on this API: renaming would add a server
+        // and orphan the old one, so editing pins the name.
+        lockName={editingServer !== null}
         onOpenChange={setEditorOpen}
         onSave={handleSaveServer}
       />
