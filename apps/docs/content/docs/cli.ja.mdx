@@ -260,7 +260,7 @@ CLI の設定ファイルには、あなたとして Multica にアクセスで�
 | | `runs <id>` | 実行履歴を表示 | |
 | | `trigger-add/trigger-update/trigger-delete/trigger-rotate-url` | スケジュールと webhook のトリガーを管理 | |
 | `workspace` | `list/get/create/update/switch` | ワークスペースを管理。`switch` は現在のプロファイルのデフォルトワークスペースを設定 | |
-| | `mcp get/set` | ワークスペース内の全エージェントで共有する MCP サーバー設定を読み取り・置換 | `set` は owner/admin のみ、ドキュメント全体を置換。`--mcp-config-file` / `--mcp-config-stdin` はトークンをシェル履歴から守る。`--mcp-config null` で削除 |
+| | `mcp get/set/add/remove` | ワークスペース内の全エージェントで共有する MCP サーバーを管理 | 書き込みは owner/admin のみ。`get` は名前と transport のみを表示し、保存された設定は書き込み専用でどのロールにも返らない。`set` はドキュメント全体を置換（`--mcp-config-file` / `--mcp-config-stdin` はトークンをシェル履歴から守る。`--mcp-config null` で削除）。`add <name>` / `remove <name>` はドキュメント全体を持たずに 1 つのサーバーだけを変更 |
 | | `member list/invite <email>` | メンバーの表示と招待 | `invite`: `--role`（member または admin。デフォルトは member） |
 | `repo` | `list/add/remove/checkout` | ワークスペースのリポジトリを管理し、ローカルにチェックアウト | `--url`（繰り返し可）；`checkout`: `--ref` |
 | `skill` | `list/get/create/update/delete` | スキルを管理 | |

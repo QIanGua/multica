@@ -244,21 +244,32 @@ Provider support is not uniform: Qwen Code accepts a managed `mcp_config` throug
 
 #### Workspace-level MCP servers
 
-A workspace can share one MCP document with every agent in it
-(`multica workspace mcp get|set`, owner/admin to write). The agent's own
-`mcp_config` is resolved on top of it at claim time, so what an agent actually
-runs with is:
+A workspace can share one MCP document with every agent in it — from workspace
+Settings → MCP in the UI, or `multica workspace mcp get|list-only`, `set`,
+`add`, `remove` (owner/admin to write). The agent's own `mcp_config` is
+resolved on top of it at claim time, so what an agent actually runs with is:
 
 | Agent `mcp_config` | Effective set |
 | --- | --- |
 | `null` (unset) | the workspace's servers |
 | declares ≥1 server | workspace servers **plus** its own; the agent wins on a name collision |
-| declares no server (`{}`) | nothing — the explicit "this agent runs with zero MCP" state also opts out of the workspace layer |
+| declares no server (`{}` or `{"mcpServers":{}}`) | nothing — the explicit "this agent runs with zero MCP" state also opts out of the workspace layer |
 
 Two consequences worth knowing before writing an agent's config: an agent that
 should keep its own private server does NOT need to re-list the shared ones
-(they merge), and `{}` is the only way to give an agent no MCP at all once the
-workspace shares servers.
+(they merge), and a config that declares no servers is the only way to give an
+agent no MCP at all once the workspace shares servers.
+
+The merge also normalizes: an agent that stored its servers under the legacy
+top-level `mcp` container gets them folded into `mcpServers` in the resolved
+payload, because the daemon's runtime merge only reads the legacy container
+when `mcpServers` is absent.
+
+The workspace document itself is **write-only** — `GET` returns only the
+server names / transports, never urls, commands, headers, or env, for any
+role. That is why editing one shared server goes through
+`PUT /api/workspaces/{id}/mcp-config/servers/{name}` (`workspace mcp add`)
+rather than a read-modify-write of the whole document.
 
 ## Skill binding
 
