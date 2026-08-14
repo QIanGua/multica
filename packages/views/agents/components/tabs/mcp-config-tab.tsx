@@ -74,13 +74,28 @@ export function McpConfigTab({
   );
   const workspaceServers = workspaceMcpQuery.data?.servers ?? [];
   // The resolution contract's opt-out: an agent whose saved configuration
-  // declares NO servers runs with zero MCP and inherits nothing. `null` /
-  // absent means "not configured at the agent layer", which DOES inherit —
-  // so key this off a present-but-empty document, not off an empty list.
+  // declares NO servers inherits none of the workspace's. `null` / absent
+  // means "not configured at the agent layer", which DOES inherit — so key
+  // this off a present-but-empty document, not off an empty list.
   const optedOutOfWorkspace =
+    !redacted &&
     agent.mcp_config !== null &&
     agent.mcp_config !== undefined &&
     managedServers.length === 0;
+  // When mcp_config is redacted this view cannot tell an explicit empty
+  // document (opted out) from one that overrides some names, so it must not
+  // claim either. Everything inheritance-related below says "unknown".
+  const inheritsWorkspace = !redacted && !optedOutOfWorkspace;
+  // Names that shadow a runtime server in the effective set. The daemon merges
+  // runtime < (workspace + agent), so a shared server hides a same-named
+  // runtime one too — marking only the agent's names under-reports it.
+  const effectiveNames = useMemo(() => {
+    const names = new Set(managedNames);
+    if (inheritsWorkspace) {
+      for (const server of workspaceServers) names.add(server.name);
+    }
+    return names;
+  }, [managedNames, inheritsWorkspace, workspaceServers]);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ManagedMcpServer | null>(
     null,
@@ -210,7 +225,9 @@ export function McpConfigTab({
             {t(($) => $.tab_body.mcp_config.workspace_hint)}
           </p>
         </div>
-        {optedOutOfWorkspace ? (
+        {redacted ? (
+          <McpNotice text={t(($) => $.tab_body.mcp_config.workspace_unknown)} />
+        ) : optedOutOfWorkspace ? (
           <McpNotice text={t(($) => $.tab_body.mcp_config.workspace_opted_out)} />
         ) : workspaceMcpQuery.isLoading ? (
           <McpNotice
@@ -295,7 +312,7 @@ export function McpConfigTab({
               transport: server.transport || "unknown",
               enabled: server.enabled,
               source: server.source,
-              overridden: managedNames.has(server.name),
+              overridden: effectiveNames.has(server.name),
             }))}
             disabledLabel={t(($) => $.tab_body.mcp_config.runtime_disabled_badge)}
             overriddenLabel={t(($) => $.tab_body.mcp_config.runtime_overridden_badge)}

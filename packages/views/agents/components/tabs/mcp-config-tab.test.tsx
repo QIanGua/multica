@@ -358,7 +358,7 @@ describe("McpConfigTab workspace inheritance", () => {
     renderTab({ mcp_config: {} });
 
     expect(
-      await screen.findByText(/runs with zero MCP servers/),
+      await screen.findByText(/inherits none of the workspace/i),
     ).toBeInTheDocument();
     // The shared server must NOT be listed as inherited: this agent opted out.
     expect(screen.queryByText("shared-linear")).toBeNull();
@@ -370,5 +370,68 @@ describe("McpConfigTab workspace inheritance", () => {
     expect(
       await screen.findByText(/workspace shares no MCP servers/),
     ).toBeInTheDocument();
+  });
+});
+
+// The runtime section's Overridden badge has to reflect the REAL precedence —
+// runtime < workspace < agent — and the whole inheritance story has to go
+// quiet when the agent's own config is hidden from this viewer.
+describe("McpConfigTab effective set", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workspaceMcp.data = { workspace_id: "ws-1", servers: [], server_count: 0 };
+  });
+
+  it("marks a runtime server shadowed by a workspace server as overridden", async () => {
+    workspaceMcp.data = {
+      workspace_id: "ws-1",
+      servers: [{ name: "fetch", transport: "http", enabled: true }],
+      server_count: 1,
+    };
+    mockRuntimeCapabilities.mockResolvedValue({
+      mcpSupported: true,
+      mcpServers: [{ name: "fetch", transport: "stdio", enabled: true, source: "runtime" }],
+    });
+    renderTab({ mcp_config: null }, vi.fn(), onlineRuntime);
+
+    // The shared server hides the runtime's same-named one, even though the
+    // agent itself declares nothing.
+    expect(
+      await screen.findByText("Overridden by Multica"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not mark a runtime server overridden when the agent opted out", async () => {
+    workspaceMcp.data = {
+      workspace_id: "ws-1",
+      servers: [{ name: "fetch", transport: "http", enabled: true }],
+      server_count: 1,
+    };
+    mockRuntimeCapabilities.mockResolvedValue({
+      mcpSupported: true,
+      mcpServers: [{ name: "fetch", transport: "stdio", enabled: true, source: "runtime" }],
+    });
+    renderTab({ mcp_config: {} }, vi.fn(), onlineRuntime);
+
+    expect(
+      await screen.findByText(/inherits none of the workspace/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Overridden by Multica")).toBeNull();
+  });
+
+  it("says inheritance cannot be determined when mcp_config is redacted", async () => {
+    workspaceMcp.data = {
+      workspace_id: "ws-1",
+      servers: [{ name: "shared-linear", transport: "http", enabled: true }],
+      server_count: 1,
+    };
+    renderTab({ mcp_config: null, mcp_config_redacted: true });
+
+    expect(
+      await screen.findByText(/cannot be determined/i),
+    ).toBeInTheDocument();
+    // Claiming the agent inherits these would be a guess: a hidden config may
+    // be an explicit empty document, or may override some of these names.
+    expect(screen.queryByText("shared-linear")).toBeNull();
   });
 });
