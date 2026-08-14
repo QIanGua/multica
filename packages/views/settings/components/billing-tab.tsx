@@ -517,6 +517,8 @@ function BillingTabContent() {
     selectedPrice?.intervalCount === 1 && formattedUnitPrice !== null;
   const hasDisplayableEstimatedTotal =
     hasDisplayableUnitPrice && formattedEstimatedTotal !== null;
+  const isPriceUnavailable =
+    !pricesQuery.isLoading && !hasDisplayableUnitPrice;
 
   return (
     <SettingsTab
@@ -701,6 +703,22 @@ function BillingTabContent() {
                 <p className="max-w-[65ch] text-caption leading-5 text-muted-foreground">
                   {t(($) => $.workspace.upgrade.price_at_checkout)}
                 </p>
+                {isPriceUnavailable ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={pricesQuery.isFetching}
+                    onClick={() => void pricesQuery.refetch()}
+                  >
+                    {pricesQuery.isFetching ? (
+                      <Loader2 className="animate-spin" />
+                    ) : (
+                      <RefreshCw />
+                    )}
+                    {t(($) => $.workspace.actions.retry)}
+                  </Button>
+                ) : null}
               </div>
               {canManage ? (
                 <Button

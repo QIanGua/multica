@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   portal: vi.fn(),
   reconcile: vi.fn(),
   refetch: vi.fn(),
+  refetchPrices: vi.fn(),
   openExternal: vi.fn(),
   role: "owner" as "owner" | "admin" | "member",
   workspaceId: "workspace-1",
@@ -30,6 +31,7 @@ const mocks = vi.hoisted(() => ({
     };
   } | null,
   pricesLoading: false,
+  pricesFetching: false,
   pricesError: false,
   entitlements: {
     workspaceId: "workspace-1",
@@ -121,6 +123,7 @@ describe("BillingTab", () => {
       },
     };
     mocks.pricesLoading = false;
+    mocks.pricesFetching = false;
     mocks.pricesError = false;
     Object.assign(mocks.entitlements, {
       plan: "free",
@@ -138,7 +141,9 @@ describe("BillingTab", () => {
         return {
           data: mocks.prices,
           isLoading: mocks.pricesLoading,
+          isFetching: mocks.pricesFetching,
           isError: mocks.pricesError,
+          refetch: mocks.refetchPrices,
         };
       }
       return {
@@ -250,6 +255,9 @@ describe("BillingTab", () => {
         ),
       ).toBeInTheDocument();
       expect(screen.queryByText(/\$0/)).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Retry" }));
+      expect(mocks.refetchPrices).toHaveBeenCalledOnce();
 
       await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
       await user.click(
