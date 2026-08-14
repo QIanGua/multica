@@ -12,7 +12,6 @@ const mocks = vi.hoisted(() => ({
   portal: vi.fn(),
   reconcile: vi.fn(),
   refetch: vi.fn(),
-  refetchPrices: vi.fn(),
   openExternal: vi.fn(),
   role: "owner" as "owner" | "admin" | "member",
   workspaceId: "workspace-1",
@@ -30,7 +29,7 @@ const mocks = vi.hoisted(() => ({
       intervalCount: number;
     };
   } | null,
-  pricesPending: false,
+  pricesLoading: false,
   pricesError: false,
   entitlements: {
     workspaceId: "workspace-1",
@@ -121,7 +120,7 @@ describe("BillingTab", () => {
         intervalCount: 1,
       },
     };
-    mocks.pricesPending = false;
+    mocks.pricesLoading = false;
     mocks.pricesError = false;
     Object.assign(mocks.entitlements, {
       plan: "free",
@@ -138,9 +137,8 @@ describe("BillingTab", () => {
       if (queryKey?.[queryKey.length - 1] === "prices") {
         return {
           data: mocks.prices,
-          isPending: mocks.pricesPending,
+          isLoading: mocks.pricesLoading,
           isError: mocks.pricesError,
-          refetch: mocks.refetchPrices,
         };
       }
       return {
@@ -215,16 +213,19 @@ describe("BillingTab", () => {
     expect(
       formatStripeMinorAmount(500, "ugx", "en-US")?.replace(/\s/g, " "),
     ).toBe("UGX 5");
+    expect(
+      formatStripeMinorAmount(1234, "huf", "en-US")?.replace(/\s/g, " "),
+    ).toBe("HUF 12.34");
   });
 
   it("shows a local price skeleton without blocking Checkout while prices load", () => {
     mocks.prices = null;
-    mocks.pricesPending = true;
+    mocks.pricesLoading = true;
 
     renderWithI18n(<BillingTab />);
 
     expect(
-      screen.getByLabelText("Loading subscription prices"),
+      screen.getByRole("status", { name: "Loading subscription prices" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Upgrade to Pro" }),
@@ -270,6 +271,27 @@ describe("BillingTab", () => {
         queryKey: ["workspace-subscriptions", "workspace-2", "prices"],
       }),
     );
+  });
+
+  it("shows the unit price without a zero estimated total when seats are unavailable", () => {
+    mocks.entitlements.seats = 0;
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("$10.00 per human seat")).toBeInTheDocument();
+    expect(screen.queryByText(/Estimated monthly total/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\$0/)).not.toBeInTheDocument();
+  });
+
+  it("does not display a price whose recurrence is not every one interval", () => {
+    if (mocks.prices) mocks.prices.month.intervalCount = 3;
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.queryByText("$10.00 per human seat")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/Stripe Checkout shows the authoritative per-seat price/),
+    ).toBeInTheDocument();
   });
 
   it("creates Checkout with a client idempotency key and opens Stripe externally", async () => {
@@ -441,6 +463,12 @@ describe("BillingTab", () => {
     expect(
       screen.queryByRole("button", { name: "Upgrade to Pro" }),
     ).not.toBeInTheDocument();
+    expect(mocks.useQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        queryKey: ["workspace-subscriptions", "workspace-1", "prices"],
+        enabled: false,
+      }),
+    );
   });
 
   it("keeps the billing portal available for a canceled Pro period", () => {

@@ -2260,7 +2260,7 @@ const WorkspaceSubscriptionPriceSchema = (
       // quote a yearly amount as a monthly one — the schema is an independent
       // boundary, so it checks the correspondence itself.
       interval: z.literal(expected),
-      interval_count: z.number().int().positive(),
+      interval_count: z.literal(1),
     })
     .loose()
     .transform(

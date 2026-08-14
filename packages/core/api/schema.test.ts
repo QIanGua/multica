@@ -977,4 +977,14 @@ describe("workspace subscription contract", () => {
     });
     expect(await client.getWorkspaceSubscriptionPrices()).toBeNull();
   });
+
+  it("rejects a prices response whose interval count is not one", async () => {
+    stubFetchJson({
+      month: { currency: "usd", unit_amount: 2000, interval: "month", interval_count: 3 },
+      year: { currency: "usd", unit_amount: 20000, interval: "year", interval_count: 1 },
+    });
+    const client = new ApiClient("https://api.example.test");
+
+    expect(await client.getWorkspaceSubscriptionPrices()).toBeNull();
+  });
 });
