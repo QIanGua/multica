@@ -1803,6 +1803,21 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		if agent.McpConfig != nil {
 			mcpConfig = json.RawMessage(agent.McpConfig)
 		}
+		// Layer the workspace's shared MCP document UNDER the agent's own
+		// config (GH #6062). Read on every claim, exactly like the agent
+		// column, so an admin's edit reaches every agent on its next task
+		// without restarting anything. Errors — including a failed read —
+		// leave the agent config untouched: a broken or unreachable shared
+		// document must never take away servers the agent runs with today.
+		if wsMcpConfig, err := h.Queries.GetWorkspaceMcpConfig(r.Context(), agent.WorkspaceID); err != nil {
+			slog.Warn("daemon claim: load workspace mcp_config failed; using agent mcp_config",
+				"task_id", uuidToString(task.ID), "workspace_id", uuidToString(agent.WorkspaceID), "error", err)
+		} else if resolved, err := resolveWorkspaceMcpConfig(json.RawMessage(wsMcpConfig), mcpConfig); err != nil {
+			slog.Warn("daemon claim: resolve workspace mcp_config failed; falling back to agent mcp_config",
+				"task_id", uuidToString(task.ID), "workspace_id", uuidToString(agent.WorkspaceID), "error", err)
+		} else {
+			mcpConfig = resolved
+		}
 		// Layer the per-task overlay (set at enqueue from the initiator
 		// user's active integrations — currently Composio) on top of the
 		// agent's saved mcp_config. Overlay wins on server-name collisions
