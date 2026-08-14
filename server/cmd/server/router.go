@@ -1159,6 +1159,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// are admin-gated below).
 					r.Get("/runtime-profiles", h.ListRuntimeProfiles)
 					r.Get("/runtime-profiles/{profileId}", h.GetRuntimeProfile)
+					// Shared MCP configuration — member-visible so the agent
+					// settings UI can show what an agent inherits; the handler
+					// redacts the document itself for everyone who cannot
+					// write it (and for agent actors unconditionally).
+					r.Get("/mcp-config", h.GetWorkspaceMcpConfig)
 					r.Get("/plugins", h.ListPlugins)
 					r.Get("/plugins/private", h.ListPrivatePlugins)
 					r.Get("/plugins/private/{pluginRef}", h.GetPrivatePluginStatus)
@@ -1176,6 +1181,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 						r.Delete("/", h.DeleteMember)
 					})
 					r.Delete("/invitations/{invitationId}", h.RevokeInvitation)
+					// Writing shared MCP servers is an admin action: the
+					// document reaches every agent in the workspace.
+					r.Put("/mcp-config", h.UpdateWorkspaceMcpConfig)
 					// Custom runtime profile mutations (admin-only).
 					r.Post("/runtime-profiles", h.CreateRuntimeProfile)
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
