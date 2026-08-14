@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
-	"sort"
 	"strings"
 	"text/tabwriter"
 	"unicode/utf8"
@@ -102,19 +102,24 @@ var workspaceSwitchCmd = &cobra.Command{
 var workspaceMcpCmd = &cobra.Command{
 	Use:   "mcp",
 	Short: "Manage the workspace's shared MCP configuration",
-	Long: "Reads and writes the MCP server document shared by every agent in the " +
-		"workspace. An agent that has no mcp_config of its own inherits this " +
-		"document; an agent with its own config merges on top of it, winning on " +
-		"server-name collisions. An agent whose mcp_config declares no servers " +
-		"(the explicit 'this agent runs with zero MCP' state) inherits nothing.",
+	Long: "Manages the MCP servers shared by every agent in the workspace. An " +
+		"agent that has no mcp_config of its own inherits them; an agent with " +
+		"its own config merges on top, winning on server-name collisions; an " +
+		"agent whose mcp_config declares no servers (the explicit 'this agent " +
+		"runs with zero MCP' state) inherits nothing.\n\n" +
+		"The stored configuration is write-only: reads return the server names " +
+		"and transports, never the urls, commands, headers, or env. Use 'add' / " +
+		"'remove' to change one server without holding the whole document.",
 }
 
 var workspaceMcpGetCmd = &cobra.Command{
 	Use:   "get [workspace-id|slug|prefix]",
-	Short: "Show the workspace's shared MCP configuration",
-	Long: "Prints the shared MCP document. Only workspace owners and admins can " +
-		"read its contents; everyone else sees mcp_config_redacted=true with the " +
-		"server count, because the entries routinely embed API tokens.",
+	Short: "List the MCP servers shared by the workspace",
+	Long: "Lists the shared MCP servers by name and transport. The stored " +
+		"configuration itself is write-only and is never returned — to anyone, " +
+		"including owners — because MCP entries routinely embed API tokens and a " +
+		"session URL is a credential on its own. Keep the source document " +
+		"wherever you manage secrets, and use 'set' / 'add' to push changes.",
 	Args: cobra.MaximumNArgs(1),
 	RunE: runWorkspaceMcpGet,
 }
@@ -133,6 +138,30 @@ var workspaceMcpSetCmd = &cobra.Command{
 	RunE: runWorkspaceMcpSet,
 }
 
+var workspaceMcpAddCmd = &cobra.Command{
+	Use:   "add <server-name> [workspace-id|slug|prefix]",
+	Short: "Add or replace one shared MCP server (admin/owner only)",
+	Long: "Adds a shared MCP server, or replaces one that already has this name. " +
+		"The other shared servers are left alone, so this is the incremental " +
+		"counterpart to 'set' — and the only way to edit one server without " +
+		"holding the whole document, which the API never returns.\n\n" +
+		"The payload is a single server entry, the same object shape that sits " +
+		"under a name in \"mcpServers\".",
+	Example: "  multica workspace mcp add linear --server-config-file ./linear.json\n" +
+		"  echo '{\"url\":\"https://mcp.example\"}' | multica workspace mcp add example --server-config-stdin",
+	Args: cobra.RangeArgs(1, 2),
+	RunE: runWorkspaceMcpAdd,
+}
+
+var workspaceMcpRemoveCmd = &cobra.Command{
+	Use:   "remove <server-name> [workspace-id|slug|prefix]",
+	Short: "Remove one shared MCP server (admin/owner only)",
+	Long: "Removes a shared MCP server by name. Removing the last one clears the " +
+		"workspace layer entirely, so agents fall back to their own configuration.",
+	Args: cobra.RangeArgs(1, 2),
+	RunE: runWorkspaceMcpRemove,
+}
+
 func init() {
 	workspaceCmd.AddCommand(workspaceListCmd)
 	workspaceCmd.AddCommand(workspaceCreateCmd)
@@ -145,6 +174,8 @@ func init() {
 	workspaceCmd.AddCommand(workspaceMcpCmd)
 	workspaceMcpCmd.AddCommand(workspaceMcpGetCmd)
 	workspaceMcpCmd.AddCommand(workspaceMcpSetCmd)
+	workspaceMcpCmd.AddCommand(workspaceMcpAddCmd)
+	workspaceMcpCmd.AddCommand(workspaceMcpRemoveCmd)
 
 	workspaceListCmd.Flags().String("output", "table", "Output format: table or json")
 	workspaceListCmd.Flags().Bool("full-id", false, "Show full UUIDs in table output")
@@ -177,6 +208,11 @@ func init() {
 	workspaceMcpSetCmd.Flags().Bool("mcp-config-stdin", false, "Read the MCP configuration JSON from stdin")
 	workspaceMcpSetCmd.Flags().String("mcp-config-file", "", "Read the MCP configuration JSON from a file")
 	workspaceMcpSetCmd.Flags().String("output", "json", "Output format: table or json")
+	workspaceMcpAddCmd.Flags().String("server-config", "", "Server entry as JSON (avoid: lands in shell history)")
+	workspaceMcpAddCmd.Flags().Bool("server-config-stdin", false, "Read the server entry JSON from stdin")
+	workspaceMcpAddCmd.Flags().String("server-config-file", "", "Read the server entry JSON from a file")
+	workspaceMcpAddCmd.Flags().String("output", "json", "Output format: table or json")
+	workspaceMcpRemoveCmd.Flags().String("output", "json", "Output format: table or json")
 }
 
 // workspaceSummary is the subset of fields the CLI needs from /api/workspaces
@@ -630,44 +666,102 @@ func runWorkspaceMcpSet(cmd *cobra.Command, args []string) error {
 	return printWorkspaceMcpConfig(cmd, resp)
 }
 
-// printWorkspaceMcpConfig renders the shared MCP document. Table output shows
-// only the server names and how each one connects — never the entry bodies,
-// which carry tokens — so the summary stays safe to paste into a ticket. Use
-// --output json (the default) to read the document itself.
+func runWorkspaceMcpAdd(cmd *cobra.Command, args []string) error {
+	serverName := strings.TrimSpace(args[0])
+	if serverName == "" {
+		return fmt.Errorf("server name must not be empty")
+	}
+	wsID, err := resolveWorkspaceArg(cmd, args[1:])
+	if err != nil {
+		return err
+	}
+	if wsID == "" {
+		return fmt.Errorf("workspace ID is required: pass an id/slug/prefix as argument or set MULTICA_WORKSPACE_ID")
+	}
+
+	entry, ok, err := resolveMcpJSONObject(cmd, "server-config", false)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("one of --server-config, --server-config-stdin, or --server-config-file is required")
+	}
+
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	var resp map[string]any
+	path := "/api/workspaces/" + wsID + "/mcp-config/servers/" + url.PathEscape(serverName)
+	if err := client.PutJSON(ctx, path, entry, &resp); err != nil {
+		return fmt.Errorf("add workspace mcp server: %w", err)
+	}
+
+	return printWorkspaceMcpConfig(cmd, resp)
+}
+
+func runWorkspaceMcpRemove(cmd *cobra.Command, args []string) error {
+	serverName := strings.TrimSpace(args[0])
+	if serverName == "" {
+		return fmt.Errorf("server name must not be empty")
+	}
+	wsID, err := resolveWorkspaceArg(cmd, args[1:])
+	if err != nil {
+		return err
+	}
+	if wsID == "" {
+		return fmt.Errorf("workspace ID is required: pass an id/slug/prefix as argument or set MULTICA_WORKSPACE_ID")
+	}
+
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	var resp map[string]any
+	path := "/api/workspaces/" + wsID + "/mcp-config/servers/" + url.PathEscape(serverName)
+	if err := client.DeleteJSONResponse(ctx, path, &resp); err != nil {
+		return fmt.Errorf("remove workspace mcp server: %w", err)
+	}
+
+	return printWorkspaceMcpConfig(cmd, resp)
+}
+
+// printWorkspaceMcpConfig renders the shared MCP server inventory returned by
+// every workspace-mcp command. There is no document to print in either format:
+// the API never returns the stored configuration, so what a token would sit in
+// — urls, commands, headers, env — simply is not in this payload.
 func printWorkspaceMcpConfig(cmd *cobra.Command, resp map[string]any) error {
 	output, _ := cmd.Flags().GetString("output")
 	if output != "table" {
 		return cli.PrintJSON(os.Stdout, resp)
 	}
 
-	if redacted, _ := resp["mcp_config_redacted"].(bool); redacted {
-		fmt.Fprintf(os.Stdout, "mcp_config is redacted for your role (%s servers shared)\n", strVal(resp, "server_count"))
-		return nil
-	}
-	doc, _ := resp["mcp_config"].(map[string]any)
-	servers, _ := doc["mcpServers"].(map[string]any)
+	servers, _ := resp["servers"].([]any)
 	if len(servers) == 0 {
 		fmt.Fprintln(os.Stdout, "no MCP servers shared by this workspace")
 		return nil
 	}
-	names := make([]string, 0, len(servers))
-	for name := range servers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	rows := make([][]string, 0, len(names))
-	for _, name := range names {
-		entry, _ := servers[name].(map[string]any)
-		transport := "http"
-		if _, hasCommand := entry["command"]; hasCommand {
-			transport = "stdio"
+	rows := make([][]string, 0, len(servers))
+	for _, raw := range servers {
+		server, _ := raw.(map[string]any)
+		if server == nil {
+			continue
 		}
-		if t := strVal(entry, "type"); t != "" {
-			transport = t
+		status := "enabled"
+		if enabled, ok := server["enabled"].(bool); ok && !enabled {
+			status = "disabled"
 		}
-		rows = append(rows, []string{name, transport})
+		rows = append(rows, []string{strVal(server, "name"), strVal(server, "transport"), status})
 	}
-	cli.PrintTable(os.Stdout, []string{"NAME", "TRANSPORT"}, rows)
+	cli.PrintTable(os.Stdout, []string{"NAME", "TRANSPORT", "STATUS"}, rows)
 	return nil
 }
 
