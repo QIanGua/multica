@@ -11,13 +11,21 @@ import {
   Trash2,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import type { Agent, AgentRuntime } from "@multica/core/types";
+import type { Agent, AgentRuntime, WorkspaceMcpServer } from "@multica/core/types";
 import { ApiError } from "@multica/core/api";
 import {
   runtimeCapabilitiesOptions,
   runtimeDisplayLabel,
 } from "@multica/core/runtimes";
-import { workspaceMcpConfigOptions } from "@multica/core/workspace/queries";
+import {
+  agentMcpServersOptions,
+  workspaceMcpServersOptions,
+} from "@multica/core/workspace/queries";
+import {
+  useAddAgentMcpServer,
+  useRemoveAgentMcpServer,
+  useSetAgentMcpServerEnabled,
+} from "@multica/core/workspace/mutations";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -30,6 +38,13 @@ import {
 } from "@multica/ui/components/ui/alert-dialog";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@multica/ui/components/ui/dropdown-menu";
+import { Switch } from "@multica/ui/components/ui/switch";
 import { toast } from "sonner";
 import { useT } from "../../../i18n";
 import {
@@ -57,12 +72,17 @@ export function McpConfigTab({
       ? runtime.id
       : null;
   const runtimeQuery = useQuery(runtimeCapabilitiesOptions(runtimeId));
-  // What this agent inherits from the workspace (GH #6062). Read-only here:
-  // the shared set is edited in workspace Settings, and the API returns names
-  // and transports only — never the shared credentials.
-  const workspaceMcpQuery = useQuery(
-    workspaceMcpConfigOptions(agent.workspace_id ?? ""),
+  // The workspace MCP servers ASSIGNED to this agent, plus the library to pick
+  // from (GH #6062). A library entry does nothing until it is added here, and
+  // each assignment carries its own toggle. The API returns names and
+  // transports only — never the stored credentials.
+  const assignedQuery = useQuery(agentMcpServersOptions(agent.id));
+  const libraryQuery = useQuery(
+    workspaceMcpServersOptions(agent.workspace_id ?? ""),
   );
+  const addServer = useAddAgentMcpServer(agent.id);
+  const setServerEnabled = useSetAgentMcpServerEnabled(agent.id);
+  const removeServer = useRemoveAgentMcpServer(agent.id);
   const redacted = agent.mcp_config_redacted === true;
   const managedServers = useMemo(
     () => listManagedMcpServers(agent.mcp_config),
@@ -72,30 +92,28 @@ export function McpConfigTab({
     () => new Set(managedServers.map((server) => server.name)),
     [managedServers],
   );
-  const workspaceServers = workspaceMcpQuery.data?.servers ?? [];
-  // The resolution contract's opt-out: an agent whose saved configuration
-  // declares NO servers inherits none of the workspace's. `null` / absent
-  // means "not configured at the agent layer", which DOES inherit — so key
-  // this off a present-but-empty document, not off an empty list.
-  const optedOutOfWorkspace =
-    !redacted &&
-    agent.mcp_config !== null &&
-    agent.mcp_config !== undefined &&
-    managedServers.length === 0;
-  // When mcp_config is redacted this view cannot tell an explicit empty
-  // document (opted out) from one that overrides some names, so it must not
-  // claim either. Everything inheritance-related below says "unknown".
-  const inheritsWorkspace = !redacted && !optedOutOfWorkspace;
+  const assignedServers = assignedQuery.data ?? [];
+  const assignedIds = useMemo(
+    () => new Set(assignedServers.map((server) => server.id)),
+    [assignedServers],
+  );
+  // What is still available to assign. An entry the agent already has is not
+  // offered again.
+  const availableServers = (libraryQuery.data ?? []).filter(
+    (server) => !assignedIds.has(server.id),
+  );
   // Names that shadow a runtime server in the effective set. The daemon merges
-  // runtime < (workspace + agent), so a shared server hides a same-named
-  // runtime one too — marking only the agent's names under-reports it.
+  // runtime < (assigned workspace servers + the agent's own), so an assigned
+  // server hides a same-named runtime one too — marking only the agent's own
+  // names would under-report it. A disabled assignment shadows nothing.
   const effectiveNames = useMemo(() => {
     const names = new Set(managedNames);
-    if (inheritsWorkspace) {
-      for (const server of workspaceServers) names.add(server.name);
+    for (const server of assignedServers) {
+      if (server.enabled !== false) names.add(server.name);
     }
     return names;
-  }, [managedNames, inheritsWorkspace, workspaceServers]);
+  }, [managedNames, assignedServers]);
+
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ManagedMcpServer | null>(
     null,
@@ -142,6 +160,35 @@ export function McpConfigTab({
       throw error;
     }
   };
+
+  // Assignment writes return the agent's resulting list, so failures surface
+  // as a toast and the cache re-syncs from the server rather than a guess.
+  const runAssignmentAction = async (action: () => Promise<unknown>) => {
+    try {
+      await action();
+    } catch (error) {
+      toast.error(
+        error instanceof Error && error.message
+          ? error.message
+          : t(($) => $.tab_body.mcp_config.workspace_action_failed),
+      );
+    }
+  };
+
+  const handleAddWorkspaceServer = (serverId: string) =>
+    runAssignmentAction(async () => {
+      await addServer.mutateAsync(serverId);
+      toast.success(t(($) => $.tab_body.mcp_config.workspace_added_toast));
+    });
+
+  const handleToggleWorkspaceServer = (serverId: string, enabled: boolean) =>
+    runAssignmentAction(() => setServerEnabled.mutateAsync({ serverId, enabled }));
+
+  const handleRemoveWorkspaceServer = (serverId: string) =>
+    runAssignmentAction(async () => {
+      await removeServer.mutateAsync(serverId);
+      toast.success(t(($) => $.tab_body.mcp_config.workspace_removed_toast));
+    });
 
   const handleDelete = async () => {
     if (!deletingServer) return;
@@ -217,35 +264,48 @@ export function McpConfigTab({
       </section>
 
       <section className="space-y-3">
-        <div>
-          <h3 className="text-body font-medium">
-            {t(($) => $.tab_body.mcp_config.workspace_title)}
-          </h3>
-          <p className="mt-1 max-w-2xl text-caption leading-5 text-muted-foreground">
-            {t(($) => $.tab_body.mcp_config.workspace_hint)}
-          </p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-body font-medium">
+              {t(($) => $.tab_body.mcp_config.workspace_title)}
+            </h3>
+            <p className="mt-1 max-w-2xl text-caption leading-5 text-muted-foreground">
+              {t(($) => $.tab_body.mcp_config.workspace_hint)}
+            </p>
+          </div>
+          {availableServers.length > 0 && (
+            <McpWorkspaceServerPicker
+              servers={availableServers}
+              disabled={addServer.isPending}
+              onSelect={(serverId) => void handleAddWorkspaceServer(serverId)}
+            />
+          )}
         </div>
-        {redacted ? (
-          <McpNotice text={t(($) => $.tab_body.mcp_config.workspace_unknown)} />
-        ) : optedOutOfWorkspace ? (
-          <McpNotice text={t(($) => $.tab_body.mcp_config.workspace_opted_out)} />
-        ) : workspaceMcpQuery.isLoading ? (
+        {assignedQuery.isLoading ? (
           <McpNotice
             loading
             text={t(($) => $.tab_body.mcp_config.workspace_loading)}
           />
-        ) : workspaceServers.length === 0 ? (
-          <McpNotice text={t(($) => $.tab_body.mcp_config.workspace_empty)} />
+        ) : assignedServers.length > 0 ? (
+          <ul className="divide-y divide-surface-border rounded-lg border">
+            {assignedServers.map((server) => (
+              <McpWorkspaceServerRow
+                key={server.id}
+                server={server}
+                overridden={managedNames.has(server.name)}
+                busy={setServerEnabled.isPending || removeServer.isPending}
+                onToggle={(enabled) => void handleToggleWorkspaceServer(server.id, enabled)}
+                onRemove={() => void handleRemoveWorkspaceServer(server.id)}
+              />
+            ))}
+          </ul>
         ) : (
-          <McpServerList
-            servers={workspaceServers.map((server) => ({
-              name: server.name,
-              transport: server.transport || "unknown",
-              enabled: server.enabled,
-              overridden: managedNames.has(server.name),
-            }))}
-            disabledLabel={t(($) => $.tab_body.mcp_config.workspace_disabled_badge)}
-            overriddenLabel={t(($) => $.tab_body.mcp_config.workspace_overridden_badge)}
+          <McpNotice
+            text={
+              (libraryQuery.data ?? []).length === 0
+                ? t(($) => $.tab_body.mcp_config.workspace_library_empty)
+                : t(($) => $.tab_body.mcp_config.workspace_none_assigned)
+            }
           />
         )}
       </section>
@@ -376,6 +436,100 @@ type McpServerView = {
   source?: string;
   overridden?: boolean;
 };
+
+/**
+ * One workspace server assigned to this agent: the per-agent toggle plus the
+ * affordance to take it away. The entry itself is never shown — it is
+ * write-only and lives in workspace Settings.
+ */
+function McpWorkspaceServerRow({
+  server,
+  overridden,
+  busy,
+  onToggle,
+  onRemove,
+}: {
+  server: WorkspaceMcpServer;
+  overridden: boolean;
+  busy: boolean;
+  onToggle: (enabled: boolean) => void;
+  onRemove: () => void;
+}) {
+  const { t } = useT("agents");
+  const enabled = server.enabled !== false;
+  return (
+    <li className="flex items-center gap-3 px-4 py-3">
+      <Server className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+      <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate text-body font-medium">{server.name}</span>
+          {overridden && (
+            <Badge variant="secondary">
+              {t(($) => $.tab_body.mcp_config.workspace_overridden_badge)}
+            </Badge>
+          )}
+        </div>
+        <p className="mt-0.5 text-caption text-muted-foreground">
+          {server.transport || "unknown"}
+        </p>
+      </div>
+      <Switch
+        checked={enabled}
+        disabled={busy}
+        onCheckedChange={onToggle}
+        aria-label={t(($) => $.tab_body.mcp_config.workspace_toggle_aria, {
+          name: server.name,
+        })}
+      />
+      <Button
+        variant="ghost"
+        size="icon"
+        disabled={busy}
+        onClick={onRemove}
+        aria-label={t(($) => $.tab_body.mcp_config.workspace_remove_aria, {
+          name: server.name,
+        })}
+      >
+        <Trash2 className="h-4 w-4" aria-hidden="true" />
+      </Button>
+    </li>
+  );
+}
+
+/** Picks an unassigned workspace server to give to this agent. */
+function McpWorkspaceServerPicker({
+  servers,
+  disabled,
+  onSelect,
+}: {
+  servers: WorkspaceMcpServer[];
+  disabled: boolean;
+  onSelect: (serverId: string) => void;
+}) {
+  const { t } = useT("agents");
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button size="sm" variant="outline" disabled={disabled}>
+            <Plus aria-hidden="true" />
+            {t(($) => $.tab_body.mcp_config.workspace_add_action)}
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="end">
+        {servers.map((server) => (
+          <DropdownMenuItem key={server.id} onClick={() => onSelect(server.id)}>
+            <span className="truncate">{server.name}</span>
+            <span className="ml-2 text-caption text-muted-foreground">
+              {server.transport || "unknown"}
+            </span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 function McpServerList({
   servers,

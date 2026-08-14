@@ -242,36 +242,36 @@ Two ways `mcp_config` differs from `custom_env`:
 
 Provider support is not uniform: Qwen Code accepts a managed `mcp_config` through a daemon-owned 0600 temporary JSON file passed with `--mcp-config`; it is removed when the run exits. Leave the field unset (`null`) to inherit Qwen Code native settings.
 
-#### Workspace-level MCP servers
+#### Workspace MCP servers
 
-A workspace can share one MCP document with every agent in it — from workspace
-Settings → MCP in the UI, or on the CLI with `multica workspace mcp get` (lists
-the servers; the document itself is never returned) plus `set` / `add` /
-`remove`, which require owner or admin. The agent's own `mcp_config` is
-resolved on top of it at claim time, so what an agent actually runs with is:
+A workspace keeps a LIBRARY of MCP servers (workspace Settings → MCP, or
+`multica workspace mcp list|add|update|remove`). Adding one there gives it to
+NO agent — same shape as a workspace skill. It reaches an agent only when
+someone assigns it:
 
-| Agent `mcp_config` | Effective set |
+```bash
+multica workspace mcp list --output table        # find the server id
+multica agent mcp add <agent-id> <server-id>     # give it to one agent
+multica agent mcp disable <agent-id> <server-id> # stop sending it, keep the assignment
+multica agent mcp remove <agent-id> <server-id>  # take it away
+```
+
+At claim time the effective set is:
+
+| Layer | Reaches the agent when |
 | --- | --- |
-| `null` (unset) | the workspace's servers |
-| declares ≥1 server | workspace servers **plus** its own; the agent wins on a name collision |
-| declares no server (`{}` or `{"mcpServers":{}}`) | none of the workspace's — the "no managed servers of my own" state also opts out of the workspace layer. The agent's RUNTIME-local servers still apply: the daemon merges runtime servers under whatever the claim carries |
+| runtime-local servers | always (the daemon merges the runtime's own file) |
+| workspace servers | assigned to THIS agent and left enabled |
+| the agent's own `mcp_config` | always; it WINS on a name collision |
 
-Two consequences worth knowing before writing an agent's config: an agent that
-should keep its own private server does NOT need to re-list the shared ones
-(they merge), and a config that declares no servers is the only way to keep the
-workspace's servers away from an agent. That is not the same as "no MCP at all"
-— the runtime's own local servers are merged by the daemon either way.
+Two consequences worth knowing before writing an agent's config: assigning a
+shared server does not require re-listing it in `mcp_config` (they merge), and
+`mcp_config` is now only about servers private to that agent — a
+managed-but-empty `{}` no longer means anything about the workspace layer,
+because nothing is inherited in the first place.
 
-The merge also normalizes: an agent that stored its servers under the legacy
-top-level `mcp` container gets them folded into `mcpServers` in the resolved
-payload, because the daemon's runtime merge only reads the legacy container
-when `mcpServers` is absent.
-
-The workspace document itself is **write-only** — `GET` returns only the
-server names / transports, never urls, commands, headers, or env, for any
-role. That is why editing one shared server goes through
-`PUT /api/workspaces/{id}/mcp-config/servers/{name}` (`workspace mcp add`)
-rather than a read-modify-write of the whole document.
+The stored entry is **write-only** — reads return the server's name and
+transport, never urls, commands, headers, or env, for any role.
 
 ## Skill binding
 

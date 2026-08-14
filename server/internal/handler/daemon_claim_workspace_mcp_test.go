@@ -34,12 +34,19 @@ func claimAgentMcpConfigForTest(t *testing.T, runtimeID string) json.RawMessage 
 }
 
 // setupWorkspaceMcpClaimFixture creates a runtime, an agent with the given
-// saved mcp_config, and one queued task ready to claim.
-func setupWorkspaceMcpClaimFixture(t *testing.T, ctx context.Context, name, agentMcpConfig string) string {
+// saved mcp_config, one queued task ready to claim, and binds the named
+// workspace MCP servers to that agent.
+func setupWorkspaceMcpClaimFixture(t *testing.T, ctx context.Context, name, agentMcpConfig string, bind ...string) string {
 	t.Helper()
 
 	runtimeID := createClaimReclaimRuntime(t, ctx, name+" runtime")
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, name+" agent")
+	for _, serverID := range bind {
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO agent_mcp_server (agent_id, server_id) VALUES ($1, $2)`, agentID, serverID); err != nil {
+			t.Fatalf("setup: bind mcp server: %v", err)
+		}
+	}
 
 	var stored []byte
 	if agentMcpConfig != "" {
@@ -62,56 +69,78 @@ func setupWorkspaceMcpClaimFixture(t *testing.T, ctx context.Context, name, agen
 	return runtimeID
 }
 
-// The claim payload is where the workspace layer actually reaches an agent, so
-// assert the resolved document on the wire — not just the merge helper.
-func TestClaimTaskByRuntime_InheritsWorkspaceMcpConfig(t *testing.T) {
+// The claim payload is where a bound workspace server actually reaches an
+// agent, so assert the resolved document on the wire — not just the resolver.
+func TestClaimTaskByRuntime_CarriesBoundWorkspaceMcpServers(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	setWorkspaceMcpConfigForTest(t, `{"mcpServers":{"shared":{"url":"https://shared.example"}}}`)
-	runtimeID := setupWorkspaceMcpClaimFixture(t, ctx, "ws-mcp-inherit", "")
+	serverID := createWorkspaceMcpServerForTest(t, "shared", `{"url":"https://shared.example"}`)
+	runtimeID := setupWorkspaceMcpClaimFixture(t, ctx, "ws-mcp-bound", "", serverID)
 
 	servers := decodeServers(t, claimAgentMcpConfigForTest(t, runtimeID))
 	if len(servers) != 1 || servers["shared"] == nil {
-		t.Fatalf("agent with no saved config should inherit the shared server, got %v", serverNames(servers))
+		t.Fatalf("agent should run the server it was given, got %v", serverNames(servers))
 	}
 }
 
-func TestClaimTaskByRuntime_MergesWorkspaceAndAgentMcpConfig(t *testing.T) {
+// The defining property, asserted end to end: a library entry nobody added
+// reaches nothing, however many agents exist.
+func TestClaimTaskByRuntime_UnboundWorkspaceMcpServerReachesNoAgent(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	setWorkspaceMcpConfigForTest(t, `{"mcpServers":{"shared":{"url":"https://shared.example"},"linear":{"url":"https://ws-linear.example"}}}`)
+	createWorkspaceMcpServerForTest(t, "shared", `{"url":"https://shared.example"}`)
+	runtimeID := setupWorkspaceMcpClaimFixture(t, ctx, "ws-mcp-unbound", "")
+
+	mcpConfig := claimAgentMcpConfigForTest(t, runtimeID)
+	if servers := decodeServers(t, mcpConfig); len(servers) != 0 {
+		t.Fatalf("an unassigned workspace server reached the agent: %v", serverNames(servers))
+	}
+	// And nothing managed at all, so the runtime keeps its native inheritance.
+	if len(mcpConfig) != 0 {
+		t.Fatalf("mcp_config = %s, want nothing managed", mcpConfig)
+	}
+}
+
+// A binding that is switched off is the same as not having it, without losing
+// the assignment.
+func TestClaimTaskByRuntime_DisabledBindingIsNotCarried(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	serverID := createWorkspaceMcpServerForTest(t, "shared", `{"url":"https://shared.example"}`)
+	runtimeID := setupWorkspaceMcpClaimFixture(t, ctx, "ws-mcp-disabled", "", serverID)
+	if _, err := testPool.Exec(ctx,
+		`UPDATE agent_mcp_server SET enabled = FALSE WHERE server_id = $1`, serverID); err != nil {
+		t.Fatalf("disable binding: %v", err)
+	}
+
+	if servers := decodeServers(t, claimAgentMcpConfigForTest(t, runtimeID)); len(servers) != 0 {
+		t.Fatalf("a disabled binding was carried: %v", serverNames(servers))
+	}
+}
+
+func TestClaimTaskByRuntime_MergesBoundAndAgentOwnMcpServers(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	shared := createWorkspaceMcpServerForTest(t, "shared", `{"url":"https://shared.example"}`)
+	linear := createWorkspaceMcpServerForTest(t, "linear", `{"url":"https://ws-linear.example"}`)
 	runtimeID := setupWorkspaceMcpClaimFixture(t, ctx, "ws-mcp-merge",
-		`{"mcpServers":{"private":{"url":"https://private.example"},"linear":{"url":"https://agent-linear.example"}}}`)
+		`{"mcpServers":{"private":{"url":"https://private.example"},"linear":{"url":"https://agent-linear.example"}}}`,
+		shared, linear)
 
 	servers := decodeServers(t, claimAgentMcpConfigForTest(t, runtimeID))
 	if len(servers) != 3 {
 		t.Fatalf("server set = %v, want shared/linear/private", serverNames(servers))
 	}
-	linear, _ := servers["linear"].(map[string]any)
-	if linear["url"] != "https://agent-linear.example" {
-		t.Errorf("agent must win the name collision, got %v", linear["url"])
-	}
-}
-
-func TestClaimTaskByRuntime_ZeroServerAgentIgnoresWorkspaceMcpConfig(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-	setWorkspaceMcpConfigForTest(t, `{"mcpServers":{"shared":{"url":"https://shared.example"}}}`)
-	runtimeID := setupWorkspaceMcpClaimFixture(t, ctx, "ws-mcp-optout", `{}`)
-
-	mcpConfig := claimAgentMcpConfigForTest(t, runtimeID)
-	if servers := decodeServers(t, mcpConfig); len(servers) != 0 {
-		t.Fatalf("opted-out agent received %v", serverNames(servers))
-	}
-	// Still managed-but-empty, which is what keeps the runtime's own MCP
-	// servers suppressed for this agent.
-	if string(mcpConfig) != `{}` {
-		t.Fatalf("mcp_config = %s, want the agent's own empty document", mcpConfig)
+	entry, _ := servers["linear"].(map[string]any)
+	if entry["url"] != "https://agent-linear.example" {
+		t.Errorf("the agent's own entry must win the name collision, got %v", entry["url"])
 	}
 }

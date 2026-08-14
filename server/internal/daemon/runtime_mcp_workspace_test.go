@@ -10,18 +10,18 @@ import (
 )
 
 // effectiveServerNames runs the full chain a claimed task actually goes
-// through — the server's workspace/agent resolution followed by this daemon's
-// runtime merge — and returns the server set the provider would end up with.
+// through — the server's binding resolution followed by this daemon's runtime
+// merge — and returns the server set the provider would end up with.
 //
 // Testing the two halves separately is not enough: they agree on the wire
 // shape only if the resolver emits its result in the container this merge
 // reads, and that coupling is exactly what regressed OpenCode agents.
-func effectiveServerNames(t *testing.T, provider, workspaceCfg, agentCfg string) map[string]any {
+func effectiveServerNames(t *testing.T, provider string, bound []handler.WorkspaceMcpBinding, agentCfg string) map[string]any {
 	t.Helper()
 
-	resolved, err := handler.ResolveWorkspaceMcpConfig(json.RawMessage(workspaceCfg), json.RawMessage(agentCfg))
+	resolved, err := handler.ResolveAgentMcpConfig(bound, json.RawMessage(agentCfg))
 	if err != nil {
-		t.Fatalf("ResolveWorkspaceMcpConfig: %v", err)
+		t.Fatalf("ResolveAgentMcpConfig: %v", err)
 	}
 	merged, err := mergeRuntimeAndAgentMcpConfig(provider, resolved)
 	if err != nil {
@@ -55,15 +55,15 @@ func writeOpencodeRuntimeConfig(t *testing.T, servers string) {
 }
 
 // An OpenCode agent that stored its servers under the legacy top-level `mcp`
-// container must keep them once the workspace starts sharing servers. The
-// daemon's merge only falls back to `mcp` when `mcpServers` is ABSENT, so a
-// resolver that wrote shared servers into `mcpServers` and left the agent's
-// entries beside them would silently drop every private server.
+// container must keep them once it is given a workspace server. The daemon's
+// merge only falls back to `mcp` when `mcpServers` is ABSENT, so a resolver
+// that wrote bound servers into `mcpServers` and left the agent's entries
+// beside them would silently drop every private server.
 func TestWorkspaceResolveThenRuntimeMergeKeepsLegacyOpencodeServers(t *testing.T) {
 	writeOpencodeRuntimeConfig(t, `{"runtime-local":{"command":"runtime-server"}}`)
 
 	servers := effectiveServerNames(t, "opencode",
-		`{"mcpServers":{"shared":{"url":"https://shared.example"}}}`,
+		[]handler.WorkspaceMcpBinding{{Name: "shared", Config: json.RawMessage(`{"url":"https://shared.example"}`)}},
 		`{"mcp":{"private":{"command":"private-server"}}}`)
 
 	for _, name := range []string{"runtime-local", "shared", "private"} {
@@ -76,32 +76,31 @@ func TestWorkspaceResolveThenRuntimeMergeKeepsLegacyOpencodeServers(t *testing.T
 	}
 }
 
-// The same agent, before the workspace shares anything, must be untouched:
-// with no workspace document the resolver passes the agent config through
-// verbatim, so the daemon still takes its legacy-container fallback.
-func TestWorkspaceResolveWithoutSharedServersLeavesLegacyOpencodeAgentAlone(t *testing.T) {
+// The same agent with nothing assigned to it must be untouched: the resolver
+// passes the agent config through verbatim, so the daemon still takes its
+// legacy-container fallback.
+func TestWorkspaceResolveWithoutBoundServersLeavesLegacyOpencodeAgentAlone(t *testing.T) {
 	writeOpencodeRuntimeConfig(t, `{"runtime-local":{"command":"runtime-server"}}`)
 
-	servers := effectiveServerNames(t, "opencode", "", `{"mcp":{"private":{"command":"private-server"}}}`)
+	servers := effectiveServerNames(t, "opencode", nil, `{"mcp":{"private":{"command":"private-server"}}}`)
 
 	if len(servers) != 2 || servers["private"] == nil || servers["runtime-local"] == nil {
 		t.Fatalf("effective set = %v, want runtime-local + private", servers)
 	}
 }
 
-// An agent that opted out (managed but empty) keeps running with only its
-// runtime's own servers — the shared ones must not reach it through the
-// daemon merge either.
-func TestWorkspaceResolveThenRuntimeMergeHonorsAgentOptOut(t *testing.T) {
+// An agent with nothing assigned keeps running with only its runtime's own
+// servers — a library entry nobody added must not reach it through the daemon
+// merge either.
+func TestWorkspaceResolveWithNoBindingsKeepsOnlyRuntimeServers(t *testing.T) {
 	writeOpencodeRuntimeConfig(t, `{"runtime-local":{"command":"runtime-server"}}`)
 
-	servers := effectiveServerNames(t, "opencode",
-		`{"mcpServers":{"shared":{"url":"https://shared.example"}}}`, `{}`)
+	servers := effectiveServerNames(t, "opencode", nil, "")
 
-	if _, leaked := servers["shared"]; leaked {
-		t.Fatalf("opted-out agent received the shared server: %v", servers)
-	}
-	if len(servers) != 1 || servers["runtime-local"] == nil {
-		t.Fatalf("effective set = %v, want only the runtime's own server", servers)
+	if len(servers) != 0 {
+		// A nil managed config means the provider keeps its native
+		// inheritance; the daemon returns it unchanged rather than building a
+		// merged document.
+		t.Fatalf("effective set = %v, want the native path (no managed document)", servers)
 	}
 }

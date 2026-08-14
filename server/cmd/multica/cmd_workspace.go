@@ -101,63 +101,57 @@ var workspaceSwitchCmd = &cobra.Command{
 
 var workspaceMcpCmd = &cobra.Command{
 	Use:   "mcp",
-	Short: "Manage the workspace's shared MCP configuration",
-	Long: "Manages the MCP servers shared by every agent in the workspace. An " +
-		"agent that has no mcp_config of its own inherits them; an agent with " +
-		"its own config merges on top, winning on server-name collisions; an " +
-		"agent whose mcp_config declares no servers inherits none of them (its " +
-		"runtime's own local servers still apply).\n\n" +
+	Short: "Manage the workspace's MCP server library",
+	Long: "Manages the workspace's library of MCP servers. A server added here " +
+		"is given to NO agent: it reaches an agent only when someone assigns it " +
+		"to that agent ('multica agent mcp add'), which also carries a per-agent " +
+		"on/off toggle. Same shape as workspace skills.\n\n" +
 		"The stored configuration is write-only: reads return the server names " +
-		"and transports, never the urls, commands, headers, or env. Use 'add' / " +
-		"'remove' to change one server without holding the whole document.",
+		"and transports, never the urls, commands, headers, or env.",
 }
 
-var workspaceMcpGetCmd = &cobra.Command{
-	Use:   "get [workspace-id|slug|prefix]",
-	Short: "List the MCP servers shared by the workspace",
-	Long: "Lists the shared MCP servers by name and transport. The stored " +
+var workspaceMcpListCmd = &cobra.Command{
+	Use:   "list [workspace-id|slug|prefix]",
+	Short: "List the workspace's MCP servers",
+	Long: "Lists the workspace MCP library by name and transport. The stored " +
 		"configuration itself is write-only and is never returned — to anyone, " +
 		"including owners — because MCP entries routinely embed API tokens and a " +
-		"session URL is a credential on its own. Keep the source document " +
-		"wherever you manage secrets, and use 'set' / 'add' to push changes.",
+		"session URL is a credential on its own.",
 	Args: cobra.MaximumNArgs(1),
-	RunE: runWorkspaceMcpGet,
-}
-
-var workspaceMcpSetCmd = &cobra.Command{
-	Use:   "set [workspace-id|slug|prefix]",
-	Short: "Replace the workspace's shared MCP configuration (admin/owner only)",
-	Long: "Replaces the whole shared MCP document — it is not merged with what is " +
-		"already stored, so removing a server means sending the document without " +
-		"it. Pass 'null' to clear the workspace layer entirely.\n\n" +
-		"Prefer --mcp-config-file or --mcp-config-stdin: MCP entries routinely " +
-		"carry API tokens, and an inline value ends up in shell history and 'ps'.",
-	Example: "  multica workspace mcp set --mcp-config-file ./mcp.json\n" +
-		"  multica workspace mcp set --mcp-config null",
-	Args: cobra.MaximumNArgs(1),
-	RunE: runWorkspaceMcpSet,
+	RunE: runWorkspaceMcpList,
 }
 
 var workspaceMcpAddCmd = &cobra.Command{
 	Use:   "add <server-name> [workspace-id|slug|prefix]",
-	Short: "Add or replace one shared MCP server (admin/owner only)",
-	Long: "Adds a shared MCP server, or replaces one that already has this name. " +
-		"The other shared servers are left alone, so this is the incremental " +
-		"counterpart to 'set' — and the only way to edit one server without " +
-		"holding the whole document, which the API never returns.\n\n" +
+	Short: "Add an MCP server to the workspace library (admin/owner only)",
+	Long: "Adds an MCP server to the workspace library. It is assigned to no " +
+		"agent — use 'multica agent mcp add <agent-id> <server-id>' to give it to " +
+		"one.\n\n" +
 		"The payload is a single server entry, the same object shape that sits " +
-		"under a name in \"mcpServers\".",
+		"under a name in \"mcpServers\". Prefer --server-config-file or " +
+		"--server-config-stdin: MCP entries routinely carry API tokens, and an " +
+		"inline value ends up in shell history and 'ps'.",
 	Example: "  multica workspace mcp add linear --server-config-file ./linear.json\n" +
 		"  echo '{\"url\":\"https://mcp.example\"}' | multica workspace mcp add example --server-config-stdin",
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runWorkspaceMcpAdd,
 }
 
+var workspaceMcpUpdateCmd = &cobra.Command{
+	Use:   "update <server-id> [workspace-id|slug|prefix]",
+	Short: "Rename or replace a workspace MCP server (admin/owner only)",
+	Long: "Renames a server, replaces its configuration, or both. Agents keep " +
+		"their assignment across a rename because assignments key off the server " +
+		"id, not its name.",
+	Args: cobra.RangeArgs(1, 2),
+	RunE: runWorkspaceMcpUpdate,
+}
+
 var workspaceMcpRemoveCmd = &cobra.Command{
-	Use:   "remove <server-name> [workspace-id|slug|prefix]",
-	Short: "Remove one shared MCP server (admin/owner only)",
-	Long: "Removes a shared MCP server by name. Removing the last one clears the " +
-		"workspace layer entirely, so agents fall back to their own configuration.",
+	Use:   "remove <server-id> [workspace-id|slug|prefix]",
+	Short: "Remove an MCP server from the workspace library (admin/owner only)",
+	Long: "Removes the server from the library and from every agent it was " +
+		"assigned to.",
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runWorkspaceMcpRemove,
 }
@@ -172,9 +166,9 @@ func init() {
 	workspaceCmd.AddCommand(workspaceUpdateCmd)
 	workspaceCmd.AddCommand(workspaceSwitchCmd)
 	workspaceCmd.AddCommand(workspaceMcpCmd)
-	workspaceMcpCmd.AddCommand(workspaceMcpGetCmd)
-	workspaceMcpCmd.AddCommand(workspaceMcpSetCmd)
+	workspaceMcpCmd.AddCommand(workspaceMcpListCmd)
 	workspaceMcpCmd.AddCommand(workspaceMcpAddCmd)
+	workspaceMcpCmd.AddCommand(workspaceMcpUpdateCmd)
 	workspaceMcpCmd.AddCommand(workspaceMcpRemoveCmd)
 
 	workspaceListCmd.Flags().String("output", "table", "Output format: table or json")
@@ -200,18 +194,19 @@ func init() {
 	workspaceUpdateCmd.Flags().String("issue-prefix", "", "New issue prefix (uppercased server-side)")
 	workspaceUpdateCmd.Flags().String("output", "json", "Output format: table or json")
 
-	workspaceMcpGetCmd.Flags().String("output", "json", "Output format: table or json")
-	// Same three mutually-exclusive input channels as `agent update`, resolved
-	// by the shared resolveMcpConfig so both surfaces agree on what a valid
-	// document is and on 'null' meaning clear.
-	workspaceMcpSetCmd.Flags().String("mcp-config", "", "MCP configuration as JSON, or 'null' to clear (avoid: lands in shell history)")
-	workspaceMcpSetCmd.Flags().Bool("mcp-config-stdin", false, "Read the MCP configuration JSON from stdin")
-	workspaceMcpSetCmd.Flags().String("mcp-config-file", "", "Read the MCP configuration JSON from a file")
-	workspaceMcpSetCmd.Flags().String("output", "json", "Output format: table or json")
+	workspaceMcpListCmd.Flags().String("output", "json", "Output format: table or json")
+	// Same three mutually-exclusive secret-safe channels as `agent update`,
+	// resolved by the shared resolveMcpJSONObject so every surface agrees on
+	// what a valid payload is.
 	workspaceMcpAddCmd.Flags().String("server-config", "", "Server entry as JSON (avoid: lands in shell history)")
 	workspaceMcpAddCmd.Flags().Bool("server-config-stdin", false, "Read the server entry JSON from stdin")
 	workspaceMcpAddCmd.Flags().String("server-config-file", "", "Read the server entry JSON from a file")
 	workspaceMcpAddCmd.Flags().String("output", "json", "Output format: table or json")
+	workspaceMcpUpdateCmd.Flags().String("name", "", "New server name")
+	workspaceMcpUpdateCmd.Flags().String("server-config", "", "Replacement server entry as JSON (avoid: lands in shell history)")
+	workspaceMcpUpdateCmd.Flags().Bool("server-config-stdin", false, "Read the replacement server entry JSON from stdin")
+	workspaceMcpUpdateCmd.Flags().String("server-config-file", "", "Read the replacement server entry JSON from a file")
+	workspaceMcpUpdateCmd.Flags().String("output", "json", "Output format: table or json")
 	workspaceMcpRemoveCmd.Flags().String("output", "json", "Output format: table or json")
 }
 
@@ -607,7 +602,7 @@ func runWorkspaceUpdate(cmd *cobra.Command, args []string) error {
 	return printWorkspace(cmd, ws)
 }
 
-func runWorkspaceMcpGet(cmd *cobra.Command, args []string) error {
+func runWorkspaceMcpList(cmd *cobra.Command, args []string) error {
 	wsID, err := resolveWorkspaceArg(cmd, args)
 	if err != nil {
 		return err
@@ -624,46 +619,12 @@ func runWorkspaceMcpGet(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
-	var resp workspaceMcpInventory
-	if err := client.GetJSON(ctx, "/api/workspaces/"+wsID+"/mcp-config", &resp); err != nil {
-		return fmt.Errorf("get workspace mcp config: %w", err)
+	var servers []workspaceMcpServer
+	if err := client.GetJSON(ctx, "/api/workspaces/"+wsID+"/mcp-servers", &servers); err != nil {
+		return fmt.Errorf("list workspace mcp servers: %w", err)
 	}
 
-	return printWorkspaceMcpConfig(cmd, resp)
-}
-
-func runWorkspaceMcpSet(cmd *cobra.Command, args []string) error {
-	wsID, err := resolveWorkspaceArg(cmd, args)
-	if err != nil {
-		return err
-	}
-	if wsID == "" {
-		return fmt.Errorf("workspace ID is required: pass an id/slug/prefix as argument or set MULTICA_WORKSPACE_ID")
-	}
-
-	mcpConfig, ok, err := resolveMcpConfig(cmd)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("one of --mcp-config, --mcp-config-stdin, or --mcp-config-file is required; pass 'null' to clear")
-	}
-
-	client, err := newAPIClient(cmd)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := cli.APIContext(context.Background())
-	defer cancel()
-
-	var resp workspaceMcpInventory
-	body := map[string]any{"mcp_config": mcpConfig}
-	if err := client.PutJSON(ctx, "/api/workspaces/"+wsID+"/mcp-config", body, &resp); err != nil {
-		return fmt.Errorf("set workspace mcp config: %w", err)
-	}
-
-	return printWorkspaceMcpConfig(cmd, resp)
+	return printWorkspaceMcpServers(cmd, servers)
 }
 
 func runWorkspaceMcpAdd(cmd *cobra.Command, args []string) error {
@@ -695,19 +656,65 @@ func runWorkspaceMcpAdd(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
-	var resp workspaceMcpInventory
-	path := "/api/workspaces/" + wsID + "/mcp-config/servers/" + url.PathEscape(serverName)
-	if err := client.PutJSON(ctx, path, entry, &resp); err != nil {
+	var server workspaceMcpServer
+	body := map[string]any{"name": serverName, "config": entry}
+	if err := client.PostJSON(ctx, "/api/workspaces/"+wsID+"/mcp-servers", body, &server); err != nil {
 		return fmt.Errorf("add workspace mcp server: %w", err)
 	}
 
-	return printWorkspaceMcpConfig(cmd, resp)
+	return printWorkspaceMcpServers(cmd, []workspaceMcpServer{server})
+}
+
+func runWorkspaceMcpUpdate(cmd *cobra.Command, args []string) error {
+	serverID := strings.TrimSpace(args[0])
+	if serverID == "" {
+		return fmt.Errorf("server ID must not be empty")
+	}
+	wsID, err := resolveWorkspaceArg(cmd, args[1:])
+	if err != nil {
+		return err
+	}
+	if wsID == "" {
+		return fmt.Errorf("workspace ID is required: pass an id/slug/prefix as argument or set MULTICA_WORKSPACE_ID")
+	}
+
+	body := map[string]any{}
+	if cmd.Flags().Changed("name") {
+		name, _ := cmd.Flags().GetString("name")
+		body["name"] = strings.TrimSpace(name)
+	}
+	entry, ok, err := resolveMcpJSONObject(cmd, "server-config", false)
+	if err != nil {
+		return err
+	}
+	if ok {
+		body["config"] = entry
+	}
+	if len(body) == 0 {
+		return fmt.Errorf("nothing to update; pass --name and/or one of --server-config, --server-config-stdin, --server-config-file")
+	}
+
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	var server workspaceMcpServer
+	path := "/api/workspaces/" + wsID + "/mcp-servers/" + url.PathEscape(serverID)
+	if err := client.PutJSON(ctx, path, body, &server); err != nil {
+		return fmt.Errorf("update workspace mcp server: %w", err)
+	}
+
+	return printWorkspaceMcpServers(cmd, []workspaceMcpServer{server})
 }
 
 func runWorkspaceMcpRemove(cmd *cobra.Command, args []string) error {
-	serverName := strings.TrimSpace(args[0])
-	if serverName == "" {
-		return fmt.Errorf("server name must not be empty")
+	serverID := strings.TrimSpace(args[0])
+	if serverID == "" {
+		return fmt.Errorf("server ID must not be empty")
 	}
 	wsID, err := resolveWorkspaceArg(cmd, args[1:])
 	if err != nil {
@@ -725,55 +732,54 @@ func runWorkspaceMcpRemove(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
-	var resp workspaceMcpInventory
-	path := "/api/workspaces/" + wsID + "/mcp-config/servers/" + url.PathEscape(serverName)
-	if err := client.DeleteJSONResponse(ctx, path, &resp); err != nil {
+	path := "/api/workspaces/" + wsID + "/mcp-servers/" + url.PathEscape(serverID)
+	if err := client.DeleteJSON(ctx, path); err != nil {
 		return fmt.Errorf("remove workspace mcp server: %w", err)
 	}
 
-	return printWorkspaceMcpConfig(cmd, resp)
+	fmt.Fprintf(os.Stdout, "removed MCP server %s\n", serverID)
+	return nil
 }
 
-// workspaceMcpInventory is the CLI's half of the write-only boundary. Decoding
-// into named fields — rather than a map[string]any that gets re-encoded — means
-// a server that regressed to returning the stored document, or a `url` /
-// `headers` inside a server entry, cannot reach stdout through ANY output
-// format. Fields not declared here are dropped by encoding/json.
-type workspaceMcpInventory struct {
-	WorkspaceID string                     `json:"workspace_id"`
-	Servers     []workspaceMcpInventoryRow `json:"servers"`
-	ServerCount int                        `json:"server_count"`
-}
-
-type workspaceMcpInventoryRow struct {
+// workspaceMcpServer is the CLI's half of the write-only boundary. Decoding
+// into named fields — rather than a map[string]any that gets re-encoded —
+// means a server that regressed to returning a stored entry, or a `url` /
+// `headers` inside one, cannot reach stdout through ANY output format. Fields
+// not declared here are dropped by encoding/json.
+type workspaceMcpServer struct {
+	ID        string `json:"id"`
 	Name      string `json:"name"`
 	Transport string `json:"transport"`
-	Enabled   bool   `json:"enabled"`
+	// Only set on an agent's assignment list; nil in the workspace library.
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
-// printWorkspaceMcpConfig renders the shared MCP server inventory returned by
-// every workspace-mcp command. There is no document to print in either format:
-// the API never returns the stored configuration, and the type above is what
-// guarantees this command cannot print one even if the API changed its mind.
-func printWorkspaceMcpConfig(cmd *cobra.Command, resp workspaceMcpInventory) error {
+// printWorkspaceMcpServers renders an MCP server list. There is no entry to
+// print in either format: the API never returns a stored configuration, and
+// the type above is what guarantees this command cannot print one even if the
+// API changed its mind.
+func printWorkspaceMcpServers(cmd *cobra.Command, servers []workspaceMcpServer) error {
 	output, _ := cmd.Flags().GetString("output")
 	if output != "table" {
-		return cli.PrintJSON(os.Stdout, resp)
+		return cli.PrintJSON(os.Stdout, servers)
 	}
 
-	if len(resp.Servers) == 0 {
-		fmt.Fprintln(os.Stdout, "no MCP servers shared by this workspace")
+	if len(servers) == 0 {
+		fmt.Fprintln(os.Stdout, "no MCP servers")
 		return nil
 	}
-	rows := make([][]string, 0, len(resp.Servers))
-	for _, server := range resp.Servers {
-		status := "enabled"
-		if !server.Enabled {
-			status = "disabled"
+	rows := make([][]string, 0, len(servers))
+	for _, server := range servers {
+		status := ""
+		if server.Enabled != nil {
+			status = "enabled"
+			if !*server.Enabled {
+				status = "disabled"
+			}
 		}
-		rows = append(rows, []string{server.Name, server.Transport, status})
+		rows = append(rows, []string{server.ID, server.Name, server.Transport, status})
 	}
-	cli.PrintTable(os.Stdout, []string{"NAME", "TRANSPORT", "STATUS"}, rows)
+	cli.PrintTable(os.Stdout, []string{"ID", "NAME", "TRANSPORT", "STATUS"}, rows)
 	return nil
 }
 

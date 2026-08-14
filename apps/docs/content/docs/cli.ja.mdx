@@ -255,12 +255,13 @@ CLI の設定ファイルには、あなたとして Multica にアクセスで�
 | | `avatar <id>` | アバターをアップロード | |
 | | `env get/set <agent-id>` | カスタム環境変数の読み書き（owner と admin のみ） | |
 | | `skills list/set/add <agent-id>` | 紐付けられたスキルを管理 | `--skill-ids`（`set` は全置換、`add` は追加） |
+| | `mcp list/add/enable/disable/remove <agent-id>` | ワークスペース MCP サーバーをこのエージェントに割り当て | server id は `workspace mcp list` から取得。ライブラリの項目はここで追加するまで機能しません。`disable` は割り当てを残したまま送信を停止します |
 | `autopilot` | `list/get/create/update/delete` | オートパイロットを管理 | `create`: `--title`、`--agent`、`--mode`（いずれも必須）、`--priority`、`--project`、`--subscriber`（繰り返し可） |
 | | `trigger <id>` | 手動で 1 回トリガー | |
 | | `runs <id>` | 実行履歴を表示 | |
 | | `trigger-add/trigger-update/trigger-delete/trigger-rotate-url` | スケジュールと webhook のトリガーを管理 | |
 | `workspace` | `list/get/create/update/switch` | ワークスペースを管理。`switch` は現在のプロファイルのデフォルトワークスペースを設定 | |
-| | `mcp get/set/add/remove` | ワークスペース内の全エージェントで共有する MCP サーバーを管理 | 書き込みは owner/admin のみ。`get` は名前と transport のみを表示し、保存された設定は書き込み専用でどのロールにも返らない。`set` はドキュメント全体を置換（`--mcp-config-file` / `--mcp-config-stdin` はトークンをシェル履歴から守る。`--mcp-config null` で削除）。`add <name>` / `remove <name>` はドキュメント全体を持たずに 1 つのサーバーだけを変更 |
+| | `mcp list/add/update/remove` | ワークスペースの MCP サーバーライブラリを管理 | 書き込みは owner/admin のみ。ここに追加したサーバーはどのエージェントにも割り当てられません — `multica agent mcp add` で割り当てます。`list` は名前と transport のみを表示し、保存されたエントリは書き込み専用でどのロールにも返りません。`--server-config-file` / `--server-config-stdin` はトークンをシェル履歴から守ります |
 | | `member list/invite <email>` | メンバーの表示と招待 | `invite`: `--role`（member または admin。デフォルトは member） |
 | `repo` | `list/add/remove/checkout` | ワークスペースのリポジトリを管理し、ローカルにチェックアウト | `--url`（繰り返し可）；`checkout`: `--ref` |
 | `skill` | `list/get/create/update/delete` | スキルを管理 | |

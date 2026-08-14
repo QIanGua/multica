@@ -50,7 +50,7 @@ import type {
   IssueReaction,
   Workspace,
   WorkspaceRepo,
-  WorkspaceMcpConfig,
+  WorkspaceMcpServer,
   MemberWithUser,
   User,
   Skill,
@@ -372,12 +372,13 @@ import {
   EMPTY_ISSUE_VIEW_PREFERENCE,
   EMPTY_PLUGIN_CATALOG,
   EMPTY_PLUGIN_INSTALLATION,
-  EMPTY_WORKSPACE_MCP_CONFIG,
+  EMPTY_WORKSPACE_MCP_SERVER,
   EMPTY_PLUGIN_INSTALLATION_LIST,
   PluginCatalogResponseSchema,
   PluginInstallationListResponseSchema,
   PluginInstallationSchema,
-  WorkspaceMcpConfigSchema,
+  WorkspaceMcpServerListSchema,
+  WorkspaceMcpServerSchema,
   type IssueView,
   type IssueViewPreference,
   type CreateIssueViewRequest,
@@ -2290,44 +2291,104 @@ export class ApiClient {
   }
 
   /**
-   * Lists the MCP servers the workspace shares with every agent. The response
-   * carries names and transports only — the stored configuration is
-   * write-only server-side, so there is nothing here to redact.
+   * The workspace's MCP server library. The response carries identity and
+   * transport only — the stored entries are write-only server-side, so there
+   * is nothing here to redact.
    */
-  async getWorkspaceMcpConfig(workspaceId: string): Promise<WorkspaceMcpConfig> {
-    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/mcp-config`);
-    return parseWithFallback(raw, WorkspaceMcpConfigSchema, EMPTY_WORKSPACE_MCP_CONFIG, {
-      endpoint: "GET /api/workspaces/{id}/mcp-config",
+  async listWorkspaceMcpServers(workspaceId: string): Promise<WorkspaceMcpServer[]> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/mcp-servers`);
+    return parseWithFallback(raw, WorkspaceMcpServerListSchema, [] as WorkspaceMcpServer[], {
+      endpoint: "GET /api/workspaces/{id}/mcp-servers",
     });
   }
 
   /**
-   * Adds or replaces ONE shared MCP server. Per-server rather than a whole
-   * document write because the client can never read the document back, so a
-   * read-modify-write is impossible; the server merges under a row lock.
+   * Adds a server to the library. It is assigned to NO agent — an agent gets
+   * it only through addAgentMcpServer.
    */
-  async upsertWorkspaceMcpServer(
+  async createWorkspaceMcpServer(
     workspaceId: string,
     name: string,
-    entry: Record<string, unknown>,
-  ): Promise<WorkspaceMcpConfig> {
-    const raw = await this.fetch<unknown>(
-      `/api/workspaces/${workspaceId}/mcp-config/servers/${encodeURIComponent(name)}`,
-      { method: "PUT", body: JSON.stringify(entry) },
-    );
-    return parseWithFallback(raw, WorkspaceMcpConfigSchema, EMPTY_WORKSPACE_MCP_CONFIG, {
-      endpoint: "PUT /api/workspaces/{id}/mcp-config/servers/{name}",
+    config: Record<string, unknown>,
+  ): Promise<WorkspaceMcpServer> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/mcp-servers`, {
+      method: "POST",
+      body: JSON.stringify({ name, config }),
+    });
+    return parseWithFallback(raw, WorkspaceMcpServerSchema, EMPTY_WORKSPACE_MCP_SERVER, {
+      endpoint: "POST /api/workspaces/{id}/mcp-servers",
     });
   }
 
-  /** Removes one shared MCP server; removing the last one clears the layer. */
-  async deleteWorkspaceMcpServer(workspaceId: string, name: string): Promise<WorkspaceMcpConfig> {
+  /**
+   * Renames a library entry, replaces its configuration, or both. Agents keep
+   * their assignment across a rename because assignments key off the id.
+   */
+  async updateWorkspaceMcpServer(
+    workspaceId: string,
+    serverId: string,
+    update: { name?: string; config?: Record<string, unknown> },
+  ): Promise<WorkspaceMcpServer> {
     const raw = await this.fetch<unknown>(
-      `/api/workspaces/${workspaceId}/mcp-config/servers/${encodeURIComponent(name)}`,
+      `/api/workspaces/${workspaceId}/mcp-servers/${encodeURIComponent(serverId)}`,
+      { method: "PUT", body: JSON.stringify(update) },
+    );
+    return parseWithFallback(raw, WorkspaceMcpServerSchema, EMPTY_WORKSPACE_MCP_SERVER, {
+      endpoint: "PUT /api/workspaces/{id}/mcp-servers/{serverId}",
+    });
+  }
+
+  /** Removes a library entry and every assignment to it. */
+  async deleteWorkspaceMcpServer(workspaceId: string, serverId: string): Promise<void> {
+    await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/mcp-servers/${encodeURIComponent(serverId)}`,
       { method: "DELETE" },
     );
-    return parseWithFallback(raw, WorkspaceMcpConfigSchema, EMPTY_WORKSPACE_MCP_CONFIG, {
-      endpoint: "DELETE /api/workspaces/{id}/mcp-config/servers/{name}",
+  }
+
+  /** The workspace MCP servers assigned to this agent, with their toggles. */
+  async listAgentMcpServers(agentId: string): Promise<WorkspaceMcpServer[]> {
+    const raw = await this.fetch<unknown>(`/api/agents/${agentId}/mcp-servers`);
+    return parseWithFallback(raw, WorkspaceMcpServerListSchema, [] as WorkspaceMcpServer[], {
+      endpoint: "GET /api/agents/{id}/mcp-servers",
+    });
+  }
+
+  /**
+   * Gives one workspace server to this agent. Every write returns the
+   * resulting assignment list, so the client never has to guess the state.
+   */
+  async addAgentMcpServer(agentId: string, serverId: string): Promise<WorkspaceMcpServer[]> {
+    const raw = await this.fetch<unknown>(`/api/agents/${agentId}/mcp-servers`, {
+      method: "POST",
+      body: JSON.stringify({ server_id: serverId }),
+    });
+    return parseWithFallback(raw, WorkspaceMcpServerListSchema, [] as WorkspaceMcpServer[], {
+      endpoint: "POST /api/agents/{id}/mcp-servers",
+    });
+  }
+
+  async setAgentMcpServerEnabled(
+    agentId: string,
+    serverId: string,
+    enabled: boolean,
+  ): Promise<WorkspaceMcpServer[]> {
+    const raw = await this.fetch<unknown>(
+      `/api/agents/${agentId}/mcp-servers/${encodeURIComponent(serverId)}/enabled`,
+      { method: "PUT", body: JSON.stringify({ enabled }) },
+    );
+    return parseWithFallback(raw, WorkspaceMcpServerListSchema, [] as WorkspaceMcpServer[], {
+      endpoint: "PUT /api/agents/{id}/mcp-servers/{serverId}/enabled",
+    });
+  }
+
+  async removeAgentMcpServer(agentId: string, serverId: string): Promise<WorkspaceMcpServer[]> {
+    const raw = await this.fetch<unknown>(
+      `/api/agents/${agentId}/mcp-servers/${encodeURIComponent(serverId)}`,
+      { method: "DELETE" },
+    );
+    return parseWithFallback(raw, WorkspaceMcpServerListSchema, [] as WorkspaceMcpServer[], {
+      endpoint: "DELETE /api/agents/{id}/mcp-servers/{serverId}",
     });
   }
 

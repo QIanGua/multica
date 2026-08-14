@@ -71,6 +71,13 @@ type AgentInvocationTarget struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type AgentMcpServer struct {
+	AgentID   pgtype.UUID        `json:"agent_id"`
+	ServerID  pgtype.UUID        `json:"server_id"`
+	Enabled   bool               `json:"enabled"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type AgentRuntime struct {
 	ID             pgtype.UUID        `json:"id"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
@@ -1393,8 +1400,7 @@ type Workspace struct {
 	IssueCounter int32              `json:"issue_counter"`
 	AvatarUrl    pgtype.Text        `json:"avatar_url"`
 	// When TRUE, an agent run that resolves to no precise accountable human (would be owner_fallback) is refused at enqueue instead of degrading to the agent owner (MUL-4302 §3.5). Default FALSE = owner_fallback. Never affects authorization (originator_user_id).
-	AttributionFailClosed bool   `json:"attribution_fail_closed"`
-	McpConfig             []byte `json:"mcp_config"`
+	AttributionFailClosed bool `json:"attribution_fail_closed"`
 }
 
 type WorkspaceInvitation struct {
@@ -1408,4 +1414,14 @@ type WorkspaceInvitation struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+}
+
+type WorkspaceMcpServer struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Name        string             `json:"name"`
+	Config      []byte             `json:"config"`
+	CreatedBy   pgtype.UUID        `json:"created_by"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }

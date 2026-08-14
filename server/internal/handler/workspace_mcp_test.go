@@ -30,91 +30,94 @@ func serverNames(servers map[string]any) []string {
 	return names
 }
 
-func TestResolveWorkspaceMcpConfig(t *testing.T) {
-	const wsDoc = `{"mcpServers":{"shared":{"url":"https://shared.example"},"linear":{"url":"https://ws-linear.example"}}}`
+func bindings(pairs ...string) []WorkspaceMcpBinding {
+	out := make([]WorkspaceMcpBinding, 0, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		out = append(out, WorkspaceMcpBinding{Name: pairs[i], Config: json.RawMessage(pairs[i+1])})
+	}
+	return out
+}
 
+func TestResolveAgentMcpConfig(t *testing.T) {
 	tests := []struct {
 		name        string
-		workspace   string
+		bound       []WorkspaceMcpBinding
 		agent       string
 		wantServers map[string]string // server name -> expected url
 		wantNil     bool
 	}{
 		{
-			name:      "agent absent inherits the whole workspace document",
-			workspace: wsDoc,
-			agent:     "",
+			// The whole point of the binding model: an agent runs with exactly
+			// the workspace servers it was given, and nothing else.
+			name:  "agent with no config of its own runs the servers it was given",
+			bound: bindings("shared", `{"url":"https://shared.example"}`),
+			agent: "",
 			wantServers: map[string]string{
 				"shared": "https://shared.example",
-				"linear": "https://ws-linear.example",
 			},
 		},
 		{
-			name:      "agent json null inherits too",
-			workspace: wsDoc,
-			agent:     "null",
-			wantServers: map[string]string{
-				"shared": "https://shared.example",
-				"linear": "https://ws-linear.example",
-			},
-		},
-		{
-			name:      "agent servers union with the workspace's",
-			workspace: wsDoc,
-			agent:     `{"mcpServers":{"private":{"url":"https://private.example"}}}`,
+			name:  "bound servers union with the agent's own",
+			bound: bindings("shared", `{"url":"https://shared.example"}`),
+			agent: `{"mcpServers":{"private":{"url":"https://private.example"}}}`,
 			wantServers: map[string]string{
 				"shared":  "https://shared.example",
-				"linear":  "https://ws-linear.example",
 				"private": "https://private.example",
 			},
 		},
 		{
-			name:      "agent wins on a server-name collision",
-			workspace: wsDoc,
-			agent:     `{"mcpServers":{"linear":{"url":"https://agent-linear.example"}}}`,
+			name:  "the agent's own entry wins on a name collision",
+			bound: bindings("linear", `{"url":"https://ws-linear.example"}`),
+			agent: `{"mcpServers":{"linear":{"url":"https://agent-linear.example"}}}`,
 			wantServers: map[string]string{
-				"shared": "https://shared.example",
 				"linear": "https://agent-linear.example",
 			},
 		},
 		{
-			// The legacy entry both shadows the shared one AND survives, now
-			// folded into the canonical container the daemon actually reads.
-			name:      "an agent name in the legacy container shadows the shared one and survives",
-			workspace: wsDoc,
-			agent:     `{"mcp":{"linear":{"url":"https://legacy-linear.example"}}}`,
+			// The legacy entry both shadows the bound one AND survives, folded
+			// into the canonical container the daemon actually reads.
+			name:  "a legacy-container name shadows the bound server and survives",
+			bound: bindings("linear", `{"url":"https://ws-linear.example"}`, "shared", `{"url":"https://shared.example"}`),
+			agent: `{"mcp":{"linear":{"url":"https://legacy-linear.example"}}}`,
 			wantServers: map[string]string{
 				"shared": "https://shared.example",
 				"linear": "https://legacy-linear.example",
 			},
 		},
 		{
-			name:      "no workspace document leaves the agent config alone",
-			workspace: "",
-			agent:     `{"mcpServers":{"private":{"url":"https://private.example"}}}`,
+			// Nothing bound: an unassigned library entry is invisible here,
+			// and the agent keeps exactly what it had.
+			name:  "no bindings leaves the agent config alone",
+			bound: nil,
+			agent: `{"mcpServers":{"private":{"url":"https://private.example"}}}`,
 			wantServers: map[string]string{
 				"private": "https://private.example",
 			},
 		},
 		{
-			name:      "an empty workspace document shares nothing",
-			workspace: `{"mcpServers":{}}`,
-			agent:     "",
-			wantNil:   true,
+			name:    "nothing bound and nothing configured stays nil",
+			bound:   nil,
+			agent:   "",
+			wantNil: true,
 		},
 		{
-			name:      "nothing configured anywhere stays nil",
-			workspace: "",
-			agent:     "",
-			wantNil:   true,
+			// A managed-but-empty agent config keeps meaning "no servers of my
+			// own"; it is not an opt-out signal any more, because there is
+			// nothing to opt out of — bindings are already explicit.
+			name:  "a managed-but-empty agent config still receives its bindings",
+			bound: bindings("shared", `{"url":"https://shared.example"}`),
+			agent: `{}`,
+			wantServers: map[string]string{
+				"shared": "https://shared.example",
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ResolveWorkspaceMcpConfig(json.RawMessage(tc.workspace), json.RawMessage(tc.agent))
+			got, err := ResolveAgentMcpConfig(tc.bound, json.RawMessage(tc.agent))
 			if err != nil {
-				t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
+				t.Fatalf("ResolveAgentMcpConfig: unexpected error: %v", err)
 			}
 			if tc.wantNil {
 				if got != nil {
@@ -139,45 +142,18 @@ func TestResolveWorkspaceMcpConfig(t *testing.T) {
 	}
 }
 
-// An agent whose saved config declares no servers is the explicit "this agent
-// runs with zero MCP" state from #3545. Sharing a workspace document must not
-// hand it credentials it was deliberately not given — that silent propagation
-// is the main risk of an inheritance layer, so it gets its own test.
-func TestResolveWorkspaceMcpConfig_ZeroServerAgentOptsOut(t *testing.T) {
-	const wsDoc = `{"mcpServers":{"shared":{"url":"https://shared.example"}}}`
-
-	for _, agentCfg := range []string{`{}`, `{"mcpServers":{}}`, `{"mcp":{}}`} {
-		t.Run(agentCfg, func(t *testing.T) {
-			got, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
-			if err != nil {
-				t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
-			}
-			if servers := decodeServers(t, got); len(servers) != 0 {
-				t.Fatalf("opted-out agent inherited %v", serverNames(servers))
-			}
-			// The agent document must also survive byte-for-byte: the
-			// three-state contract keys strict mode off "managed but empty",
-			// which a nil result would silently turn back into "inherit".
-			if string(got) != agentCfg {
-				t.Fatalf("agent document = %s, want it returned unchanged (%s)", got, agentCfg)
-			}
-		})
-	}
-}
-
 // The agent's servers must survive whichever container they were stored in,
 // and the result must be normalized onto `mcpServers`. This is the case that
 // regressed OpenCode agents: the daemon's runtime merge only falls back to the
 // legacy `mcp` container when `mcpServers` is absent, so leaving the agent's
-// entries behind in `mcp` while writing shared ones into `mcpServers` made the
-// daemon read the shared set and drop the agent's own servers entirely.
-func TestResolveWorkspaceMcpConfig_FoldsLegacyContainerIntoCanonical(t *testing.T) {
-	const wsDoc = `{"mcpServers":{"shared":{"url":"https://shared.example"}}}`
+// entries behind in `mcp` while writing bound ones into `mcpServers` made the
+// daemon read the bound set and drop the agent's own servers entirely.
+func TestResolveAgentMcpConfig_FoldsLegacyContainerIntoCanonical(t *testing.T) {
 	const agentCfg = `{"mcp":{"legacy":{"command":"legacy-server"}},"inputs":[{"id":"token"}]}`
 
-	got, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+	got, err := ResolveAgentMcpConfig(bindings("shared", `{"url":"https://shared.example"}`), json.RawMessage(agentCfg))
 	if err != nil {
-		t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
+		t.Fatalf("ResolveAgentMcpConfig: unexpected error: %v", err)
 	}
 	var doc map[string]any
 	if err := json.Unmarshal(got, &doc); err != nil {
@@ -197,13 +173,12 @@ func TestResolveWorkspaceMcpConfig_FoldsLegacyContainerIntoCanonical(t *testing.
 
 // A name present in BOTH containers resolves to the canonical entry — the
 // precedence the agent settings UI already displays.
-func TestResolveWorkspaceMcpConfig_CanonicalContainerWinsOverLegacy(t *testing.T) {
-	const wsDoc = `{"mcpServers":{"shared":{"url":"https://shared.example"}}}`
+func TestResolveAgentMcpConfig_CanonicalContainerWinsOverLegacy(t *testing.T) {
 	const agentCfg = `{"mcpServers":{"dup":{"url":"https://canonical.example"}},"mcp":{"dup":{"url":"https://legacy.example"}}}`
 
-	got, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+	got, err := ResolveAgentMcpConfig(bindings("shared", `{"url":"https://shared.example"}`), json.RawMessage(agentCfg))
 	if err != nil {
-		t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
+		t.Fatalf("ResolveAgentMcpConfig: unexpected error: %v", err)
 	}
 	servers := decodeServers(t, got)
 	dup, _ := servers["dup"].(map[string]any)
@@ -212,16 +187,14 @@ func TestResolveWorkspaceMcpConfig_CanonicalContainerWinsOverLegacy(t *testing.T
 	}
 }
 
-// Fail-soft: a malformed shared document must never take away servers the
-// agent runs with today. It reports the error and returns the agent config.
-func TestResolveWorkspaceMcpConfig_MalformedWorkspaceKeepsAgentConfig(t *testing.T) {
-	const agentCfg = `{"mcpServers":{"private":{"url":"https://private.example"}}}`
-
-	for _, wsDoc := range []string{`{"mcpServers":[]}`, `not json`, `{"mcpServers":{"broken":"not-an-object"}}`} {
-		t.Run(wsDoc, func(t *testing.T) {
-			got, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+// Fail-soft: a malformed agent document must never cost the agent its servers.
+// It reports the error and returns the agent config untouched.
+func TestResolveAgentMcpConfig_MalformedAgentConfigIsReturnedUnchanged(t *testing.T) {
+	for _, agentCfg := range []string{`{"mcpServers":[]}`, `not json`, `{"mcpServers":{"broken":"not-an-object"}}`} {
+		t.Run(agentCfg, func(t *testing.T) {
+			got, err := ResolveAgentMcpConfig(bindings("shared", `{"url":"https://shared.example"}`), json.RawMessage(agentCfg))
 			if err == nil {
-				t.Fatalf("expected an error for workspace document %s", wsDoc)
+				t.Fatalf("expected an error for agent document %s", agentCfg)
 			}
 			if string(got) != agentCfg {
 				t.Fatalf("agent config = %s, want it returned unchanged (%s)", got, agentCfg)
@@ -230,16 +203,17 @@ func TestResolveWorkspaceMcpConfig_MalformedWorkspaceKeepsAgentConfig(t *testing
 	}
 }
 
-// The claim path applies the workspace layer before the per-task overlay, so
-// the two merges have to compose into workspace < agent < overlay.
-func TestResolveWorkspaceMcpConfig_ComposesWithTaskOverlay(t *testing.T) {
-	const wsDoc = `{"mcpServers":{"shared":{"url":"https://shared.example"},"composio":{"url":"https://ws-composio.example"}}}`
+// The claim path applies the bindings before the per-task overlay, so the two
+// merges have to compose into bound < agent < overlay.
+func TestResolveAgentMcpConfig_ComposesWithTaskOverlay(t *testing.T) {
 	const agentCfg = `{"mcpServers":{"private":{"url":"https://private.example"}}}`
 	const overlay = `{"mcpServers":{"composio":{"url":"https://session-composio.example"}}}`
 
-	resolved, err := ResolveWorkspaceMcpConfig(json.RawMessage(wsDoc), json.RawMessage(agentCfg))
+	resolved, err := ResolveAgentMcpConfig(
+		bindings("shared", `{"url":"https://shared.example"}`, "composio", `{"url":"https://ws-composio.example"}`),
+		json.RawMessage(agentCfg))
 	if err != nil {
-		t.Fatalf("ResolveWorkspaceMcpConfig: unexpected error: %v", err)
+		t.Fatalf("ResolveAgentMcpConfig: unexpected error: %v", err)
 	}
 	merged, err := mergeMCPOverlay(resolved, json.RawMessage(overlay))
 	if err != nil {
@@ -251,53 +225,64 @@ func TestResolveWorkspaceMcpConfig_ComposesWithTaskOverlay(t *testing.T) {
 	}
 	composio, _ := servers["composio"].(map[string]any)
 	if composio["url"] != "https://session-composio.example" {
-		t.Errorf("overlay must win over the workspace entry, got %v", composio["url"])
+		t.Errorf("overlay must win over the bound entry, got %v", composio["url"])
 	}
 }
 
-func TestValidateWorkspaceMcpConfig(t *testing.T) {
+func TestValidateWorkspaceMcpServerEntry(t *testing.T) {
 	tests := []struct {
 		name    string
 		raw     string
 		wantErr bool
 	}{
-		{name: "servers", raw: `{"mcpServers":{"a":{"url":"https://a.example"}}}`},
-		{name: "empty object", raw: `{}`},
-		{name: "empty server map", raw: `{"mcpServers":{}}`},
+		{name: "stdio entry", raw: `{"command":"npx","args":["-y","server"]}`},
+		{name: "http entry", raw: `{"type":"http","url":"https://mcp.example"}`},
+		{name: "empty object", raw: `{}`, wantErr: true},
 		{name: "array", raw: `[]`, wantErr: true},
 		{name: "string", raw: `"nope"`, wantErr: true},
-		{name: "servers not an object", raw: `{"mcpServers":[]}`, wantErr: true},
-		{name: "server entry not an object", raw: `{"mcpServers":{"a":"https://a.example"}}`, wantErr: true},
-		{name: "empty server name", raw: `{"mcpServers":{"":{"url":"https://a.example"}}}`, wantErr: true},
-		{name: "legacy container", raw: `{"mcp":{"a":{"url":"https://a.example"}}}`, wantErr: true},
-		{name: "no servers key", raw: `{"inputs":[]}`, wantErr: true},
+		{name: "null", raw: `null`, wantErr: true},
 		{name: "empty input", raw: ``, wantErr: true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateWorkspaceMcpConfig(json.RawMessage(tc.raw))
+			err := validateWorkspaceMcpServerEntry(json.RawMessage(tc.raw))
 			if tc.wantErr && err == nil {
-				t.Fatalf("validateWorkspaceMcpConfig(%s): expected an error", tc.raw)
+				t.Fatalf("validateWorkspaceMcpServerEntry(%s): expected an error", tc.raw)
 			}
 			if !tc.wantErr && err != nil {
-				t.Fatalf("validateWorkspaceMcpConfig(%s): unexpected error: %v", tc.raw, err)
+				t.Fatalf("validateWorkspaceMcpServerEntry(%s): unexpected error: %v", tc.raw, err)
 			}
 		})
 	}
 }
 
-// Validation errors are surfaced to the caller verbatim, and a shared document
-// is exactly where a token would sit — so the message must never quote input.
-func TestValidateWorkspaceMcpConfig_ErrorNeverEchoesInput(t *testing.T) {
-	secret := `{"mcpServers":{"a":{"headers":{"Authorization":"Bearer sk-live-should-not-leak"` // deliberately truncated
+// Validation errors are surfaced to the caller verbatim, and a server entry is
+// exactly where a token sits — so the message must never quote input.
+func TestValidateWorkspaceMcpServerEntry_ErrorNeverEchoesInput(t *testing.T) {
+	secret := `{"headers":{"Authorization":"Bearer sk-live-should-not-leak"` // deliberately truncated
 
-	err := validateWorkspaceMcpConfig(json.RawMessage(secret))
+	err := validateWorkspaceMcpServerEntry(json.RawMessage(secret))
 	if err == nil {
-		t.Fatal("expected an error for a truncated document")
+		t.Fatal("expected an error for a truncated entry")
 	}
 	if strings.Contains(err.Error(), "sk-live-should-not-leak") {
 		t.Fatalf("validation error leaked input: %q", err.Error())
+	}
+}
+
+func TestValidateWorkspaceMcpServerName(t *testing.T) {
+	for _, name := range []string{"linear", "local-tool", "my_server", "abc123"} {
+		if err := validateWorkspaceMcpServerName(name); err != nil {
+			t.Errorf("validateWorkspaceMcpServerName(%q): unexpected error: %v", name, err)
+		}
+	}
+	// The name is what a runtime mounts the server under, so keep it to the
+	// same character set the agent settings dialog enforces.
+	for _, name := range []string{"", "has space", "dot.name", "slash/name", "emoji🎉"} {
+		if err := validateWorkspaceMcpServerName(name); err == nil {
+			t.Errorf("validateWorkspaceMcpServerName(%q): expected an error", name)
+		}
 	}
 }
 

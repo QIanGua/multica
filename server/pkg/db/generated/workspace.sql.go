@@ -11,40 +11,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const clearWorkspaceMcpConfig = `-- name: ClearWorkspaceMcpConfig :one
-UPDATE workspace SET mcp_config = NULL, updated_at = now()
-WHERE id = $1
-RETURNING id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed, mcp_config
-`
-
-// Restores the "nothing shared at this layer" state. Every agent that was
-// inheriting falls back to its own mcp_config on its next claim.
-func (q *Queries) ClearWorkspaceMcpConfig(ctx context.Context, id pgtype.UUID) (Workspace, error) {
-	row := q.db.QueryRow(ctx, clearWorkspaceMcpConfig, id)
-	var i Workspace
-	err := row.Scan(
-		&i.ID,
-		&i.Name,
-		&i.Slug,
-		&i.Description,
-		&i.Settings,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.Context,
-		&i.Repos,
-		&i.IssuePrefix,
-		&i.IssueCounter,
-		&i.AvatarUrl,
-		&i.AttributionFailClosed,
-		&i.McpConfig,
-	)
-	return i, err
-}
-
 const createWorkspace = `-- name: CreateWorkspace :one
 INSERT INTO workspace (name, slug, description, context, issue_prefix)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed, mcp_config
+RETURNING id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed
 `
 
 type CreateWorkspaceParams struct {
@@ -78,7 +48,6 @@ func (q *Queries) CreateWorkspace(ctx context.Context, arg CreateWorkspaceParams
 		&i.IssueCounter,
 		&i.AvatarUrl,
 		&i.AttributionFailClosed,
-		&i.McpConfig,
 	)
 	return i, err
 }
@@ -149,6 +118,20 @@ cleared_issue_properties AS (
 ),
 cleared_quick_actions AS (
     DELETE FROM quick_action WHERE workspace_id = $1
+),
+ws_mcp_servers AS (
+    SELECT id FROM workspace_mcp_server WHERE workspace_id = $1
+),
+cleared_agent_mcp_bindings AS (
+    -- agent_mcp_server carries no FK in either direction, so sweep it from
+    -- both sides: the workspace's own servers, and any binding held by an
+    -- agent that is about to be removed with the workspace.
+    DELETE FROM agent_mcp_server
+    WHERE server_id IN (SELECT id FROM ws_mcp_servers)
+       OR agent_id IN (SELECT id FROM ws_agents)
+),
+cleared_workspace_mcp_servers AS (
+    DELETE FROM workspace_mcp_server WHERE workspace_id = $1
 ),
 deleted_pending_check_suites AS (
     DELETE FROM github_pending_check_suite WHERE workspace_id = $1
@@ -224,7 +207,7 @@ func (q *Queries) GetDaemonWorkspace(ctx context.Context, id pgtype.UUID) (GetDa
 }
 
 const getWorkspace = `-- name: GetWorkspace :one
-SELECT id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed, mcp_config FROM workspace
+SELECT id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed FROM workspace
 WHERE id = $1
 `
 
@@ -245,7 +228,6 @@ func (q *Queries) GetWorkspace(ctx context.Context, id pgtype.UUID) (Workspace, 
 		&i.IssueCounter,
 		&i.AvatarUrl,
 		&i.AttributionFailClosed,
-		&i.McpConfig,
 	)
 	return i, err
 }
@@ -265,7 +247,7 @@ func (q *Queries) GetWorkspaceAttributionFailClosed(ctx context.Context, id pgty
 }
 
 const getWorkspaceBySlug = `-- name: GetWorkspaceBySlug :one
-SELECT id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed, mcp_config FROM workspace
+SELECT id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed FROM workspace
 WHERE slug = $1
 `
 
@@ -286,25 +268,8 @@ func (q *Queries) GetWorkspaceBySlug(ctx context.Context, slug string) (Workspac
 		&i.IssueCounter,
 		&i.AvatarUrl,
 		&i.AttributionFailClosed,
-		&i.McpConfig,
 	)
 	return i, err
-}
-
-const getWorkspaceMcpConfig = `-- name: GetWorkspaceMcpConfig :one
-SELECT mcp_config FROM workspace
-WHERE id = $1
-`
-
-// Lean read of the workspace's shared MCP document for the daemon claim path,
-// which resolves it under every agent's own mcp_config on each claim. Kept
-// narrow (like GetWorkspaceAttributionFailClosed) so the hot path never drags
-// settings/repos/context along. NULL = nothing shared at this layer.
-func (q *Queries) GetWorkspaceMcpConfig(ctx context.Context, id pgtype.UUID) ([]byte, error) {
-	row := q.db.QueryRow(ctx, getWorkspaceMcpConfig, id)
-	var mcp_config []byte
-	err := row.Scan(&mcp_config)
-	return mcp_config, err
 }
 
 const incrementIssueCounter = `-- name: IncrementIssueCounter :one
@@ -367,31 +332,15 @@ WHERE m.user_id = $1
 ORDER BY w.created_at ASC
 `
 
-type ListWorkspacesRow struct {
-	ID                    pgtype.UUID        `json:"id"`
-	Name                  string             `json:"name"`
-	Slug                  string             `json:"slug"`
-	Description           pgtype.Text        `json:"description"`
-	Settings              []byte             `json:"settings"`
-	CreatedAt             pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
-	Context               pgtype.Text        `json:"context"`
-	Repos                 []byte             `json:"repos"`
-	IssuePrefix           string             `json:"issue_prefix"`
-	IssueCounter          int32              `json:"issue_counter"`
-	AvatarUrl             pgtype.Text        `json:"avatar_url"`
-	AttributionFailClosed bool               `json:"attribution_fail_closed"`
-}
-
-func (q *Queries) ListWorkspaces(ctx context.Context, userID pgtype.UUID) ([]ListWorkspacesRow, error) {
+func (q *Queries) ListWorkspaces(ctx context.Context, userID pgtype.UUID) ([]Workspace, error) {
 	rows, err := q.db.Query(ctx, listWorkspaces, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ListWorkspacesRow{}
+	items := []Workspace{}
 	for rows.Next() {
-		var i ListWorkspacesRow
+		var i Workspace
 		if err := rows.Scan(
 			&i.ID,
 			&i.Name,
@@ -461,60 +410,6 @@ func (q *Queries) LockWorkspaceForDelete(ctx context.Context, id pgtype.UUID) (p
 	return id_2, err
 }
 
-const lockWorkspaceMcpConfig = `-- name: LockWorkspaceMcpConfig :one
-SELECT mcp_config FROM workspace
-WHERE id = $1
-FOR UPDATE
-`
-
-// Read-for-update half of the per-server edit path. The shared document is
-// never echoed back to clients, so a UI cannot do the read-modify-write
-// itself; the server does it instead, and this lock is what keeps two admins
-// editing different servers from losing one another's write. Takes only the
-// workspace row, so it cannot deadlock against the workspace -> chat_session
-// -> agent_task_queue lock order used elsewhere.
-func (q *Queries) LockWorkspaceMcpConfig(ctx context.Context, id pgtype.UUID) ([]byte, error) {
-	row := q.db.QueryRow(ctx, lockWorkspaceMcpConfig, id)
-	var mcp_config []byte
-	err := row.Scan(&mcp_config)
-	return mcp_config, err
-}
-
-const setWorkspaceMcpConfig = `-- name: SetWorkspaceMcpConfig :one
-UPDATE workspace SET mcp_config = $2, updated_at = now()
-WHERE id = $1
-RETURNING id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed, mcp_config
-`
-
-type SetWorkspaceMcpConfigParams struct {
-	ID        pgtype.UUID `json:"id"`
-	McpConfig []byte      `json:"mcp_config"`
-}
-
-// Writes the shared MCP document. Mirrors the agent column's two-query
-// pattern: COALESCE cannot restore NULL, so clearing has its own query below.
-func (q *Queries) SetWorkspaceMcpConfig(ctx context.Context, arg SetWorkspaceMcpConfigParams) (Workspace, error) {
-	row := q.db.QueryRow(ctx, setWorkspaceMcpConfig, arg.ID, arg.McpConfig)
-	var i Workspace
-	err := row.Scan(
-		&i.ID,
-		&i.Name,
-		&i.Slug,
-		&i.Description,
-		&i.Settings,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.Context,
-		&i.Repos,
-		&i.IssuePrefix,
-		&i.IssueCounter,
-		&i.AvatarUrl,
-		&i.AttributionFailClosed,
-		&i.McpConfig,
-	)
-	return i, err
-}
-
 const updateWorkspace = `-- name: UpdateWorkspace :one
 UPDATE workspace SET
     name = COALESCE($2, name),
@@ -526,7 +421,7 @@ UPDATE workspace SET
     avatar_url = COALESCE($8, avatar_url),
     updated_at = now()
 WHERE id = $1
-RETURNING id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed, mcp_config
+RETURNING id, name, slug, description, settings, created_at, updated_at, context, repos, issue_prefix, issue_counter, avatar_url, attribution_fail_closed
 `
 
 type UpdateWorkspaceParams struct {
@@ -566,7 +461,6 @@ func (q *Queries) UpdateWorkspace(ctx context.Context, arg UpdateWorkspaceParams
 		&i.IssueCounter,
 		&i.AvatarUrl,
 		&i.AttributionFailClosed,
-		&i.McpConfig,
 	)
 	return i, err
 }

@@ -18,10 +18,11 @@ import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useCurrentMember } from "@multica/core/permissions";
-import { workspaceMcpConfigOptions } from "@multica/core/workspace/queries";
+import { workspaceMcpServersOptions } from "@multica/core/workspace/queries";
 import {
+  useCreateWorkspaceMcpServer,
   useDeleteWorkspaceMcpServer,
-  useUpsertWorkspaceMcpServer,
+  useUpdateWorkspaceMcpServer,
 } from "@multica/core/workspace/mutations";
 import type { WorkspaceMcpServer } from "@multica/core/types";
 import { McpServerDialog } from "../../agents/components/tabs/mcp-server-dialog";
@@ -30,18 +31,19 @@ import { useT } from "../../i18n";
 import { SettingsCard, SettingsSection, SettingsTab } from "./settings-layout";
 
 /**
- * Workspace-level MCP servers (GH #6062).
+ * The workspace MCP server library (GH #6062).
  *
  * Two things shape this screen and are worth stating up front:
  *
+ *  - A server added here is given to NO agent. It is a library entry, exactly
+ *    like a workspace skill: an agent owner assigns it on the agent's own MCP
+ *    tab, where it also gets a per-agent on/off toggle. Nothing here reaches an
+ *    agent implicitly.
  *  - The stored configuration is WRITE-ONLY. The API returns names and
  *    transports, never urls / commands / headers / env, so there is no
  *    "current value" to prefill and editing a server means supplying its
- *    configuration again. The UI says so rather than pretending the empty
- *    form is the saved state.
- *  - Because the client cannot read the document, it cannot do the
- *    read-modify-write the agent tab does. Each row maps to a per-server
- *    endpoint and the server merges under a row lock.
+ *    configuration again. The UI says so rather than pretending the empty form
+ *    is the saved state.
  */
 export function McpTab() {
   const { t } = useT("settings");
@@ -51,11 +53,12 @@ export function McpTab() {
   const canManage =
     currentMember.role === "owner" || currentMember.role === "admin";
 
-  const configQuery = useQuery(workspaceMcpConfigOptions(wsId));
-  const upsertServer = useUpsertWorkspaceMcpServer(wsId);
+  const serversQuery = useQuery(workspaceMcpServersOptions(wsId));
+  const createServer = useCreateWorkspaceMcpServer(wsId);
+  const updateServer = useUpdateWorkspaceMcpServer(wsId);
   const deleteServer = useDeleteWorkspaceMcpServer(wsId);
 
-  const servers = configQuery.data?.servers ?? [];
+  const servers = serversQuery.data ?? [];
   const existingNames = useMemo(
     () => new Set(servers.map((server) => server.name)),
     [servers],
@@ -65,7 +68,9 @@ export function McpTab() {
   const [editingServer, setEditingServer] = useState<WorkspaceMcpServer | null>(
     null,
   );
-  const [deletingName, setDeletingName] = useState<string | null>(null);
+  const [deletingServer, setDeletingServer] = useState<WorkspaceMcpServer | null>(
+    null,
+  );
 
   // The dialog is shared with the agent MCP tab, which hands it the saved
   // entry to prefill. Here there is nothing to prefill — an edit always
@@ -77,7 +82,9 @@ export function McpTab() {
         config: {},
         container: "mcpServers",
         transport: editingServer.transport,
-        enabled: editingServer.enabled,
+        // The library has no per-agent toggle; this field only feeds the
+        // dialog's shape.
+        enabled: true,
       }
     : null;
 
@@ -85,12 +92,14 @@ export function McpTab() {
     name: string,
     config: Record<string, unknown>,
   ) => {
-    // The name is pinned while editing (see lockName below), so an edit can
-    // only ever replace the entry it opened — never create a second one and
-    // leave the original behind while reporting "updated".
-    const targetName = editingServer ? editingServer.name : name;
     try {
-      await upsertServer.mutateAsync({ name: targetName, entry: config });
+      if (editingServer) {
+        // Renaming is safe here: assignments key off the server id, so an
+        // agent that uses this server keeps using it.
+        await updateServer.mutateAsync({ serverId: editingServer.id, name, config });
+      } else {
+        await createServer.mutateAsync({ name, config });
+      }
       toast.success(
         editingServer
           ? t(($) => $.mcp.updated_toast)
@@ -107,11 +116,11 @@ export function McpTab() {
   };
 
   const handleDelete = async () => {
-    if (!deletingName) return;
+    if (!deletingServer) return;
     try {
-      await deleteServer.mutateAsync(deletingName);
+      await deleteServer.mutateAsync(deletingServer.id);
       toast.success(t(($) => $.mcp.removed_toast));
-      setDeletingName(null);
+      setDeletingServer(null);
     } catch (error) {
       toast.error(
         error instanceof Error && error.message
@@ -145,7 +154,7 @@ export function McpTab() {
         }
       >
         <SettingsCard>
-          {configQuery.isLoading ? (
+          {serversQuery.isLoading ? (
             <div className="flex items-center justify-center py-8 text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
             </div>
@@ -170,7 +179,7 @@ export function McpTab() {
                     setEditingServer(server);
                     setEditorOpen(true);
                   }}
-                  onDelete={() => setDeletingName(server.name)}
+                  onDelete={() => setDeletingServer(server)}
                 />
               ))}
             </ul>
@@ -187,24 +196,21 @@ export function McpTab() {
         open={editorOpen}
         server={dialogServer}
         existingNames={existingNames}
-        // No atomic rename exists on this API: renaming would add a server
-        // and orphan the old one, so editing pins the name.
-        lockName={editingServer !== null}
         onOpenChange={setEditorOpen}
         onSave={handleSaveServer}
       />
 
       <AlertDialog
-        open={deletingName !== null}
+        open={deletingServer !== null}
         onOpenChange={(open) => {
-          if (!open) setDeletingName(null);
+          if (!open) setDeletingServer(null);
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t(($) => $.mcp.delete_title)}</AlertDialogTitle>
             <AlertDialogDescription>
-              {t(($) => $.mcp.delete_description, { name: deletingName ?? "" })}
+              {t(($) => $.mcp.delete_description, { name: deletingServer?.name ?? "" })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
