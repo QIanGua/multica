@@ -406,7 +406,13 @@ type Daemon struct {
 	// Guarded by d.mu — deliberately the same lock every register-response
 	// apply takes, which is what totally orders "record the verdict" against
 	// "apply a response" instead of merely narrowing the window between them.
-	demotedProviders map[string]demotionRecord // provider -> the rejected version and when it was rejected
+	demotedProviders map[string]demotionRecord // provider -> the evidence that condemned it and when
+
+	// notExecutableSince is when each provider was FIRST observed to be
+	// unrunnable, for the confirmation window in confirmNotExecutable. Entries
+	// are cleared by the round that finds the provider healthy again. Guarded
+	// by d.mu.
+	notExecutableSince map[string]time.Time
 
 	// demotionSeq is a monotonic counter stamped onto each demotion record so a
 	// probe round can tell whether its evidence predates a verdict.
@@ -1555,15 +1561,16 @@ func (d *Daemon) providerDemotedLocked(provider string) bool {
 	return demoted
 }
 
-// demotionRecord is a confirmed below-minimum verdict: the version that was
-// rejected, plus the demotionSeq tick that establishes when it was reached.
+// demotionRecord is a confirmed verdict about the binary on disk: the evidence
+// that produced it (the rejected version, or why the CLI could not be run),
+// plus the demotionSeq tick that establishes when it was reached.
 type demotionRecord struct {
-	version string
-	seq     uint64
+	evidence string
+	seq      uint64
 }
 
-// markProvidersDemoted records a CONFIRMED below-minimum verdict so a register
-// response still in flight cannot revive the provider. Callers must hold d.mu.
+// markProvidersDemoted records a CONFIRMED verdict so a register response still
+// in flight cannot revive the provider. Callers must hold d.mu.
 func (d *Daemon) markProvidersDemotedLocked(providers map[string]string) {
 	if len(providers) == 0 {
 		return
@@ -1574,9 +1581,49 @@ func (d *Daemon) markProvidersDemotedLocked(providers map[string]string) {
 	// One tick per verdict batch: every record written here is newer than any
 	// probe round that snapshotted the counter before this call.
 	d.demotionSeq++
-	for provider, version := range providers {
-		d.demotedProviders[provider] = demotionRecord{version: version, seq: d.demotionSeq}
+	for provider, evidence := range providers {
+		d.demotedProviders[provider] = demotionRecord{evidence: evidence, seq: d.demotionSeq}
 	}
+}
+
+// notExecutableConfirmWindow is how long a "the OS will not run this file"
+// verdict must keep reproducing before the daemon acts on it.
+//
+// The verdict itself is deterministic, but the file is not: the repair we tell
+// users to run (`node <pkg>/install.cjs`) overwrites the bin entry in place, and
+// a probe that lands mid-copy sees a truncated file. Requiring a second sighting
+// this far apart makes an overwrite window impossible to mistake for a broken
+// install, and costs a genuinely broken install only one extra probe round.
+// A var so tests can collapse the wait.
+var notExecutableConfirmWindow = time.Minute
+
+// confirmNotExecutable records that this round found provider unrunnable and
+// reports whether the verdict is now old enough to act on.
+//
+// The first sighting only starts the clock. Two sightings are required no matter
+// how the window is configured, so concurrent probe rounds — four callers reach
+// detectBuiltinRuntimes — cannot combine into an instant demotion.
+func (d *Daemon) confirmNotExecutable(provider string, now time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	first, seen := d.notExecutableSince[provider]
+	if !seen {
+		if d.notExecutableSince == nil {
+			d.notExecutableSince = make(map[string]time.Time, 1)
+		}
+		d.notExecutableSince[provider] = now
+		return false
+	}
+	return now.Sub(first) >= notExecutableConfirmWindow
+}
+
+// clearNotExecutable forgets the pending verdict for a provider that probed OK,
+// so a later unrelated failure starts its own confirmation window instead of
+// inheriting a stale one.
+func (d *Daemon) clearNotExecutable(provider string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.notExecutableSince, provider)
 }
 
 // demotionSeqSnapshot returns the current demotion counter. A probe round takes
@@ -1614,13 +1661,13 @@ func (d *Daemon) clearProviderDemotions(providers []string, sampledAfter uint64)
 			continue
 		}
 		if record.seq > sampledAfter {
-			d.logger.Info("keeping below-minimum hold: this probe round started before the verdict",
-				"provider", provider, "rejected_version", record.version)
+			d.logger.Info("keeping demotion hold: this probe round started before the verdict",
+				"provider", provider, "verdict", record.evidence)
 			continue
 		}
 		delete(d.demotedProviders, provider)
-		d.logger.Info("agent CLI is back at or above the minimum supported version",
-			"provider", provider, "rejected_version", record.version)
+		d.logger.Info("agent CLI is usable again",
+			"provider", provider, "previous_verdict", record.evidence)
 	}
 }
 
@@ -2056,23 +2103,30 @@ var runtimeVersionProbeRetryDelay = 500 * time.Millisecond
 // Overridable for tests.
 var runtimeVersionProbeRetryWindow = time.Second
 
-// builtinProbeVerdict distinguishes the two ways a provider can fail its probe,
+// builtinProbeVerdict distinguishes the ways a provider can fail its probe,
 // which callers must treat differently.
 //
 // "Could not read a version" is transient by construction — the CLI was busy,
 // mid-upgrade, or fork/exec hiccuped — so the right response is to leave
-// whatever is registered alone and try again. "Read a version and it is below
-// the minimum supported one" is a confirmed verdict about a binary that is on
-// disk right now, and leaving it registered means the daemon keeps handing it
-// work it cannot run correctly. Collapsing both into one bool made the second
-// case indistinguishable from a hiccup, which is what let a downgraded CLI keep
-// claiming tasks.
+// whatever is registered alone and try again. The other two are confirmed
+// verdicts about a binary that is on disk right now, and leaving either
+// registered means the daemon keeps handing work to a CLI it has already proven
+// it cannot use: "read a version and it is below the minimum supported one",
+// and "the OS refuses to execute the file at all". Collapsing these into one
+// bool made a confirmed verdict indistinguishable from a hiccup, which is what
+// let a downgraded CLI keep claiming tasks.
 type builtinProbeVerdict int
 
 const (
 	builtinProbeOK builtinProbeVerdict = iota
 	builtinProbeUnavailable
 	builtinProbeBelowMinimum
+	// builtinProbeNotExecutable: the file resolved, but the OS rejected it as
+	// not a runnable program (an npm placeholder stub whose postinstall was
+	// blocked is the case in the field — MUL-6164). Deterministic in the same
+	// sense as below-minimum: the same bytes will be refused every time until
+	// someone reinstalls, so retrying is not what fixes it.
+	builtinProbeNotExecutable
 )
 
 // probeBuiltinRuntime resolves and version-detects one built-in provider,
@@ -2192,6 +2246,18 @@ func (d *Daemon) probeBuiltinRuntime(ctx context.Context, name string, entry Age
 		d.logger.Debug("agent version detected", "name", name, "version", version, "path", resolved.Path)
 		return version, "", builtinProbeOK
 	}
+	// The OS refusing to execute the file is not a failed probe, it is a
+	// finding: the CLI is installed, resolvable, and unrunnable. Report it as
+	// its own verdict so the caller can take the runtime offline instead of
+	// keeping it online for a binary that cannot start (MUL-6164). The
+	// diagnosis attached in pkg/agent rides along as the reason, so /health
+	// carries the repair command and not just the errno.
+	if agent.IsExecFormatError(lastErr) {
+		d.logger.Warn("skip registering runtime: agent CLI is not executable on this machine",
+			"name", name, "attempts", attempts, "error", lastErr)
+		return "", fmt.Sprintf("agent CLI is not executable: %v", lastErr), builtinProbeNotExecutable
+	}
+
 	d.logger.Warn("skip registering runtime", "name", name, "attempts", attempts, "error", lastErr)
 	reason := "version detection failed"
 	if lastErr != nil {
@@ -2255,7 +2321,7 @@ func (d *Daemon) detectBuiltinRuntimes(ctx context.Context) ([]map[string]string
 		mu          sync.Mutex
 		results     []detected
 		skipped     = map[string]string{}
-		belowMin    = map[string]string{}
+		demotable   = map[string]string{}
 		unavailable = map[string]string{}
 		g           errgroup.Group
 	)
@@ -2265,16 +2331,25 @@ func (d *Daemon) detectBuiltinRuntimes(ctx context.Context) ([]map[string]string
 		g.Go(func() error {
 			version, reason, verdict := d.probeBuiltinRuntime(ctx, name, entry)
 			if verdict != builtinProbeOK {
+				// A not-executable verdict is deterministic, but the file can be
+				// unreadable for a moment while an installer overwrites it in
+				// place — which is exactly the repair we are telling users to
+				// run. Demote only once the verdict has survived a second probe
+				// a confirmation window later; until then it is treated as
+				// transient, which costs one more round and nothing else.
+				demote := verdict == builtinProbeBelowMinimum ||
+					(verdict == builtinProbeNotExecutable && d.confirmNotExecutable(name, time.Now()))
 				mu.Lock()
 				skipped[name] = reason
-				if verdict == builtinProbeBelowMinimum {
-					belowMin[name] = version
+				if demote {
+					demotable[name] = reason
 				} else {
 					unavailable[name] = reason
 				}
 				mu.Unlock()
 				return nil
 			}
+			d.clearNotExecutable(name)
 			mu.Lock()
 			results = append(results, detected{name: name, version: version})
 			mu.Unlock()
@@ -2320,7 +2395,7 @@ func (d *Daemon) detectBuiltinRuntimes(ctx context.Context) ([]map[string]string
 			"status":  "online",
 		})
 	}
-	return runtimes, belowMin, unavailable
+	return runtimes, demotable, unavailable
 }
 
 // cloneRuntimeEntries deep-copies a registration runtime payload. Callers that
@@ -2370,29 +2445,30 @@ func (d *Daemon) registerRuntimesForWorkspaceLocked(ctx context.Context, workspa
 // transient, so dropping the rows would tear a working runtime down over one
 // failed probe.
 //
-// Below-minimum is the half that is easy to get wrong, because the verdict IS
-// confirmed — a version was read and rejected. What is missing on these paths is
-// not the evidence but the authority to act on it. Taking a runtime offline for
-// being too old requires two things neither the runtime_gone recovery nor the
-// profile-drift refresh has: the claim barrier, so the rows are never pulled out
-// from under a task that is still executing, and a seq-stamped hold, so a
-// register sent before the verdict cannot revive the provider when it lands.
-// demoteBelowMinimumRuntimes has both and is the single owner of the demotion.
-// A path that drops the rows without them reaches the same verdict and leaves no
-// record that it did, so the next in-flight response quietly undoes it.
+// Demotable is the half that is easy to get wrong, because the verdict IS
+// confirmed — a version was read and rejected, or the OS refused to run the
+// file. What is missing on these paths is not the evidence but the authority to
+// act on it. Taking a runtime offline requires two things neither the
+// runtime_gone recovery nor the profile-drift refresh has: the claim barrier, so
+// the rows are never pulled out from under a task that is still executing, and a
+// seq-stamped hold, so a register sent before the verdict cannot revive the
+// provider when it lands. demoteUnusableRuntimes has both and is the single
+// owner of the demotion. A path that drops the rows without them reaches the
+// same verdict and leaves no record that it did, so the next in-flight response
+// quietly undoes it.
 //
-// Preserving here costs at most one refresh tick of a too-old CLI staying
+// Preserving here costs at most one refresh tick of an unusable CLI staying
 // online, which is the pre-demotion status quo rather than a new exposure.
-func preserveProvidersFromProbe(unavailable, belowMinimum map[string]string) map[string]string {
-	if len(belowMinimum) == 0 {
+func preserveProvidersFromProbe(unavailable, demotable map[string]string) map[string]string {
+	if len(demotable) == 0 {
 		return unavailable
 	}
-	preserve := make(map[string]string, len(unavailable)+len(belowMinimum))
+	preserve := make(map[string]string, len(unavailable)+len(demotable))
 	for provider, reason := range unavailable {
 		preserve[provider] = reason
 	}
-	for provider, version := range belowMinimum {
-		preserve[provider] = "below minimum supported version: " + version
+	for provider, reason := range demotable {
+		preserve[provider] = reason
 	}
 	return preserve
 }

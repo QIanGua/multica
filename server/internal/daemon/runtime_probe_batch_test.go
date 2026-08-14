@@ -813,8 +813,8 @@ func TestDetectBuiltinRuntimes_SelfHealRejectionIsABelowMinimumVerdict(t *testin
 	// the heal, the loop goes on to probe the vanished pinned path, can only
 	// report "version detection failed", and the runtime stays online serving a
 	// CLI that cannot launch.
-	if belowMin["codex"] != "0.0.1" {
-		t.Errorf("below-minimum verdict = %v, want codex 0.0.1", belowMin)
+	if !strings.Contains(belowMin["codex"], "0.0.1") || !strings.Contains(belowMin["codex"], "below minimum") {
+		t.Errorf("demotable verdict = %v, want codex condemned for being below minimum at 0.0.1", belowMin)
 	}
 	// Unlike the direct below-minimum case, the heal verdict gets the bounded
 	// fast-failure retry before it is returned: the heal re-resolves PATH per

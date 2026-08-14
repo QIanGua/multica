@@ -38,7 +38,7 @@ import (
 // preflight error travels out through the daemon's launch boundary — and a
 // diagnosis printed twice is worse than the bare errno it replaced.
 func ExplainExecError(err error) error {
-	if err == nil || !errors.Is(err, syscall.ENOEXEC) {
+	if err == nil || !IsExecFormatError(err) {
 		return err
 	}
 	var explained explainedExecError
@@ -53,6 +53,20 @@ func ExplainExecError(err error) error {
 type explainedExecError struct{ error }
 
 func (e explainedExecError) Unwrap() error { return e.error }
+
+// IsExecFormatError reports whether the OS refused to run a file because it is
+// not a program this machine can execute.
+//
+// This is a verdict about a file that is on disk right now, not a transient
+// launch failure: the same binary will be rejected the same way until someone
+// changes it. Callers use that to tell a permanent install problem apart from a
+// CLI that was merely busy or mid-upgrade.
+func IsExecFormatError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.ENOEXEC) || isPlatformExecFormatError(err)
+}
 
 // execPathFromError recovers the executable path the OS refused to run.
 // os/exec reports a failed launch as *fs.PathError (fork/exec) and a failed
