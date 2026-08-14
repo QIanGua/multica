@@ -47,6 +47,17 @@ WHERE id = $1;
 SELECT mcp_config FROM workspace
 WHERE id = $1;
 
+-- name: LockWorkspaceMcpConfig :one
+-- Read-for-update half of the per-server edit path. The shared document is
+-- never echoed back to clients, so a UI cannot do the read-modify-write
+-- itself; the server does it instead, and this lock is what keeps two admins
+-- editing different servers from losing one another's write. Takes only the
+-- workspace row, so it cannot deadlock against the workspace -> chat_session
+-- -> agent_task_queue lock order used elsewhere.
+SELECT mcp_config FROM workspace
+WHERE id = $1
+FOR UPDATE;
+
 -- name: SetWorkspaceMcpConfig :one
 -- Writes the shared MCP document. Mirrors the agent column's two-query
 -- pattern: COALESCE cannot restore NULL, so clearing has its own query below.

@@ -1182,8 +1182,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					})
 					r.Delete("/invitations/{invitationId}", h.RevokeInvitation)
 					// Writing shared MCP servers is an admin action: the
-					// document reaches every agent in the workspace.
+					// document reaches every agent in the workspace. The
+					// whole-document PUT is the declarative path (CLI); the
+					// per-server routes are what the settings UI uses, since
+					// the document is never echoed back for it to edit.
 					r.Put("/mcp-config", h.UpdateWorkspaceMcpConfig)
+					r.Put("/mcp-config/servers/{serverName}", h.UpsertWorkspaceMcpServer)
+					r.Delete("/mcp-config/servers/{serverName}", h.DeleteWorkspaceMcpServer)
 					// Custom runtime profile mutations (admin-only).
 					r.Post("/runtime-profiles", h.CreateRuntimeProfile)
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)

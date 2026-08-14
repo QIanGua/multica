@@ -1,24 +1,17 @@
 package handler
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
-const workspaceMcpTestDoc = `{"mcpServers":{"linear":{"url":"https://linear.example","headers":{"Authorization":"Bearer sk-live-workspace"}}}}`
+const workspaceMcpTestSecret = "sk-live-workspace-should-never-be-echoed"
 
-// carriesDocument reports whether a decoded mcp_config field holds an actual
-// document. The field is always present on the wire so clients can tell "not
-// configured" from "redacted" via the companion flag, and a JSON null decodes
-// into json.RawMessage as the literal bytes `null` rather than Go nil.
-func carriesDocument(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
-}
+var workspaceMcpTestDoc = `{"mcpServers":{"linear":{"url":"https://linear.example","headers":{"Authorization":"Bearer ` + workspaceMcpTestSecret + `"}}}}`
 
 // setWorkspaceMcpConfigForTest stores a shared document and restores whatever
 // was there afterwards, so these tests can run against the shared fixture
@@ -44,25 +37,16 @@ func setWorkspaceMcpConfigForTest(t *testing.T, doc string) {
 	})
 }
 
-// setWorkspaceAlwaysRedactForTest flips the workspace-level always-redact
-// setting and restores the previous settings blob afterwards.
-func setWorkspaceAlwaysRedactForTest(t *testing.T) {
+func storedWorkspaceMcpConfig(t *testing.T) string {
 	t.Helper()
-
-	ctx := context.Background()
-	var previous []byte
-	if err := testPool.QueryRow(ctx, `SELECT settings FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&previous); err != nil {
-		t.Fatalf("load workspace settings: %v", err)
+	var stored []byte
+	if err := testPool.QueryRow(context.Background(), `SELECT mcp_config FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&stored); err != nil {
+		t.Fatalf("read back mcp_config: %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE workspace SET settings = '{"always_redact_env":true}'::jsonb WHERE id = $1`, testWorkspaceID); err != nil {
-		t.Fatalf("set workspace settings: %v", err)
-	}
-	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `UPDATE workspace SET settings = $1 WHERE id = $2`, previous, testWorkspaceID)
-	})
+	return string(stored)
 }
 
-func getWorkspaceMcpConfigForTest(t *testing.T, mutate func(*http.Request)) (int, WorkspaceMcpConfigResponse) {
+func getWorkspaceMcpConfigForTest(t *testing.T, mutate func(*http.Request)) (int, WorkspaceMcpConfigResponse, string) {
 	t.Helper()
 
 	req := newRequest(http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/mcp-config", nil)
@@ -74,68 +58,51 @@ func getWorkspaceMcpConfigForTest(t *testing.T, mutate func(*http.Request)) (int
 	testHandler.GetWorkspaceMcpConfig(w, req)
 
 	var resp WorkspaceMcpConfigResponse
+	raw := w.Body.String()
 	if w.Code == http.StatusOK {
-		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		if err := json.Unmarshal([]byte(raw), &resp); err != nil {
 			t.Fatalf("decode response: %v", err)
 		}
 	}
-	return w.Code, resp
+	return w.Code, resp, raw
 }
 
-func TestGetWorkspaceMcpConfig_OwnerSeesDocument(t *testing.T) {
+// The shared document is write-only (GH #6062): the read path returns the
+// non-secret inventory and nothing else, for EVERY role. This is the test that
+// pins that contract — it asserts on the raw response body, not the decoded
+// struct, so adding a secret-bearing field later fails here.
+func TestGetWorkspaceMcpConfig_NeverEchoesSecrets(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
 	setWorkspaceMcpConfigForTest(t, workspaceMcpTestDoc)
 
-	code, resp := getWorkspaceMcpConfigForTest(t, nil)
+	code, resp, raw := getWorkspaceMcpConfigForTest(t, nil)
 	if code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", code)
+		t.Fatalf("expected 200, got %d: %s", code, raw)
 	}
-	if resp.McpConfigRedacted {
-		t.Fatal("workspace owner should read the shared document")
+	// The workspace owner is the most privileged caller there is; if anyone
+	// could read the credential back it would be this request.
+	if strings.Contains(raw, workspaceMcpTestSecret) {
+		t.Fatalf("response echoed the shared credential: %s", raw)
 	}
-	if !bytes.Contains(resp.McpConfig, []byte("sk-live-workspace")) {
-		t.Fatalf("expected the stored document, got %s", resp.McpConfig)
+	if strings.Contains(raw, "linear.example") {
+		t.Fatalf("response echoed the server URL, which is itself credential material: %s", raw)
+	}
+	if len(resp.Servers) != 1 || resp.Servers[0].Name != "linear" {
+		t.Fatalf("expected the server inventory, got %+v", resp.Servers)
+	}
+	if resp.Servers[0].Transport != "http" || !resp.Servers[0].Enabled {
+		t.Errorf("inventory = %+v, want an enabled http server", resp.Servers[0])
 	}
 	if resp.ServerCount != 1 {
 		t.Errorf("server_count = %d, want 1", resp.ServerCount)
 	}
 }
 
-// An agent actor never reads the shared document, even when the PAT it runs
-// under belongs to a workspace owner — the lateral-movement rule mcp_config
-// already follows on agents (MUL-2600).
-func TestGetWorkspaceMcpConfig_RedactsForAgentActor(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	setWorkspaceMcpConfigForTest(t, workspaceMcpTestDoc)
-
-	caller := createHandlerTestAgent(t, "ws-mcp-caller", nil)
-	taskID := insertHandlerTestTask(t, caller)
-
-	code, resp := getWorkspaceMcpConfigForTest(t, func(req *http.Request) {
-		req.Header.Set("X-Actor-Source", "task_token")
-		req.Header.Set("X-Agent-ID", caller)
-		req.Header.Set("X-Task-ID", taskID)
-	})
-	if code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", code)
-	}
-	if !resp.McpConfigRedacted {
-		t.Error("expected mcp_config_redacted=true for an agent actor")
-	}
-	if carriesDocument(resp.McpConfig) {
-		t.Errorf("leaked the shared document to an agent actor: %s", resp.McpConfig)
-	}
-	// The coarse count stays visible: it carries no credential material.
-	if resp.ServerCount != 1 {
-		t.Errorf("server_count = %d, want 1", resp.ServerCount)
-	}
-}
-
-func TestGetWorkspaceMcpConfig_RedactsForNonAdminMember(t *testing.T) {
+// The inventory is member-visible so an agent's settings view can show what it
+// inherits; there is nothing secret in it to gate on role.
+func TestGetWorkspaceMcpConfig_InventoryVisibleToPlainMember(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -160,33 +127,17 @@ func TestGetWorkspaceMcpConfig_RedactsForNonAdminMember(t *testing.T) {
 		t.Fatalf("add workspace member: %v", err)
 	}
 
-	code, resp := getWorkspaceMcpConfigForTest(t, func(req *http.Request) {
+	code, resp, raw := getWorkspaceMcpConfigForTest(t, func(req *http.Request) {
 		req.Header.Set("X-User-ID", plainUserID)
 	})
 	if code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", code)
+		t.Fatalf("expected 200, got %d: %s", code, raw)
 	}
-	if !resp.McpConfigRedacted {
-		t.Error("expected mcp_config_redacted=true for a plain member")
+	if strings.Contains(raw, workspaceMcpTestSecret) {
+		t.Fatalf("response echoed the shared credential to a plain member: %s", raw)
 	}
-	if carriesDocument(resp.McpConfig) {
-		t.Errorf("leaked the shared document to a plain member: %s", resp.McpConfig)
-	}
-}
-
-func TestGetWorkspaceMcpConfig_HonorsAlwaysRedactSetting(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	setWorkspaceMcpConfigForTest(t, workspaceMcpTestDoc)
-	setWorkspaceAlwaysRedactForTest(t)
-
-	code, resp := getWorkspaceMcpConfigForTest(t, nil)
-	if code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", code)
-	}
-	if !resp.McpConfigRedacted {
-		t.Error("always_redact_env must redact even for the workspace owner")
+	if resp.ServerCount != 1 {
+		t.Errorf("server_count = %d, want 1", resp.ServerCount)
 	}
 }
 
@@ -196,15 +147,29 @@ func TestGetWorkspaceMcpConfig_UnconfiguredWorkspace(t *testing.T) {
 	}
 	setWorkspaceMcpConfigForTest(t, "")
 
-	code, resp := getWorkspaceMcpConfigForTest(t, nil)
+	code, resp, raw := getWorkspaceMcpConfigForTest(t, nil)
 	if code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", code)
+		t.Fatalf("expected 200, got %d: %s", code, raw)
 	}
-	if resp.McpConfigRedacted {
-		t.Error("an unconfigured workspace is not a redacted one")
+	if len(resp.Servers) != 0 || resp.ServerCount != 0 {
+		t.Errorf("expected an empty inventory, got %+v", resp.Servers)
 	}
-	if carriesDocument(resp.McpConfig) || resp.ServerCount != 0 {
-		t.Errorf("expected an empty response, got %s / %d servers", resp.McpConfig, resp.ServerCount)
+}
+
+// A document that somehow became malformed must still render the settings
+// screen rather than 500 it.
+func TestGetWorkspaceMcpConfig_MalformedDocumentYieldsEmptyInventory(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	setWorkspaceMcpConfigForTest(t, `{"mcpServers":{"broken":"not-an-object"}}`)
+
+	code, resp, raw := getWorkspaceMcpConfigForTest(t, nil)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", code, raw)
+	}
+	if len(resp.Servers) != 0 {
+		t.Errorf("expected an empty inventory for a malformed document, got %+v", resp.Servers)
 	}
 }
 
@@ -244,13 +209,13 @@ func TestUpdateWorkspaceMcpConfig_SetAndClear(t *testing.T) {
 	if resp.ServerCount != 1 {
 		t.Errorf("server_count = %d, want 1", resp.ServerCount)
 	}
-
-	var stored []byte
-	if err := testPool.QueryRow(context.Background(), `SELECT mcp_config FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&stored); err != nil {
-		t.Fatalf("read back mcp_config: %v", err)
+	// Even the write response — sent to the admin who just supplied the
+	// document — does not echo it back.
+	if strings.Contains(raw, workspaceMcpTestSecret) {
+		t.Fatalf("write response echoed the shared credential: %s", raw)
 	}
-	if !bytes.Contains(stored, []byte("sk-live-workspace")) {
-		t.Fatalf("stored document = %s, want the submitted one", stored)
+	if !strings.Contains(storedWorkspaceMcpConfig(t), workspaceMcpTestSecret) {
+		t.Fatalf("stored document = %s, want the submitted one", storedWorkspaceMcpConfig(t))
 	}
 
 	// An explicit null clears the layer; every inheriting agent falls back to
@@ -259,10 +224,7 @@ func TestUpdateWorkspaceMcpConfig_SetAndClear(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("clear: expected 200, got %d: %s", code, raw)
 	}
-	if err := testPool.QueryRow(context.Background(), `SELECT mcp_config FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&stored); err != nil {
-		t.Fatalf("read back cleared mcp_config: %v", err)
-	}
-	if stored != nil {
+	if stored := storedWorkspaceMcpConfig(t); stored != "" {
 		t.Fatalf("expected NULL after clear, got %s", stored)
 	}
 }
@@ -286,11 +248,7 @@ func TestUpdateWorkspaceMcpConfig_RejectsBadShape(t *testing.T) {
 		}
 	}
 
-	var stored []byte
-	if err := testPool.QueryRow(context.Background(), `SELECT mcp_config FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&stored); err != nil {
-		t.Fatalf("read back mcp_config: %v", err)
-	}
-	if stored != nil {
+	if stored := storedWorkspaceMcpConfig(t); stored != "" {
 		t.Fatalf("a rejected write must not touch the stored document, got %s", stored)
 	}
 }
@@ -306,15 +264,140 @@ func TestUpdateWorkspaceMcpConfig_DeniesAgentActor(t *testing.T) {
 
 	caller := createHandlerTestAgent(t, "ws-mcp-writer", nil)
 	taskID := insertHandlerTestTask(t, caller)
-
-	code, _, raw := updateWorkspaceMcpConfigForTest(t, map[string]any{
-		"mcp_config": json.RawMessage(workspaceMcpTestDoc),
-	}, func(req *http.Request) {
+	asAgent := func(req *http.Request) {
 		req.Header.Set("X-Actor-Source", "task_token")
 		req.Header.Set("X-Agent-ID", caller)
 		req.Header.Set("X-Task-ID", taskID)
-	})
+	}
+
+	code, _, raw := updateWorkspaceMcpConfigForTest(t, map[string]any{
+		"mcp_config": json.RawMessage(workspaceMcpTestDoc),
+	}, asAgent)
 	if code != http.StatusForbidden {
-		t.Fatalf("expected 403 for an agent actor, got %d: %s", code, raw)
+		t.Fatalf("full replace: expected 403 for an agent actor, got %d: %s", code, raw)
+	}
+
+	code, _, raw = upsertWorkspaceMcpServerForTest(t, "linear", map[string]any{"url": "https://x.example"}, asAgent)
+	if code != http.StatusForbidden {
+		t.Fatalf("per-server upsert: expected 403 for an agent actor, got %d: %s", code, raw)
+	}
+}
+
+func upsertWorkspaceMcpServerForTest(t *testing.T, name string, entry any, mutate func(*http.Request)) (int, WorkspaceMcpConfigResponse, string) {
+	t.Helper()
+
+	req := newRequest(http.MethodPut, "/api/workspaces/"+testWorkspaceID+"/mcp-config/servers/"+name, entry)
+	req = withURLParams(req, "id", testWorkspaceID, "serverName", name)
+	if mutate != nil {
+		mutate(req)
+	}
+	w := httptest.NewRecorder()
+	testHandler.UpsertWorkspaceMcpServer(w, req)
+
+	var resp WorkspaceMcpConfigResponse
+	raw := w.Body.String()
+	if w.Code == http.StatusOK {
+		if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+	}
+	return w.Code, resp, raw
+}
+
+func deleteWorkspaceMcpServerForTest(t *testing.T, name string) (int, WorkspaceMcpConfigResponse, string) {
+	t.Helper()
+
+	req := newRequest(http.MethodDelete, "/api/workspaces/"+testWorkspaceID+"/mcp-config/servers/"+name, nil)
+	req = withURLParams(req, "id", testWorkspaceID, "serverName", name)
+	w := httptest.NewRecorder()
+	testHandler.DeleteWorkspaceMcpServer(w, req)
+
+	var resp WorkspaceMcpConfigResponse
+	raw := w.Body.String()
+	if w.Code == http.StatusOK {
+		if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+	}
+	return w.Code, resp, raw
+}
+
+// The per-server path is what the settings UI uses: because it can never read
+// the document, the server has to do the read-modify-write for it — and must
+// not disturb the servers the caller did not mention.
+func TestUpsertWorkspaceMcpServer_MergesWithoutReadingBack(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	setWorkspaceMcpConfigForTest(t, workspaceMcpTestDoc)
+
+	code, resp, raw := upsertWorkspaceMcpServerForTest(t, "github", map[string]any{"command": "github-mcp"}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", code, raw)
+	}
+	if resp.ServerCount != 2 {
+		t.Fatalf("server_count = %d, want 2 (%+v)", resp.ServerCount, resp.Servers)
+	}
+	if resp.Servers[0].Name != "github" || resp.Servers[0].Transport != "stdio" {
+		t.Errorf("inventory[0] = %+v, want the new stdio server first (sorted)", resp.Servers[0])
+	}
+	// The untouched server keeps its credential in storage.
+	if !strings.Contains(storedWorkspaceMcpConfig(t), workspaceMcpTestSecret) {
+		t.Fatalf("upsert dropped the existing server's credentials: %s", storedWorkspaceMcpConfig(t))
+	}
+
+	// Replacing an existing name overwrites just that entry.
+	code, resp, raw = upsertWorkspaceMcpServerForTest(t, "linear", map[string]any{"url": "https://linear-v2.example"}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("replace: expected 200, got %d: %s", code, raw)
+	}
+	if resp.ServerCount != 2 {
+		t.Fatalf("replace: server_count = %d, want 2", resp.ServerCount)
+	}
+	if strings.Contains(storedWorkspaceMcpConfig(t), workspaceMcpTestSecret) {
+		t.Errorf("replacing an entry must overwrite it, not merge into it: %s", storedWorkspaceMcpConfig(t))
+	}
+}
+
+func TestUpsertWorkspaceMcpServer_RejectsBadEntry(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	setWorkspaceMcpConfigForTest(t, "")
+
+	for _, entry := range []any{"not-an-object", []any{}, 42} {
+		code, _, raw := upsertWorkspaceMcpServerForTest(t, "bad", entry, nil)
+		if code != http.StatusBadRequest {
+			t.Errorf("entry %v: expected 400, got %d: %s", entry, code, raw)
+		}
+	}
+	if stored := storedWorkspaceMcpConfig(t); stored != "" {
+		t.Fatalf("a rejected upsert must not write, got %s", stored)
+	}
+}
+
+// Deleting the last shared server clears the column rather than storing an
+// empty document, so inheriting agents fall back to their own config instead
+// of being handed a managed-empty one.
+func TestDeleteWorkspaceMcpServer_LastServerClearsTheLayer(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	setWorkspaceMcpConfigForTest(t, workspaceMcpTestDoc)
+
+	code, _, raw := deleteWorkspaceMcpServerForTest(t, "does-not-exist")
+	if code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown server, got %d: %s", code, raw)
+	}
+
+	code, resp, raw := deleteWorkspaceMcpServerForTest(t, "linear")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", code, raw)
+	}
+	if resp.ServerCount != 0 {
+		t.Errorf("server_count = %d, want 0", resp.ServerCount)
+	}
+	if stored := storedWorkspaceMcpConfig(t); stored != "" {
+		t.Fatalf("expected NULL after removing the last server, got %s", stored)
 	}
 }

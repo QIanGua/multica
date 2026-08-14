@@ -461,6 +461,25 @@ func (q *Queries) LockWorkspaceForDelete(ctx context.Context, id pgtype.UUID) (p
 	return id_2, err
 }
 
+const lockWorkspaceMcpConfig = `-- name: LockWorkspaceMcpConfig :one
+SELECT mcp_config FROM workspace
+WHERE id = $1
+FOR UPDATE
+`
+
+// Read-for-update half of the per-server edit path. The shared document is
+// never echoed back to clients, so a UI cannot do the read-modify-write
+// itself; the server does it instead, and this lock is what keeps two admins
+// editing different servers from losing one another's write. Takes only the
+// workspace row, so it cannot deadlock against the workspace -> chat_session
+// -> agent_task_queue lock order used elsewhere.
+func (q *Queries) LockWorkspaceMcpConfig(ctx context.Context, id pgtype.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, lockWorkspaceMcpConfig, id)
+	var mcp_config []byte
+	err := row.Scan(&mcp_config)
+	return mcp_config, err
+}
+
 const setWorkspaceMcpConfig = `-- name: SetWorkspaceMcpConfig :one
 UPDATE workspace SET mcp_config = $2, updated_at = now()
 WHERE id = $1
