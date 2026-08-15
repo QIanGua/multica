@@ -90,6 +90,8 @@ export type {
   PluginRemoteMCPConfig,
   RemoteMCPConfigRequest,
   RemoteMCPDiscoveryResponse,
+  RemoteMCPOAuthStartRequest,
+  RemoteMCPOAuthStartResponse,
   RemoteMCPTool,
 } from "./plugin";
 export type { InboxItem, InboxSeverity, InboxItemType, InboxWorkspaceUnread } from "./inbox";

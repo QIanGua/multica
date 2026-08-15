@@ -114,7 +114,10 @@ func validRemoteMCPManifest() Manifest {
 		Description:      "Deterministic fixture tools.",
 		Transport:        "streamable-http",
 		ProtocolVersions: []string{"2025-03-26", "2024-11-05"},
-		EndpointPolicy:   RemoteMCPEndpointPolicy{AllowedHosts: []string{"mcp.example.test"}},
+		EndpointPolicy: RemoteMCPEndpointPolicy{
+			DefaultEndpoint: "https://mcp.example.test/mcp", AllowedHosts: []string{"mcp.example.test"},
+		},
+		Authentication: RemoteMCPAuthentication{Preferred: "oauth", Supported: []string{"oauth"}},
 		ToolIntent: []RemoteMCPToolIntent{
 			{Name: "fixture.read", Description: "Read fixture state.", Risk: "read"},
 			{Name: "fixture.write", Description: "Mutate fixture state.", Risk: "write"},
@@ -165,6 +168,12 @@ func TestManifestRemoteMCPFailsClosed(t *testing.T) {
 		{name: "secret-looking endpoint", edit: func(m *Manifest) {
 			m.Contributes.RemoteMCP[0].EndpointPolicy.AllowedHosts = []string{"https://token@mcp.example"}
 		}, want: "invalid host"},
+		{name: "default endpoint outside allowlist", edit: func(m *Manifest) {
+			m.Contributes.RemoteMCP[0].EndpointPolicy.DefaultEndpoint = "https://other.example/mcp"
+		}, want: "covered by allowed_hosts"},
+		{name: "preferred auth not supported", edit: func(m *Manifest) {
+			m.Contributes.RemoteMCP[0].Authentication.Preferred = "bearer"
+		}, want: "must appear in supported"},
 		{name: "invalid risk", edit: func(m *Manifest) { m.Contributes.RemoteMCP[0].ToolIntent[0].Risk = "admin" }, want: "read or write"},
 		{name: "wildcard understates risk", edit: func(m *Manifest) {
 			m.Contributes.RemoteMCP[0].ToolIntent = []RemoteMCPToolIntent{{Name: RemoteMCPAnyToolIntent, Risk: "read"}}

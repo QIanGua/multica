@@ -96,6 +96,41 @@ func (q *Queries) ActivatePluginWorkspaceCapabilitySnapshot(ctx context.Context,
 	return i, err
 }
 
+const claimPluginRemoteMCPOAuthState = `-- name: ClaimPluginRemoteMCPOAuthState :one
+UPDATE plugin_remote_mcp_oauth_state
+SET consumed_at = now()
+WHERE state_hash = $1
+  AND consumed_at IS NULL
+  AND expires_at > now()
+RETURNING state_hash, workspace_id, installation_id, contribution_id, actor_id, endpoint, public_config, failure_policy, authorization_endpoint, token_endpoint, client_id, scope, redirect_uri, return_to, secret_ciphertext, expires_at, consumed_at, created_at
+`
+
+func (q *Queries) ClaimPluginRemoteMCPOAuthState(ctx context.Context, stateHash []byte) (PluginRemoteMcpOauthState, error) {
+	row := q.db.QueryRow(ctx, claimPluginRemoteMCPOAuthState, stateHash)
+	var i PluginRemoteMcpOauthState
+	err := row.Scan(
+		&i.StateHash,
+		&i.WorkspaceID,
+		&i.InstallationID,
+		&i.ContributionID,
+		&i.ActorID,
+		&i.Endpoint,
+		&i.PublicConfig,
+		&i.FailurePolicy,
+		&i.AuthorizationEndpoint,
+		&i.TokenEndpoint,
+		&i.ClientID,
+		&i.Scope,
+		&i.RedirectUri,
+		&i.ReturnTo,
+		&i.SecretCiphertext,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createPluginArtifactFile = `-- name: CreatePluginArtifactFile :one
 WITH parent AS MATERIALIZED (
     SELECT plugin_release.id
@@ -568,9 +603,9 @@ WITH parent AS MATERIALIZED (
      AND release.revocation_status = 'active'
     JOIN plugin_contribution contribution
       ON contribution.release_id = release.id
-     AND contribution.id = $12
+     AND contribution.id = $14
      AND contribution.type = 'tool.remote-mcp.v1'
-    WHERE installation.id = $13
+    WHERE installation.id = $15
       AND installation.workspace_id = $1
       AND installation.uninstalled_at IS NULL
       AND (
@@ -589,40 +624,44 @@ WITH parent AS MATERIALIZED (
 ), next_revision AS (
     SELECT COALESCE(MAX(revision), 0) + 1 AS revision
     FROM plugin_installation_config
-    WHERE installation_id = $13
-      AND contribution_id = $12
+    WHERE installation_id = $15
+      AND contribution_id = $14
 )
 INSERT INTO plugin_installation_config (
     workspace_id, installation_id, contribution_id, revision,
     endpoint, public_config, auth_type, auth_header, secret_ref,
+    discovered_tools, discovered_schema_digest,
     approved_tools, schema_digest, failure_policy,
     reviewed_by, reviewed_at, created_by
 )
 SELECT
     $1, parent.id, parent.contribution_id, next_revision.revision,
     $2, $3, $4, $5, $6,
-    $7, $8, $9,
-    $10,
-    CASE WHEN $10::uuid IS NULL THEN NULL ELSE now() END,
-    $11
+    $7, $8,
+    $9, $10, $11,
+    $12,
+    CASE WHEN $12::uuid IS NULL THEN NULL ELSE now() END,
+    $13
 FROM parent, next_revision
-RETURNING id, workspace_id, installation_id, contribution_id, revision, endpoint, public_config, auth_type, auth_header, secret_ref, approved_tools, schema_digest, failure_policy, reviewed_by, reviewed_at, created_by, created_at
+RETURNING id, workspace_id, installation_id, contribution_id, revision, endpoint, public_config, auth_type, auth_header, secret_ref, approved_tools, schema_digest, failure_policy, reviewed_by, reviewed_at, created_by, created_at, discovered_tools, discovered_schema_digest
 `
 
 type CreatePluginInstallationConfigParams struct {
-	WorkspaceID    pgtype.UUID `json:"workspace_id"`
-	Endpoint       string      `json:"endpoint"`
-	PublicConfig   []byte      `json:"public_config"`
-	AuthType       string      `json:"auth_type"`
-	AuthHeader     string      `json:"auth_header"`
-	SecretRef      pgtype.UUID `json:"secret_ref"`
-	ApprovedTools  []byte      `json:"approved_tools"`
-	SchemaDigest   pgtype.Text `json:"schema_digest"`
-	FailurePolicy  string      `json:"failure_policy"`
-	ReviewedBy     pgtype.UUID `json:"reviewed_by"`
-	CreatedBy      pgtype.UUID `json:"created_by"`
-	ContributionID pgtype.UUID `json:"contribution_id"`
-	InstallationID pgtype.UUID `json:"installation_id"`
+	WorkspaceID            pgtype.UUID `json:"workspace_id"`
+	Endpoint               string      `json:"endpoint"`
+	PublicConfig           []byte      `json:"public_config"`
+	AuthType               string      `json:"auth_type"`
+	AuthHeader             string      `json:"auth_header"`
+	SecretRef              pgtype.UUID `json:"secret_ref"`
+	DiscoveredTools        []byte      `json:"discovered_tools"`
+	DiscoveredSchemaDigest pgtype.Text `json:"discovered_schema_digest"`
+	ApprovedTools          []byte      `json:"approved_tools"`
+	SchemaDigest           pgtype.Text `json:"schema_digest"`
+	FailurePolicy          string      `json:"failure_policy"`
+	ReviewedBy             pgtype.UUID `json:"reviewed_by"`
+	CreatedBy              pgtype.UUID `json:"created_by"`
+	ContributionID         pgtype.UUID `json:"contribution_id"`
+	InstallationID         pgtype.UUID `json:"installation_id"`
 }
 
 func (q *Queries) CreatePluginInstallationConfig(ctx context.Context, arg CreatePluginInstallationConfigParams) (PluginInstallationConfig, error) {
@@ -633,6 +672,8 @@ func (q *Queries) CreatePluginInstallationConfig(ctx context.Context, arg Create
 		arg.AuthType,
 		arg.AuthHeader,
 		arg.SecretRef,
+		arg.DiscoveredTools,
+		arg.DiscoveredSchemaDigest,
 		arg.ApprovedTools,
 		arg.SchemaDigest,
 		arg.FailurePolicy,
@@ -660,6 +701,8 @@ func (q *Queries) CreatePluginInstallationConfig(ctx context.Context, arg Create
 		&i.ReviewedAt,
 		&i.CreatedBy,
 		&i.CreatedAt,
+		&i.DiscoveredTools,
+		&i.DiscoveredSchemaDigest,
 	)
 	return i, err
 }
@@ -739,6 +782,83 @@ func (q *Queries) CreatePluginRelease(ctx context.Context, arg CreatePluginRelea
 	return i, err
 }
 
+const createPluginRemoteMCPOAuthState = `-- name: CreatePluginRemoteMCPOAuthState :one
+INSERT INTO plugin_remote_mcp_oauth_state (
+    state_hash, workspace_id, installation_id, contribution_id, actor_id,
+    endpoint, public_config, failure_policy,
+    authorization_endpoint, token_endpoint, client_id, scope,
+    redirect_uri, return_to, secret_ciphertext, expires_at
+) VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8,
+    $9, $10, $11, $12,
+    $13, $14, $15, $16
+)
+RETURNING state_hash, workspace_id, installation_id, contribution_id, actor_id, endpoint, public_config, failure_policy, authorization_endpoint, token_endpoint, client_id, scope, redirect_uri, return_to, secret_ciphertext, expires_at, consumed_at, created_at
+`
+
+type CreatePluginRemoteMCPOAuthStateParams struct {
+	StateHash             []byte             `json:"state_hash"`
+	WorkspaceID           pgtype.UUID        `json:"workspace_id"`
+	InstallationID        pgtype.UUID        `json:"installation_id"`
+	ContributionID        pgtype.UUID        `json:"contribution_id"`
+	ActorID               pgtype.UUID        `json:"actor_id"`
+	Endpoint              string             `json:"endpoint"`
+	PublicConfig          []byte             `json:"public_config"`
+	FailurePolicy         string             `json:"failure_policy"`
+	AuthorizationEndpoint string             `json:"authorization_endpoint"`
+	TokenEndpoint         string             `json:"token_endpoint"`
+	ClientID              string             `json:"client_id"`
+	Scope                 string             `json:"scope"`
+	RedirectUri           string             `json:"redirect_uri"`
+	ReturnTo              string             `json:"return_to"`
+	SecretCiphertext      []byte             `json:"secret_ciphertext"`
+	ExpiresAt             pgtype.Timestamptz `json:"expires_at"`
+}
+
+func (q *Queries) CreatePluginRemoteMCPOAuthState(ctx context.Context, arg CreatePluginRemoteMCPOAuthStateParams) (PluginRemoteMcpOauthState, error) {
+	row := q.db.QueryRow(ctx, createPluginRemoteMCPOAuthState,
+		arg.StateHash,
+		arg.WorkspaceID,
+		arg.InstallationID,
+		arg.ContributionID,
+		arg.ActorID,
+		arg.Endpoint,
+		arg.PublicConfig,
+		arg.FailurePolicy,
+		arg.AuthorizationEndpoint,
+		arg.TokenEndpoint,
+		arg.ClientID,
+		arg.Scope,
+		arg.RedirectUri,
+		arg.ReturnTo,
+		arg.SecretCiphertext,
+		arg.ExpiresAt,
+	)
+	var i PluginRemoteMcpOauthState
+	err := row.Scan(
+		&i.StateHash,
+		&i.WorkspaceID,
+		&i.InstallationID,
+		&i.ContributionID,
+		&i.ActorID,
+		&i.Endpoint,
+		&i.PublicConfig,
+		&i.FailurePolicy,
+		&i.AuthorizationEndpoint,
+		&i.TokenEndpoint,
+		&i.ClientID,
+		&i.Scope,
+		&i.RedirectUri,
+		&i.ReturnTo,
+		&i.SecretCiphertext,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createPluginRemoteMCPSecret = `-- name: CreatePluginRemoteMCPSecret :one
 WITH parent AS MATERIALIZED (
     SELECT installation.id, contribution.id AS contribution_id
@@ -808,6 +928,19 @@ func (q *Queries) CreatePluginRemoteMCPSecret(ctx context.Context, arg CreatePlu
 	return i, err
 }
 
+const deleteExpiredPluginRemoteMCPOAuthStates = `-- name: DeleteExpiredPluginRemoteMCPOAuthStates :execrows
+DELETE FROM plugin_remote_mcp_oauth_state
+WHERE expires_at <= now() OR consumed_at < now() - interval '1 hour'
+`
+
+func (q *Queries) DeleteExpiredPluginRemoteMCPOAuthStates(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredPluginRemoteMCPOAuthStates)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const ensurePluginWorkspaceCapabilityState = `-- name: EnsurePluginWorkspaceCapabilityState :one
 WITH workspace_guard AS MATERIALIZED (
     SELECT workspace.id
@@ -853,6 +986,47 @@ type GetActivePluginRemoteMCPSecretParams struct {
 
 func (q *Queries) GetActivePluginRemoteMCPSecret(ctx context.Context, arg GetActivePluginRemoteMCPSecretParams) (PluginRemoteMcpSecret, error) {
 	row := q.db.QueryRow(ctx, getActivePluginRemoteMCPSecret,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.InstallationID,
+		arg.ContributionID,
+	)
+	var i PluginRemoteMcpSecret
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.InstallationID,
+		&i.ContributionID,
+		&i.Version,
+		&i.Ciphertext,
+		&i.Hint,
+		&i.Status,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const getActivePluginRemoteMCPSecretForUpdate = `-- name: GetActivePluginRemoteMCPSecretForUpdate :one
+SELECT id, workspace_id, installation_id, contribution_id, version, ciphertext, hint, status, created_by, created_at, revoked_at FROM plugin_remote_mcp_secret
+WHERE id = $1
+  AND workspace_id = $2
+  AND installation_id = $3
+  AND contribution_id = $4
+  AND status = 'active'
+FOR UPDATE
+`
+
+type GetActivePluginRemoteMCPSecretForUpdateParams struct {
+	ID             pgtype.UUID `json:"id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	InstallationID pgtype.UUID `json:"installation_id"`
+	ContributionID pgtype.UUID `json:"contribution_id"`
+}
+
+func (q *Queries) GetActivePluginRemoteMCPSecretForUpdate(ctx context.Context, arg GetActivePluginRemoteMCPSecretForUpdateParams) (PluginRemoteMcpSecret, error) {
+	row := q.db.QueryRow(ctx, getActivePluginRemoteMCPSecretForUpdate,
 		arg.ID,
 		arg.WorkspaceID,
 		arg.InstallationID,
@@ -936,8 +1110,69 @@ func (q *Queries) GetInstallationRemoteMCPContribution(ctx context.Context, arg 
 	return i, err
 }
 
+const getInstallationRemoteMCPContributionByID = `-- name: GetInstallationRemoteMCPContributionByID :one
+SELECT contribution.id, contribution.release_id, contribution.contribution_key, contribution.type, contribution.schema_version, contribution.display_name, contribution.description, contribution.entry_path, contribution.entry_digest, contribution.artifact_digest, contribution.required_daemon_features, contribution.ordinal, contribution.created_at, release.manifest
+FROM plugin_installation installation
+JOIN plugin_release release
+  ON release.id = installation.desired_release_id
+ AND release.plugin_id = installation.plugin_id
+ AND release.revocation_status = 'active'
+JOIN plugin_contribution contribution
+  ON contribution.release_id = release.id
+ AND contribution.type = 'tool.remote-mcp.v1'
+WHERE installation.id = $1
+  AND installation.workspace_id = $2
+  AND installation.uninstalled_at IS NULL
+  AND contribution.id = $3
+`
+
+type GetInstallationRemoteMCPContributionByIDParams struct {
+	InstallationID pgtype.UUID `json:"installation_id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	ContributionID pgtype.UUID `json:"contribution_id"`
+}
+
+type GetInstallationRemoteMCPContributionByIDRow struct {
+	ID                     pgtype.UUID        `json:"id"`
+	ReleaseID              pgtype.UUID        `json:"release_id"`
+	ContributionKey        string             `json:"contribution_key"`
+	Type                   string             `json:"type"`
+	SchemaVersion          int32              `json:"schema_version"`
+	DisplayName            string             `json:"display_name"`
+	Description            string             `json:"description"`
+	EntryPath              string             `json:"entry_path"`
+	EntryDigest            string             `json:"entry_digest"`
+	ArtifactDigest         string             `json:"artifact_digest"`
+	RequiredDaemonFeatures []byte             `json:"required_daemon_features"`
+	Ordinal                int32              `json:"ordinal"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	Manifest               []byte             `json:"manifest"`
+}
+
+func (q *Queries) GetInstallationRemoteMCPContributionByID(ctx context.Context, arg GetInstallationRemoteMCPContributionByIDParams) (GetInstallationRemoteMCPContributionByIDRow, error) {
+	row := q.db.QueryRow(ctx, getInstallationRemoteMCPContributionByID, arg.InstallationID, arg.WorkspaceID, arg.ContributionID)
+	var i GetInstallationRemoteMCPContributionByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.ReleaseID,
+		&i.ContributionKey,
+		&i.Type,
+		&i.SchemaVersion,
+		&i.DisplayName,
+		&i.Description,
+		&i.EntryPath,
+		&i.EntryDigest,
+		&i.ArtifactDigest,
+		&i.RequiredDaemonFeatures,
+		&i.Ordinal,
+		&i.CreatedAt,
+		&i.Manifest,
+	)
+	return i, err
+}
+
 const getLatestPluginInstallationConfig = `-- name: GetLatestPluginInstallationConfig :one
-SELECT id, workspace_id, installation_id, contribution_id, revision, endpoint, public_config, auth_type, auth_header, secret_ref, approved_tools, schema_digest, failure_policy, reviewed_by, reviewed_at, created_by, created_at FROM plugin_installation_config
+SELECT id, workspace_id, installation_id, contribution_id, revision, endpoint, public_config, auth_type, auth_header, secret_ref, approved_tools, schema_digest, failure_policy, reviewed_by, reviewed_at, created_by, created_at, discovered_tools, discovered_schema_digest FROM plugin_installation_config
 WHERE workspace_id = $1
   AND installation_id = $2
   AND contribution_id = $3
@@ -972,6 +1207,8 @@ func (q *Queries) GetLatestPluginInstallationConfig(ctx context.Context, arg Get
 		&i.ReviewedAt,
 		&i.CreatedBy,
 		&i.CreatedAt,
+		&i.DiscoveredTools,
+		&i.DiscoveredSchemaDigest,
 	)
 	return i, err
 }
@@ -1552,7 +1789,7 @@ func (q *Queries) ListLatestPluginGrants(ctx context.Context, installationID pgt
 }
 
 const listLatestPluginInstallationConfigs = `-- name: ListLatestPluginInstallationConfigs :many
-SELECT DISTINCT ON (config.contribution_id) config.id, config.workspace_id, config.installation_id, config.contribution_id, config.revision, config.endpoint, config.public_config, config.auth_type, config.auth_header, config.secret_ref, config.approved_tools, config.schema_digest, config.failure_policy, config.reviewed_by, config.reviewed_at, config.created_by, config.created_at
+SELECT DISTINCT ON (config.contribution_id) config.id, config.workspace_id, config.installation_id, config.contribution_id, config.revision, config.endpoint, config.public_config, config.auth_type, config.auth_header, config.secret_ref, config.approved_tools, config.schema_digest, config.failure_policy, config.reviewed_by, config.reviewed_at, config.created_by, config.created_at, config.discovered_tools, config.discovered_schema_digest
 FROM plugin_installation_config config
 WHERE config.workspace_id = $1
   AND config.installation_id = $2
@@ -1591,6 +1828,8 @@ func (q *Queries) ListLatestPluginInstallationConfigs(ctx context.Context, arg L
 			&i.ReviewedAt,
 			&i.CreatedBy,
 			&i.CreatedAt,
+			&i.DiscoveredTools,
+			&i.DiscoveredSchemaDigest,
 		); err != nil {
 			return nil, err
 		}
@@ -1684,7 +1923,7 @@ latest_bindings AS (
     ORDER BY installation_id, scope_type, scope_id, binding_revision DESC
 ),
 latest_configs AS (
-    SELECT DISTINCT ON (installation_id, contribution_id) id, workspace_id, installation_id, contribution_id, revision, endpoint, public_config, auth_type, auth_header, secret_ref, approved_tools, schema_digest, failure_policy, reviewed_by, reviewed_at, created_by, created_at
+    SELECT DISTINCT ON (installation_id, contribution_id) id, workspace_id, installation_id, contribution_id, revision, endpoint, public_config, auth_type, auth_header, secret_ref, approved_tools, schema_digest, failure_policy, reviewed_by, reviewed_at, created_by, created_at, discovered_tools, discovered_schema_digest
     FROM plugin_installation_config
     WHERE workspace_id = $1
     ORDER BY installation_id, contribution_id, revision DESC
@@ -2449,6 +2688,53 @@ func (q *Queries) UninstallPluginInstallation(ctx context.Context, arg Uninstall
 		&i.UpdatedAt,
 		&i.DisabledAt,
 		&i.UninstalledAt,
+	)
+	return i, err
+}
+
+const updateActivePluginRemoteMCPSecret = `-- name: UpdateActivePluginRemoteMCPSecret :one
+UPDATE plugin_remote_mcp_secret
+SET ciphertext = $1,
+    hint = $2
+WHERE id = $3
+  AND workspace_id = $4
+  AND installation_id = $5
+  AND contribution_id = $6
+  AND status = 'active'
+RETURNING id, workspace_id, installation_id, contribution_id, version, ciphertext, hint, status, created_by, created_at, revoked_at
+`
+
+type UpdateActivePluginRemoteMCPSecretParams struct {
+	Ciphertext     []byte      `json:"ciphertext"`
+	Hint           string      `json:"hint"`
+	ID             pgtype.UUID `json:"id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	InstallationID pgtype.UUID `json:"installation_id"`
+	ContributionID pgtype.UUID `json:"contribution_id"`
+}
+
+func (q *Queries) UpdateActivePluginRemoteMCPSecret(ctx context.Context, arg UpdateActivePluginRemoteMCPSecretParams) (PluginRemoteMcpSecret, error) {
+	row := q.db.QueryRow(ctx, updateActivePluginRemoteMCPSecret,
+		arg.Ciphertext,
+		arg.Hint,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.InstallationID,
+		arg.ContributionID,
+	)
+	var i PluginRemoteMcpSecret
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.InstallationID,
+		&i.ContributionID,
+		&i.Version,
+		&i.Ciphertext,
+		&i.Hint,
+		&i.Status,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.RevokedAt,
 	)
 	return i, err
 }

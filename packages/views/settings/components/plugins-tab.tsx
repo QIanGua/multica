@@ -17,6 +17,7 @@ import {
   useRollbackPlugin,
   useSetPluginEnabled,
   useTestPluginRemoteMCP,
+  useStartPluginRemoteMCPOAuth,
   useUninstallPlugin,
   useUpgradePlugin,
 } from "@multica/core/plugins";
@@ -46,7 +47,7 @@ import { SettingsCard, SettingsSection, SettingsTab } from "./settings-layout";
 
 type BindingScope = "workspace" | "agent";
 
-type RemoteMCPAuthType = "none" | "bearer" | "header";
+type RemoteMCPAuthType = "none" | "oauth" | "bearer" | "header";
 
 function RemoteMCPConfiguration({
   wsId,
@@ -64,16 +65,37 @@ function RemoteMCPConfiguration({
   const testMutation = useTestPluginRemoteMCP(wsId);
   const approveMutation = useApprovePluginRemoteMCPTools(wsId);
   const revokeMutation = useRevokePluginRemoteMCPCredential(wsId);
-  const [endpoint, setEndpoint] = useState("");
-  const [authType, setAuthType] = useState<RemoteMCPAuthType>("none");
+  const oauthMutation = useStartPluginRemoteMCPOAuth(wsId);
+  const [endpoint, setEndpoint] = useState(config.default_endpoint ?? "");
+  const [authType, setAuthType] = useState<RemoteMCPAuthType>(
+    config.preferred_auth === "oauth" ? "oauth" : "none",
+  );
   const [authHeader, setAuthHeader] = useState("Authorization");
   const [credential, setCredential] = useState("");
+  const [oauthScope, setOAuthScope] = useState("");
+  const [oauthClientId, setOAuthClientId] = useState("");
+  const [oauthClientSecret, setOAuthClientSecret] = useState("");
+  const [oauthAuthorizationEndpoint, setOAuthAuthorizationEndpoint] = useState("");
+  const [oauthTokenEndpoint, setOAuthTokenEndpoint] = useState("");
+  const [oauthTokenAuthMethod, setOAuthTokenAuthMethod] = useState<"none" | "client_secret_basic" | "client_secret_post">("none");
   const [publicConfig, setPublicConfig] = useState("{}");
   const [failurePolicy, setFailurePolicy] = useState<"required" | "optional">("required");
-  const [discovery, setDiscovery] = useState<RemoteMCPDiscoveryResponse | null>(null);
-  const [approvedTools, setApprovedTools] = useState<string[]>([]);
+  const [discovery, setDiscovery] = useState<RemoteMCPDiscoveryResponse | null>(() =>
+    !config.reviewed && config.discovered_tools.length > 0
+      ? {
+          config_revision: config.config_revision ?? 0,
+          discovered_tools: config.discovered_tools,
+          discovered_schema_digest: config.discovered_schema_digest ?? "",
+        }
+      : null,
+  );
+  const [approvedTools, setApprovedTools] = useState<string[]>(() =>
+    !config.reviewed ? config.discovered_tools.map((tool) => tool.name) : [],
+  );
   const isPending = configureMutation.isPending || testMutation.isPending
-    || approveMutation.isPending || revokeMutation.isPending;
+    || approveMutation.isPending || revokeMutation.isPending || oauthMutation.isPending;
+  const isConnected = Boolean(config.config_revision)
+    && (config.credential_state === "configured" || config.credential_state === "not_required");
 
   const reportError = (error: unknown) => {
     toast.error(error instanceof Error ? error.message : t(($) => $.plugins.action_failed));
@@ -89,7 +111,7 @@ function RemoteMCPConfiguration({
       : config.credential_state === "not_required"
         ? t(($) => $.plugins.remote_mcp.credential_states.not_required)
         : t(($) => $.plugins.remote_mcp.credential_states.missing);
-  const configure = async () => {
+  const configure = async (requestedAuth: RemoteMCPAuthType = authType) => {
     let parsedPublicConfig: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(publicConfig);
@@ -100,15 +122,35 @@ function RemoteMCPConfiguration({
       return;
     }
     try {
+      if (requestedAuth === "oauth") {
+        const result = await oauthMutation.mutateAsync({
+          installationId,
+          contributionKey: config.contribution_key,
+          request: {
+            endpoint: endpoint.trim() || config.default_endpoint,
+            public_config: parsedPublicConfig,
+            failure_policy: failurePolicy,
+            scope: oauthScope.trim() || undefined,
+            client_id: oauthClientId.trim() || undefined,
+            client_secret: oauthClientSecret || undefined,
+            token_endpoint_auth_method: oauthClientId.trim() ? oauthTokenAuthMethod : undefined,
+            authorization_endpoint: oauthAuthorizationEndpoint.trim() || undefined,
+            token_endpoint: oauthTokenEndpoint.trim() || undefined,
+            return_to: `${window.location.pathname}${window.location.search}`,
+          },
+        });
+        window.location.assign(result.authorization_url);
+        return;
+      }
       const result = await configureMutation.mutateAsync({
         installationId,
         contributionKey: config.contribution_key,
         request: {
           endpoint: endpoint.trim(),
           public_config: parsedPublicConfig,
-          auth_type: authType,
-          auth_header: authType === "header" ? authHeader.trim() : undefined,
-          credential: authType === "none" ? undefined : credential,
+          auth_type: requestedAuth,
+          auth_header: requestedAuth === "header" ? authHeader.trim() : undefined,
+          credential: requestedAuth === "none" ? undefined : credential,
           failure_policy: failurePolicy,
         },
       });
@@ -150,7 +192,30 @@ function RemoteMCPConfiguration({
         ) : null}
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2">
+      {config.default_endpoint && (config.preferred_auth === "oauth" || config.preferred_auth === "none") ? (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-surface-border bg-background p-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-caption font-medium">
+              {isConnected ? t(($) => $.plugins.remote_mcp.connected) : t(($) => $.plugins.remote_mcp.ready_to_connect)}
+            </div>
+            <div className="mt-0.5 truncate text-caption text-muted-foreground">{config.default_endpoint}</div>
+          </div>
+          <Button
+            size="sm"
+            disabled={!canManage || isPending || isConnected}
+            onClick={() => configure(config.preferred_auth as RemoteMCPAuthType)}
+          >
+            {oauthMutation.isPending || configureMutation.isPending ? <Loader2 className="animate-spin" /> : null}
+            {isConnected ? t(($) => $.plugins.remote_mcp.connected) : t(($) => $.plugins.remote_mcp.connect)}
+          </Button>
+        </div>
+      ) : null}
+
+      <details className="group rounded-lg border border-surface-border bg-background">
+        <summary className="cursor-pointer select-none px-3 py-2 text-caption font-medium">
+          {t(($) => $.plugins.remote_mcp.advanced)}
+        </summary>
+        <div className="grid gap-3 border-t border-surface-border p-3 sm:grid-cols-2">
         <label className="space-y-1 text-caption sm:col-span-2">
           <span className="font-medium">{t(($) => $.plugins.remote_mcp.endpoint)}</span>
           <Input
@@ -163,7 +228,7 @@ function RemoteMCPConfiguration({
         <label className="space-y-1 text-caption">
           <span className="font-medium">{t(($) => $.plugins.remote_mcp.auth)}</span>
           <Select
-            items={(["none", "bearer", "header"] as const).map((value) => ({
+            items={(["none", "oauth", "bearer", "header"] as const).map((value) => ({
               value,
               label: t(($) => $.plugins.remote_mcp.auth_types[value]),
             }))}
@@ -174,6 +239,7 @@ function RemoteMCPConfiguration({
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="none">{t(($) => $.plugins.remote_mcp.auth_types.none)}</SelectItem>
+              <SelectItem value="oauth">{t(($) => $.plugins.remote_mcp.auth_types.oauth)}</SelectItem>
               <SelectItem value="bearer">{t(($) => $.plugins.remote_mcp.auth_types.bearer)}</SelectItem>
               <SelectItem value="header">{t(($) => $.plugins.remote_mcp.auth_types.header)}</SelectItem>
             </SelectContent>
@@ -203,7 +269,7 @@ function RemoteMCPConfiguration({
             <Input value={authHeader} onChange={(event) => setAuthHeader(event.target.value)} disabled={!canManage || isPending} />
           </label>
         ) : null}
-        {authType !== "none" ? (
+        {authType === "bearer" || authType === "header" ? (
           <label className="space-y-1 text-caption">
             <span className="font-medium">{t(($) => $.plugins.remote_mcp.credential)}</span>
             <Input
@@ -215,6 +281,48 @@ function RemoteMCPConfiguration({
             />
           </label>
         ) : null}
+        {authType === "oauth" ? (
+          <>
+            <label className="space-y-1 text-caption sm:col-span-2">
+              <span className="font-medium">{t(($) => $.plugins.remote_mcp.oauth_scope)}</span>
+              <Input value={oauthScope} onChange={(event) => setOAuthScope(event.target.value)} disabled={!canManage || isPending} />
+            </label>
+            <label className="space-y-1 text-caption">
+              <span className="font-medium">{t(($) => $.plugins.remote_mcp.oauth_client_id)}</span>
+              <Input value={oauthClientId} onChange={(event) => setOAuthClientId(event.target.value)} disabled={!canManage || isPending} />
+            </label>
+            <label className="space-y-1 text-caption">
+              <span className="font-medium">{t(($) => $.plugins.remote_mcp.oauth_client_secret)}</span>
+              <Input type="password" autoComplete="new-password" value={oauthClientSecret} onChange={(event) => setOAuthClientSecret(event.target.value)} disabled={!canManage || isPending} />
+            </label>
+            <label className="space-y-1 text-caption">
+              <span className="font-medium">{t(($) => $.plugins.remote_mcp.oauth_authorization_endpoint)}</span>
+              <Input value={oauthAuthorizationEndpoint} onChange={(event) => setOAuthAuthorizationEndpoint(event.target.value)} disabled={!canManage || isPending} />
+            </label>
+            <label className="space-y-1 text-caption">
+              <span className="font-medium">{t(($) => $.plugins.remote_mcp.oauth_token_endpoint)}</span>
+              <Input value={oauthTokenEndpoint} onChange={(event) => setOAuthTokenEndpoint(event.target.value)} disabled={!canManage || isPending} />
+            </label>
+            {oauthClientSecret ? (
+              <label className="space-y-1 text-caption sm:col-span-2">
+                <span className="font-medium">{t(($) => $.plugins.remote_mcp.oauth_token_auth_method)}</span>
+                <Select
+                  items={(["none", "client_secret_basic", "client_secret_post"] as const).map((value) => ({ value, label: value }))}
+                  value={oauthTokenAuthMethod}
+                  onValueChange={(value) => value && setOAuthTokenAuthMethod(value as typeof oauthTokenAuthMethod)}
+                  disabled={!canManage || isPending}
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">{t(($) => $.plugins.remote_mcp.oauth_token_auth_methods.none)}</SelectItem>
+                    <SelectItem value="client_secret_basic">{t(($) => $.plugins.remote_mcp.oauth_token_auth_methods.client_secret_basic)}</SelectItem>
+                    <SelectItem value="client_secret_post">{t(($) => $.plugins.remote_mcp.oauth_token_auth_methods.client_secret_post)}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+            ) : null}
+          </>
+        ) : null}
         <label className="space-y-1 text-caption sm:col-span-2">
           <span className="font-medium">{t(($) => $.plugins.remote_mcp.public_config)}</span>
           <Textarea
@@ -224,15 +332,15 @@ function RemoteMCPConfiguration({
             disabled={!canManage || isPending}
           />
         </label>
-      </div>
+        </div>
 
-      <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 border-t border-surface-border p-3">
         <Button
           size="sm"
-          disabled={!canManage || isPending || endpoint.trim() === "" || (authType !== "none" && credential === "")}
-          onClick={configure}
+          disabled={!canManage || isPending || endpoint.trim() === "" || ((authType === "bearer" || authType === "header") && credential === "")}
+          onClick={() => configure()}
         >
-          {configureMutation.isPending ? <Loader2 className="animate-spin" /> : null}
+          {configureMutation.isPending || oauthMutation.isPending ? <Loader2 className="animate-spin" /> : null}
           {t(($) => $.plugins.remote_mcp.configure_and_discover)}
         </Button>
         <Button
@@ -248,7 +356,8 @@ function RemoteMCPConfiguration({
           {testMutation.isPending ? <Loader2 className="animate-spin" /> : null}
           {t(($) => $.plugins.remote_mcp.test)}
         </Button>
-      </div>
+        </div>
+      </details>
 
       {discovery ? (
         <div className="space-y-3 border-t border-surface-border pt-3">

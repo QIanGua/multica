@@ -149,7 +149,12 @@ func runPluginInit(cmd *cobra.Command, args []string) error {
 		manifest.Contributes.RemoteMCP = []plugincontract.RemoteMCPContribution{{
 			Key: "example-tools", Name: name, Description: "Expose explicitly reviewed remote tools.",
 			Transport: "streamable-http", ProtocolVersions: []string{"2025-03-26", "2024-11-05"},
-			EndpointPolicy:      plugincontract.RemoteMCPEndpointPolicy{AllowedHosts: []string{endpointHost}},
+			EndpointPolicy: plugincontract.RemoteMCPEndpointPolicy{
+				DefaultEndpoint: "https://" + endpointHost + "/mcp", AllowedHosts: []string{endpointHost},
+			},
+			Authentication: plugincontract.RemoteMCPAuthentication{
+				Preferred: "oauth", Supported: []string{"oauth", "bearer", "header", "none"},
+			},
 			ToolIntent:          []plugincontract.RemoteMCPToolIntent{{Name: "example.read", Description: "Read an example value.", Risk: "read"}},
 			ConfigurationSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
 		}}

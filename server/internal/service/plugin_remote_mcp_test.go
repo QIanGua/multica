@@ -82,3 +82,14 @@ func TestRemoteMCPAuthHeaderRejectsProtocolAndHopByHopHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeRemoteMCPReturnTo(t *testing.T) {
+	if got := sanitizeRemoteMCPReturnTo("/workspace/settings?tab=plugins"); got != "/workspace/settings?tab=plugins" {
+		t.Fatalf("safe return path changed to %q", got)
+	}
+	for _, unsafe := range []string{"https://evil.example", "//evil.example/path", "/ok\r\nLocation: https://evil.example"} {
+		if got := sanitizeRemoteMCPReturnTo(unsafe); got != "/" {
+			t.Errorf("unsafe return path %q became %q", unsafe, got)
+		}
+	}
+}

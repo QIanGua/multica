@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -75,15 +76,23 @@ type pluginContributionResponse struct {
 }
 
 type pluginRemoteMCPConfigResponse struct {
-	ContributionKey string                        `json:"contribution_key"`
-	ConfigRevision  int64                         `json:"config_revision,omitempty"`
-	EndpointDomain  string                        `json:"endpoint_domain,omitempty"`
-	CredentialState string                        `json:"credential_state"`
-	CredentialHint  string                        `json:"credential_hint,omitempty"`
-	FailurePolicy   string                        `json:"failure_policy,omitempty"`
-	ApprovedTools   []pluginruntime.RemoteMCPTool `json:"approved_tools"`
-	SchemaDigest    string                        `json:"schema_digest,omitempty"`
-	Reviewed        bool                          `json:"reviewed"`
+	ContributionKey  string                        `json:"contribution_key"`
+	DefaultEndpoint  string                        `json:"default_endpoint,omitempty"`
+	PreferredAuth    string                        `json:"preferred_auth,omitempty"`
+	SupportedAuth    []string                      `json:"supported_auth,omitempty"`
+	ConfigRevision   int64                         `json:"config_revision,omitempty"`
+	EndpointDomain   string                        `json:"endpoint_domain,omitempty"`
+	AuthType         string                        `json:"auth_type,omitempty"`
+	ConnectionScope  string                        `json:"connection_scope,omitempty"`
+	ConnectedBy      string                        `json:"connected_by,omitempty"`
+	CredentialState  string                        `json:"credential_state"`
+	CredentialHint   string                        `json:"credential_hint,omitempty"`
+	FailurePolicy    string                        `json:"failure_policy,omitempty"`
+	ApprovedTools    []pluginruntime.RemoteMCPTool `json:"approved_tools"`
+	DiscoveredTools  []pluginruntime.RemoteMCPTool `json:"discovered_tools"`
+	DiscoveredDigest string                        `json:"discovered_schema_digest,omitempty"`
+	SchemaDigest     string                        `json:"schema_digest,omitempty"`
+	Reviewed         bool                          `json:"reviewed"`
 }
 
 type pluginInstallationResponse struct {
@@ -192,19 +201,31 @@ func (h *Handler) pluginInstallationResponseWithReleases(r *http.Request, instal
 				ContributionKey: contribution.ContributionKey,
 				CredentialState: "missing",
 				ApprovedTools:   []pluginruntime.RemoteMCPTool{},
+				DiscoveredTools: []pluginruntime.RemoteMCPTool{},
+			}
+			for _, declaration := range manifest.Contributes.RemoteMCP {
+				if declaration.Key == contribution.ContributionKey {
+					remote.DefaultEndpoint = declaration.EndpointPolicy.DefaultEndpoint
+					remote.PreferredAuth = declaration.Authentication.Preferred
+					remote.SupportedAuth = append([]string(nil), declaration.Authentication.Supported...)
+					break
+				}
 			}
 			config, configErr := h.Queries.GetLatestPluginInstallationConfig(r.Context(), db.GetLatestPluginInstallationConfigParams{
 				WorkspaceID: installation.WorkspaceID, InstallationID: installation.ID, ContributionID: contribution.ID,
 			})
 			if configErr == nil {
 				remote.ConfigRevision = config.Revision
+				remote.AuthType = config.AuthType
 				remote.FailurePolicy = config.FailurePolicy
 				remote.SchemaDigest = config.SchemaDigest.String
+				remote.DiscoveredDigest = config.DiscoveredSchemaDigest.String
 				remote.Reviewed = config.ReviewedAt.Valid
 				if endpoint, parseErr := url.Parse(config.Endpoint); parseErr == nil {
 					remote.EndpointDomain = endpoint.Hostname()
 				}
 				_ = json.Unmarshal(config.ApprovedTools, &remote.ApprovedTools)
+				_ = json.Unmarshal(config.DiscoveredTools, &remote.DiscoveredTools)
 				if config.AuthType == "none" {
 					remote.CredentialState = "not_required"
 				} else if config.SecretRef.Valid {
@@ -215,6 +236,11 @@ func (h *Handler) pluginInstallationResponseWithReleases(r *http.Request, instal
 					if secretErr == nil {
 						remote.CredentialState = "configured"
 						remote.CredentialHint = secret.Hint
+						remote.ConnectedBy = uuidToString(secret.CreatedBy)
+						// V1 execution configs are workspace-pinned. Recording the
+						// connecting user now keeps the wire contract ready for a
+						// future per-user connection selector without exposing tokens.
+						remote.ConnectionScope = "workspace"
 					} else if errors.Is(secretErr, pgx.ErrNoRows) {
 						remote.CredentialState = "revoked"
 					}
@@ -734,6 +760,77 @@ type remoteMCPConfigRequest struct {
 	AuthHeader    string          `json:"auth_header"`
 	Credential    string          `json:"credential"`
 	FailurePolicy string          `json:"failure_policy"`
+}
+
+type remoteMCPOAuthStartRequest struct {
+	Endpoint                string          `json:"endpoint"`
+	PublicConfig            json.RawMessage `json:"public_config"`
+	FailurePolicy           string          `json:"failure_policy"`
+	Scope                   string          `json:"scope"`
+	ClientID                string          `json:"client_id"`
+	ClientSecret            string          `json:"client_secret"`
+	TokenEndpointAuthMethod string          `json:"token_endpoint_auth_method"`
+	AuthorizationEndpoint   string          `json:"authorization_endpoint"`
+	TokenEndpoint           string          `json:"token_endpoint"`
+	ReturnTo                string          `json:"return_to"`
+}
+
+const remoteMCPOAuthCallbackPath = "/api/plugins/remote-mcp/oauth/callback"
+
+func (h *Handler) StartPluginRemoteMCPOAuth(w http.ResponseWriter, r *http.Request) {
+	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r, false)
+	if !ok {
+		return
+	}
+	var request remoteMCPOAuthStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	callbackBase := strings.TrimRight(h.cfg.PublicURL, "/")
+	if callbackBase == "" {
+		writeError(w, http.StatusServiceUnavailable, "MULTICA_PUBLIC_URL is required for Remote MCP OAuth")
+		return
+	}
+	result, err := h.PluginService.BeginRemoteMCPOAuth(r.Context(), workspaceID, installationID, actorID, chi.URLParam(r, "contributionKey"), service.RemoteMCPOAuthStartInput{
+		Endpoint: request.Endpoint, PublicConfig: request.PublicConfig, FailurePolicy: request.FailurePolicy,
+		Scope: request.Scope, ClientID: request.ClientID, ClientSecret: request.ClientSecret,
+		TokenEndpointAuthMethod: request.TokenEndpointAuthMethod,
+		AuthorizationEndpoint:   request.AuthorizationEndpoint, TokenEndpoint: request.TokenEndpoint,
+		RedirectURI: callbackBase + remoteMCPOAuthCallbackPath, ReturnTo: request.ReturnTo,
+	})
+	if err != nil {
+		writePluginError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"authorization_url": result.AuthorizationURL})
+}
+
+// CompletePluginRemoteMCPOAuth is intentionally public. The single-use,
+// short-lived state hash carries the installation and actor identity; browser
+// cookies are neither required nor trusted on this cross-site callback.
+func (h *Handler) CompletePluginRemoteMCPOAuth(w http.ResponseWriter, r *http.Request) {
+	result, err := h.PluginService.CompleteRemoteMCPOAuth(r.Context(), r.URL.Query().Get("state"), r.URL.Query().Get("code"))
+	returnTo := result.ReturnTo
+	if returnTo == "" {
+		returnTo = "/"
+	}
+	parsed, parseErr := url.Parse(returnTo)
+	if parseErr != nil || !strings.HasPrefix(parsed.Path, "/") {
+		parsed = &url.URL{Path: "/"}
+	}
+	query := parsed.Query()
+	if err == nil {
+		query.Set("remote_mcp_connected", "1")
+	} else {
+		query.Set("remote_mcp_error", "connect_failed")
+	}
+	parsed.RawQuery = query.Encode()
+	destination := parsed.String()
+	if appURL := resolveFrontendAppURL(); appURL != "" {
+		destination = strings.TrimRight(appURL, "/") + destination
+	}
+	http.Redirect(w, r, destination, http.StatusFound)
 }
 
 func (h *Handler) ConfigurePluginRemoteMCP(w http.ResponseWriter, r *http.Request) {

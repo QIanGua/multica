@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -44,6 +45,22 @@ type Manifest struct {
 	Compatibility         Compatibility         `json:"compatibility"`
 	RequestedCapabilities []string              `json:"requested_capabilities"`
 	Contributes           ManifestContributions `json:"contributes"`
+}
+
+func remoteMCPHostAllowed(host string, policies []string) bool {
+	for _, policy := range policies {
+		policy = strings.ToLower(strings.TrimSuffix(policy, "."))
+		if host == policy {
+			return true
+		}
+		if strings.HasPrefix(policy, "*.") {
+			suffix := strings.TrimPrefix(policy, "*")
+			if strings.HasSuffix(host, suffix) && host != strings.TrimPrefix(suffix, ".") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type Metadata struct {
@@ -85,12 +102,23 @@ type RemoteMCPContribution struct {
 	Transport           string                  `json:"transport"`
 	ProtocolVersions    []string                `json:"protocol_versions"`
 	EndpointPolicy      RemoteMCPEndpointPolicy `json:"endpoint_policy"`
+	Authentication      RemoteMCPAuthentication `json:"authentication,omitempty"`
 	ToolIntent          []RemoteMCPToolIntent   `json:"tool_intent"`
 	ConfigurationSchema json.RawMessage         `json:"configuration_schema,omitempty"`
 }
 
 type RemoteMCPEndpointPolicy struct {
-	AllowedHosts []string `json:"allowed_hosts,omitempty"`
+	// DefaultEndpoint is the publisher-suggested hosted endpoint used by the
+	// one-click Connect flow. It is configuration, never a grant: the host must
+	// also be covered by AllowedHosts and the server still applies its public
+	// HTTPS/SSRF checks before every discovery or execution request.
+	DefaultEndpoint string   `json:"default_endpoint,omitempty"`
+	AllowedHosts    []string `json:"allowed_hosts,omitempty"`
+}
+
+type RemoteMCPAuthentication struct {
+	Preferred string   `json:"preferred,omitempty"`
+	Supported []string `json:"supported,omitempty"`
 }
 
 type RemoteMCPToolIntent struct {
@@ -271,6 +299,28 @@ func (m Manifest) Validate() error {
 			if strings.ContainsAny(host, "/:@?#") || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") || strings.ToLower(host) != host {
 				return fmt.Errorf("%s.endpoint_policy.allowed_hosts contains invalid host %q", field, host)
 			}
+		}
+		if remote.EndpointPolicy.DefaultEndpoint != "" {
+			endpoint, err := url.Parse(remote.EndpointPolicy.DefaultEndpoint)
+			if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+				return fmt.Errorf("%s.endpoint_policy.default_endpoint must be a plain HTTPS URL", field)
+			}
+			host := strings.ToLower(strings.TrimSuffix(endpoint.Hostname(), "."))
+			if !remoteMCPHostAllowed(host, remote.EndpointPolicy.AllowedHosts) {
+				return fmt.Errorf("%s.endpoint_policy.default_endpoint host must be covered by allowed_hosts", field)
+			}
+		}
+		authModes, err := uniqueStrings(field+".authentication.supported", remote.Authentication.Supported)
+		if err != nil {
+			return err
+		}
+		for mode := range authModes {
+			if mode != "none" && mode != "oauth" && mode != "bearer" && mode != "header" {
+				return fmt.Errorf("%s.authentication.supported contains unsupported mode %q", field, mode)
+			}
+		}
+		if remote.Authentication.Preferred != "" && !authModes[remote.Authentication.Preferred] {
+			return fmt.Errorf("%s.authentication.preferred must appear in supported", field)
 		}
 		if len(remote.ToolIntent) == 0 {
 			return fmt.Errorf("%s.tool_intent must not be empty", field)

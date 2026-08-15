@@ -109,6 +109,21 @@ WHERE installation.id = @installation_id
   AND installation.uninstalled_at IS NULL
   AND contribution.contribution_key = @contribution_key;
 
+-- name: GetInstallationRemoteMCPContributionByID :one
+SELECT contribution.*, release.manifest
+FROM plugin_installation installation
+JOIN plugin_release release
+  ON release.id = installation.desired_release_id
+ AND release.plugin_id = installation.plugin_id
+ AND release.revocation_status = 'active'
+JOIN plugin_contribution contribution
+  ON contribution.release_id = release.id
+ AND contribution.type = 'tool.remote-mcp.v1'
+WHERE installation.id = @installation_id
+  AND installation.workspace_id = @workspace_id
+  AND installation.uninstalled_at IS NULL
+  AND contribution.id = @contribution_id;
+
 -- name: LockPluginRemoteMCPInstallation :one
 SELECT installation.id
 FROM plugin_installation installation
@@ -166,6 +181,15 @@ WHERE id = @id
   AND contribution_id = @contribution_id
   AND status = 'active';
 
+-- name: GetActivePluginRemoteMCPSecretForUpdate :one
+SELECT * FROM plugin_remote_mcp_secret
+WHERE id = @id
+  AND workspace_id = @workspace_id
+  AND installation_id = @installation_id
+  AND contribution_id = @contribution_id
+  AND status = 'active'
+FOR UPDATE;
+
 -- name: RevokePluginRemoteMCPSecrets :many
 UPDATE plugin_remote_mcp_secret
 SET status = 'revoked', revoked_at = now()
@@ -174,6 +198,43 @@ WHERE workspace_id = @workspace_id
   AND contribution_id = @contribution_id
   AND status = 'active'
 RETURNING *;
+
+-- name: UpdateActivePluginRemoteMCPSecret :one
+UPDATE plugin_remote_mcp_secret
+SET ciphertext = @ciphertext,
+    hint = @hint
+WHERE id = @id
+  AND workspace_id = @workspace_id
+  AND installation_id = @installation_id
+  AND contribution_id = @contribution_id
+  AND status = 'active'
+RETURNING *;
+
+-- name: CreatePluginRemoteMCPOAuthState :one
+INSERT INTO plugin_remote_mcp_oauth_state (
+    state_hash, workspace_id, installation_id, contribution_id, actor_id,
+    endpoint, public_config, failure_policy,
+    authorization_endpoint, token_endpoint, client_id, scope,
+    redirect_uri, return_to, secret_ciphertext, expires_at
+) VALUES (
+    @state_hash, @workspace_id, @installation_id, @contribution_id, @actor_id,
+    @endpoint, @public_config, @failure_policy,
+    @authorization_endpoint, @token_endpoint, @client_id, @scope,
+    @redirect_uri, @return_to, @secret_ciphertext, @expires_at
+)
+RETURNING *;
+
+-- name: ClaimPluginRemoteMCPOAuthState :one
+UPDATE plugin_remote_mcp_oauth_state
+SET consumed_at = now()
+WHERE state_hash = @state_hash
+  AND consumed_at IS NULL
+  AND expires_at > now()
+RETURNING *;
+
+-- name: DeleteExpiredPluginRemoteMCPOAuthStates :execrows
+DELETE FROM plugin_remote_mcp_oauth_state
+WHERE expires_at <= now() OR consumed_at < now() - interval '1 hour';
 
 -- name: CreatePluginInstallationConfig :one
 WITH parent AS MATERIALIZED (
@@ -212,12 +273,14 @@ WITH parent AS MATERIALIZED (
 INSERT INTO plugin_installation_config (
     workspace_id, installation_id, contribution_id, revision,
     endpoint, public_config, auth_type, auth_header, secret_ref,
+    discovered_tools, discovered_schema_digest,
     approved_tools, schema_digest, failure_policy,
     reviewed_by, reviewed_at, created_by
 )
 SELECT
     @workspace_id, parent.id, parent.contribution_id, next_revision.revision,
     @endpoint, @public_config, @auth_type, @auth_header, sqlc.narg('secret_ref'),
+    @discovered_tools, sqlc.narg('discovered_schema_digest'),
     @approved_tools, sqlc.narg('schema_digest'), @failure_policy,
     sqlc.narg('reviewed_by'),
     CASE WHEN sqlc.narg('reviewed_by')::uuid IS NULL THEN NULL ELSE now() END,

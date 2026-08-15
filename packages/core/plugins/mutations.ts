@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
-import type { PluginBindingRequest, PluginReleaseRequest, RemoteMCPConfigRequest } from "../types";
+import type { PluginBindingRequest, PluginReleaseRequest, RemoteMCPConfigRequest, RemoteMCPOAuthStartRequest } from "../types";
 import { pluginKeys } from "./queries";
 
 function useInvalidatePlugins(wsId: string) {
@@ -67,6 +67,13 @@ export function useTestPluginRemoteMCP(wsId: string) {
   return useMutation({
     mutationFn: ({ installationId, contributionKey }: { installationId: string; contributionKey: string }) =>
       api.testPluginRemoteMCP(wsId, installationId, contributionKey),
+  });
+}
+
+export function useStartPluginRemoteMCPOAuth(wsId: string) {
+  return useMutation({
+    mutationFn: ({ installationId, contributionKey, request }: { installationId: string; contributionKey: string; request: RemoteMCPOAuthStartRequest }) =>
+      api.startPluginRemoteMCPOAuth(wsId, installationId, contributionKey, request),
   });
 }
 

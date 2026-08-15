@@ -5,7 +5,7 @@
     "key": "dev.multica.mobbin-design-reference",
     "name": "Mobbin Design Reference",
     "description": "Example Plugin combining Mobbin design-research guidance with Mobbin's OAuth-protected hosted MCP server",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "publisher": "multica.examples"
   },
   "compatibility": {
@@ -37,7 +37,12 @@
         "transport": "streamable-http",
         "protocol_versions": ["2025-03-26", "2024-11-05"],
         "endpoint_policy": {
+          "default_endpoint": "https://api.mobbin.com/mcp",
           "allowed_hosts": ["api.mobbin.com"]
+        },
+        "authentication": {
+          "preferred": "oauth",
+          "supported": ["oauth"]
         },
         "tool_intent": [
           {

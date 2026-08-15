@@ -256,11 +256,27 @@
       "auth": "인증",
       "auth_types": {
         "none": "없음",
+        "oauth": "OAuth(권장)",
         "bearer": "Bearer 토큰",
         "header": "사용자 지정 헤더"
       },
       "header_name": "헤더 이름",
       "credential": "인증 정보(암호화 저장)",
+      "connect": "연결",
+      "connected": "연결됨",
+      "ready_to_connect": "연결할 수 있음",
+      "advanced": "고급 구성",
+      "oauth_scope": "OAuth 범위(비워두면 자동)",
+      "oauth_client_id": "OAuth 클라이언트 ID(비워두면 자동)",
+      "oauth_client_secret": "OAuth 클라이언트 보안 비밀",
+      "oauth_authorization_endpoint": "인증 엔드포인트 재정의",
+      "oauth_token_endpoint": "토큰 엔드포인트 재정의",
+      "oauth_token_auth_method": "토큰 엔드포인트 인증",
+      "oauth_token_auth_methods": {
+        "none": "공개 클라이언트(PKCE)",
+        "client_secret_basic": "클라이언트 시크릿(HTTP Basic)",
+        "client_secret_post": "클라이언트 시크릿(요청 본문)"
+      },
       "public_config": "공개 설정(JSON 객체)",
       "invalid_public_config": "공개 설정은 유효한 JSON 객체여야 합니다",
       "failure_policy": "실패 정책",

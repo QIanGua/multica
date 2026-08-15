@@ -256,11 +256,27 @@
       "auth": "Authentication",
       "auth_types": {
         "none": "None",
+        "oauth": "OAuth (recommended)",
         "bearer": "Bearer token",
         "header": "Custom header"
       },
       "header_name": "Header name",
       "credential": "Credential (stored encrypted)",
+      "connect": "Connect",
+      "connected": "Connected",
+      "ready_to_connect": "Ready to connect",
+      "advanced": "Advanced configuration",
+      "oauth_scope": "OAuth scopes (automatic when empty)",
+      "oauth_client_id": "OAuth client ID (automatic when empty)",
+      "oauth_client_secret": "OAuth client secret",
+      "oauth_authorization_endpoint": "Authorization endpoint override",
+      "oauth_token_endpoint": "Token endpoint override",
+      "oauth_token_auth_method": "Token endpoint authentication",
+      "oauth_token_auth_methods": {
+        "none": "Public client (PKCE)",
+        "client_secret_basic": "Client secret (HTTP Basic)",
+        "client_secret_post": "Client secret (request body)"
+      },
       "public_config": "Public configuration (JSON object)",
       "invalid_public_config": "Public configuration must be a valid JSON object",
       "failure_policy": "Failure policy",

@@ -1057,6 +1057,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// Auth group made a missing cookie a hard 401, breaking the flow for exactly
 	// the browsers above; the other four composio endpoints stay session-gated.
 	r.Get("/api/integrations/composio/callback", h.ComposioCallback)
+	// Generic hosted Remote MCP OAuth callback. Identity and installation scope
+	// come exclusively from the encrypted, single-use state record.
+	r.With(authVerifyRL).Get("/api/plugins/remote-mcp/oauth/callback", h.CompletePluginRemoteMCPOAuth)
 
 	// Daemon API routes (require daemon token or valid user token)
 	r.Route("/api/daemon", func(r chi.Router) {
@@ -1203,6 +1206,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/plugins/{installationId}/enable", h.EnablePlugin)
 					r.Post("/plugins/{installationId}/disable", h.DisablePlugin)
 					r.Put("/plugins/{installationId}/remote-mcp/{contributionKey}/config", h.ConfigurePluginRemoteMCP)
+					r.Post("/plugins/{installationId}/remote-mcp/{contributionKey}/oauth/start", h.StartPluginRemoteMCPOAuth)
 					r.Post("/plugins/{installationId}/remote-mcp/{contributionKey}/test", h.TestPluginRemoteMCP)
 					r.Post("/plugins/{installationId}/remote-mcp/{contributionKey}/approve", h.ReviewPluginRemoteMCPTools)
 					r.Delete("/plugins/{installationId}/remote-mcp/{contributionKey}/credential", h.RevokePluginRemoteMCPCredential)

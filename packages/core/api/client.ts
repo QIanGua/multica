@@ -146,6 +146,8 @@ import type {
   PluginReleaseRequest,
   RemoteMCPConfigRequest,
   RemoteMCPDiscoveryResponse,
+  RemoteMCPOAuthStartRequest,
+  RemoteMCPOAuthStartResponse,
   GitHubPullRequest,
   ListGitHubInstallationsResponse,
   ListGitHubRepositoriesResponse,
@@ -2291,6 +2293,13 @@ export class ApiClient {
     });
     return parseWithFallback(raw, RemoteMCPDiscoveryResponseSchema, { config_revision: 0, discovered_tools: [], discovered_schema_digest: "" }, {
       endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{contributionKey}/test",
+    });
+  }
+
+  async startPluginRemoteMCPOAuth(workspaceId: string, installationId: string, contributionKey: string, request: RemoteMCPOAuthStartRequest): Promise<RemoteMCPOAuthStartResponse> {
+    return this.fetch(`/api/workspaces/${workspaceId}/plugins/${installationId}/remote-mcp/${encodeURIComponent(contributionKey)}/oauth/start`, {
+      method: "POST",
+      body: JSON.stringify(request),
     });
   }
 

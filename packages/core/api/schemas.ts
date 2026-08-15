@@ -88,12 +88,20 @@ export const RemoteMCPToolSchema = z.object({
 
 export const PluginRemoteMCPConfigSchema = z.object({
   contribution_key: z.string(),
+  default_endpoint: z.string().optional(),
+  preferred_auth: z.string().optional(),
+  supported_auth: z.array(z.string()).default([]),
   config_revision: z.number().optional(),
   endpoint_domain: z.string().optional(),
+  auth_type: z.string().optional(),
+  connection_scope: z.string().optional(),
+  connected_by: z.string().optional(),
   credential_state: z.string().default("missing"),
   credential_hint: z.string().optional(),
   failure_policy: z.string().optional(),
   approved_tools: z.array(RemoteMCPToolSchema).default([]),
+  discovered_tools: z.array(RemoteMCPToolSchema).default([]),
+  discovered_schema_digest: z.string().optional(),
   schema_digest: z.string().optional(),
   reviewed: z.boolean().default(false),
 });

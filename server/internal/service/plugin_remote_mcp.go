@@ -115,6 +115,7 @@ func (s *PluginService) ConfigureRemoteMCP(ctx context.Context, workspaceID, ins
 		return RemoteMCPConfigResult{}, newPluginError(PluginErrorInvalid, "Remote MCP connection test failed", err)
 	}
 	applyDeclaredRisk(discovered, declaration)
+	discoveredJSON, _ := json.Marshal(discovered)
 
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
@@ -153,7 +154,9 @@ func (s *PluginService) ConfigureRemoteMCP(ctx context.Context, workspaceID, ins
 	config, err := q.CreatePluginInstallationConfig(ctx, db.CreatePluginInstallationConfigParams{
 		WorkspaceID: workspaceID, InstallationID: installationID, ContributionID: contribution.ID,
 		Endpoint: input.Endpoint, PublicConfig: publicConfig, AuthType: input.AuthType, AuthHeader: input.AuthHeader,
-		SecretRef: secretRef, ApprovedTools: []byte(`[]`), FailurePolicy: input.FailurePolicy, CreatedBy: actorID,
+		SecretRef: secretRef, DiscoveredTools: discoveredJSON,
+		DiscoveredSchemaDigest: pgtype.Text{String: digest, Valid: true},
+		ApprovedTools:          []byte(`[]`), FailurePolicy: input.FailurePolicy, CreatedBy: actorID,
 	})
 	if err != nil {
 		return RemoteMCPConfigResult{}, err
@@ -201,7 +204,7 @@ func (s *PluginService) ReviewRemoteMCPTools(ctx context.Context, workspaceID, i
 	if err != nil {
 		return RemoteMCPConfigResult{}, err
 	}
-	discovered, _, err := remotemcp.Discover(ctx, latest.Endpoint, declaration.EndpointPolicy.AllowedHosts, declaration.ProtocolVersions, headers)
+	discovered, discoveredDigest, err := remotemcp.Discover(ctx, latest.Endpoint, declaration.EndpointPolicy.AllowedHosts, declaration.ProtocolVersions, headers)
 	if err != nil {
 		return RemoteMCPConfigResult{}, newPluginError(PluginErrorInvalid, "Remote MCP tool discovery failed", err)
 	}
@@ -215,6 +218,7 @@ func (s *PluginService) ReviewRemoteMCPTools(ctx context.Context, workspaceID, i
 		return RemoteMCPConfigResult{}, err
 	}
 	approvedJSON, _ := json.Marshal(approved)
+	discoveredJSON, _ := json.Marshal(discovered)
 
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
@@ -225,7 +229,8 @@ func (s *PluginService) ReviewRemoteMCPTools(ctx context.Context, workspaceID, i
 	config, err := q.CreatePluginInstallationConfig(ctx, db.CreatePluginInstallationConfigParams{
 		WorkspaceID: workspaceID, InstallationID: installationID, ContributionID: contribution.ID,
 		Endpoint: latest.Endpoint, PublicConfig: latest.PublicConfig, AuthType: latest.AuthType, AuthHeader: latest.AuthHeader,
-		SecretRef: latest.SecretRef, ApprovedTools: approvedJSON,
+		SecretRef: latest.SecretRef, DiscoveredTools: discoveredJSON,
+		DiscoveredSchemaDigest: pgtype.Text{String: discoveredDigest, Valid: true}, ApprovedTools: approvedJSON,
 		SchemaDigest: pgtype.Text{String: digest, Valid: true}, FailurePolicy: latest.FailurePolicy,
 		ReviewedBy: actorID, CreatedBy: actorID,
 	})
@@ -367,18 +372,27 @@ func (s *PluginService) resolveTaskRemoteMCPEntry(ctx context.Context, workspace
 		if err != nil || s.RemoteMCPSecrets == nil {
 			return pluginruntime.RemoteMCPConnection{}, errors.New("credential is unavailable")
 		}
-		secret, err := s.Queries.GetActivePluginRemoteMCPSecret(ctx, db.GetActivePluginRemoteMCPSecretParams{
-			ID: secretID, WorkspaceID: workspaceID, InstallationID: installationID, ContributionID: contributionID,
-		})
-		if err != nil {
-			return pluginruntime.RemoteMCPConnection{}, errors.New("credential is revoked or outside task scope")
-		}
-		opened, err := s.RemoteMCPSecrets.Open(secret.Ciphertext)
-		if err != nil {
-			return pluginruntime.RemoteMCPConnection{}, errors.New("credential cannot be decrypted")
-		}
 		credentialHeader = entry.AuthHeader
-		credential = string(opened)
+		if entry.AuthType == "oauth" {
+			accessToken, err := s.remoteMCPOAuthAccessToken(ctx, workspaceID, installationID, contributionID, secretID)
+			if err != nil {
+				return pluginruntime.RemoteMCPConnection{}, errors.New("OAuth connection is expired or unavailable")
+			}
+			credentialHeader = "Authorization"
+			credential = "Bearer " + accessToken
+		} else {
+			secret, err := s.Queries.GetActivePluginRemoteMCPSecret(ctx, db.GetActivePluginRemoteMCPSecretParams{
+				ID: secretID, WorkspaceID: workspaceID, InstallationID: installationID, ContributionID: contributionID,
+			})
+			if err != nil {
+				return pluginruntime.RemoteMCPConnection{}, errors.New("credential is revoked or outside task scope")
+			}
+			opened, err := s.RemoteMCPSecrets.Open(secret.Ciphertext)
+			if err != nil {
+				return pluginruntime.RemoteMCPConnection{}, errors.New("credential cannot be decrypted")
+			}
+			credential = string(opened)
+		}
 		if entry.AuthType == "bearer" {
 			credentialHeader = "Authorization"
 			credential = "Bearer " + credential
@@ -429,6 +443,17 @@ func (s *PluginService) loadRemoteMCPDeclaration(ctx context.Context, q *db.Quer
 func (s *PluginService) remoteMCPHeaders(ctx context.Context, workspaceID, installationID, contributionID pgtype.UUID, authType, authHeader, plaintext string, secretRef pgtype.UUID) (http.Header, error) {
 	headers := make(http.Header)
 	if authType == "none" {
+		return headers, nil
+	}
+	if authType == "oauth" {
+		if !secretRef.Valid {
+			return nil, newPluginError(PluginErrorConflict, "Remote MCP OAuth connection is unavailable", nil)
+		}
+		accessToken, err := s.remoteMCPOAuthAccessToken(ctx, workspaceID, installationID, contributionID, secretRef)
+		if err != nil {
+			return nil, newPluginError(PluginErrorConflict, "Remote MCP OAuth connection is unavailable", err)
+		}
+		headers.Set("Authorization", "Bearer "+accessToken)
 		return headers, nil
 	}
 	if plaintext == "" {
