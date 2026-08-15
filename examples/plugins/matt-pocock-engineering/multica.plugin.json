@@ -1,0 +1,37 @@
+{
+  "api_version": "multica.plugin/v1",
+  "kind": "Plugin",
+  "metadata": {
+    "key": "dev.multica.matt-pocock-engineering-example",
+    "name": "Matt Pocock Engineering Skills Example",
+    "description": "Community compatibility example containing two MIT-licensed Skills from github.com/mattpocock/skills at commit 8b78b531ab965735c5dc74f6f7a219e1e37326df",
+    "version": "0.1.0",
+    "publisher": "multica.examples"
+  },
+  "compatibility": {
+    "host_api": ">=1.0.0 <2.0.0",
+    "required_daemon_features": [
+      "execution-manifest-v1",
+      "agent-skill-v1"
+    ]
+  },
+  "requested_capabilities": [
+    "agent.skill.contribute"
+  ],
+  "contributes": {
+    "agent_skills": [
+      {
+        "key": "research",
+        "name": "Research",
+        "description": "Investigate a question against high-trust primary sources and capture the findings as a cited Markdown file.",
+        "entry": "skills/research/SKILL.md"
+      },
+      {
+        "key": "resolving-merge-conflicts",
+        "name": "Resolving Merge Conflicts",
+        "description": "Resolve an in-progress Git merge or rebase by tracing both sides to their primary sources and preserving intent.",
+        "entry": "skills/resolving-merge-conflicts/SKILL.md"
+      }
+    ]
+  }
+}

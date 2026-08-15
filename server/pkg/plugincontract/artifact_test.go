@@ -78,6 +78,20 @@ func TestValidateArtifactAcceptsRemoteMCPOnlyPlugin(t *testing.T) {
 	}
 }
 
+func TestValidateArtifactAcceptsThirdPartyLicenseFiles(t *testing.T) {
+	files := append(referenceArchiveFiles(t), zipFixtureFile{
+		name:    ThirdPartyLicensesRoot + "dependency-MIT.txt",
+		content: []byte("MIT License\n\nCopyright dependency author\n"),
+	})
+	artifact, err := ValidateArtifact(buildArchive(t, files))
+	if err != nil {
+		t.Fatalf("ValidateArtifact: %v", err)
+	}
+	if len(artifact.Files) != 4 {
+		t.Fatalf("files = %d, want 4", len(artifact.Files))
+	}
+}
+
 func TestArtifactDigestIgnoresZipEntryOrder(t *testing.T) {
 	files := referenceArchiveFiles(t)
 	reversed := []zipFixtureFile{files[2], files[1], files[0]}
