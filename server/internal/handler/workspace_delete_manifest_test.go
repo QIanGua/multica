@@ -95,6 +95,7 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"plugin_identity":                   workspaceDeleteKeep,
 	"plugin_installation_config":        workspaceDelete,
 	"plugin_installation":               workspaceDelete,
+	"plugin_remote_mcp_oauth_state":     workspaceDelete,
 	"plugin_remote_mcp_secret":          workspaceDelete,
 	"plugin_release":                    workspaceDeleteKeep,
 	"plugin_workspace_capability_state": workspaceDelete,

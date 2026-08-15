@@ -603,6 +603,10 @@ deleted_workspace_state AS (
     DELETE FROM plugin_workspace_capability_state
     WHERE workspace_id = $1
 ),
+deleted_remote_mcp_oauth_states AS (
+    DELETE FROM plugin_remote_mcp_oauth_state
+    WHERE workspace_id = $1
+),
 deleted_remote_mcp_configs AS (
     DELETE FROM plugin_installation_config
     WHERE workspace_id = $1
