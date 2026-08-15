@@ -213,6 +213,7 @@ func (s *PluginService) InstallPluginRelease(ctx context.Context, workspaceID, a
 			return db.PluginInstallation{}, newPluginError(PluginErrorConflict, "Plugin is already installed", nil)
 		}
 		auditAction := "plugin_private_uploaded"
+		needsReconcile := false
 		if existing.DesiredReleaseID != release.ID {
 			currentRelease, currentErr := q.GetPluginRelease(ctx, existing.DesiredReleaseID)
 			if currentErr != nil {
@@ -231,10 +232,32 @@ func (s *PluginService) InstallPluginRelease(ctx context.Context, workspaceID, a
 			if err != nil {
 				return db.PluginInstallation{}, fmt.Errorf("update private Plugin release: %w", err)
 			}
+			needsReconcile = true
+			auditAction = "plugin_private_upgraded"
+		}
+		// Private Plugin uploads are the capability-approval surface: a fresh
+		// install grants every requested capability below. Keep upgrades
+		// consistent by granting capabilities newly introduced by the release.
+		// Existing denied grants remain denied; an upload must not silently
+		// override an explicit revocation. This also repairs installations made
+		// by older servers that activated the contribution metadata but omitted
+		// its new grant, leaving the Skill visible in status yet absent at run
+		// time.
+		grantsChanged, err := grantMissingPrivatePluginCapabilities(
+			ctx,
+			q,
+			workspaceID,
+			existing.ID,
+			actorID,
+			publication.Release.Manifest.RequestedCapabilities,
+		)
+		if err != nil {
+			return db.PluginInstallation{}, err
+		}
+		if needsReconcile || grantsChanged {
 			if _, err := s.reconcileWorkspaceTx(ctx, q, workspaceID); err != nil {
 				return db.PluginInstallation{}, err
 			}
-			auditAction = "plugin_private_upgraded"
 		}
 		if err := createPluginAudit(ctx, q, workspaceID, actorID, auditAction, identity, release, existing); err != nil {
 			return db.PluginInstallation{}, err
@@ -280,6 +303,41 @@ func (s *PluginService) InstallPluginRelease(ctx context.Context, workspaceID, a
 		return db.PluginInstallation{}, err
 	}
 	return s.Queries.GetPluginInstallation(ctx, installation.ID)
+}
+
+func grantMissingPrivatePluginCapabilities(
+	ctx context.Context,
+	q *db.Queries,
+	workspaceID, installationID, actorID pgtype.UUID,
+	requested []string,
+) (bool, error) {
+	latest, err := q.ListLatestPluginGrants(ctx, installationID)
+	if err != nil {
+		return false, fmt.Errorf("list private Plugin grants: %w", err)
+	}
+	existing := make(map[string]struct{}, len(latest))
+	for _, grant := range latest {
+		existing[grant.Capability] = struct{}{}
+	}
+	changed := false
+	for _, capability := range requested {
+		if _, ok := existing[capability]; ok {
+			continue
+		}
+		if _, err := q.CreatePluginGrantRevision(ctx, db.CreatePluginGrantRevisionParams{
+			Capability:     capability,
+			Decision:       "granted",
+			Limits:         []byte(`{}`),
+			ApprovedBy:     actorID,
+			InstallationID: installationID,
+			WorkspaceID:    workspaceID,
+		}); err != nil {
+			return false, fmt.Errorf("grant upgraded private Plugin capability %s: %w", capability, err)
+		}
+		existing[capability] = struct{}{}
+		changed = true
+	}
+	return changed, nil
 }
 
 func ensurePluginRelease(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID, publication PluginReleasePublication) (db.PluginIdentity, db.PluginRelease, error) {

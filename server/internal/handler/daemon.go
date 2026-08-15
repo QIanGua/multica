@@ -1748,6 +1748,52 @@ type claimBuildFailure struct {
 	message string
 }
 
+// failClaimedTaskBeforeLaunch settles a durable claim-time rejection before
+// the daemon ever receives the task. Leaving these failures in dispatched
+// makes the stale-claim reaper deliver the same impossible task forever and
+// leaves chat showing "starting" with no actionable outcome. If settlement
+// itself fails, release the exact claim so a later attempt can retry the gate.
+func (h *Handler) failClaimedTaskBeforeLaunch(
+	ctx context.Context,
+	task *db.AgentTaskQueue,
+	userMessage string,
+	failureReason taskfailure.Reason,
+	outcome string,
+	status int,
+	claimMessage string,
+) *claimBuildFailure {
+	if _, err := h.TaskService.FailTask(
+		ctx,
+		task.ID,
+		userMessage,
+		"",
+		"",
+		"",
+		failureReason.String(),
+		false,
+		"",
+	); err != nil {
+		slog.Error("task claim: fail rejected task failed; requeueing claim",
+			"task_id", uuidToString(task.ID),
+			"outcome", outcome,
+			"error", err,
+		)
+		if _, requeueErr := h.TaskService.RequeueTaskAfterClaimFailure(ctx, *task); requeueErr != nil {
+			slog.Error("task claim: requeue after rejected-task settlement failure failed; stale reclaim will recover it",
+				"task_id", uuidToString(task.ID),
+				"outcome", outcome,
+				"error", requeueErr,
+			)
+		}
+		return &claimBuildFailure{
+			outcome: outcome + "_settle",
+			status:  http.StatusInternalServerError,
+			message: "failed to settle a task rejected before launch",
+		}
+	}
+	return &claimBuildFailure{outcome: outcome, status: status, message: claimMessage}
+}
+
 // buildClaimedTaskResponse assembles the full daemon claim payload for a
 // single already-claimed task and computes the exact comment ids embedded in
 // it (deliveredCommentIDs). Shared by the per-runtime handler
@@ -1777,13 +1823,31 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	_, pluginSkillRefs, pluginManifest, pluginErr := h.TaskService.LoadTaskPluginSkillBundles(r.Context(), task.ID)
 	if pluginErr != nil {
 		slog.Error("daemon claim: load pinned plugin contributions failed", "task_id", uuidToString(task.ID), "error", pluginErr)
-		return resp, deliveredCommentIDs, 0, 0, &claimBuildFailure{status: http.StatusInternalServerError, message: "pinned plugin contributions are unavailable"}
+		failure := h.failClaimedTaskBeforeLaunch(
+			r.Context(),
+			task,
+			"This task could not start because its pinned Plugin contributions are unavailable. Retry the task; if it fails again, reinstall or re-enable the Plugin.",
+			taskfailure.ReasonSkillBundleUnavailable,
+			"error_plugin_contributions",
+			http.StatusInternalServerError,
+			"pinned plugin contributions are unavailable",
+		)
+		return resp, deliveredCommentIDs, 0, 0, failure
 	}
 	resp.PluginExecutionManifest = pluginManifest
 	remoteConnections, remoteDiagnostics, remoteErr := h.PluginService.ResolveTaskRemoteMCPConnections(r.Context(), task.ID)
 	if remoteErr != nil {
 		slog.Error("daemon claim: resolve pinned Remote MCP contribution failed", "task_id", uuidToString(task.ID), "error", remoteErr)
-		return resp, deliveredCommentIDs, 0, 0, &claimBuildFailure{status: http.StatusConflict, message: "required Remote MCP contribution is unavailable"}
+		failure := h.failClaimedTaskBeforeLaunch(
+			r.Context(),
+			task,
+			"This task could not start because a required Remote MCP contribution is unavailable. Test the Plugin connection or update its configuration, then retry.",
+			taskfailure.ReasonAgentMissingConfig,
+			"error_required_remote_mcp",
+			http.StatusConflict,
+			"required Remote MCP contribution is unavailable",
+		)
+		return resp, deliveredCommentIDs, 0, 0, failure
 	}
 	if pluginManifest != nil && len(remoteDiagnostics) > 0 {
 		pluginManifest.Diagnostics = append(pluginManifest.Diagnostics, remoteDiagnostics...)
@@ -1791,7 +1855,16 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	if len(remoteConnections) > 0 && !requestHasClientCapability(r, protocol.DaemonCapabilityRemoteMCPV1) {
 		for _, connection := range remoteConnections {
 			if connection.FailurePolicy == "required" {
-				return resp, deliveredCommentIDs, 0, 0, &claimBuildFailure{status: http.StatusConflict, message: "runtime does not support this task's required Remote MCP contribution"}
+				failure := h.failClaimedTaskBeforeLaunch(
+					r.Context(),
+					task,
+					"This task could not start because its runtime does not support the required Remote MCP contribution. Update the runtime, then retry.",
+					taskfailure.ReasonAgentRuntimeVersionUnsupported,
+					"error_remote_mcp_runtime_incompatible",
+					http.StatusConflict,
+					"runtime does not support this task's required Remote MCP contribution",
+				)
+				return resp, deliveredCommentIDs, 0, 0, failure
 			}
 		}
 		if pluginManifest != nil {
@@ -1803,7 +1876,16 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	if len(pluginSkillRefs) > 0 && (!requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1) ||
 		!requestHasClientCapability(r, protocol.DaemonCapabilityExecutionManifestV1) ||
 		!requestHasClientCapability(r, protocol.DaemonCapabilityAgentSkillV1)) {
-		return resp, deliveredCommentIDs, 0, 0, &claimBuildFailure{status: http.StatusConflict, message: "runtime does not support this task's plugin execution manifest"}
+		failure := h.failClaimedTaskBeforeLaunch(
+			r.Context(),
+			task,
+			"This task could not start because its runtime does not support the Plugin's Skill contribution. Update the runtime, then retry.",
+			taskfailure.ReasonAgentRuntimeVersionUnsupported,
+			"error_plugin_skill_runtime_incompatible",
+			http.StatusConflict,
+			"runtime does not support this task's plugin execution manifest",
+		)
+		return resp, deliveredCommentIDs, 0, 0, failure
 	}
 	if agent, err := h.Queries.GetAgent(r.Context(), task.AgentID); err == nil {
 		useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)

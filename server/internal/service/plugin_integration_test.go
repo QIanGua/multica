@@ -295,9 +295,27 @@ func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upgrade private Plugin: %v", err)
 	}
+	// Simulate an installation upgraded by an older server that retained only
+	// the release metadata and missed a newly requested capability grant. An
+	// idempotent upload must repair the missing grant and recompile the active
+	// snapshot so the contribution reaches the next task.
+	if _, err := pool.Exec(ctx, `
+		DELETE FROM plugin_grant
+		WHERE installation_id = $1 AND capability = 'agent.skill.contribute'
+	`, privateInstallation.ID); err != nil {
+		t.Fatalf("remove private Plugin grant: %v", err)
+	}
 	idempotentInstallation, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, privateArchiveV2)
 	if err != nil || idempotentInstallation.ID != privateInstallation.ID {
 		t.Fatalf("idempotent private upload: installation=%+v err=%v", idempotentInstallation, err)
+	}
+	var repairedGrant string
+	if err := pool.QueryRow(ctx, `
+		SELECT decision FROM plugin_grant
+		WHERE installation_id = $1 AND capability = 'agent.skill.contribute'
+		ORDER BY grant_revision DESC LIMIT 1
+	`, privateInstallation.ID).Scan(&repairedGrant); err != nil || repairedGrant != "granted" {
+		t.Fatalf("private Plugin grant was not repaired: decision=%q err=%v", repairedGrant, err)
 	}
 	repackedArchive := repackPluginArchive(t, privateArchiveV2)
 	if bytes.Equal(repackedArchive, privateArchiveV2) {
