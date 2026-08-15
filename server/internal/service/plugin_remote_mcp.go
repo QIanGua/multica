@@ -612,7 +612,11 @@ func applyDeclaredRisk(tools []pluginruntime.RemoteMCPTool, declaration pluginco
 		risks[intent.Name] = intent.Risk
 	}
 	for index := range tools {
-		tools[index].Risk = risks[tools[index].Name]
+		risk := risks[tools[index].Name]
+		if risk == "" {
+			risk = risks[plugincontract.RemoteMCPAnyToolIntent]
+		}
+		tools[index].Risk = risk
 	}
 }
 
@@ -624,6 +628,7 @@ func selectApprovedRemoteMCPTools(discovered []pluginruntime.RemoteMCPTool, decl
 	for _, tool := range declaration.ToolIntent {
 		intended[tool.Name] = true
 	}
+	allowDiscovered := intended[plugincontract.RemoteMCPAnyToolIntent]
 	available := make(map[string]pluginruntime.RemoteMCPTool, len(discovered))
 	for _, tool := range discovered {
 		available[tool.Name] = tool
@@ -631,7 +636,7 @@ func selectApprovedRemoteMCPTools(discovered []pluginruntime.RemoteMCPTool, decl
 	approved := make([]pluginruntime.RemoteMCPTool, 0, len(names))
 	seen := map[string]bool{}
 	for _, name := range names {
-		if seen[name] || !intended[name] {
+		if seen[name] || (!allowDiscovered && !intended[name]) {
 			return nil, fmt.Errorf("tool %q is duplicate or outside declared intent", name)
 		}
 		tool, ok := available[name]

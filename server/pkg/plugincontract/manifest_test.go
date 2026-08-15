@@ -144,6 +144,16 @@ func TestManifestAcceptsRemoteMCPOnlyAndMixedContributions(t *testing.T) {
 	}
 }
 
+func TestManifestAcceptsReviewedWildcardRemoteMCPToolIntent(t *testing.T) {
+	manifest := validRemoteMCPManifest()
+	manifest.Contributes.RemoteMCP[0].ToolIntent = []RemoteMCPToolIntent{{
+		Name: RemoteMCPAnyToolIntent, Description: "Discover tools for explicit administrator review.", Risk: "write",
+	}}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("Validate wildcard Remote MCP tool intent: %v", err)
+	}
+}
+
 func TestManifestRemoteMCPFailsClosed(t *testing.T) {
 	tests := []struct {
 		name string
@@ -156,6 +166,9 @@ func TestManifestRemoteMCPFailsClosed(t *testing.T) {
 			m.Contributes.RemoteMCP[0].EndpointPolicy.AllowedHosts = []string{"https://token@mcp.example"}
 		}, want: "invalid host"},
 		{name: "invalid risk", edit: func(m *Manifest) { m.Contributes.RemoteMCP[0].ToolIntent[0].Risk = "admin" }, want: "read or write"},
+		{name: "wildcard understates risk", edit: func(m *Manifest) {
+			m.Contributes.RemoteMCP[0].ToolIntent = []RemoteMCPToolIntent{{Name: RemoteMCPAnyToolIntent, Risk: "read"}}
+		}, want: "must be write for wildcard"},
 		{name: "missing capability", edit: func(m *Manifest) { m.RequestedCapabilities = nil }, want: "requested_capabilities"},
 		{name: "missing daemon feature", edit: func(m *Manifest) { m.Compatibility.RequiredDaemonFeatures = []string{DaemonFeatureExecutionManifestV1} }, want: DaemonFeatureRemoteMCPV1},
 	}

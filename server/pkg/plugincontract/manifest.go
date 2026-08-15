@@ -20,6 +20,7 @@ const (
 	CapabilityAgentSkillContribute = "agent.skill.contribute"
 	ContributionRemoteMCPV1        = "tool.remote-mcp.v1"
 	CapabilityRemoteMCPConnect     = "tool.remote-mcp.connect"
+	RemoteMCPAnyToolIntent         = "*"
 
 	DaemonFeatureExecutionManifestV1 = "execution-manifest-v1"
 	DaemonFeatureAgentSkillV1        = "agent-skill-v1"
@@ -93,6 +94,11 @@ type RemoteMCPEndpointPolicy struct {
 }
 
 type RemoteMCPToolIntent struct {
+	// Name may be "*" for hosted MCP servers whose exact tool set is only
+	// available after authentication. The administrator must still explicitly
+	// approve discovered tool names, and execution pins each approved schema;
+	// newly discovered tools never become available automatically. Wildcard
+	// intent is conservatively classified as write until exact tools are known.
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Risk        string `json:"risk"`
@@ -272,7 +278,7 @@ func (m Manifest) Validate() error {
 		toolNames := make(map[string]bool, len(remote.ToolIntent))
 		for toolIndex, tool := range remote.ToolIntent {
 			toolField := fmt.Sprintf("%s.tool_intent[%d]", field, toolIndex)
-			if !contributionKeyPattern.MatchString(tool.Name) && !regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.:-]{0,127}$`).MatchString(tool.Name) {
+			if tool.Name != RemoteMCPAnyToolIntent && !contributionKeyPattern.MatchString(tool.Name) && !regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.:-]{0,127}$`).MatchString(tool.Name) {
 				return fmt.Errorf("%s.name is invalid", toolField)
 			}
 			if toolNames[tool.Name] {
@@ -286,6 +292,9 @@ func (m Manifest) Validate() error {
 			}
 			if tool.Risk != "read" && tool.Risk != "write" {
 				return fmt.Errorf("%s.risk must be read or write", toolField)
+			}
+			if tool.Name == RemoteMCPAnyToolIntent && tool.Risk != "write" {
+				return fmt.Errorf("%s.risk must be write for wildcard tool intent", toolField)
 			}
 		}
 		if len(remote.ConfigurationSchema) > 0 {

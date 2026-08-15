@@ -48,6 +48,21 @@ func TestSelectApprovedRemoteMCPToolsFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSelectApprovedRemoteMCPToolsAllowsExplicitlyReviewedWildcard(t *testing.T) {
+	declaration := plugincontract.RemoteMCPContribution{ToolIntent: []plugincontract.RemoteMCPToolIntent{
+		{Name: plugincontract.RemoteMCPAnyToolIntent, Risk: "write"},
+	}}
+	discovered := []pluginruntime.RemoteMCPTool{{Name: "search-screens"}, {Name: "get-flow"}}
+	applyDeclaredRisk(discovered, declaration)
+	approved, err := selectApprovedRemoteMCPTools(discovered, declaration, []string{"search-screens"})
+	if err != nil || len(approved) != 1 || approved[0].Name != "search-screens" || approved[0].Risk != "write" {
+		t.Fatalf("approved = %#v, %v", approved, err)
+	}
+	if _, err := selectApprovedRemoteMCPTools(discovered, declaration, []string{"not-discovered"}); err == nil {
+		t.Fatal("undiscovered wildcard tool was approved")
+	}
+}
+
 func TestSecretHintDoesNotExposeShortCredential(t *testing.T) {
 	if got := secretHint("abc"); got != "••••" || strings.Contains(got, "abc") {
 		t.Fatalf("secretHint = %q", got)
