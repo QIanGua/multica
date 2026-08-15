@@ -230,6 +230,20 @@ describe("Agent creation cache handoff", () => {
       queryClient.getQueryData(workspaceKeys.agent("ws-1", CREATED_AGENT.id)),
     ).toEqual(CREATED_AGENT);
   });
+
+  it("can update detail without inserting a list entry that was not present", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData<Agent[]>(workspaceKeys.agents("ws-1"), []);
+
+    cacheAgentResponse(queryClient, "ws-1", CREATED_AGENT, {
+      insertIntoList: false,
+    });
+
+    expect(queryClient.getQueryData(workspaceKeys.agents("ws-1"))).toEqual([]);
+    expect(
+      queryClient.getQueryData(workspaceKeys.agent("ws-1", CREATED_AGENT.id)),
+    ).toEqual(CREATED_AGENT);
+  });
 });
 
 // The list endpoint returns the stored message untouched, still in the builder

@@ -70,12 +70,15 @@ export function cacheAgentResponse(
   queryClient: QueryClient,
   wsId: string,
   agent: Agent,
+  options: { insertIntoList?: boolean } = {},
 ) {
   queryClient.setQueryData(workspaceKeys.agent(wsId, agent.id), agent);
   queryClient.setQueryData<Agent[]>(workspaceKeys.agents(wsId), (current) => {
     if (!current) return current;
     const existingIndex = current.findIndex((item) => item.id === agent.id);
-    if (existingIndex === -1) return [...current, agent];
+    if (existingIndex === -1) {
+      return options.insertIntoList === false ? current : [...current, agent];
+    }
     return current.map((item, index) =>
       index === existingIndex ? agent : item,
     );

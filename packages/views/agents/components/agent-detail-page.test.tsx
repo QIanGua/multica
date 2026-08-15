@@ -83,13 +83,16 @@ vi.mock("@multica/core/workspace/queries", () => ({
     queryClient: QueryClient,
     wsId: string,
     agent: Agent,
+    options: { insertIntoList?: boolean } = {},
   ) => {
     queryClient.setQueryData(["agents", wsId, "detail", agent.id], agent);
     queryClient.setQueryData<Agent[]>(["agents", wsId], (current) =>
       current?.some((item) => item.id === agent.id)
         ? current.map((item) => (item.id === agent.id ? agent : item))
         : current
-          ? [...current, agent]
+          ? options.insertIntoList === false
+            ? current
+            : [...current, agent]
           : current,
     );
   },
@@ -326,6 +329,28 @@ describe("AgentDetailPage direct-detail fallback", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Network request failed")).toBeInTheDocument();
     expect(screen.queryByText("Agent not found")).not.toBeInTheDocument();
+  });
+
+  it("keeps successful detail data visible through a transient refetch error", async () => {
+    agentsRef.current = [];
+    mockGetAgent.mockResolvedValueOnce(baseAgent);
+    const { queryClient } = renderPage();
+    await screen.findByRole("button", { name: "Assign work" });
+
+    mockGetAgent.mockRejectedValue(new Error("Network request failed"));
+    await act(async () => {
+      await queryClient.invalidateQueries({
+        queryKey: ["agents", "ws-1", "detail", "agent-1"],
+        exact: true,
+      });
+    });
+
+    expect(
+      screen.getByRole("button", { name: "Assign work" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Couldn't load this agent"),
+    ).not.toBeInTheDocument();
   });
 
   it("optimistically updates a detail-only cache entry", async () => {

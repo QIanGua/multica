@@ -101,16 +101,18 @@ export function AgentDetailPage({ agentId }: AgentDetailPageProps) {
     enabled: !agentsLoading && !listAgent && !!agentId,
   });
   const detailError = detailQuery.error;
-  // TanStack intentionally keeps successful data when a refetch fails. Do not
-  // let that stale snapshot mask a later 403/404 after access is revoked or the
-  // agent is deleted; a still-visible list response remains authoritative.
-  const agent = listAgent ?? (detailError ? null : detailQuery.data) ?? null;
-  const presence: AgentPresenceDetail | null =
-    agent ? presenceMap.get(agent.id) ?? null : null;
   const isForbidden =
     detailError instanceof ApiError && detailError.status === 403;
   const isNotFound =
     detailError instanceof ApiError && detailError.status === 404;
+  // TanStack intentionally keeps successful data when a refetch fails. Do not
+  // let that stale snapshot mask a later 403/404 after access is revoked or the
+  // agent is deleted, but preserve it through transient network failures. A
+  // still-visible list response remains authoritative in either case.
+  const agent =
+    listAgent ?? (isForbidden || isNotFound ? null : detailQuery.data) ?? null;
+  const presence: AgentPresenceDetail | null =
+    agent ? presenceMap.get(agent.id) ?? null : null;
 
   // Permission hook MUST be called unconditionally — its `agent | null`
   // signature handles the not-found / loading case internally so the early
@@ -176,7 +178,7 @@ export function AgentDetailPage({ agentId }: AgentDetailPageProps) {
         id,
         data as UpdateAgentRequest,
       );
-      cacheAgentResponse(qc, wsId, updatedAgent);
+      cacheAgentResponse(qc, wsId, updatedAgent, { insertIntoList: false });
       void qc.invalidateQueries({ queryKey });
       toast.success(t(($) => $.detail.agent_updated_toast));
     } catch (e) {
