@@ -135,7 +135,7 @@ func validatePluginSkillRelativePath(relative string) error {
 	if separator := strings.IndexByte(relative, '/'); separator >= 0 {
 		firstSegment = relative[:separator]
 	}
-	if relative == "" || relative == "." || strings.EqualFold(firstSegment, "SKILL.md") || strings.Contains(relative, "\\") || path.IsAbs(relative) || path.Clean(relative) != relative || strings.HasPrefix(relative, "../") {
+	if relative == "" || relative == "." || relative == ".." || strings.EqualFold(firstSegment, "SKILL.md") || strings.Contains(relative, "\\") || path.IsAbs(relative) || path.Clean(relative) != relative || strings.HasPrefix(relative, "../") {
 		return fmt.Errorf("plugin Skill companion path %q is invalid", relative)
 	}
 	return nil

@@ -303,6 +303,8 @@
       "read": "読み取り",
       "write": "書き込み",
       "configured_success": "接続を保存しました。検出されたツールを確認してください",
+      "oauth_connected_success": "OAuth 接続が完了しました。検出されたツールを確認してください",
+      "oauth_connect_failed": "OAuth 接続を完了できませんでした。もう一度お試しください。",
       "test_success": "接続テストに成功しました",
       "approved_success": "ツールへのアクセスを承認しました",
       "revoked_success": "認証情報を失効し、Plugin を無効にしました"

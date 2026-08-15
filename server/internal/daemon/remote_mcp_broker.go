@@ -85,7 +85,13 @@ func startTaskRemoteMCPBrokers(setupCtx, lifetimeCtx context.Context, taskID, pr
 			}
 			headers = resolvedHeaders
 		} else if connection.CredentialHeader != "" {
-			headers.Set(connection.CredentialHeader, connection.Credential)
+			message := fmt.Sprintf("Remote MCP %s credential resolver is unavailable", connection.ContributionKey)
+			if connection.FailurePolicy == "optional" {
+				diagnostics = append(diagnostics, message)
+				continue
+			}
+			set.Close()
+			return nil, diagnostics, nil, errors.New(message)
 		}
 		discovered, _, err := remotemcp.Discover(setupCtx, connection.Endpoint, connection.EndpointAllowedHosts, connection.ProtocolVersions, headers)
 		if err == nil {

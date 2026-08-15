@@ -303,6 +303,8 @@
       "read": "Read",
       "write": "Write",
       "configured_success": "Connection saved; review the discovered tools",
+      "oauth_connected_success": "OAuth connection completed; review the discovered tools",
+      "oauth_connect_failed": "OAuth connection could not be completed. Try again.",
       "test_success": "Connection test succeeded",
       "approved_success": "Tool access approved",
       "revoked_success": "Credential revoked and the Plugin disabled"

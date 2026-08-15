@@ -38,6 +38,3 @@ CREATE TABLE plugin_remote_mcp_oauth_state (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (expires_at > created_at)
 );
-
-CREATE INDEX plugin_remote_mcp_oauth_state_expiry_idx
-    ON plugin_remote_mcp_oauth_state (expires_at);

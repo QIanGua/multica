@@ -50,8 +50,11 @@ export interface PluginRemoteMCPConfig {
   preferred_auth?: "none" | "oauth" | "bearer" | "header" | string;
   supported_auth?: string[];
   config_revision?: number;
+  endpoint?: string;
   endpoint_domain?: string;
   auth_type?: "none" | "oauth" | "bearer" | "header" | string;
+  auth_header?: string;
+  public_config?: Record<string, unknown>;
   connection_scope?: "workspace" | "user" | string;
   connected_by?: string;
   credential_state: "missing" | "configured" | "revoked" | "not_required" | string;

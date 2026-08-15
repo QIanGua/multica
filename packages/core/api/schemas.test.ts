@@ -51,6 +51,8 @@ import {
   PluginCatalogResponseSchema,
   PluginInstallationSchema,
   RemoteMCPDiscoveryResponseSchema,
+  RemoteMCPOAuthStartResponseSchema,
+  EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE,
 } from "./schemas";
 import { IssueViewSchema, IssueViewListSchema } from "./schemas";
 import { parseWithFallback } from "./schema";
@@ -1423,6 +1425,18 @@ describe("Plugin catalog schemas", () => {
       { endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{key}/test" },
     );
     expect(parsed).toEqual(fallback);
+  });
+
+  it("rejects a malformed Remote MCP OAuth start response", () => {
+    expect(parseWithFallback(
+      { authorization_url: undefined },
+      RemoteMCPOAuthStartResponseSchema,
+      EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE,
+      { endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{key}/oauth/start" },
+    )).toEqual(EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE);
+    expect(RemoteMCPOAuthStartResponseSchema.parse({
+      authorization_url: "https://auth.example.test/authorize?state=opaque",
+    }).authorization_url).toContain("auth.example.test");
   });
 
   it("degrades a malformed catalog response to unsupported and empty", () => {

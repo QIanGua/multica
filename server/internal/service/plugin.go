@@ -15,13 +15,15 @@ import (
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
 	"github.com/multica-ai/multica/server/pkg/pluginruntime"
 	"github.com/multica-ai/multica/server/pkg/skillbundle"
+	"golang.org/x/sync/singleflight"
 )
 
 type PluginService struct {
-	Queries          *db.Queries
-	TxStarter        TxStarter
-	BundledCatalog   *pluginbundled.Catalog
-	RemoteMCPSecrets RemoteMCPSecretBox
+	Queries               *db.Queries
+	TxStarter             TxStarter
+	BundledCatalog        *pluginbundled.Catalog
+	RemoteMCPSecrets      RemoteMCPSecretBox
+	remoteMCPOAuthRefresh singleflight.Group
 }
 
 const (

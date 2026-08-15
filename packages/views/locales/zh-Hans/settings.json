@@ -303,6 +303,8 @@
       "read": "读取",
       "write": "写入",
       "configured_success": "连接已保存；请审核已发现的工具",
+      "oauth_connected_success": "OAuth 连接已完成；请审核已发现的工具",
+      "oauth_connect_failed": "OAuth 连接未能完成，请重试。",
       "test_success": "连接测试成功",
       "approved_success": "工具访问权限已批准",
       "revoked_success": "凭证已吊销，Plugin 已禁用"

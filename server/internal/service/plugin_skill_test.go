@@ -115,4 +115,7 @@ func TestValidatePluginSkillRelativePathRejectsPrimaryContentDescendant(t *testi
 	if err := validatePluginSkillRelativePath("SKILL.md/hidden.txt"); err == nil {
 		t.Fatal("primary content descendant was accepted")
 	}
+	if err := validatePluginSkillRelativePath(".."); err == nil {
+		t.Fatal("bare parent path was accepted")
+	}
 }

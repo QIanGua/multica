@@ -81,8 +81,11 @@ type pluginRemoteMCPConfigResponse struct {
 	PreferredAuth    string                        `json:"preferred_auth,omitempty"`
 	SupportedAuth    []string                      `json:"supported_auth,omitempty"`
 	ConfigRevision   int64                         `json:"config_revision,omitempty"`
+	Endpoint         string                        `json:"endpoint,omitempty"`
 	EndpointDomain   string                        `json:"endpoint_domain,omitempty"`
 	AuthType         string                        `json:"auth_type,omitempty"`
+	AuthHeader       string                        `json:"auth_header,omitempty"`
+	PublicConfig     json.RawMessage               `json:"public_config,omitempty"`
 	ConnectionScope  string                        `json:"connection_scope,omitempty"`
 	ConnectedBy      string                        `json:"connected_by,omitempty"`
 	CredentialState  string                        `json:"credential_state"`
@@ -222,7 +225,10 @@ func (h *Handler) pluginInstallationResponseWithReleases(r *http.Request, instal
 			})
 			if configErr == nil {
 				remote.ConfigRevision = config.Revision
+				remote.Endpoint = config.Endpoint
 				remote.AuthType = config.AuthType
+				remote.AuthHeader = config.AuthHeader
+				remote.PublicConfig = append(json.RawMessage(nil), config.PublicConfig...)
 				remote.FailurePolicy = config.FailurePolicy
 				remote.SchemaDigest = config.SchemaDigest.String
 				remote.DiscoveredDigest = config.DiscoveredSchemaDigest.String
@@ -818,12 +824,32 @@ func (h *Handler) StartPluginRemoteMCPOAuth(w http.ResponseWriter, r *http.Reque
 // cookies are neither required nor trusted on this cross-site callback.
 func (h *Handler) CompletePluginRemoteMCPOAuth(w http.ResponseWriter, r *http.Request) {
 	result, err := h.PluginService.CompleteRemoteMCPOAuth(r.Context(), r.URL.Query().Get("state"), r.URL.Query().Get("code"))
+	if err != nil {
+		providerError := strings.TrimSpace(r.URL.Query().Get("error"))
+		if len(providerError) > 128 {
+			providerError = providerError[:128]
+		}
+		errorKind := "internal"
+		errorMessage := "Remote MCP OAuth callback failed"
+		var pluginErr *service.PluginError
+		if errors.As(err, &pluginErr) {
+			errorKind = string(pluginErr.Kind)
+			errorMessage = pluginErr.Message
+		}
+		slog.Warn("Remote MCP OAuth callback failed",
+			"error_kind", errorKind,
+			"error_message", errorMessage,
+			"provider_error", providerError,
+			"has_state", r.URL.Query().Get("state") != "",
+			"has_code", r.URL.Query().Get("code") != "",
+		)
+	}
 	returnTo := result.ReturnTo
 	if returnTo == "" {
 		returnTo = "/"
 	}
 	parsed, parseErr := url.Parse(returnTo)
-	if parseErr != nil || !strings.HasPrefix(parsed.Path, "/") {
+	if parseErr != nil || parsed.IsAbs() || parsed.Host != "" || !strings.HasPrefix(parsed.Path, "/") || strings.HasPrefix(parsed.Path, "//") {
 		parsed = &url.URL{Path: "/"}
 	}
 	query := parsed.Query()

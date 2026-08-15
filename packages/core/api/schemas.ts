@@ -92,8 +92,11 @@ export const PluginRemoteMCPConfigSchema = z.object({
   preferred_auth: z.string().optional(),
   supported_auth: z.array(z.string()).default([]),
   config_revision: z.number().optional(),
+  endpoint: z.string().optional(),
   endpoint_domain: z.string().optional(),
   auth_type: z.string().optional(),
+  auth_header: z.string().optional(),
+  public_config: z.record(z.string(), z.unknown()).optional(),
   connection_scope: z.string().optional(),
   connected_by: z.string().optional(),
   credential_state: z.string().default("missing"),
@@ -115,6 +118,12 @@ export const RemoteMCPDiscoveryResponseSchema = z.object({
   discovered_tools: z.array(RemoteMCPToolSchema).default([]),
   discovered_schema_digest: z.string().default(""),
 });
+
+export const RemoteMCPOAuthStartResponseSchema = z.object({
+  authorization_url: z.string().url(),
+});
+
+export const EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE = { authorization_url: "" };
 
 export const PluginInstallationSchema = z.object({
   id: z.string(),

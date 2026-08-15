@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,6 +20,7 @@ import (
 )
 
 const remoteMCPOAuthStateTTL = 10 * time.Minute
+const remoteMCPOAuthRefreshTimeout = 10 * time.Second
 
 type RemoteMCPOAuthStartInput struct {
 	Endpoint                string
@@ -178,8 +180,8 @@ func (s *PluginService) CompleteRemoteMCPOAuth(ctx context.Context, state, code 
 	if s.RemoteMCPSecrets == nil {
 		return RemoteMCPOAuthCallbackResult{}, newPluginError(PluginErrorIncompatible, "Remote MCP credential encryption is not configured", nil)
 	}
-	if state == "" || code == "" {
-		return RemoteMCPOAuthCallbackResult{}, newPluginError(PluginErrorInvalid, "OAuth callback is missing state or code", nil)
+	if state == "" {
+		return RemoteMCPOAuthCallbackResult{}, newPluginError(PluginErrorInvalid, "OAuth callback is missing state", nil)
 	}
 	stateHash := sha256.Sum256([]byte(state))
 	claimed, err := s.Queries.ClaimPluginRemoteMCPOAuthState(ctx, stateHash[:])
@@ -188,6 +190,9 @@ func (s *PluginService) CompleteRemoteMCPOAuth(ctx context.Context, state, code 
 	}
 	if err != nil {
 		return RemoteMCPOAuthCallbackResult{}, err
+	}
+	if code == "" {
+		return RemoteMCPOAuthCallbackResult{ReturnTo: claimed.ReturnTo}, newPluginError(PluginErrorInvalid, "OAuth callback did not include an authorization code", nil)
 	}
 	opened, err := s.RemoteMCPSecrets.Open(claimed.SecretCiphertext)
 	if err != nil {
@@ -325,62 +330,118 @@ func (s *PluginService) remoteMCPOAuthAccessToken(ctx context.Context, workspace
 	if s.RemoteMCPSecrets == nil {
 		return "", errors.New("credential encryption is not configured")
 	}
-	tx, err := s.TxStarter.Begin(ctx)
+	_, token, err := s.loadRemoteMCPOAuthToken(ctx, s.Queries, workspaceID, installationID, contributionID, secretID)
 	if err != nil {
 		return "", err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	q := s.Queries.WithTx(tx)
-	secret, err := q.GetActivePluginRemoteMCPSecretForUpdate(ctx, db.GetActivePluginRemoteMCPSecretForUpdateParams{
-		ID: secretID, WorkspaceID: workspaceID, InstallationID: installationID, ContributionID: contributionID,
-	})
-	if err != nil {
-		return "", err
-	}
-	opened, err := s.RemoteMCPSecrets.Open(secret.Ciphertext)
-	if err != nil {
-		return "", err
-	}
-	var token remoteMCPOAuthTokenSecret
-	if err := json.Unmarshal(opened, &token); err != nil || token.AccessToken == "" {
-		return "", errors.New("OAuth token is invalid")
 	}
 	if token.ExpiresAt.IsZero() || token.ExpiresAt.After(time.Now().Add(time.Minute)) {
+		return token.AccessToken, nil
+	}
+
+	key := base64.RawURLEncoding.EncodeToString(secretID.Bytes[:])
+	value, err, _ := s.remoteMCPOAuthRefresh.Do(key, func() (any, error) {
+		secret, current, err := s.loadRemoteMCPOAuthToken(ctx, s.Queries, workspaceID, installationID, contributionID, secretID)
+		if err != nil {
+			return "", err
+		}
+		if current.ExpiresAt.IsZero() || current.ExpiresAt.After(time.Now().Add(time.Minute)) {
+			return current.AccessToken, nil
+		}
+		if current.RefreshToken == "" {
+			return "", errors.New("OAuth access token expired without a refresh token")
+		}
+
+		refreshCtx, cancel := context.WithTimeout(ctx, remoteMCPOAuthRefreshTimeout)
+		defer cancel()
+		refreshed, err := remotemcp.RefreshOAuthToken(refreshCtx, current.TokenEndpoint, current.Resource, current.RefreshToken, remotemcp.OAuthClientRegistration{
+			ClientID: current.ClientID, ClientSecret: current.ClientSecret, TokenEndpointAuthMethod: current.TokenEndpointAuthMethod,
+		})
+		if err != nil {
+			return "", err
+		}
+		current.AccessToken = refreshed.AccessToken
+		if refreshed.RefreshToken != "" {
+			current.RefreshToken = refreshed.RefreshToken
+		}
+		if refreshed.Scope != "" {
+			current.Scope = refreshed.Scope
+		}
+		current.ExpiresAt = remotemcp.OAuthExpiry(time.Now(), refreshed.ExpiresIn)
+
+		// The network call intentionally happens before the write lock. Once the
+		// provider responds, lock briefly to re-check revocation/rotation and
+		// publish the refreshed token atomically.
+		tx, err := s.TxStarter.Begin(ctx)
+		if err != nil {
+			return "", err
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck
+		q := s.Queries.WithTx(tx)
+		locked, err := q.GetActivePluginRemoteMCPSecretForUpdate(ctx, db.GetActivePluginRemoteMCPSecretForUpdateParams{
+			ID: secretID, WorkspaceID: workspaceID, InstallationID: installationID, ContributionID: contributionID,
+		})
+		if err != nil {
+			return "", err
+		}
+		lockedToken, err := s.decodeRemoteMCPOAuthToken(locked.Ciphertext)
+		if err != nil {
+			return "", err
+		}
+		if lockedToken.ExpiresAt.IsZero() || lockedToken.ExpiresAt.After(time.Now().Add(time.Minute)) {
+			if err := tx.Commit(ctx); err != nil {
+				return "", err
+			}
+			return lockedToken.AccessToken, nil
+		}
+		if !bytes.Equal(locked.Ciphertext, secret.Ciphertext) {
+			return "", errors.New("OAuth token changed while it was being refreshed")
+		}
+
+		encoded, _ := json.Marshal(current)
+		sealed, err := s.RemoteMCPSecrets.Seal(encoded)
+		if err != nil {
+			return "", err
+		}
+		if _, err := q.UpdateActivePluginRemoteMCPSecret(ctx, db.UpdateActivePluginRemoteMCPSecretParams{
+			Ciphertext: sealed, Hint: "OAuth", ID: secretID, WorkspaceID: workspaceID,
+			InstallationID: installationID, ContributionID: contributionID,
+		}); err != nil {
+			return "", err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return "", err
 		}
-		return token.AccessToken, nil
-	}
-	if token.RefreshToken == "" {
-		return "", errors.New("OAuth access token expired without a refresh token")
-	}
-	refreshed, err := remotemcp.RefreshOAuthToken(ctx, token.TokenEndpoint, token.Resource, token.RefreshToken, remotemcp.OAuthClientRegistration{
-		ClientID: token.ClientID, ClientSecret: token.ClientSecret, TokenEndpointAuthMethod: token.TokenEndpointAuthMethod,
+		return current.AccessToken, nil
 	})
 	if err != nil {
 		return "", err
 	}
-	token.AccessToken = refreshed.AccessToken
-	if refreshed.RefreshToken != "" {
-		token.RefreshToken = refreshed.RefreshToken
+	accessToken, ok := value.(string)
+	if !ok || accessToken == "" {
+		return "", errors.New("OAuth token refresh returned no access token")
 	}
-	if refreshed.Scope != "" {
-		token.Scope = refreshed.Scope
-	}
-	token.ExpiresAt = remotemcp.OAuthExpiry(time.Now(), refreshed.ExpiresIn)
-	encoded, _ := json.Marshal(token)
-	sealed, err := s.RemoteMCPSecrets.Seal(encoded)
+	return accessToken, nil
+}
+
+func (s *PluginService) loadRemoteMCPOAuthToken(ctx context.Context, q *db.Queries, workspaceID, installationID, contributionID, secretID pgtype.UUID) (db.PluginRemoteMcpSecret, remoteMCPOAuthTokenSecret, error) {
+	secret, err := q.GetActivePluginRemoteMCPSecret(ctx, db.GetActivePluginRemoteMCPSecretParams{
+		ID: secretID, WorkspaceID: workspaceID, InstallationID: installationID, ContributionID: contributionID,
+	})
 	if err != nil {
-		return "", err
+		return db.PluginRemoteMcpSecret{}, remoteMCPOAuthTokenSecret{}, err
 	}
-	if _, err := q.UpdateActivePluginRemoteMCPSecret(ctx, db.UpdateActivePluginRemoteMCPSecretParams{
-		Ciphertext: sealed, Hint: "OAuth", ID: secretID, WorkspaceID: workspaceID,
-		InstallationID: installationID, ContributionID: contributionID,
-	}); err != nil {
-		return "", err
+	token, err := s.decodeRemoteMCPOAuthToken(secret.Ciphertext)
+	return secret, token, err
+}
+
+func (s *PluginService) decodeRemoteMCPOAuthToken(ciphertext []byte) (remoteMCPOAuthTokenSecret, error) {
+	opened, err := s.RemoteMCPSecrets.Open(ciphertext)
+	if err != nil {
+		return remoteMCPOAuthTokenSecret{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return "", err
+	var token remoteMCPOAuthTokenSecret
+	if err := json.Unmarshal(opened, &token); err != nil || token.AccessToken == "" {
+		return remoteMCPOAuthTokenSecret{}, errors.New("OAuth token is invalid")
 	}
-	return token.AccessToken, nil
+	return token, nil
 }

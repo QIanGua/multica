@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertCircle, CheckCircle2, Loader2, PackageCheck, ShieldCheck, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -43,6 +43,8 @@ import {
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { Textarea } from "@multica/ui/components/ui/textarea";
 import { useT } from "../../i18n";
+import { isDesktopShell } from "../../platform/local-directory";
+import { openExternal } from "../../platform/open-external";
 import { SettingsCard, SettingsSection, SettingsTab } from "./settings-layout";
 
 type BindingScope = "workspace" | "agent";
@@ -66,11 +68,13 @@ function RemoteMCPConfiguration({
   const approveMutation = useApprovePluginRemoteMCPTools(wsId);
   const revokeMutation = useRevokePluginRemoteMCPCredential(wsId);
   const oauthMutation = useStartPluginRemoteMCPOAuth(wsId);
-  const [endpoint, setEndpoint] = useState(config.default_endpoint ?? "");
+  const [endpoint, setEndpoint] = useState(config.endpoint ?? config.default_endpoint ?? "");
   const [authType, setAuthType] = useState<RemoteMCPAuthType>(
-    config.preferred_auth === "oauth" ? "oauth" : "none",
+    config.auth_type === "oauth" || config.auth_type === "bearer" || config.auth_type === "header" || config.auth_type === "none"
+      ? config.auth_type
+      : config.preferred_auth === "oauth" ? "oauth" : "none",
   );
-  const [authHeader, setAuthHeader] = useState("Authorization");
+  const [authHeader, setAuthHeader] = useState(config.auth_header ?? "Authorization");
   const [credential, setCredential] = useState("");
   const [oauthScope, setOAuthScope] = useState("");
   const [oauthClientId, setOAuthClientId] = useState("");
@@ -78,8 +82,10 @@ function RemoteMCPConfiguration({
   const [oauthAuthorizationEndpoint, setOAuthAuthorizationEndpoint] = useState("");
   const [oauthTokenEndpoint, setOAuthTokenEndpoint] = useState("");
   const [oauthTokenAuthMethod, setOAuthTokenAuthMethod] = useState<"none" | "client_secret_basic" | "client_secret_post">("none");
-  const [publicConfig, setPublicConfig] = useState("{}");
-  const [failurePolicy, setFailurePolicy] = useState<"required" | "optional">("required");
+  const [publicConfig, setPublicConfig] = useState(() => JSON.stringify(config.public_config ?? {}, null, 2));
+  const [failurePolicy, setFailurePolicy] = useState<"required" | "optional">(
+    config.failure_policy === "optional" ? "optional" : "required",
+  );
   const [discovery, setDiscovery] = useState<RemoteMCPDiscoveryResponse | null>(() =>
     !config.reviewed && config.discovered_tools.length > 0
       ? {
@@ -139,7 +145,14 @@ function RemoteMCPConfiguration({
             return_to: `${window.location.pathname}${window.location.search}`,
           },
         });
-        window.location.assign(result.authorization_url);
+        if (!result.authorization_url) {
+          throw new Error(t(($) => $.plugins.remote_mcp.oauth_connect_failed));
+        }
+        if (isDesktopShell()) {
+          openExternal(result.authorization_url);
+        } else {
+          window.location.assign(result.authorization_url);
+        }
         return;
       }
       const result = await configureMutation.mutateAsync({
@@ -421,6 +434,7 @@ export function PluginsTab() {
   const canManage = currentMember.role === "owner" || currentMember.role === "admin";
   const catalogQuery = useQuery(pluginCatalogOptions(wsId));
   const installationsQuery = useQuery(pluginInstallationsOptions(wsId));
+  const refetchInstallations = installationsQuery.refetch;
   const agentsQuery = useQuery(agentListOptions(wsId));
   const membersQuery = useQuery(memberListOptions(wsId));
   const installMutation = useInstallPlugin(wsId);
@@ -431,6 +445,24 @@ export function PluginsTab() {
   const [selectedVersions, setSelectedVersions] = useState<Record<string, string>>({});
   const [selectedScopes, setSelectedScopes] = useState<Record<string, BindingScope>>({});
   const [selectedAgents, setSelectedAgents] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    const search = new URLSearchParams(window.location.search);
+    const connected = search.get("remote_mcp_connected") === "1";
+    const failed = search.has("remote_mcp_error");
+    if (!connected && !failed) return;
+
+    if (connected) {
+      toast.success(t(($) => $.plugins.remote_mcp.oauth_connected_success));
+      void refetchInstallations();
+    } else {
+      toast.error(t(($) => $.plugins.remote_mcp.oauth_connect_failed));
+    }
+    search.delete("remote_mcp_connected");
+    search.delete("remote_mcp_error");
+    const query = search.toString();
+    window.history.replaceState(window.history.state, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
+  }, [refetchInstallations, t]);
 
   const releasesByPlugin = useMemo(() => {
     const grouped = new Map<string, PluginCatalogRelease[]>();

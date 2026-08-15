@@ -373,6 +373,8 @@ import {
   PluginInstallationListResponseSchema,
   PluginInstallationSchema,
   RemoteMCPDiscoveryResponseSchema,
+  RemoteMCPOAuthStartResponseSchema,
+  EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE,
   type IssueView,
   type IssueViewPreference,
   type CreateIssueViewRequest,
@@ -2297,9 +2299,12 @@ export class ApiClient {
   }
 
   async startPluginRemoteMCPOAuth(workspaceId: string, installationId: string, contributionKey: string, request: RemoteMCPOAuthStartRequest): Promise<RemoteMCPOAuthStartResponse> {
-    return this.fetch(`/api/workspaces/${workspaceId}/plugins/${installationId}/remote-mcp/${encodeURIComponent(contributionKey)}/oauth/start`, {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/${installationId}/remote-mcp/${encodeURIComponent(contributionKey)}/oauth/start`, {
       method: "POST",
       body: JSON.stringify(request),
+    });
+    return parseWithFallback(raw, RemoteMCPOAuthStartResponseSchema, EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE, {
+      endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{contributionKey}/oauth/start",
     });
   }
 

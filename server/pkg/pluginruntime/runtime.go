@@ -77,9 +77,9 @@ type RemoteMCPTool struct {
 	Risk         string          `json:"risk,omitempty"`
 }
 
-// RemoteMCPConnection is claim-time, task-scoped material resolved from a
-// pinned entry. Credential is intentionally absent from snapshots/manifests
-// and is delivered only to the daemon broker over the authenticated claim.
+// RemoteMCPConnection is claim-time, task-scoped connection metadata resolved
+// from a pinned entry. Credentials are intentionally absent from this wire
+// type and are resolved just-in-time by the daemon broker.
 type RemoteMCPConnection struct {
 	InstallationID       string          `json:"installation_id"`
 	ContributionID       string          `json:"contribution_id"`
@@ -92,7 +92,6 @@ type RemoteMCPConnection struct {
 	ProtocolVersions     []string        `json:"protocol_versions"`
 	EndpointAllowedHosts []string        `json:"endpoint_allowed_hosts,omitempty"`
 	CredentialHeader     string          `json:"credential_header,omitempty"`
-	Credential           string          `json:"credential,omitempty"`
 	ApprovedTools        []RemoteMCPTool `json:"approved_tools"`
 	ToolSchemaDigest     string          `json:"tool_schema_digest"`
 	FailurePolicy        string          `json:"failure_policy"`
