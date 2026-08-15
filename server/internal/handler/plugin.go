@@ -35,30 +35,6 @@ func (h *Handler) requirePluginsV1(w http.ResponseWriter, r *http.Request) bool 
 	return false
 }
 
-func (h *Handler) privatePluginsV1Enabled(ctx context.Context) bool {
-	return featureflags.PrivatePluginsV1Enabled(ctx, h.FeatureFlags)
-}
-
-func (h *Handler) requirePrivatePluginsV1(w http.ResponseWriter, r *http.Request) bool {
-	if h.privatePluginsV1Enabled(r.Context()) {
-		return true
-	}
-	writeError(w, http.StatusServiceUnavailable, "Private Plugin management is not enabled")
-	return false
-}
-
-func (h *Handler) remoteMCPPluginsV1Enabled(ctx context.Context) bool {
-	return featureflags.RemoteMCPPluginsV1Enabled(ctx, h.FeatureFlags)
-}
-
-func (h *Handler) requireRemoteMCPPluginsV1(w http.ResponseWriter, r *http.Request) bool {
-	if h.remoteMCPPluginsV1Enabled(r.Context()) {
-		return true
-	}
-	writeError(w, http.StatusServiceUnavailable, "Remote MCP Plugin management is not enabled")
-	return false
-}
-
 type pluginBindingResponse struct {
 	ScopeType string `json:"scope_type"`
 	ScopeID   string `json:"scope_id"`
@@ -307,7 +283,7 @@ func (h *Handler) ListPlugins(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPrivatePlugins(w http.ResponseWriter, r *http.Request) {
-	if !h.requirePrivatePluginsV1(w, r) {
+	if !h.requirePluginsV1(w, r) {
 		return
 	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
@@ -323,7 +299,7 @@ func (h *Handler) ListPrivatePlugins(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetPrivatePluginStatus(w http.ResponseWriter, r *http.Request) {
-	if !h.requirePrivatePluginsV1(w, r) {
+	if !h.requirePluginsV1(w, r) {
 		return
 	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
@@ -548,9 +524,6 @@ func (h *Handler) InstallPlugin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "plugin_key and version are required")
 		return
 	}
-	if entry, found := h.PluginService.FindCatalogRelease(request.PluginKey, request.Version); found && len(entry.Release.Manifest.Contributes.RemoteMCP) > 0 && !h.requireRemoteMCPPluginsV1(w, r) {
-		return
-	}
 	installation, err := h.PluginService.InstallCatalogRelease(r.Context(), workspaceID, actorID, request.PluginKey, request.Version)
 	if err != nil {
 		writePluginError(w, r, err)
@@ -565,7 +538,7 @@ func (h *Handler) InstallPlugin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) InstallPrivatePlugin(w http.ResponseWriter, r *http.Request) {
-	if !h.requirePrivatePluginsV1(w, r) {
+	if !h.requirePluginsV1(w, r) {
 		return
 	}
 	workspaceID, actorID, ok := pluginRequestIDs(w, r)
@@ -591,12 +564,8 @@ func (h *Handler) InstallPrivatePlugin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Private Plugin package exceeds the package limit")
 		return
 	}
-	artifact, validateErr := plugincontract.ValidateArtifact(archive)
-	if validateErr != nil {
+	if _, validateErr := plugincontract.ValidateArtifact(archive); validateErr != nil {
 		writeError(w, http.StatusBadRequest, "Private Plugin package is invalid")
-		return
-	}
-	if len(artifact.Manifest.Contributes.RemoteMCP) > 0 && !h.requireRemoteMCPPluginsV1(w, r) {
 		return
 	}
 	installation, err := h.PluginService.InstallPrivateArchive(r.Context(), workspaceID, actorID, archive)
@@ -624,7 +593,7 @@ func (h *Handler) UpgradePlugin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, false) {
+	if !h.requirePluginInstallation(w, r, workspaceID, installationID) {
 		return
 	}
 	var request pluginReleaseRequest
@@ -673,7 +642,7 @@ func (h *Handler) setPluginEnabled(w http.ResponseWriter, r *http.Request, enabl
 	if !ok {
 		return
 	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, !enabled) {
+	if !h.requirePluginInstallation(w, r, workspaceID, installationID) {
 		return
 	}
 	request := pluginBindingRequest{ScopeType: "workspace", ScopeID: uuidToString(workspaceID)}
@@ -721,7 +690,7 @@ func (h *Handler) RollbackPlugin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, false) {
+	if !h.requirePluginInstallation(w, r, workspaceID, installationID) {
 		return
 	}
 	var request struct {
@@ -756,7 +725,7 @@ func (h *Handler) UninstallPlugin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, true) {
+	if !h.requirePluginInstallation(w, r, workspaceID, installationID) {
 		return
 	}
 	if err := h.PluginService.UninstallPlugin(r.Context(), workspaceID, installationID, actorID); err != nil {
@@ -791,7 +760,7 @@ type remoteMCPOAuthStartRequest struct {
 const remoteMCPOAuthCallbackPath = "/api/plugins/remote-mcp/oauth/callback"
 
 func (h *Handler) StartPluginRemoteMCPOAuth(w http.ResponseWriter, r *http.Request) {
-	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r, false)
+	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r)
 	if !ok {
 		return
 	}
@@ -823,6 +792,9 @@ func (h *Handler) StartPluginRemoteMCPOAuth(w http.ResponseWriter, r *http.Reque
 // short-lived state hash carries the installation and actor identity; browser
 // cookies are neither required nor trusted on this cross-site callback.
 func (h *Handler) CompletePluginRemoteMCPOAuth(w http.ResponseWriter, r *http.Request) {
+	if !h.requirePluginsV1(w, r) {
+		return
+	}
 	result, err := h.PluginService.CompleteRemoteMCPOAuth(r.Context(), r.URL.Query().Get("state"), r.URL.Query().Get("code"))
 	if err != nil {
 		providerError := strings.TrimSpace(r.URL.Query().Get("error"))
@@ -867,7 +839,7 @@ func (h *Handler) CompletePluginRemoteMCPOAuth(w http.ResponseWriter, r *http.Re
 }
 
 func (h *Handler) ConfigurePluginRemoteMCP(w http.ResponseWriter, r *http.Request) {
-	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r, false)
+	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r)
 	if !ok {
 		return
 	}
@@ -894,7 +866,7 @@ func (h *Handler) ConfigurePluginRemoteMCP(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handler) TestPluginRemoteMCP(w http.ResponseWriter, r *http.Request) {
-	workspaceID, _, installationID, ok := h.remoteMCPRequestIDs(w, r, false)
+	workspaceID, _, installationID, ok := h.remoteMCPRequestIDs(w, r)
 	if !ok {
 		return
 	}
@@ -910,7 +882,7 @@ func (h *Handler) TestPluginRemoteMCP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ReviewPluginRemoteMCPTools(w http.ResponseWriter, r *http.Request) {
-	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r, false)
+	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r)
 	if !ok {
 		return
 	}
@@ -933,7 +905,7 @@ func (h *Handler) ReviewPluginRemoteMCPTools(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *Handler) RevokePluginRemoteMCPCredential(w http.ResponseWriter, r *http.Request) {
-	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r, true)
+	workspaceID, actorID, installationID, ok := h.remoteMCPRequestIDs(w, r)
 	if !ok {
 		return
 	}
@@ -986,7 +958,10 @@ func (h *Handler) ResolveTaskRemoteMCPCredential(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, map[string]string{"credential_header": header, "credential": credential})
 }
 
-func (h *Handler) remoteMCPRequestIDs(w http.ResponseWriter, r *http.Request, teardown bool) (pgtype.UUID, pgtype.UUID, pgtype.UUID, bool) {
+func (h *Handler) remoteMCPRequestIDs(w http.ResponseWriter, r *http.Request) (pgtype.UUID, pgtype.UUID, pgtype.UUID, bool) {
+	if !h.requirePluginsV1(w, r) {
+		return pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, false
+	}
 	workspaceID, actorID, ok := pluginRequestIDs(w, r)
 	if !ok {
 		return pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, false
@@ -995,10 +970,7 @@ func (h *Handler) remoteMCPRequestIDs(w http.ResponseWriter, r *http.Request, te
 	if !ok {
 		return pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, false
 	}
-	if !teardown && !h.requireRemoteMCPPluginsV1(w, r) {
-		return pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, false
-	}
-	if !h.requirePluginInstallationFeature(w, r, workspaceID, installationID, teardown) {
+	if !h.requirePluginInstallation(w, r, workspaceID, installationID) {
 		return pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, false
 	}
 	return workspaceID, actorID, installationID, true
@@ -1011,26 +983,11 @@ func credentialState(config db.PluginInstallationConfig) string {
 	return "configured"
 }
 
-func (h *Handler) requirePluginInstallationFeature(w http.ResponseWriter, r *http.Request, workspaceID, installationID pgtype.UUID, allowPrivateTeardown bool) bool {
+func (h *Handler) requirePluginInstallation(w http.ResponseWriter, r *http.Request, workspaceID, installationID pgtype.UUID) bool {
 	installation, err := h.Queries.GetPluginInstallation(r.Context(), installationID)
 	if err != nil || installation.WorkspaceID != workspaceID || installation.UninstalledAt.Valid {
 		writeError(w, http.StatusNotFound, "Plugin installation not found")
 		return false
-	}
-	if installation.SourceKind == plugincontract.SourcePrivateDev && !allowPrivateTeardown && !h.requirePrivatePluginsV1(w, r) {
-		return false
-	}
-	if !allowPrivateTeardown {
-		contributions, listErr := h.Queries.ListPluginContributionsByRelease(r.Context(), installation.DesiredReleaseID)
-		if listErr != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load Plugin contributions")
-			return false
-		}
-		for _, contribution := range contributions {
-			if contribution.Type == plugincontract.ContributionRemoteMCPV1 && !h.requireRemoteMCPPluginsV1(w, r) {
-				return false
-			}
-		}
 	}
 	return true
 }
