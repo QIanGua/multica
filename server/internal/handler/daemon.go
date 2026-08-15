@@ -1702,6 +1702,16 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
+		remoteMCPToken, daemonTokens, derr := remoteMCPDaemonTokenForClaim(resp, rt)
+		if derr != nil {
+			slog.Error("batch claim: generate Remote MCP daemon token failed; requeueing claim",
+				"task_id", uuidToString(task.ID), "error", derr)
+			if _, rerr := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), task); rerr != nil {
+				slog.Error("batch claim: requeue after Remote MCP token failure failed",
+					"task_id", uuidToString(task.ID), "error", rerr)
+			}
+			continue
+		}
 		// Route through the SAME finalization as the per-runtime endpoint so the
 		// token and the comment-delivery receipt (delivered_comment_ids for
 		// comment/coalesced-comment tasks) are persisted atomically; on failure
@@ -1714,7 +1724,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			WorkspaceID: parseUUID(resp.WorkspaceID),
 			UserID:      rt.OwnerID,
 			ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
-		}, deliveredCommentIDs, commentBackedTask)
+		}, deliveredCommentIDs, commentBackedTask, daemonTokens...)
 		if ferr != nil {
 			slog.Error("batch claim: finalize task claim failed; requeueing claim",
 				"task_id", uuidToString(task.ID), "error", ferr)
@@ -1725,6 +1735,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		resp.AuthToken = tokenStr
+		resp.RemoteMCPDaemonToken = remoteMCPToken
 		resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
 		out = append(out, resp)
 	}
@@ -1746,6 +1757,29 @@ type claimBuildFailure struct {
 	outcome string
 	status  int
 	message string
+}
+
+// remoteMCPDaemonTokenForClaim prepares the short-lived credential the daemon
+// uses to resolve write-only Remote MCP secrets for this task. The raw token is
+// returned only in the claim response; its hash is committed atomically with
+// the task-scoped agent token by FinalizeTaskClaim.
+func remoteMCPDaemonTokenForClaim(resp AgentTaskResponse, runtime db.AgentRuntime) (string, []db.CreateDaemonTokenParams, error) {
+	if len(resp.RemoteMCPConnections) == 0 {
+		return "", nil, nil
+	}
+	if !runtime.DaemonID.Valid || strings.TrimSpace(runtime.DaemonID.String) == "" {
+		return "", nil, errors.New("runtime daemon_id is required for Remote MCP")
+	}
+	raw, err := auth.GenerateDaemonToken()
+	if err != nil {
+		return "", nil, fmt.Errorf("generate Remote MCP daemon token: %w", err)
+	}
+	return raw, []db.CreateDaemonTokenParams{{
+		TokenHash:   auth.HashToken(raw),
+		WorkspaceID: runtime.WorkspaceID,
+		DaemonID:    runtime.DaemonID.String,
+		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+	}}, nil
 }
 
 // failClaimedTaskBeforeLaunch settles a durable claim-time rejection before
@@ -3056,6 +3090,15 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to mint task token")
 		return
 	}
+	remoteMCPToken, daemonTokens, derr := remoteMCPDaemonTokenForClaim(resp, runtime)
+	if derr != nil {
+		outcome = "error_remote_mcp_token"
+		slog.Error("task claim: failed to generate Remote MCP daemon token",
+			"task_id", uuidToString(task.ID), "error", derr)
+		requeueFailedClaim("remote_mcp_token_generation")
+		writeError(w, http.StatusInternalServerError, "failed to mint Remote MCP daemon token")
+		return
+	}
 	receipt, ferr := h.TaskService.FinalizeTaskClaim(r.Context(), *task, db.CreateTaskTokenParams{
 		TokenHash:   auth.HashToken(tokenStr),
 		TaskID:      task.ID,
@@ -3063,7 +3106,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		WorkspaceID: parseUUID(resp.WorkspaceID),
 		UserID:      runtime.OwnerID,
 		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
-	}, deliveredCommentIDs, commentBackedTask)
+	}, deliveredCommentIDs, commentBackedTask, daemonTokens...)
 	if ferr != nil {
 		outcome = "error_claim_finalize"
 		slog.Error("task claim: failed to finalize token and comment delivery receipt",
@@ -3077,6 +3120,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.AuthToken = tokenStr
+	resp.RemoteMCPDaemonToken = remoteMCPToken
 	task.DeliveredCommentIds = receipt
 	resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
 

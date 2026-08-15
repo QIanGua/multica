@@ -934,6 +934,23 @@ func (h *Handler) ResolveTaskRemoteMCPCredential(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
+	// A daemon token is workspace scoped, but the credential belongs to the
+	// concrete machine executing this task. Do not let another daemon in the
+	// same workspace use its own token to resolve this task's secret.
+	runtime, err := h.Queries.GetAgentRuntime(r.Context(), task.RuntimeID)
+	if err != nil {
+		if !isNotFound(err) {
+			slog.Warn("load Remote MCP task runtime failed", "task_id", uuidToString(task.ID), "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+			return
+		}
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if !runtime.DaemonID.Valid || runtime.DaemonID.String != middleware.DaemonIDFromContext(r.Context()) {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
 	header, credential, err := h.PluginService.ResolveTaskRemoteMCPCredential(r.Context(), task.ID, chi.URLParam(r, "contributionId"))
 	if err != nil {
 		writePluginError(w, r, err)

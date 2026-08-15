@@ -302,6 +302,10 @@ type AgentTaskResponse struct {
 	WorkspaceID             string                               `json:"workspace_id"`
 	PluginExecutionManifest *service.PluginExecutionManifestData `json:"plugin_execution_manifest,omitempty"`
 	RemoteMCPConnections    []pluginruntime.RemoteMCPConnection  `json:"remote_mcp_connections,omitempty"`
+	// RemoteMCPDaemonToken is a short-lived, workspace-and-daemon scoped
+	// credential used only by the local daemon's write-only Remote MCP broker.
+	// It is never injected into the agent process.
+	RemoteMCPDaemonToken string `json:"remote_mcp_daemon_token,omitempty"`
 	// WorkspaceContext is the workspace-level system prompt set in workspace
 	// settings (`workspace.context` DB column). Injected into the agent brief
 	// as `## Workspace Context` so every agent running in this workspace —

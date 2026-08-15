@@ -65,6 +65,9 @@ type Task struct {
 	WorkspaceID             string                              `json:"workspace_id"`
 	PluginExecutionManifest *PluginExecutionManifestData        `json:"plugin_execution_manifest,omitempty"`
 	RemoteMCPConnections    []pluginruntime.RemoteMCPConnection `json:"remote_mcp_connections,omitempty"`
+	// RemoteMCPDaemonToken stays inside the daemon and authenticates the local
+	// broker's credential-resolution calls. It must never enter agent env/config.
+	RemoteMCPDaemonToken string `json:"remote_mcp_daemon_token,omitempty"`
 	// WorkspaceContext mirrors workspace.context (the per-workspace system
 	// prompt set in Settings → General). Server populates this on every claim
 	// regardless of task kind so the daemon can inject `## Workspace Context`

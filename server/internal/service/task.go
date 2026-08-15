@@ -3138,10 +3138,11 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	return claimed, nil
 }
 
-// FinalizeTaskClaim atomically persists the task-scoped token and, for a
+// FinalizeTaskClaim atomically persists the task-scoped agent token, an
+// optional short-lived daemon token used by the Remote MCP broker, and, for a
 // comment-backed task, the exact comment ids embedded in the response. The
 // handler must call this only after the full payload has been built and before
-// writing any response bytes. A failure rolls both writes back so the claim can
+// writing any response bytes. A failure rolls every write back so the claim can
 // be safely returned to the queue.
 func (s *TaskService) FinalizeTaskClaim(
 	ctx context.Context,
@@ -3149,11 +3150,25 @@ func (s *TaskService) FinalizeTaskClaim(
 	token db.CreateTaskTokenParams,
 	deliveredCommentIDs []pgtype.UUID,
 	recordCommentReceipt bool,
+	daemonTokens ...db.CreateDaemonTokenParams,
 ) ([]pgtype.UUID, error) {
+	if len(daemonTokens) > 1 {
+		return nil, fmt.Errorf("finalize task claim: expected at most one daemon token, got %d", len(daemonTokens))
+	}
 	receipt := task.DeliveredCommentIds
 	err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		if _, err := qtx.CreateTaskToken(ctx, token); err != nil {
 			return fmt.Errorf("create task token: %w", err)
+		}
+		if len(daemonTokens) == 1 {
+			// Opportunistic bounded cleanup keeps short-lived per-task daemon
+			// credentials from accumulating without adding another sweeper.
+			if err := qtx.DeleteExpiredDaemonTokens(ctx); err != nil {
+				return fmt.Errorf("delete expired daemon tokens: %w", err)
+			}
+			if _, err := qtx.CreateDaemonToken(ctx, daemonTokens[0]); err != nil {
+				return fmt.Errorf("create remote MCP daemon token: %w", err)
+			}
 		}
 		if !recordCommentReceipt {
 			return nil

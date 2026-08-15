@@ -420,3 +420,24 @@ func TestResolveTaskRemoteMCPCredentialRejectsNonDaemonAuth(t *testing.T) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestResolveTaskRemoteMCPCredentialRejectsDifferentDaemonInWorkspace(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fixture := createCommentDeliveryFixture(t, "Remote MCP daemon isolation")
+	request := newDaemonTokenRequest(http.MethodGet,
+		"/api/daemon/tasks/"+fixture.taskID+"/remote-mcp/contribution-id/credential",
+		nil, testWorkspaceID, "different-daemon")
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("taskId", fixture.taskID)
+	routeCtx.URLParams.Add("contributionId", "contribution-id")
+	request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, routeCtx))
+
+	recorder := httptest.NewRecorder()
+	testHandler.ResolveTaskRemoteMCPCredential(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}

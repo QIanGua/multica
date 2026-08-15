@@ -6089,7 +6089,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	remoteMCPConfig, remoteMCPDiagnostics, remoteMCPBrokers, remoteMCPErr := startTaskRemoteMCPBrokers(
 		prepareCtx, ctx, task.ID, provider, task.RemoteMCPConnections,
 		func(resolveCtx context.Context, contributionID string) (http.Header, error) {
-			return d.client.ResolveRemoteMCPCredential(resolveCtx, task.ID, contributionID)
+			return d.client.ResolveRemoteMCPCredential(resolveCtx, task.RemoteMCPDaemonToken, task.ID, contributionID)
 		},
 		taskLog,
 	)
