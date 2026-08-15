@@ -265,6 +265,7 @@
       "connect": "接続",
       "connected": "接続済み",
       "ready_to_connect": "接続できます",
+      "complete_before_enabling": "スコープを有効にする前に MCP に接続し、少なくとも 1 つのツールを承認してください。",
       "advanced": "詳細設定",
       "oauth_scope": "OAuth スコープ（空欄は自動）",
       "oauth_client_id": "OAuth クライアント ID（空欄は自動）",

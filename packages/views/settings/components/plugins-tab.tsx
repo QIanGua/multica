@@ -541,6 +541,7 @@ export function PluginsTab() {
         const state = installation ? installationState(installation) : null;
         const activeBindings = installation?.bindings.filter((binding) => binding.enabled === true) ?? [];
         const workspaceBindingActive = activeBindings.some((binding) => binding.scope_type === "workspace");
+        const remoteMCPReady = installation?.remote_mcp.every((config) => config.ready) ?? true;
 
         return (
           <SettingsSection key={pluginKey}>
@@ -684,6 +685,12 @@ export function PluginsTab() {
                       <p className="text-caption text-muted-foreground">{t(($) => $.plugins.no_bindings)}</p>
                     )}
 
+                    {!remoteMCPReady ? (
+                      <p className="text-caption text-muted-foreground">
+                        {t(($) => $.plugins.remote_mcp.complete_before_enabling)}
+                      </p>
+                    ) : null}
+
                     <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                       <Select
                         items={[
@@ -712,7 +719,7 @@ export function PluginsTab() {
                         </Select>
                       ) : null}
                       <Button
-                        disabled={!canManage || isMutating || (scope === "agent" && !selectedAgent)}
+                        disabled={!canManage || isMutating || !remoteMCPReady || (scope === "agent" && !selectedAgent)}
                         onClick={() => enabledMutation.mutateAsync({
                           installationId: installation.id,
                           enabled: true,
@@ -788,6 +795,7 @@ export function PluginsTab() {
         const selectedAgent = selectedAgents[installation.id] ?? agents[0]?.id ?? "";
         const state = installationState(installation);
         const activeBindings = installation.bindings.filter((binding) => binding.enabled === true);
+        const remoteMCPReady = installation.remote_mcp.every((config) => config.ready);
         const uploaderName = members.find((member) => member.user_id === installation.uploader_id)?.name;
         const rollbackVersion = [...installation.available_versions]
           .sort((left, right) => comparePluginVersions(right, left))
@@ -890,6 +898,12 @@ export function PluginsTab() {
                     </div>
                   ) : <p className="text-caption text-muted-foreground">{t(($) => $.plugins.no_bindings)}</p>}
 
+                  {!remoteMCPReady ? (
+                    <p className="text-caption text-muted-foreground">
+                      {t(($) => $.plugins.remote_mcp.complete_before_enabling)}
+                    </p>
+                  ) : null}
+
                   <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                     <Select
                       items={[
@@ -918,7 +932,7 @@ export function PluginsTab() {
                       </Select>
                     ) : null}
                     <Button
-                      disabled={!canManage || isMutating || (scope === "agent" && !selectedAgent)}
+                      disabled={!canManage || isMutating || !remoteMCPReady || (scope === "agent" && !selectedAgent)}
                       onClick={() => enabledMutation.mutateAsync({
                         installationId: installation.id,
                         enabled: true,

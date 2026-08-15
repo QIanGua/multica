@@ -93,6 +93,12 @@ type pluginRemoteMCPConfigResponse struct {
 	DiscoveredDigest string                        `json:"discovered_schema_digest,omitempty"`
 	SchemaDigest     string                        `json:"schema_digest,omitempty"`
 	Reviewed         bool                          `json:"reviewed"`
+	Ready            bool                          `json:"ready"`
+}
+
+func remoteMCPConfigResponseReady(config pluginRemoteMCPConfigResponse) bool {
+	credentialReady := config.CredentialState == "configured" || config.CredentialState == "not_required"
+	return config.ConfigRevision > 0 && config.Reviewed && len(config.ApprovedTools) > 0 && config.SchemaDigest != "" && credentialReady
 }
 
 type pluginInstallationResponse struct {
@@ -248,6 +254,7 @@ func (h *Handler) pluginInstallationResponseWithReleases(r *http.Request, instal
 			} else if !errors.Is(configErr, pgx.ErrNoRows) {
 				return pluginInstallationResponse{}, configErr
 			}
+			remote.Ready = remoteMCPConfigResponseReady(remote)
 			response.RemoteMCP = append(response.RemoteMCP, remote)
 		}
 	}

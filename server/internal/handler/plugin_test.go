@@ -17,6 +17,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/testutil/plugintest"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
+	"github.com/multica-ai/multica/server/pkg/pluginruntime"
 )
 
 type failPluginDetailQueryDB struct {
@@ -59,6 +60,31 @@ func pluginHandlerRequest(method, path string, body []byte, params map[string]st
 		routeContext.URLParams.Add(key, value)
 	}
 	return request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, routeContext))
+}
+
+func TestRemoteMCPConfigResponseReady(t *testing.T) {
+	ready := pluginRemoteMCPConfigResponse{
+		ConfigRevision: 1, CredentialState: "configured", Reviewed: true,
+		ApprovedTools: []pluginruntime.RemoteMCPTool{{Name: "search"}}, SchemaDigest: "sha256:test",
+	}
+	if !remoteMCPConfigResponseReady(ready) {
+		t.Fatal("complete Remote MCP configuration was not ready")
+	}
+	for name, edit := range map[string]func(*pluginRemoteMCPConfigResponse){
+		"missing config":     func(config *pluginRemoteMCPConfigResponse) { config.ConfigRevision = 0 },
+		"missing credential": func(config *pluginRemoteMCPConfigResponse) { config.CredentialState = "missing" },
+		"unreviewed":         func(config *pluginRemoteMCPConfigResponse) { config.Reviewed = false },
+		"no approved tools":  func(config *pluginRemoteMCPConfigResponse) { config.ApprovedTools = nil },
+		"missing digest":     func(config *pluginRemoteMCPConfigResponse) { config.SchemaDigest = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := ready
+			edit(&config)
+			if remoteMCPConfigResponseReady(config) {
+				t.Fatal("incomplete Remote MCP configuration was ready")
+			}
+		})
+	}
 }
 
 func TestPluginHTTPLifecycleForInstalledReferenceRelease(t *testing.T) {

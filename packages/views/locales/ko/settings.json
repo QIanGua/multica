@@ -265,6 +265,7 @@
       "connect": "연결",
       "connected": "연결됨",
       "ready_to_connect": "연결할 수 있음",
+      "complete_before_enabling": "범위를 활성화하기 전에 MCP를 연결하고 도구를 하나 이상 승인하세요.",
       "advanced": "고급 구성",
       "oauth_scope": "OAuth 범위(비워두면 자동)",
       "oauth_client_id": "OAuth 클라이언트 ID(비워두면 자동)",

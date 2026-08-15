@@ -265,6 +265,7 @@
       "connect": "Connect",
       "connected": "Connected",
       "ready_to_connect": "Ready to connect",
+      "complete_before_enabling": "Connect the MCP and approve at least one tool before enabling a scope.",
       "advanced": "Advanced configuration",
       "oauth_scope": "OAuth scopes (automatic when empty)",
       "oauth_client_id": "OAuth client ID (automatic when empty)",

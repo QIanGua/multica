@@ -62,6 +62,7 @@ export interface PluginRemoteMCPConfig {
   discovered_schema_digest?: string;
   schema_digest?: string;
   reviewed: boolean;
+  ready: boolean;
 }
 
 export interface RemoteMCPConfigRequest {

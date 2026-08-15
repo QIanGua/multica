@@ -265,6 +265,7 @@
       "connect": "连接",
       "connected": "已连接",
       "ready_to_connect": "可以连接",
+      "complete_before_enabling": "请先连接 MCP 并批准至少一个工具，再启用作用范围。",
       "advanced": "高级配置",
       "oauth_scope": "OAuth scopes（留空自动获取）",
       "oauth_client_id": "OAuth client ID（留空自动注册）",

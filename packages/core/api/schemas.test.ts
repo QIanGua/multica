@@ -1405,10 +1405,12 @@ describe("Plugin catalog schemas", () => {
           risk: "read",
         }],
         reviewed: true,
+        ready: true,
       }],
     });
     expect(parsed.remote_mcp[0]?.credential_state).toBe("configured");
     expect(parsed.remote_mcp[0]?.approved_tools[0]?.name).toBe("search.read");
+    expect(parsed.remote_mcp[0]?.ready).toBe(true);
     expect(parsed.remote_mcp[0]).not.toHaveProperty("credential");
   });
 

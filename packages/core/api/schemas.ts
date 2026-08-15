@@ -104,6 +104,7 @@ export const PluginRemoteMCPConfigSchema = z.object({
   discovered_schema_digest: z.string().optional(),
   schema_digest: z.string().optional(),
   reviewed: z.boolean().default(false),
+  ready: z.boolean().default(false),
 });
 
 export const RemoteMCPDiscoveryResponseSchema = z.object({
