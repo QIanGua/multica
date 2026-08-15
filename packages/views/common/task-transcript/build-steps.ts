@@ -1,0 +1,348 @@
+import type { TimelineItem } from "./build-timeline";
+
+/**
+ * A run's steps, derived from the flat event stream.
+ *
+ * The stream stores a tool call and its result as two independent rows
+ * (`tool_use` then `tool_result`), which is how the transcript ended up twice
+ * as long as the work it describes: a 75-call run rendered 150 rows, and the
+ * output row was where raw base64 and 8KB command dumps landed. A step folds
+ * the pair back together, so one call reads as one line and its result is that
+ * line's detail.
+ *
+ * Pairing is positional because the events carry no call id. `agent.Message`
+ * has `CallID` all the way to the daemon, but `TaskMessageData` drops it before
+ * the report and `task_message` has no column for it — until that lands, a
+ * result belongs to the oldest still-open call with the same tool name.
+ */
+
+/** One tool call. Either side can be missing: a call still running has no
+ *  result yet, and a stream that reconnected mid-flight can deliver a result
+ *  whose call was never recorded. */
+export interface TraceCallStep {
+  kind: "call";
+  /** Ordering key: the call's seq, or the result's when the call is missing. */
+  seq: number;
+  tool: string;
+  call?: TimelineItem;
+  result?: TimelineItem;
+  startedAt?: string;
+  endedAt?: string;
+  /** Wall-clock ms between call and result. Undefined when either side is
+   *  missing a timestamp — never guessed. */
+  durationMs?: number;
+}
+
+/** Agent prose, model thinking, or an error: one message, nothing to pair. */
+export interface TraceMessageStep {
+  kind: "text" | "thinking" | "error";
+  seq: number;
+  item: TimelineItem;
+  startedAt?: string;
+}
+
+export type TraceStep = TraceCallStep | TraceMessageStep;
+
+/** Consecutive same-tool calls, folded. Expands back to its members. */
+export interface TraceGroupRow {
+  kind: "group";
+  seq: number;
+  tool: string;
+  steps: TraceCallStep[];
+  startedAt?: string;
+  endedAt?: string;
+  durationMs?: number;
+}
+
+export type TraceRow = TraceStep | TraceGroupRow;
+
+/**
+ * How many consecutive same-tool calls it takes to fold into one row.
+ *
+ * Three, not two: two shell commands are two distinct things a reader wants to
+ * see, while five file reads are one act. A size rule keeps this
+ * provider-agnostic — a tool-name allowlist would have to be re-guessed for
+ * every backend we add.
+ */
+export const MIN_GROUP_SIZE = 3;
+
+function timeMs(iso: string | undefined): number | undefined {
+  if (!iso) return undefined;
+  const ms = new Date(iso).getTime();
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+function durationBetween(start?: string, end?: string): number | undefined {
+  const a = timeMs(start);
+  const b = timeMs(end);
+  if (a === undefined || b === undefined) return undefined;
+  // Clamp rather than drop: the daemon flushes in 500ms batches, so a fast
+  // call can land with its result on the same tick or one tick earlier.
+  return Math.max(0, b - a);
+}
+
+/** Fold `tool_use` / `tool_result` pairs into single steps, in stream order. */
+export function buildSteps(items: TimelineItem[]): TraceStep[] {
+  const steps: TraceStep[] = [];
+  // Open calls per tool, oldest first. FIFO rather than nearest-preceding:
+  // when a provider runs two calls of the same tool in parallel it returns
+  // them in call order more often than in reverse.
+  const open = new Map<string, TraceCallStep[]>();
+
+  for (const item of items) {
+    if (item.type === "tool_use") {
+      const tool = item.tool ?? "";
+      const step: TraceCallStep = {
+        kind: "call",
+        seq: item.seq,
+        tool,
+        call: item,
+        startedAt: item.created_at,
+      };
+      steps.push(step);
+      const queue = open.get(tool);
+      if (queue) queue.push(step);
+      else open.set(tool, [step]);
+      continue;
+    }
+
+    if (item.type === "tool_result") {
+      const tool = item.tool ?? "";
+      const pending = open.get(tool)?.shift();
+      if (pending) {
+        pending.result = item;
+        pending.endedAt = item.created_at;
+        pending.durationMs = durationBetween(pending.startedAt, item.created_at);
+        continue;
+      }
+      // Orphan result: keep it as a step of its own so no output is dropped.
+      steps.push({
+        kind: "call",
+        seq: item.seq,
+        tool,
+        result: item,
+        startedAt: item.created_at,
+        endedAt: item.created_at,
+      });
+      continue;
+    }
+
+    steps.push({
+      kind: item.type,
+      seq: item.seq,
+      item,
+      startedAt: item.created_at,
+    });
+  }
+
+  return steps;
+}
+
+/** Fold runs of `MIN_GROUP_SIZE`+ consecutive same-tool calls into group rows. */
+export function groupSteps(steps: TraceStep[]): TraceRow[] {
+  const rows: TraceRow[] = [];
+  let run: TraceCallStep[] = [];
+
+  const flush = () => {
+    if (run.length === 0) return;
+    if (run.length < MIN_GROUP_SIZE) {
+      rows.push(...run);
+    } else {
+      const first = run[0]!;
+      const last = run[run.length - 1]!;
+      rows.push({
+        kind: "group",
+        seq: first.seq,
+        tool: first.tool,
+        steps: run,
+        startedAt: first.startedAt,
+        endedAt: last.endedAt,
+        durationMs: durationBetween(first.startedAt, last.endedAt),
+      });
+    }
+    run = [];
+  };
+
+  for (const step of steps) {
+    if (step.kind === "call" && (run.length === 0 || run[0]!.tool === step.tool)) {
+      run.push(step);
+      continue;
+    }
+    flush();
+    if (step.kind === "call") run.push(step);
+    else rows.push(step);
+  }
+  flush();
+
+  return rows;
+}
+
+// `TraceMessageStep` carries three kinds on one interface, so a `kind` check
+// alone narrows the property without dropping the constituent. These predicates
+// are what let callers switch on a row and get a usable type back.
+export function isGroupRow(row: TraceRow): row is TraceGroupRow {
+  return row.kind === "group";
+}
+
+export function isCallStep(row: TraceRow): row is TraceCallStep {
+  return row.kind === "call";
+}
+
+export function isMessageStep(row: TraceRow): row is TraceMessageStep {
+  return row.kind === "text" || row.kind === "thinking" || row.kind === "error";
+}
+
+/** Every call inside a row, so a group and a lone call read the same way. */
+export function rowCalls(row: TraceRow): TraceCallStep[] {
+  if (row.kind === "group") return row.steps;
+  return row.kind === "call" ? [row] : [];
+}
+
+// ─── Lanes ──────────────────────────────────────────────────────────────────
+
+export type LaneSegmentKind = "tool" | "think" | "report" | "error";
+
+export interface LaneSegment {
+  /** ms from the run's start. */
+  startMs: number;
+  durationMs: number;
+  kind: LaneSegmentKind;
+}
+
+export interface TraceLanes {
+  /** Model turns: the complement of the tool lane. */
+  model: LaneSegment[];
+  tool: LaneSegment[];
+  modelMs: number;
+  toolMs: number;
+  totalMs: number;
+}
+
+interface Interval {
+  start: number;
+  end: number;
+}
+
+function mergeIntervals(intervals: Interval[]): Interval[] {
+  const sorted = [...intervals].sort((a, b) => a.start - b.start);
+  const out: Interval[] = [];
+  for (const interval of sorted) {
+    const prev = out[out.length - 1];
+    if (prev && interval.start <= prev.end) {
+      prev.end = Math.max(prev.end, interval.end);
+      continue;
+    }
+    out.push({ ...interval });
+  }
+  return out;
+}
+
+/**
+ * Two lanes: what the tools were doing, and what the model was doing.
+ *
+ * The model lane is derived as the complement of the tool lane rather than
+ * from the model's own events, because that is the only honest source we have
+ * — a `text` or `thinking` row carries one arrival timestamp, not a span. The
+ * gaps between tool calls ARE the model's time, which is what makes the
+ * "28 minutes went where" question answerable at all.
+ *
+ * Returns null when the events carry no usable timestamps; callers drop the
+ * timeline entirely rather than draw an axis that means nothing.
+ */
+export function buildLanes(
+  steps: TraceStep[],
+  runStart: string | undefined,
+  runEnd: string | undefined,
+): TraceLanes | null {
+  const stamps = steps
+    .flatMap((step) => [timeMs(step.startedAt), timeMs(step.kind === "call" ? step.endedAt : undefined)])
+    .filter((ms): ms is number => ms !== undefined);
+  if (stamps.length === 0) return null;
+
+  const startMs = Math.min(timeMs(runStart) ?? Infinity, ...stamps);
+  const endMs = Math.max(timeMs(runEnd) ?? -Infinity, ...stamps);
+  const totalMs = endMs - startMs;
+  if (!Number.isFinite(totalMs) || totalMs <= 0) return null;
+
+  const calls: Interval[] = [];
+  for (const step of steps) {
+    if (step.kind !== "call") continue;
+    const start = timeMs(step.startedAt);
+    const end = timeMs(step.endedAt);
+    if (start === undefined || end === undefined || end <= start) continue;
+    calls.push({
+      start: Math.max(startMs, start),
+      end: Math.min(endMs, end),
+    });
+  }
+
+  const merged = mergeIntervals(calls.filter((c) => c.end > c.start));
+  const tool: LaneSegment[] = merged.map((c) => ({
+    startMs: c.start - startMs,
+    durationMs: c.end - c.start,
+    kind: "tool",
+  }));
+
+  // Model segments fill every gap the tools left, including the head and tail.
+  const model: LaneSegment[] = [];
+  let cursor = startMs;
+  const pushModel = (from: number, to: number) => {
+    if (to <= from) return;
+    model.push({ startMs: from - startMs, durationMs: to - from, kind: kindForGap(steps, from, to) });
+  };
+  for (const interval of merged) {
+    pushModel(cursor, interval.start);
+    cursor = Math.max(cursor, interval.end);
+  }
+  pushModel(cursor, endMs);
+
+  return {
+    model,
+    tool,
+    modelMs: model.reduce((sum, s) => sum + s.durationMs, 0),
+    toolMs: tool.reduce((sum, s) => sum + s.durationMs, 0),
+    totalMs,
+  };
+}
+
+/**
+ * What the model was doing in this gap, judged by the messages that landed in
+ * it: an error outranks a report, a report outranks plain thinking. Colour
+ * therefore carries state (fine / delivered / failed), never taxonomy — the
+ * token set has no categorical ramp to spend on five event types.
+ */
+function kindForGap(steps: TraceStep[], from: number, to: number): LaneSegmentKind {
+  let kind: LaneSegmentKind = "think";
+  for (const step of steps) {
+    if (step.kind === "call") continue;
+    const at = timeMs(step.startedAt);
+    if (at === undefined || at < from || at > to) continue;
+    if (step.kind === "error") return "error";
+    if (step.kind === "text") kind = "report";
+  }
+  return kind;
+}
+
+/** Axis ticks at a round interval, chosen so a run gets 4–7 of them. */
+export function timelineTicks(totalMs: number): number[] {
+  if (!Number.isFinite(totalMs) || totalMs <= 0) return [];
+  const steps = [
+    15_000, 30_000, 60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000, 15 * 60_000,
+    30 * 60_000, 60 * 60_000, 2 * 60 * 60_000, 6 * 60 * 60_000,
+  ];
+  const interval = steps.find((step) => totalMs / step <= 6) ?? steps[steps.length - 1]!;
+  const ticks: number[] = [];
+  for (let at = 0; at < totalMs; at += interval) ticks.push(at);
+  ticks.push(totalMs);
+  return ticks;
+}
+
+/** Below these, a timeline is chrome: it would render a handful of bars that
+ *  say less than the durations already on each row. */
+export const TIMELINE_MIN_STEPS = 8;
+export const TIMELINE_MIN_MS = 60_000;
+
+export function shouldShowTimeline(steps: TraceStep[], lanes: TraceLanes | null): boolean {
+  if (!lanes) return false;
+  return steps.length >= TIMELINE_MIN_STEPS && lanes.totalMs >= TIMELINE_MIN_MS;
+}
