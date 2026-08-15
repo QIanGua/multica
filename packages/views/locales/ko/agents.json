@@ -752,7 +752,13 @@
     "close_step": "세부 정보 닫기",
     "image_result": "이미지",
     "steps_count_other": "{{count}}단계",
-    "steps_filtered": "{{total}}단계 중 {{shown}}단계"
+    "steps_filtered": "{{total}}단계 중 {{shown}}단계",
+    "timeline_zoom_in": "확대",
+    "timeline_zoom_out": "축소",
+    "tool_kind_command": "명령",
+    "tool_kind_write": "편집",
+    "tool_kind_read": "읽기",
+    "tool_kind_misc": "기타"
   },
   "task_failure": {
     "agent_error": "에이전트 실행 오류",

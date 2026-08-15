@@ -68,6 +68,7 @@ import {
   isGroupRow,
   rowCalls,
   shouldShowTimeline,
+  toolKindTotals,
   type TraceCallStep,
   type TraceGroupRow,
   type TraceMessageStep,
@@ -452,6 +453,7 @@ export function AgentTranscriptDialog({
   // A short run's timeline says less than the durations already on each row,
   // so it does not render at all.
   const showTimeline = shouldShowTimeline(steps, lanes);
+  const toolKinds = useMemo(() => toolKindTotals(steps), [steps]);
   const outcome = useMemo(() => buildRunOutcome(steps), [steps]);
 
   const selectedStep = useMemo(() => {
@@ -951,7 +953,12 @@ export function AgentTranscriptDialog({
 
         {/* ── Where the time went ────────────────────────────────────── */}
         {showTimeline && lanes && (
-          <RunTimeline lanes={lanes} selectedOffsetMs={selectedOffsetMs} onSeek={handleSeek} />
+          <RunTimeline
+            lanes={lanes}
+            toolKinds={toolKinds}
+            selectedOffsetMs={selectedOffsetMs}
+            onSeek={handleSeek}
+          />
         )}
 
         {/* ── Optional header slot (e.g. webhook payload preview) ── */}

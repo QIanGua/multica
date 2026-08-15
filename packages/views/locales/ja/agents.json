@@ -744,7 +744,13 @@
     "close_step": "詳細を閉じる",
     "image_result": "画像",
     "steps_count_other": "{{count}} ステップ",
-    "steps_filtered": "{{total}} 件中 {{shown}} ステップ"
+    "steps_filtered": "{{total}} 件中 {{shown}} ステップ",
+    "timeline_zoom_in": "拡大",
+    "timeline_zoom_out": "縮小",
+    "tool_kind_command": "コマンド",
+    "tool_kind_write": "編集",
+    "tool_kind_read": "読み取り",
+    "tool_kind_misc": "その他"
   },
   "task_failure": {
     "agent_error": "エージェント実行エラー",

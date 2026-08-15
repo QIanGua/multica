@@ -851,7 +851,13 @@
     "close_step": "关闭详情",
     "image_result": "图片",
     "steps_count_other": "{{count}} 个步骤",
-    "steps_filtered": "{{shown}} / {{total}} 个步骤"
+    "steps_filtered": "{{shown}} / {{total}} 个步骤",
+    "timeline_zoom_in": "放大",
+    "timeline_zoom_out": "缩小",
+    "tool_kind_command": "命令",
+    "tool_kind_write": "编辑",
+    "tool_kind_read": "读取",
+    "tool_kind_misc": "其他"
   },
   "task_failure": {
     "agent_error": "智能体执行出错",

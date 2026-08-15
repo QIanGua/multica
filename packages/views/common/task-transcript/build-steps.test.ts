@@ -5,6 +5,8 @@ import {
   groupSteps,
   rowCalls,
   shouldShowTimeline,
+  timelineTicks,
+  toolKindTotals,
   type TraceCallStep,
 } from "./build-steps";
 import type { TimelineItem } from "./build-timeline";
@@ -217,6 +219,43 @@ describe("buildLanes", () => {
     const steps = buildSteps([call("Bash", 0), result("Bash", 0)]);
 
     expect(buildLanes(steps, at(0), at(0))).toBeNull();
+  });
+});
+
+describe("timelineTicks", () => {
+  it("keeps tick density constant as the track is zoomed", () => {
+    const total = 30 * 60_000;
+
+    // Same run, four times the width: four times the labels, so the on-screen
+    // spacing between them does not thin out.
+    expect(timelineTicks(total, 6).length).toBeLessThanOrEqual(7);
+    expect(timelineTicks(total, 24).length).toBeGreaterThan(timelineTicks(total, 6).length);
+  });
+
+  it("returns nothing for a run with no length", () => {
+    expect(timelineTicks(0)).toEqual([]);
+  });
+});
+
+describe("toolKindTotals", () => {
+  it("splits tool time by what the calls were doing", () => {
+    const steps = buildSteps([
+      { seq: ++seq, type: "tool_use", tool: "Bash", input: { command: "pnpm test" }, created_at: at(0) },
+      { seq: ++seq, type: "tool_result", tool: "Bash", output: "ok", created_at: at(60) },
+      { seq: ++seq, type: "tool_use", tool: "Edit", input: { file_path: "a.ts", old_string: "a", new_string: "b" }, created_at: at(60) },
+      { seq: ++seq, type: "tool_result", tool: "Edit", output: "ok", created_at: at(62) },
+      { seq: ++seq, type: "tool_use", tool: "Read", input: { file_path: "b.ts" }, created_at: at(62) },
+      { seq: ++seq, type: "tool_result", tool: "Read", output: "ok", created_at: at(63) },
+    ]);
+
+    // The lopsidedness is the point: one kind dominates, which is why this is
+    // a tooltip and not three more lanes.
+    expect(toolKindTotals(steps)).toEqual({
+      command: 60_000,
+      write: 2_000,
+      read: 1_000,
+      other: 0,
+    });
   });
 });
 

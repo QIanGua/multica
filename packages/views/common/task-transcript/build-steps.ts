@@ -338,18 +338,62 @@ function kindForGap(steps: TraceStep[], from: number, to: number): LaneSegmentKi
   return kind;
 }
 
-/** Axis ticks at a round interval, chosen so a run gets 4–7 of them. */
-export function timelineTicks(totalMs: number): number[] {
+/**
+ * Axis ticks at a round interval.
+ *
+ * `maxTicks` scales with zoom: a timeline stretched to 4x its container has
+ * four screenfuls to label, so it needs four times the ticks to keep the same
+ * on-screen density.
+ */
+export function timelineTicks(totalMs: number, maxTicks = 6): number[] {
   if (!Number.isFinite(totalMs) || totalMs <= 0) return [];
   const steps = [
-    15_000, 30_000, 60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000, 15 * 60_000,
-    30 * 60_000, 60 * 60_000, 2 * 60 * 60_000, 6 * 60 * 60_000,
+    1_000, 5_000, 15_000, 30_000, 60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000,
+    15 * 60_000, 30 * 60_000, 60 * 60_000, 2 * 60 * 60_000, 6 * 60 * 60_000,
   ];
-  const interval = steps.find((step) => totalMs / step <= 6) ?? steps[steps.length - 1]!;
+  const interval = steps.find((step) => totalMs / step <= maxTicks) ?? steps[steps.length - 1]!;
   const ticks: number[] = [];
   for (let at = 0; at < totalMs; at += interval) ticks.push(at);
   ticks.push(totalMs);
   return ticks;
+}
+
+/**
+ * How the tool lane's time splits by what the calls were doing.
+ *
+ * The lane itself stays whole: in a real run one kind dominates (commands run
+ * for minutes, reads and edits finish in milliseconds), so a lane per kind
+ * would draw three near-empty tracks to say what one line of text says. This
+ * is that line of text.
+ */
+export interface ToolKindTotals {
+  command: number;
+  write: number;
+  read: number;
+  other: number;
+}
+
+export function toolKindTotals(steps: TraceStep[]): ToolKindTotals {
+  const totals: ToolKindTotals = { command: 0, write: 0, read: 0, other: 0 };
+  for (const step of steps) {
+    if (step.kind !== "call" || step.durationMs === undefined) continue;
+    const input = step.call?.input;
+    const kind: keyof ToolKindTotals =
+      typeof input?.command === "string"
+        ? "command"
+        : typeof input?.old_string === "string" ||
+            typeof input?.content === "string" ||
+            input?.changes !== undefined
+          ? "write"
+          : typeof input?.file_path === "string" ||
+              typeof input?.path === "string" ||
+              typeof input?.pattern === "string" ||
+              typeof input?.query === "string"
+            ? "read"
+            : "other";
+    totals[kind] += step.durationMs;
+  }
+  return totals;
 }
 
 /** Below these, a timeline is chrome: it would render a handful of bars that

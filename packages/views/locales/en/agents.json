@@ -869,7 +869,13 @@
     "image_result": "Image",
     "steps_count_one": "{{count}} step",
     "steps_count_other": "{{count}} steps",
-    "steps_filtered": "{{shown}} of {{total}} steps"
+    "steps_filtered": "{{shown}} of {{total}} steps",
+    "timeline_zoom_in": "Zoom in",
+    "timeline_zoom_out": "Zoom out",
+    "tool_kind_command": "Commands",
+    "tool_kind_write": "Edits",
+    "tool_kind_read": "Reads",
+    "tool_kind_misc": "Other"
   },
   "task_failure": {
     "agent_error": "Agent execution error",
