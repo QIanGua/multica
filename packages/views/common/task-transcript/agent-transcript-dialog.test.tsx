@@ -353,12 +353,13 @@ describe("AgentTranscriptDialog", () => {
       { seq: 6, type: "tool_result", tool: "Read", output: "c" },
     ]);
 
-    const group = screen.getByRole("button", { name: /3 calls/ });
-    expect(screen.queryByText("/a.ts")).not.toBeInTheDocument();
+    // The folded row still names what it touched first — "Read · 3 calls"
+    // alone would hide the only detail that makes a group scannable.
+    const group = screen.getByRole("button", { name: /\/a\.ts.*3 calls/ });
+    expect(screen.queryByText("/c.ts")).not.toBeInTheDocument();
 
     fireEvent.click(group);
 
-    expect(screen.getByText("/a.ts")).toBeInTheDocument();
     expect(screen.getByText("/c.ts")).toBeInTheDocument();
   });
 

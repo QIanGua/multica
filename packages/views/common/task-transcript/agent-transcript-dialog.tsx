@@ -1432,7 +1432,12 @@ function GroupRow({
         />
         <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
           <span className="shrink-0 text-caption font-medium">{row.tool}</span>
-          <span className="truncate text-micro text-muted-foreground">
+          {/* Name the first thing it touched, not just how many: "Read · 4
+              calls" hides the one detail that makes a folded group scannable. */}
+          <span className="truncate font-mono text-micro text-muted-foreground">
+            {callSummary(row.steps[0]!, summaryLabels)}
+          </span>
+          <span className="shrink-0 text-micro text-faint-foreground">
             {t(($) => $.transcript.group_calls, { count: row.steps.length })}
           </span>
         </span>

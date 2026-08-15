@@ -59,12 +59,23 @@ export type TraceRow = TraceStep | TraceGroupRow;
 /**
  * How many consecutive same-tool calls it takes to fold into one row.
  *
- * Three, not two: two shell commands are two distinct things a reader wants to
- * see, while five file reads are one act. A size rule keeps this
- * provider-agnostic — a tool-name allowlist would have to be re-guessed for
- * every backend we add.
+ * Three, not two: two file reads are still two lines worth reading, five are
+ * one act.
  */
 export const MIN_GROUP_SIZE = 3;
+
+/**
+ * A shell call never folds, however many run in a row.
+ *
+ * Reading a run, `pnpm typecheck` and `pnpm exec playwright test` are two
+ * different things that happened; "Bash · 5 calls" hides exactly what the
+ * reader came for, and a group duration spanning the gaps between them reads
+ * as one ten-minute command. Keyed on the input carrying a `command` string
+ * rather than a tool-name allowlist, so it holds for every backend.
+ */
+function isShellCall(step: TraceCallStep): boolean {
+  return typeof step.call?.input?.command === "string";
+}
 
 function timeMs(iso: string | undefined): number | undefined {
   if (!iso) return undefined;
@@ -164,7 +175,11 @@ export function groupSteps(steps: TraceStep[]): TraceRow[] {
   };
 
   for (const step of steps) {
-    if (step.kind === "call" && (run.length === 0 || run[0]!.tool === step.tool)) {
+    if (
+      step.kind === "call" &&
+      !isShellCall(step) &&
+      (run.length === 0 || run[0]!.tool === step.tool)
+    ) {
       run.push(step);
       continue;
     }

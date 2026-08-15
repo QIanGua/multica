@@ -121,6 +121,21 @@ describe("groupSteps", () => {
     expect(groupSteps(steps).map((r) => r.kind)).toEqual(["call", "call"]);
   });
 
+  it("never folds shell commands — five commands are five things that happened", () => {
+    const items: TimelineItem[] = [];
+    for (let i = 0; i < 5; i++) {
+      items.push(
+        { seq: ++seq, type: "tool_use", tool: "Bash", input: { command: `step ${i}` }, created_at: at(i * 10) },
+        { seq: ++seq, type: "tool_result", tool: "Bash", output: "ok", created_at: at(i * 10 + 1) },
+      );
+    }
+
+    const rows = groupSteps(buildSteps(items));
+
+    expect(rows).toHaveLength(5);
+    expect(rows.every((row) => row.kind === "call")).toBe(true);
+  });
+
   it("does not group across a different tool or across prose", () => {
     const steps = buildSteps([
       call("Read", 0),
