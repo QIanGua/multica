@@ -67,7 +67,10 @@ type AgentSkillContribution struct {
 	Key         string `json:"key"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	Entry       string `json:"entry"`
+	// Entry is the canonical SKILL.md. Every other regular UTF-8 file below
+	// skills/<key>/ is carried as an immutable companion file in the same
+	// agent.skill.v1 bundle.
+	Entry string `json:"entry"`
 }
 
 // RemoteMCPContribution is a declarative request to connect an installation to

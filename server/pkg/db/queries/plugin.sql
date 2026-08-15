@@ -483,6 +483,16 @@ WHERE release_id = $1 AND path = $2;
 SELECT * FROM plugin_artifact_file
 WHERE id = $1;
 
+-- name: ListPluginArtifactFilesByRelease :many
+SELECT * FROM plugin_artifact_file
+WHERE release_id = $1
+ORDER BY path, id;
+
+-- name: ListPluginArtifactFilesByIDs :many
+SELECT * FROM plugin_artifact_file
+WHERE id = ANY(@ids::uuid[])
+ORDER BY path, id;
+
 -- name: GetLatestPluginRelease :one
 SELECT release.*
 FROM plugin_release release

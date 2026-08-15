@@ -1602,6 +1602,74 @@ func (q *Queries) ListLatestPluginInstallationConfigs(ctx context.Context, arg L
 	return items, nil
 }
 
+const listPluginArtifactFilesByIDs = `-- name: ListPluginArtifactFilesByIDs :many
+SELECT id, release_id, path, digest, size_bytes, content, created_at FROM plugin_artifact_file
+WHERE id = ANY($1::uuid[])
+ORDER BY path, id
+`
+
+func (q *Queries) ListPluginArtifactFilesByIDs(ctx context.Context, ids []pgtype.UUID) ([]PluginArtifactFile, error) {
+	rows, err := q.db.Query(ctx, listPluginArtifactFilesByIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PluginArtifactFile{}
+	for rows.Next() {
+		var i PluginArtifactFile
+		if err := rows.Scan(
+			&i.ID,
+			&i.ReleaseID,
+			&i.Path,
+			&i.Digest,
+			&i.SizeBytes,
+			&i.Content,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPluginArtifactFilesByRelease = `-- name: ListPluginArtifactFilesByRelease :many
+SELECT id, release_id, path, digest, size_bytes, content, created_at FROM plugin_artifact_file
+WHERE release_id = $1
+ORDER BY path, id
+`
+
+func (q *Queries) ListPluginArtifactFilesByRelease(ctx context.Context, releaseID pgtype.UUID) ([]PluginArtifactFile, error) {
+	rows, err := q.db.Query(ctx, listPluginArtifactFilesByRelease, releaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PluginArtifactFile{}
+	for rows.Next() {
+		var i PluginArtifactFile
+		if err := rows.Scan(
+			&i.ID,
+			&i.ReleaseID,
+			&i.Path,
+			&i.Digest,
+			&i.SizeBytes,
+			&i.Content,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPluginCompilationContributions = `-- name: ListPluginCompilationContributions :many
 WITH latest_grants AS (
     SELECT DISTINCT ON (installation_id, capability)

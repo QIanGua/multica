@@ -145,6 +145,9 @@ func ValidateArtifact(archive []byte) (Artifact, error) {
 		if root == "" {
 			return Artifact{}, fmt.Errorf("plugin archive path %q is outside a declared contribution", name)
 		}
+		if name != allowedRoots[root].Entry && skillCompanionCollidesWithEntry(name, root) {
+			return Artifact{}, fmt.Errorf("plugin archive path %q collides with reserved primary Skill content", name)
+		}
 		counts[root]++
 		sizes[root] += file.SizeBytes
 		if counts[root] > MaxSkillFiles {
@@ -169,6 +172,15 @@ func ValidateArtifact(archive []byte) (Artifact, error) {
 		SizeBytes:         totalSize,
 		Files:             ordered,
 	}, nil
+}
+
+func skillCompanionCollidesWithEntry(name, root string) bool {
+	relative := strings.TrimPrefix(name, root)
+	firstSegment := relative
+	if separator := strings.IndexByte(relative, '/'); separator >= 0 {
+		firstSegment = relative[:separator]
+	}
+	return strings.EqualFold(firstSegment, "SKILL.md")
 }
 
 func isThirdPartyLicensePath(name string) bool {

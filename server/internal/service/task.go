@@ -4933,6 +4933,39 @@ func (s *TaskService) LoadTaskPluginSkillBundles(ctx context.Context, taskID pgt
 	if len(entries) == 0 {
 		return nil, nil, data, nil
 	}
+	artifactFileIDs := make([]pgtype.UUID, 0)
+	seenArtifactFileIDs := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.ContributionType != plugincontract.ContributionAgentSkillV1 {
+			continue
+		}
+		ids := make([]string, 0, len(entry.SkillFiles)+1)
+		ids = append(ids, entry.ArtifactFileID)
+		for _, file := range entry.SkillFiles {
+			ids = append(ids, file.ArtifactFileID)
+		}
+		for _, id := range ids {
+			if _, exists := seenArtifactFileIDs[id]; exists {
+				continue
+			}
+			parsed, parseErr := util.ParseUUID(id)
+			if parseErr != nil {
+				return nil, nil, nil, fmt.Errorf("execution manifest contains invalid artifact file id")
+			}
+			seenArtifactFileIDs[id] = struct{}{}
+			artifactFileIDs = append(artifactFileIDs, parsed)
+		}
+	}
+	artifactFilesByID := make(map[string]db.PluginArtifactFile, len(artifactFileIDs))
+	if len(artifactFileIDs) > 0 {
+		artifactFiles, listErr := s.Queries.ListPluginArtifactFilesByIDs(ctx, artifactFileIDs)
+		if listErr != nil {
+			return nil, nil, nil, fmt.Errorf("load pinned plugin Skill artifacts: %w", listErr)
+		}
+		for _, file := range artifactFiles {
+			artifactFilesByID[util.UUIDToString(file.ID)] = file
+		}
+	}
 
 	skills := make([]AgentSkillData, 0, len(entries))
 	skillEntries := make([]pluginruntime.CompiledEntry, 0, len(entries))
@@ -4946,25 +4979,11 @@ func (s *TaskService) LoadTaskPluginSkillBundles(ctx context.Context, taskID pgt
 		if entry.ContributionType != plugincontract.ContributionAgentSkillV1 || entry.ArtifactFileID == "" {
 			return nil, nil, nil, fmt.Errorf("execution manifest contains unsupported plugin contribution")
 		}
-		artifactFileID, parseErr := util.ParseUUID(entry.ArtifactFileID)
-		if parseErr != nil {
-			return nil, nil, nil, fmt.Errorf("execution manifest contains invalid artifact file id")
+		skill, materializeErr := materializePinnedPluginSkill(entry, artifactFilesByID)
+		if materializeErr != nil {
+			return nil, nil, nil, materializeErr
 		}
-		artifact, getErr := s.Queries.GetPluginArtifactFile(ctx, artifactFileID)
-		if getErr != nil {
-			return nil, nil, nil, fmt.Errorf("load pinned plugin artifact: %w", getErr)
-		}
-		releaseID, parseErr := util.ParseUUID(entry.ReleaseID)
-		if parseErr != nil || artifact.ReleaseID != releaseID || artifact.Path != entry.EntryPath || artifact.Digest != entry.EntryDigest || plugincontract.DigestBytes([]byte(artifact.Content)) != entry.EntryDigest {
-			return nil, nil, nil, fmt.Errorf("pinned plugin artifact failed digest validation")
-		}
-		skills = append(skills, AgentSkillData{
-			ID:          "plugin:" + entry.ContributionID,
-			Source:      skillbundle.SourcePlugin,
-			Name:        entry.ContributionKey,
-			Description: entry.Description,
-			Content:     artifact.Content,
-		})
+		skills = append(skills, skill)
 		skillEntries = append(skillEntries, entry)
 	}
 	bundles, refs := BuildAgentSkillBundles(skills)

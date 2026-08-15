@@ -5,7 +5,7 @@
     "key": "dev.multica.matt-pocock-engineering-example",
     "name": "Matt Pocock Engineering Skills Example",
     "description": "Community compatibility example containing two MIT-licensed Skills from github.com/mattpocock/skills at commit 8b78b531ab965735c5dc74f6f7a219e1e37326df",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "publisher": "multica.examples"
   },
   "compatibility": {

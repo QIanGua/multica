@@ -789,6 +789,7 @@ func (s *PluginService) reconcileWorkspaceTx(ctx context.Context, q *db.Queries,
 	})
 
 	entries := make([]pluginruntime.CompiledEntry, 0, len(rows))
+	releaseFiles := make(map[string][]db.PluginArtifactFile)
 	for _, key := range keys {
 		contributionRows := grouped[key]
 		row := contributionRows[0]
@@ -821,16 +822,31 @@ func (s *PluginService) reconcileWorkspaceTx(ctx context.Context, q *db.Queries,
 		}
 		switch row.ContributionType {
 		case plugincontract.ContributionAgentSkillV1:
+			releaseKey := util.UUIDToString(row.ReleaseID)
+			artifactFiles, ok := releaseFiles[releaseKey]
+			if !ok {
+				artifactFiles, err = q.ListPluginArtifactFilesByRelease(ctx, row.ReleaseID)
+				if err != nil {
+					return db.PluginCapabilitySnapshot{}, fmt.Errorf("load plugin Skill artifacts: %w", err)
+				}
+				releaseFiles[releaseKey] = artifactFiles
+			}
+			pinnedFiles, bundleFiles, err := compilePluginSkillFiles(row.ReleaseID, row.ContributionKey, row.EntryPath, artifactFiles)
+			if err != nil {
+				return db.PluginCapabilitySnapshot{}, fmt.Errorf("compile plugin Skill %s: %w", row.ContributionKey, err)
+			}
 			bundleManifest := skillbundle.BuildManifest(skillbundle.Skill{
 				ID:          "plugin:" + util.UUIDToString(row.ContributionID),
 				Source:      skillbundle.SourcePlugin,
 				Name:        row.ContributionKey,
 				Description: row.Description,
 				Content:     row.EntryContent,
+				Files:       bundleFiles,
 			})
 			base.SkillBundleHash = bundleManifest.Hash
 			base.SkillSizeBytes = bundleManifest.SizeBytes
 			base.SkillFileCount = bundleManifest.FileCount
+			base.SkillFiles = pinnedFiles
 		case plugincontract.ContributionRemoteMCPV1:
 			if !row.ConfigID.Valid || !row.ConfigRevision.Valid || !row.Endpoint.Valid || !row.AuthType.Valid || !row.FailurePolicy.Valid || !row.SchemaDigest.Valid {
 				return db.PluginCapabilitySnapshot{}, fmt.Errorf("remote MCP contribution %s has incomplete reviewed configuration", row.ContributionKey)

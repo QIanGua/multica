@@ -121,6 +121,7 @@ func TestValidateArtifactRejectsUnsafeOrUnownedFiles(t *testing.T) {
 		{name: "traversal", file: zipFixtureFile{name: "../escape.md", content: []byte("no")}, wantErr: "unsafe"},
 		{name: "backslash", file: zipFixtureFile{name: `skills\escape.md`, content: []byte("no")}, wantErr: "unsafe"},
 		{name: "unowned", file: zipFixtureFile{name: "README.md", content: []byte("no")}, wantErr: "outside a declared contribution"},
+		{name: "primary content descendant", file: zipFixtureFile{name: "skills/review-readiness/SKILL.md/hidden.txt", content: []byte("no")}, wantErr: "reserved primary Skill content"},
 		{name: "executable", file: zipFixtureFile{name: "skills/review-readiness/run.sh", content: []byte("echo no"), mode: 0o700}, wantErr: "executable"},
 		{name: "symlink", file: zipFixtureFile{name: "skills/review-readiness/link", content: []byte("target"), mode: fs.ModeSymlink | 0o777}, wantErr: "not a regular file"},
 		{name: "binary", file: zipFixtureFile{name: "skills/review-readiness/binary", content: []byte{0xff, 0xfe}}, wantErr: "not UTF-8 text"},

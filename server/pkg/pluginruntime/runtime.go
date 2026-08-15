@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	CompilerVersion = "plugin-compiler-v1"
+	CompilerVersion = "plugin-compiler-v2"
 	ComposerVersion = "plugin-composer-v1"
 	SchemaVersion   = 1
 )
@@ -43,6 +43,7 @@ type CompiledEntry struct {
 	SkillBundleHash        string          `json:"skill_bundle_hash,omitempty"`
 	SkillSizeBytes         int64           `json:"skill_size_bytes,omitempty"`
 	SkillFileCount         int             `json:"skill_file_count,omitempty"`
+	SkillFiles             []SkillFile     `json:"skill_files,omitempty"`
 	ConfigID               string          `json:"config_id,omitempty"`
 	ConfigRevision         int64           `json:"config_revision,omitempty"`
 	Endpoint               string          `json:"endpoint,omitempty"`
@@ -56,6 +57,16 @@ type CompiledEntry struct {
 	Transport              string          `json:"transport,omitempty"`
 	ProtocolVersions       []string        `json:"protocol_versions,omitempty"`
 	EndpointAllowedHosts   []string        `json:"endpoint_allowed_hosts,omitempty"`
+}
+
+// SkillFile pins one companion file from an agent.skill.v1 contribution.
+// Path is relative to the contribution's skills/<key>/ root; SKILL.md remains
+// pinned separately by ArtifactFileID, EntryPath, and EntryDigest.
+type SkillFile struct {
+	ArtifactFileID string `json:"artifact_file_id"`
+	Path           string `json:"path"`
+	Digest         string `json:"digest"`
+	SizeBytes      int64  `json:"size_bytes"`
 }
 
 type RemoteMCPTool struct {
@@ -100,6 +111,12 @@ func Canonicalize(entries []CompiledEntry) {
 		sort.Strings(entries[i].RequiredDaemonFeatures)
 		sort.Strings(entries[i].ProtocolVersions)
 		sort.Strings(entries[i].EndpointAllowedHosts)
+		sort.Slice(entries[i].SkillFiles, func(left, right int) bool {
+			if entries[i].SkillFiles[left].Path != entries[i].SkillFiles[right].Path {
+				return entries[i].SkillFiles[left].Path < entries[i].SkillFiles[right].Path
+			}
+			return entries[i].SkillFiles[left].ArtifactFileID < entries[i].SkillFiles[right].ArtifactFileID
+		})
 		sort.Slice(entries[i].ApprovedTools, func(left, right int) bool {
 			return entries[i].ApprovedTools[left].Name < entries[i].ApprovedTools[right].Name
 		})
