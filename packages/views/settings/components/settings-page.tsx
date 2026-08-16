@@ -19,7 +19,6 @@ import {
 } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@multica/ui/components/ui/tabs";
 import { useIsMobile } from "@multica/ui/hooks/use-mobile";
-import { cn } from "@multica/ui/lib/utils";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useFeatureEnabled } from "@multica/core/config";
 import {
@@ -48,10 +47,8 @@ import { useT } from "../../i18n";
 
 // Three scopes, in order of how far each setting reaches: the account travels
 // with the person, the desktop group with this one machine, the workspace with
-// the team. Within a scope the order answers, in turn: what is this → who can
-// use it → how we work in it → what it is connected to. A new setting joins the
-// end of ITS segment, not the end of the column — that is what kept the old
-// order drifting into "newest feature last" (MUL-6232).
+// the team (MUL-6232). Only the scopes get a heading; within one, the list is
+// flat and evenly spaced.
 const ACCOUNT_TAB_KEYS = ["profile", "preferences", "shortcuts", "issue", "chat", "notifications", "tokens"] as const;
 const ACCOUNT_TAB_ICONS = {
   // `profile` is the account's General page, so it carries the same gear as
@@ -65,12 +62,25 @@ const ACCOUNT_TAB_ICONS = {
   tokens: Key,
 } as const;
 
-const WORKSPACE_TAB_SEGMENTS = [
-  ["general", "members", "billing"],
-  ["issue"],
-  ["repositories", "integrations", "mcp", "plugins", "labs"],
+// The runs below are an ordering rule, not a visual grouping: one flat list,
+// evenly spaced. A new setting joins the end of its own run rather than the end
+// of the list, which is what keeps the order from drifting back into
+// "newest feature last".
+const WORKSPACE_TAB_KEYS = [
+  // what this workspace is, and who can use it
+  "general",
+  "members",
+  "billing",
+  // how we work in it
+  "issue",
+  // what it is connected to
+  "repositories",
+  "integrations",
+  "mcp",
+  "plugins",
+  "labs",
 ] as const;
-type WorkspaceTabKey = (typeof WORKSPACE_TAB_SEGMENTS)[number][number];
+type WorkspaceTabKey = (typeof WORKSPACE_TAB_KEYS)[number];
 
 const WORKSPACE_TAB_VALUES = {
   general: "workspace",
@@ -160,21 +170,15 @@ export function SettingsPage({ desktopTabs }: SettingsPageProps = {}) {
     false,
   );
 
-  const visibleWorkspaceSegments = React.useMemo(
-    () =>
-      WORKSPACE_TAB_SEGMENTS.map((segment) =>
-        segment.filter(
-          (key) =>
-            (key !== "plugins" || pluginsEnabled) &&
-            (key !== "billing" || billingEnabled) &&
-            (key !== "labs" || LABS_HAS_EXPERIMENTS),
-        ),
-      ).filter((segment) => segment.length > 0),
-    [billingEnabled, pluginsEnabled],
-  );
   const visibleWorkspaceTabKeys = React.useMemo(
-    () => visibleWorkspaceSegments.flat(),
-    [visibleWorkspaceSegments],
+    () =>
+      WORKSPACE_TAB_KEYS.filter(
+        (key) =>
+          (key !== "plugins" || pluginsEnabled) &&
+          (key !== "billing" || billingEnabled) &&
+          (key !== "labs" || LABS_HAS_EXPERIMENTS),
+      ),
+    [billingEnabled, pluginsEnabled],
   );
 
   // Whitelist of valid tab values; unknown ?tab=… values silently fall back to
@@ -211,13 +215,8 @@ export function SettingsPage({ desktopTabs }: SettingsPageProps = {}) {
     value: string,
     label: string,
     Icon: React.ComponentType<{ className?: string }>,
-    className?: string,
   ) => (
-    <TabsTrigger
-      key={value}
-      value={value}
-      className={cn(SETTINGS_TAB_TRIGGER_CLASS, className)}
-    >
+    <TabsTrigger key={value} value={value} className={SETTINGS_TAB_TRIGGER_CLASS}>
       <Icon className="h-4 w-4" />
       {label}
     </TabsTrigger>
@@ -271,24 +270,13 @@ export function SettingsPage({ desktopTabs }: SettingsPageProps = {}) {
           <span className="hidden truncate px-2 pb-1 pt-4 text-caption font-medium text-muted-foreground md:block">
             {workspaceName ?? t(($) => $.page.workspace_fallback)}
           </span>
-          {visibleWorkspaceSegments.map((segment, index) => (
-            <React.Fragment key={segment.join("-")}>
-              {segment.map((key, keyIndex) =>
-                renderTrigger(
-                  WORKSPACE_TAB_VALUES[key],
-                  t(($) => $.page.tabs[WORKSPACE_TAB_LABEL_KEYS[key]]),
-                  WORKSPACE_TAB_ICONS[key],
-                  // Segment break: extra space on the first row of each
-                  // segment after the first. A rule here fenced single-entry
-                  // segments on both sides, which reads as separation rather
-                  // than grouping — spacing groups just as well and adds no
-                  // chrome. Vertical only; at mobile widths this list is one
-                  // scrolling row, where the gap belongs between columns.
-                  index > 0 && keyIndex === 0 ? "md:mt-3" : undefined,
-                ),
-              )}
-            </React.Fragment>
-          ))}
+          {visibleWorkspaceTabKeys.map((key) =>
+            renderTrigger(
+              WORKSPACE_TAB_VALUES[key],
+              t(($) => $.page.tabs[WORKSPACE_TAB_LABEL_KEYS[key]]),
+              WORKSPACE_TAB_ICONS[key],
+            ),
+          )}
         </TabsList>
       </div>
 
