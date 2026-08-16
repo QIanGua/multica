@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@multica/ui/components/ui/tabs";
 import { useIsMobile } from "@multica/ui/hooks/use-mobile";
+import { cn } from "@multica/ui/lib/utils";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useFeatureEnabled } from "@multica/core/config";
 import {
@@ -210,8 +211,13 @@ export function SettingsPage({ desktopTabs }: SettingsPageProps = {}) {
     value: string,
     label: string,
     Icon: React.ComponentType<{ className?: string }>,
+    className?: string,
   ) => (
-    <TabsTrigger key={value} value={value} className={SETTINGS_TAB_TRIGGER_CLASS}>
+    <TabsTrigger
+      key={value}
+      value={value}
+      className={cn(SETTINGS_TAB_TRIGGER_CLASS, className)}
+    >
       <Icon className="h-4 w-4" />
       {label}
     </TabsTrigger>
@@ -267,20 +273,18 @@ export function SettingsPage({ desktopTabs }: SettingsPageProps = {}) {
           </span>
           {visibleWorkspaceSegments.map((segment, index) => (
             <React.Fragment key={segment.join("-")}>
-              {/* Segment break. Horizontal-only: at mobile widths this list is
-                  a single scrolling row, where a rule would read as a column
-                  break that isn't there. */}
-              {index > 0 ? (
-                <span
-                  role="presentation"
-                  className="hidden h-px bg-surface-border md:mx-2 md:my-2 md:block"
-                />
-              ) : null}
-              {segment.map((key) =>
+              {segment.map((key, keyIndex) =>
                 renderTrigger(
                   WORKSPACE_TAB_VALUES[key],
                   t(($) => $.page.tabs[WORKSPACE_TAB_LABEL_KEYS[key]]),
                   WORKSPACE_TAB_ICONS[key],
+                  // Segment break: extra space on the first row of each
+                  // segment after the first. A rule here fenced single-entry
+                  // segments on both sides, which reads as separation rather
+                  // than grouping — spacing groups just as well and adds no
+                  // chrome. Vertical only; at mobile widths this list is one
+                  // scrolling row, where the gap belongs between columns.
+                  index > 0 && keyIndex === 0 ? "md:mt-3" : undefined,
                 ),
               )}
             </React.Fragment>
