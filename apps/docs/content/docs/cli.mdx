@@ -259,6 +259,8 @@ The tables below cover every current top-level command, grouped the way the CLI 
 | `property` | `list/get/create/update/archive/unarchive` | Manage workspace custom properties | `create`: `--name`, `--type`, `--option` (repeatable); `list`: `--include-archived`; the type cannot be changed after creation |
 | `agent` | `list/get/create/update/archive/restore` | Manage agents | `--name`, `--runtime-id` (required for `create`), `--instructions`, `--model`, `--thinking-level`, `--mcp-config`, `--permission-mode`, `--max-concurrent-tasks` |
 | | `copy <agent-id>` | Copy into a new agent; the original is untouched | `--name` (defaults to the original name plus ` (copy)`), `--runtime-id` (copying to another runtime also requires `--model`), `--no-skills`; secret configuration such as `custom_env`, `mcp_config`, and `runtime_config` is not copied — re-provide it with the same flags as `create` |
+| | `export [agent-id...]` | Write agents' portable configuration to a JSON document | `--all` (every non-archived agent), `--file` (written 0600; stdout otherwise). `custom_env`, `mcp_config`, and `runtime_config` are never exported — the document records only that they existed |
+| | `import` | Create or update agents from an exported document | `--file` / `--stdin`, `--runtime-id` (omit only when re-importing into the workspace the document came from), `--on-conflict` (`fail` / `overwrite` / `rename` / `skip`) matched on agent name, `--into <agent-id>`, `--dry-run` |
 | | `tasks <id>` | View an agent's tasks | |
 | | `avatar <id>` | Upload an avatar | |
 | | `env get/set <agent-id>` | Read and write custom environment variables (owner and admin only) | |

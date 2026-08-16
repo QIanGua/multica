@@ -147,6 +147,22 @@ multica agent copy <agent-id>
 
 By default the copy stays on the same runtime; add `--runtime-id` to move it to another runtime, which also requires `--model`. Environment variables, MCP configuration, and `runtime_config` are never copied; the runtime binding itself is kept. Full flags in [Using the CLI](/cli).
 
+## Exporting and importing configuration
+
+Export writes an agent's portable configuration to a JSON document you can review, commit, or move to another workspace; import applies one back.
+
+```bash
+multica agent export <agent-id> --file agents.json     # one agent
+multica agent export --all --file agents.json          # every non-archived agent
+multica agent import --file agents.json --dry-run      # see the plan, write nothing
+```
+
+The document carries the same fields duplication does: name, description, instructions, avatar, model, thinking level, service tier, custom arguments, concurrency limit, Access settings, and skills. Environment variable values, MCP configuration, and `runtime_config` are never written to it — the document records only that the source agent had them, and the import report tells you what still needs setting.
+
+Importing into the workspace the document came from returns each agent to its recorded runtime. Anywhere else, pass `--runtime-id`; because a model chosen for one runtime may not exist on another, that also requires `--model` (use `--model ""` to accept the target runtime's default). Skills are matched in the target workspace by id first, then by name, and anything missing is reported rather than dropped silently.
+
+When an agent of the same name already exists, `--on-conflict` decides: `fail` (the default) stops before writing anything, `overwrite` updates that agent in place, `rename` creates `"<name> (2)"`, and `skip` leaves it alone. An overwrite replaces the target's configuration with the document, so run `--dry-run` first.
+
 ## Next steps
 
 - [Assign issues to agents](/assigning-issues) — validate the configuration with real work.

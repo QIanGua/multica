@@ -251,6 +251,8 @@ CLI 설정 파일에는 사용자를 대신해 Multica에 접근할 수 있는 t
 | `property` | `list/get/create/update/archive/unarchive` | 워크스페이스 사용자 지정 속성 관리 | `create`: `--name`, `--type`, `--option`(반복 가능). `list`: `--include-archived`. 유형은 생성 후 변경 불가 |
 | `agent` | `list/get/create/update/archive/restore` | 에이전트 관리 | `--name`, `--runtime-id`(`create`에서 필수), `--instructions`, `--model`, `--thinking-level`, `--mcp-config`, `--permission-mode`, `--max-concurrent-tasks` |
 | | `copy <agent-id>` | 원래 에이전트에 영향 없이 새 에이전트로 복사 | `--name`(기본값은 원래 이름 + ` (copy)`), `--runtime-id`(다른 런타임으로 복사할 때 `--model`도 필수), `--no-skills`. `custom_env`, `mcp_config`, `runtime_config` 같은 기밀 설정은 복사되지 않으며 `create`와 같은 flag로 다시 제공해야 함 |
+| | `export [agent-id...]` | 에이전트의 이식 가능한 설정을 JSON 문서로 내보내기 | `--all`(보관되지 않은 모든 에이전트), `--file`(0600으로 저장. 지정하지 않으면 stdout). `custom_env`, `mcp_config`, `runtime_config`는 내보내지 않으며 존재 여부만 기록됨 |
+| | `import` | 내보낸 문서로 에이전트를 생성하거나 업데이트 | `--file` / `--stdin`, `--runtime-id`(문서를 만든 워크스페이스로 되돌릴 때만 생략 가능), `--on-conflict`(`fail` / `overwrite` / `rename` / `skip`. 에이전트 이름으로 대조), `--into <agent-id>`, `--dry-run` |
 | | `tasks <id>` | 에이전트 태스크 확인 | |
 | | `avatar <id>` | 아바타 업로드 | |
 | | `env get/set <agent-id>` | 사용자 지정 환경 변수 읽기/쓰기(owner와 admin만) | |

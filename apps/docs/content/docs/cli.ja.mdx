@@ -251,6 +251,8 @@ CLI の設定ファイルには、あなたとして Multica にアクセスで�
 | `property` | `list/get/create/update/archive/unarchive` | ワークスペースのカスタムプロパティを管理 | `create`: `--name`、`--type`、`--option`（繰り返し可）；`list`: `--include-archived`；タイプは作成後に変更できません |
 | `agent` | `list/get/create/update/archive/restore` | エージェントを管理 | `--name`、`--runtime-id`（`create` では必須）、`--instructions`、`--model`、`--thinking-level`、`--mcp-config`、`--permission-mode`、`--max-concurrent-tasks` |
 | | `copy <agent-id>` | 新しいエージェントとして複製。元のエージェントは変更されません | `--name`（デフォルトは元の名前 + ` (copy)`）、`--runtime-id`（別のランタイムへ複製する場合は `--model` の同時指定が必須）、`--no-skills`；`custom_env`、`mcp_config`、`runtime_config` などの機密設定は複製されないため、`create` と同じフラグで再指定してください |
+| | `export [agent-id...]` | エージェントの移植可能な設定を JSON ドキュメントに書き出す | `--all`（アーカイブされていない全エージェント）、`--file`（0600 で書き込み。指定しない場合は stdout）。`custom_env`、`mcp_config`、`runtime_config` は書き出されず、存在したことだけが記録されます |
+| | `import` | 書き出したドキュメントからエージェントを作成または更新 | `--file` / `--stdin`、`--runtime-id`（ドキュメントの生成元ワークスペースに戻す場合のみ省略可）、`--on-conflict`（`fail` / `overwrite` / `rename` / `skip`。エージェント名で照合）、`--into <agent-id>`、`--dry-run` |
 | | `tasks <id>` | エージェントのタスクを表示 | |
 | | `avatar <id>` | アバターをアップロード | |
 | | `env get/set <agent-id>` | カスタム環境変数の読み書き（owner と admin のみ） | |

@@ -45,6 +45,25 @@ go test ./internal/service -run TestBuiltinSkillsConformToTemplate
 | Skills copied in the create transaction | 239 | Source skill ids sent as `skill_ids`, bound in the same `POST /api/agents` tx (267); `--no-skills` opts out | read `runAgentCopy` |
 | Secrets never copied | 240–266 | `custom_env`/`mcp_config`/`runtime_config` set only from explicit secret-safe flags, never read from the source | `multica agent copy --help` |
 
+## Export / import — `cmd_agent_config_doc.go`, `cmd_agent_export.go`, `cmd_agent_import.go`
+
+| Contract | Line | Behavior | Safe check |
+|---|---|---|---|
+| Document envelope `kind` + `version` | `cmd_agent_config_doc.go` 23–24, 28–33 | `multica.agent.config` v1; `decodeAgentConfigDoc` refuses a foreign kind, an unknown version, an empty agent list, a nameless entry, or duplicate names | `multica agent export <agent-id>` |
+| Portable field whitelist | `cmd_agent_config_doc.go` `buildAgentConfigEntry` | Projects the GET response onto the same field set `agent copy` treats as portable; anything else is dropped by construction, so a future API field cannot leak into the document | `multica agent export <agent-id>` |
+| Complete-statement entries | `cmd_agent_config_doc.go` `agentConfigEntry` | Fields an agent always has are serialized even when empty, so an overwrite import leaves the target matching the document; genuinely optional data (avatar, out-of-range historical concurrency, empty allow-list) is omitted and left untouched | read the struct tags |
+| Secrets never exported | `cmd_agent_config_doc.go` `agentConfigOmitted` / `agentConfigOmittedFrom` | `custom_env`/`mcp_config`/`runtime_config` are absent; only their presence is recorded, and the import report restates it | `multica agent export <agent-id>` |
+| `agentExportCmd` (`export [agent-id...]`) + flag registrar | `cmd_agent_export.go` 20, 40, 47 | Own file with its own `init()`; `registerAgentExportFlags` shared with the tests. Ids or `--all`, never both; `--all` skips archived agents | `multica agent export --help` |
+| Export file mode | `cmd_agent_export.go` `runAgentExport` | `--file` writes 0600 — no credentials by construction, but instructions are the owner's own material | `multica agent export <id> --file <path>` then `ls -l` |
+| `agentImportCmd` (`import`) + flag registrar | `cmd_agent_import.go` 36, 68, 75 | Reads `--file` / `--stdin`; refuses when both, when neither, and when `--stdin` competes with a `*-stdin` secret channel | `multica agent import --help` |
+| Conflict strategies | `cmd_agent_import.go` 22–28, `planAgentImport` | `fail` (default) aborts before the first write; `skip`; `rename` → `"<name> (2)"` via `freeAgentName`; `overwrite` refuses an ambiguous name and points at `--into`. Vocabulary matches `skill import` | `multica agent import --file <doc> --dry-run` |
+| Plan-then-apply | `cmd_agent_import.go` `planAgentImport` / `applyAgentImport` | Every entry resolves to an action before any write, so a conflict or a missing `--model` cannot leave half a document applied; the report prints even when apply fails midway | `multica agent import --file <doc> --dry-run` |
+| Runtime + model rule | `cmd_agent_import.go` `planAgentImport` | `--runtime-id` optional only when `source.workspace_id` equals the target workspace; a different runtime drops `model`/`thinking_level`/`service_tier` and requires explicit `--model` — same contract as `agent copy` | `multica agent import --help` |
+| Cross-workspace allow-list | `cmd_agent_import.go` `resolveImportedPermission` | `workspace` targets survive; `member`/`team` targets name source-workspace ids and are dropped; an empty result falls back to `private`, never a `public_to` nobody can invoke | `multica agent import --file <doc> --dry-run` |
+| Skill re-resolution | `cmd_agent_import.go` `resolveImportedSkills` | Binds by id when it exists in the target workspace, else by a unique name match; ambiguous or missing skills are reported, not silently dropped | `multica agent import --file <doc> --dry-run` |
+| Secrets on import | `cmd_agent_import.go` `applyImportSecrets` | `custom_env` rides along only on create; the overwrite path calls the audited `PUT /api/agents/{id}/env` separately, because the generic update endpoint rejects `custom_env` by design | `multica agent import --help` |
+| Single-agent flag guard | `cmd_agent_import.go` `runAgentImport` | `--name`, `--into` and every secret channel are refused when the document holds more than one agent | `multica agent import --help` |
+
 ## Create handler — `server/internal/handler/agent.go`
 
 | Contract | Line | Behavior |

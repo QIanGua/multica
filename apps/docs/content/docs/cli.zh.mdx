@@ -251,6 +251,8 @@ CLI 配置文件包含可代表你访问 Multica 的令牌。不要提交到仓�
 | `property` | `list/get/create/update/archive/unarchive` | 管理工作区自定义属性 | `create`：`--name`、`--type`、`--option`（可重复）；`list`：`--include-archived`；类型创建后不可修改 |
 | `agent` | `list/get/create/update/archive/restore` | 管理智能体 | `--name`、`--runtime-id`（`create` 必填）、`--instructions`、`--model`、`--thinking-level`、`--mcp-config`、`--permission-mode`、`--max-concurrent-tasks` |
 | | `copy <agent-id>` | 复制为新智能体，原智能体不受影响 | `--name`（默认为原名加 ` (copy)`）、`--runtime-id`（复制到其他运行时时必须同时指定 `--model`）、`--no-skills`；`custom_env`、`mcp_config`、`runtime_config` 等机密配置不会复制，需用与 `create` 相同的 flag 重新提供 |
+| | `export [agent-id...]` | 把智能体的可移植配置导出为 JSON 文档 | `--all`（导出所有未归档智能体）、`--file`（以 0600 写入；不指定则输出到 stdout）。`custom_env`、`mcp_config`、`runtime_config` 不会导出，文档里只记录它们曾经存在 |
+| | `import` | 用导出的文档创建或更新智能体 | `--file` / `--stdin`、`--runtime-id`（只有导回文档来源的工作区时可以省略）、`--on-conflict`（`fail` / `overwrite` / `rename` / `skip`，按智能体名称匹配）、`--into <agent-id>`、`--dry-run` |
 | | `tasks <id>` | 查看智能体的 task | |
 | | `avatar <id>` | 上传头像 | |
 | | `env get/set <agent-id>` | 读写自定义环境变量（仅 owner 和 admin） | |

@@ -147,6 +147,22 @@ multica agent copy <agent-id>
 
 默认复制到同一运行时；加 `--runtime-id` 换到其他运行时，必须同时指定 `--model`。环境变量、MCP 配置和 `runtime_config` 永不复制；运行时绑定本身会保留。完整参数见[使用 CLI](/cli)。
 
+## 导出和导入配置
+
+导出会把智能体的可移植配置写成一份 JSON 文档，可以直接查看、提交到仓库，或者搬到另一个工作区；导入则把它应用回去。
+
+```bash
+multica agent export <agent-id> --file agents.json     # 单个智能体
+multica agent export --all --file agents.json          # 所有未归档智能体
+multica agent import --file agents.json --dry-run      # 只看计划，不写入
+```
+
+文档携带的字段和复制一致：名称、描述、指令、头像、模型、思考等级、服务档位、自定义参数、并发上限、访问设置和 skill。环境变量的值、MCP 配置和 `runtime_config` 不会写进文档 —— 文档只记录源智能体有过这些，导入结果会告诉你还有哪些需要另行配置。
+
+导回文档来源的工作区时，每个智能体会回到它记录的运行时。导到别处要指定 `--runtime-id`；由于为某个运行时选的模型在另一个运行时未必存在，此时还必须指定 `--model`（用 `--model ""` 表示接受目标运行时的默认模型）。skill 会先按 id、再按名称在目标工作区匹配，匹配不上的会明确报出来，而不是悄悄丢掉。
+
+工作区里已有同名智能体时，由 `--on-conflict` 决定：`fail`（默认）在写入任何内容前停下，`overwrite` 原地更新那个智能体，`rename` 新建一个 `"<名称> (2)"`，`skip` 则跳过不动。overwrite 会用文档替换目标的配置，所以先跑 `--dry-run`。
+
 ## 接下来
 
 - [分配 issue 给智能体](/assigning-issues) — 用真实工作验证配置。

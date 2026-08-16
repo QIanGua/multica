@@ -109,6 +109,60 @@ multica agent copy <source-agent-id> --runtime-id <target> --model <model>  # cr
   `--runtime-config`), or with `agent env set` after the copy exists.
 - `--no-skills` skips copying the source's skill bindings.
 
+## Exporting and importing agents
+
+`multica agent export` writes agents' portable configuration to a JSON
+document; `multica agent import` applies one back. Same portable field set as
+`agent copy` — one definition of "portable agent configuration", not two — and
+the same composition over existing endpoints: export is `GET /api/agents/<id>`,
+import is `POST /api/agents` (create) or `PUT /api/agents/{id}` plus
+`PUT /api/agents/{id}/skills` (overwrite). No dedicated server API.
+
+```bash
+multica agent export <agent-id> --file agents.json     # one agent
+multica agent export --all --file agents.json          # every non-archived agent
+multica agent import --file agents.json --dry-run      # plan, no writes
+multica agent import --file agents.json --runtime-id <target> --model <model>
+```
+
+The document is `{"kind": "multica.agent.config", "version": 1, "source": {…},
+"agents": […]}`. A wrong `kind` or an unknown `version` is refused outright
+rather than half-applied. Each entry is a COMPLETE statement of one agent's
+portable config, so an overwrite leaves the target matching the document
+instead of keeping values the document does not carry.
+
+- **Never exported**: `custom_env`, `mcp_config`, `runtime_config`. The
+  document records only that they existed (`excluded`), and the import report
+  restates it as a warning so a new agent's missing API key is discovered
+  before its first run rather than during it. Supply fresh values on a
+  single-agent import with the same secret-safe flags as `agent create`, or
+  afterwards with `agent env set` / `agent update --mcp-config`.
+- **Conflicts** reuse the `skill import` vocabulary: `--on-conflict
+  fail|overwrite|rename|skip`, matched on agent name among non-archived agents.
+  `fail` (the default) aborts before the first write; `rename` creates
+  `"<name> (2)"`; `overwrite` refuses an ambiguous name and points at
+  `--into <agent-id>`, which targets one specific agent regardless of its name.
+- **Runtime**: `--runtime-id` may be omitted only when re-importing into the
+  workspace the document came from, where each agent returns to its recorded
+  runtime. Landing anywhere else drops `model`/`thinking_level`/`service_tier`
+  and requires an explicit `--model` (`--model ""` accepts the target runtime
+  default) — the same rule as `agent copy`.
+- **Skills** are re-resolved against the target workspace by id first, then by
+  a unique name match; anything unresolved is reported, not silently dropped.
+  `--no-skills` skips them on create and leaves an overwritten agent's existing
+  bindings untouched.
+- **Invocation permission**: a `workspace` allow-list entry travels anywhere.
+  `member` / `team` entries name ids from the source workspace and are dropped
+  on a cross-workspace import; an agent left with no entries at all falls back
+  to `private` rather than to a `public_to` mode nobody can invoke.
+- `--dry-run` reports the full plan — action, target id, and warnings per
+  entry — without writing anything.
+
+Not in the document, and therefore not imported: the three secret /
+machine-local fields above, plus workspace MCP server assignments
+(`agent mcp`), `disabled_runtime_skills`, `composio_toolkit_allowlist`,
+`status`, and archive state.
+
 ## Field contracts
 
 | Field | Persisted as | Validated? | Consumed by |
@@ -297,13 +351,18 @@ not pasted into `instructions`.
 
 ## Side effects needing approval
 
-Read-only (safe): `agent get`, `agent skills list`, `agent env get`.
+Read-only (safe): `agent get`, `agent skills list`, `agent env get`,
+`agent export`, `agent import --dry-run`.
 
 State-changing (require an explicit instruction — do not run speculatively):
 
 - `multica agent create` — inserts a new agent row.
 - `multica agent copy` — inserts a new agent row (a fork of an existing agent);
   the source is left untouched.
+- `multica agent import` — inserts agent rows, or updates existing ones under
+  `--on-conflict overwrite` / `--into` (destructive: the document replaces the
+  target's portable config and, unless `--no-skills`, its skill bindings).
+  `--dry-run` first.
 - `multica agent skills add` / `set` — mutate bindings (`set` is destructive:
   it drops bindings not in the new list).
 - `multica agent env set` — overwrites the full `custom_env` map and writes an
@@ -326,6 +385,11 @@ State-changing (require an explicit instruction — do not run speculatively):
   unknown provider-level literal is — model-specific gaps fail at run time.
 - "`set` and `add` are interchangeable for skills." `set` replaces all
   bindings; using it when you meant `add` silently removes capabilities.
+- "An exported document can recreate a working agent on its own." It cannot if
+  the source used env vars, an `mcp_config`, or a `runtime_config` — none of
+  those are in the document. The import report names what is still missing.
+- "`agent import` merges into the existing agent." It does not — an overwrite
+  applies the document as a complete statement of the portable config.
 
 ## References
 
