@@ -56,17 +56,38 @@ describe("web app manifest", () => {
     expect(launch({})).toContain("/login");
   });
 
+  it("never launches onto the marketing site for a session with no known workspace", () => {
+    // Reachable whenever `multica_logged_in` outlives `last_workspace_slug`:
+    // a member who signed up but has not opened a workspace yet, or cleared
+    // cookies. The proxy used to bounce this state to "/", which the official
+    // marketing hosts keep on the public site — so the installed app opened
+    // the landing page with no URL bar to escape it.
+    const target = launch({ multica_logged_in: "1" });
+
+    expect(target).toContain("/login");
+    expect(new URL(target ?? "", "https://www.multica.ai").pathname).not.toBe(
+      "/",
+    );
+  });
+
   it("points every shortcut at a path that resolves the same way", () => {
     const shortcuts = manifest().shortcuts ?? [];
 
     expect(shortcuts.length).toBeGreaterThan(0);
     for (const shortcut of shortcuts) {
-      const target = proxy(
-        new NextRequest(`https://www.multica.ai${shortcut.url}`, {
-          headers: { cookie: "multica_logged_in=1; last_workspace_slug=acme" },
-        }),
-      ).headers.get("location");
-      expect(target).toContain(`/acme${shortcut.url}`);
+      const resolve = (cookie: string) =>
+        proxy(
+          new NextRequest(`https://www.multica.ai${shortcut.url}`, {
+            headers: { cookie },
+          }),
+        ).headers.get("location");
+
+      expect(
+        resolve("multica_logged_in=1; last_workspace_slug=acme"),
+      ).toContain(`/acme${shortcut.url}`);
+      // Same three states as start_url — a shortcut is a launcher entry too.
+      expect(resolve("multica_logged_in=1")).toContain("/login");
+      expect(resolve("")).toContain("/login");
     }
   });
 });

@@ -9,7 +9,6 @@ import type { SupportedLocale } from "@multica/core/i18n";
 import { RESOURCES } from "@multica/views/locales";
 import { getRequestLocale } from "@/lib/request-locale";
 import { SITE_TITLE, TITLE_TEMPLATE } from "@/platform/document-title";
-import { ServiceWorkerRegistrar } from "@/platform/service-worker";
 import {
   resolveBrowserApiBaseUrl,
   resolveBrowserWsUrl,
@@ -166,14 +165,6 @@ export default async function RootLayout({
             strategy="beforeInteractive"
           />
         )}
-        {/*
-          Registers public/sw.js, which is what makes the app installable on
-          Android (iOS only needs the manifest and the apple-* meta tags).
-          Skipped in development: `next dev` serves modules straight off disk
-          over HMR, and a worker registered against localhost outlives the dev
-          server and leaks into whatever else is served from the same port.
-        */}
-        {process.env.NODE_ENV !== "development" && <ServiceWorkerRegistrar />}
         <ThemeProvider>
           <WebProviders
             locale={locale}

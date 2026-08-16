@@ -8,9 +8,11 @@ import type { MetadataRoute } from "next";
  * root path on the public site even for a signed-in session (see
  * `isOfficialMarketingHost` in proxy.ts), so an installed app pointed at "/"
  * would open the landing page. "/inbox" is one of `LEGACY_ROUTE_SEGMENTS`,
- * which proxy.ts resolves per session: signed in it lands on the last
- * workspace's inbox, signed out it lands on /login. That is exactly the
- * launcher behaviour we want, and manifest.test.ts pins the coupling.
+ * which proxy.ts resolves per session: signed in with a known workspace it
+ * lands on that workspace's inbox, signed in without one it lands on /login
+ * (which resolves against the workspace list), and signed out it lands on
+ * /login too. All three are pinned in manifest.test.ts, because a launcher
+ * icon has no URL bar to recover from a wrong destination.
  *
  * The icons under /icons are generated, not hand-drawn. To regenerate after a
  * brand change, edit public/icons/icon.svg and run from public/icons:
