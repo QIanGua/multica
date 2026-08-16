@@ -13,6 +13,8 @@
   "delete_issue": {
     "title": "删除任务",
     "description": "将永久删除该任务及其所有评论。此操作不可撤销。",
+    "description_named": "将永久删除 {{identifier}} 及其所有评论。此操作不可撤销。",
+    "sub_issues_detached_other": "它的 {{count}} 个子任务不会被删除，会变成独立任务。",
     "hint": "工作区任何成员都可以删除任务。",
     "cancel": "取消",
     "confirm": "删除",

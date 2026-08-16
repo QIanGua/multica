@@ -23,7 +23,6 @@ import {
   pruneDeletedIssueFromParentChildrenCaches,
 } from "./delete-cache";
 import { useWorkspaceId } from "../hooks";
-import { useRecentContextStore } from "../chat/recent-context-store";
 import { useRecentIssuesStore } from "./stores";
 import type { InboxItem, Issue, IssueReaction } from "../types";
 import type {
@@ -313,7 +312,6 @@ export function useDeleteIssue() {
       const prevFlatLists = qc.getQueriesData<IssueFlatCache>({
         queryKey: issueKeys.flatAll(wsId),
       });
-      const prevDetail = qc.getQueryData<Issue>(issueKeys.detail(wsId, id));
       const prevChildren = new Map<string, Issue[] | undefined>();
       for (const parentId of metadata.parentIssueIds) {
         prevChildren.set(
@@ -322,16 +320,20 @@ export function useDeleteIssue() {
         );
       }
 
+      // Rows leave the lists immediately — the user stays on the surface and
+      // watching the row linger reads as a dropped click. The detail entry is
+      // deliberately NOT removed here: the confirm modal is still on screen
+      // with the issue's own page behind it, and pulling that entry out from
+      // under the mounted detail view collapses it to a skeleton and fires a
+      // GET for the issue we are deleting. It goes in `onSuccess` instead,
+      // once the server has actually confirmed.
       pruneDeletedIssueFromListCaches(qc, wsId, id);
       pruneDeletedIssueFromParentChildrenCaches(qc, wsId, id, metadata);
-      qc.removeQueries({ queryKey: issueKeys.detail(wsId, id) });
       return {
-        id,
         metadata,
         prevLists,
         prevMyLists,
         prevFlatLists,
-        prevDetail,
         prevChildren,
       };
     },
@@ -351,9 +353,6 @@ export function useDeleteIssue() {
           qc.setQueryData(key, snapshot);
         }
       }
-      if (ctx?.prevDetail) {
-        qc.setQueryData(issueKeys.detail(wsId, ctx.id), ctx.prevDetail);
-      }
       if (ctx?.prevChildren) {
         for (const [parentId, snapshot] of ctx.prevChildren) {
           qc.setQueryData(issueKeys.children(wsId, parentId), snapshot);
@@ -361,7 +360,6 @@ export function useDeleteIssue() {
       }
     },
     onSuccess: (_data, id, ctx) => {
-      useRecentContextStore.getState().forgetContext(wsId, { type: "issue", id });
       cleanupDeletedIssueCaches(qc, wsId, id, ctx?.metadata);
     },
     onSettled: (_data, _err, _id, ctx) => {
@@ -625,9 +623,7 @@ export function useBatchDeleteIssues() {
     },
     onSuccess: (data, ids, ctx) => {
       if (data.deleted === ids.length) {
-        const { forgetContext } = useRecentContextStore.getState();
         for (const id of ids) {
-          forgetContext(wsId, { type: "issue", id });
           cleanupDeletedIssueCaches(qc, wsId, id, ctx?.metadataById.get(id));
         }
         return;
