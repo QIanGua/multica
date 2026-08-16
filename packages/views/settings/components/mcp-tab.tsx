@@ -29,6 +29,7 @@ import { McpServerDialog } from "../../agents/components/tabs/mcp-server-dialog"
 import type { ManagedMcpServer } from "../../agents/components/tabs/mcp-config-model";
 import { useT } from "../../i18n";
 import { SettingsCard, SettingsSection, SettingsTab } from "./settings-layout";
+import { ComposioSection } from "./composio-tab";
 
 /**
  * The workspace MCP server library (GH #6062).
@@ -191,6 +192,10 @@ export function McpTab() {
           </p>
         ) : null}
       </SettingsSection>
+
+      {/* Composio ships hosted MCP apps — the same job as the servers above,
+          so it belongs here rather than under Integrations (MUL-6232). */}
+      <ComposioSection />
 
       <McpServerDialog
         open={editorOpen}

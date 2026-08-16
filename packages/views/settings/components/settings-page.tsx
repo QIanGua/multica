@@ -2,7 +2,6 @@
 
 import React from "react";
 import {
-  User,
   SlidersHorizontal,
   Key,
   Settings,
@@ -12,15 +11,12 @@ import {
   Bell,
   Plug,
   MessageCircle,
-  Tags,
   Keyboard,
   ListTodo,
-  Zap,
   Blocks,
   CreditCard,
   Server,
 } from "lucide-react";
-import { GitHubMark } from "./github-mark";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@multica/ui/components/ui/tabs";
 import { useIsMobile } from "@multica/ui/hooks/use-mobile";
 import { useCurrentWorkspace } from "@multica/core/paths";
@@ -38,13 +34,10 @@ import { TokensTab } from "./tokens-tab";
 import { WorkspaceTab } from "./workspace-tab";
 import { MembersTab } from "./members-tab";
 import { RepositoriesTab } from "./repositories-tab";
-import { GitHubTab } from "./github-tab";
 import { IntegrationsTab } from "./integrations-tab";
-import { LabsTab } from "./labs-tab";
+import { LabsTab, LABS_HAS_EXPERIMENTS } from "./labs-tab";
 import { NotificationsTab } from "./notifications-tab";
-import { LabelsTab } from "./labels-tab";
-import { PropertiesTab } from "./properties-tab";
-import { QuickActionsTab } from "./quick-actions-tab";
+import { WorkspaceIssueTab } from "./workspace-issue-tab";
 import { KeyboardShortcutsTab } from "./keyboard-shortcuts-tab";
 import { PluginsTab } from "./plugins-tab";
 import { McpTab } from "./mcp-tab";
@@ -52,9 +45,17 @@ import { BillingTab } from "./billing-tab";
 import { CollapsedNavTrigger } from "../../layout/page-header";
 import { useT } from "../../i18n";
 
+// Three scopes, in order of how far each setting reaches: the account travels
+// with the person, the desktop group with this one machine, the workspace with
+// the team. Within a scope the order answers, in turn: what is this → who can
+// use it → how we work in it → what it is connected to. A new setting joins the
+// end of ITS segment, not the end of the column — that is what kept the old
+// order drifting into "newest feature last" (MUL-6232).
 const ACCOUNT_TAB_KEYS = ["profile", "preferences", "shortcuts", "issue", "chat", "notifications", "tokens"] as const;
 const ACCOUNT_TAB_ICONS = {
-  profile: User,
+  // `profile` is the account's General page, so it carries the same gear as
+  // the workspace's General; the group heading above it supplies the scope.
+  profile: Settings,
   preferences: SlidersHorizontal,
   shortcuts: Keyboard,
   issue: ListTodo,
@@ -63,64 +64,74 @@ const ACCOUNT_TAB_ICONS = {
   tokens: Key,
 } as const;
 
-const WORKSPACE_TAB_KEYS = [
-  "general",
-  "repositories",
-  "github",
-  "integrations",
-  "labs",
-  "members",
-  "billing",
-  "labels",
-  "properties",
-  "quick_actions",
-  "mcp",
-  "plugins",
+const WORKSPACE_TAB_SEGMENTS = [
+  ["general", "members", "billing"],
+  ["issue"],
+  ["repositories", "integrations", "mcp", "plugins", "labs"],
 ] as const;
+type WorkspaceTabKey = (typeof WORKSPACE_TAB_SEGMENTS)[number][number];
+
 const WORKSPACE_TAB_VALUES = {
   general: "workspace",
-  repositories: "repositories",
-  github: "github",
-  integrations: "integrations",
-  labs: "labs",
   members: "members",
   billing: "billing",
-  labels: "labels",
-  properties: "properties",
-  quick_actions: "quick-actions",
+  // Not `issue`: that value belongs to the account's Issue tab. Same feature
+  // name in both scopes, two distinct panels, so they need distinct values.
+  issue: "workspace-issue",
+  repositories: "repositories",
+  integrations: "integrations",
   mcp: "mcp",
   plugins: "plugins",
-} as const;
+  labs: "labs",
+} as const satisfies Record<WorkspaceTabKey, string>;
+
 const WORKSPACE_TAB_ICONS = {
   general: Settings,
-  repositories: FolderGit2,
-  github: GitHubMark,
-  integrations: Plug,
-  labs: FlaskConical,
   members: Users,
   billing: CreditCard,
-  labels: Tags,
-  properties: SlidersHorizontal,
-  quick_actions: Zap,
+  issue: ListTodo,
+  repositories: FolderGit2,
+  integrations: Plug,
   mcp: Server,
   plugins: Blocks,
-} as const;
+  labs: FlaskConical,
+} as const satisfies Record<WorkspaceTabKey, React.ComponentType<{ className?: string }>>;
+
+const WORKSPACE_TAB_LABEL_KEYS = {
+  general: "general",
+  members: "members",
+  billing: "billing",
+  issue: "workspace_issue",
+  repositories: "repositories",
+  integrations: "integrations",
+  mcp: "mcp",
+  plugins: "plugins",
+  labs: "labs",
+} as const satisfies Record<WorkspaceTabKey, string>;
 
 const DEFAULT_TAB = "profile";
 const TAB_QUERY_KEY = "tab";
 
 // Legacy `?tab=…` values that have been collapsed into another tab. Old
-// bookmarks still land on the correct surface without us preserving a
-// dead TabsContent entry. Lark used to be its own top-level workspace
-// tab; it now lives inside Integrations.
+// bookmarks and in-app deep links still land on the correct surface without us
+// preserving a dead TabsContent entry. Lark used to be its own top-level
+// workspace tab and now lives inside Integrations; MUL-6232 folded GitHub and
+// the self-hosted providers into Repositories, Composio into MCP, and
+// Labels / Properties / Quick Actions into the workspace Issue tab, which
+// reads the matching section from the same query string.
 const LEGACY_WORKSPACE_TAB_REDIRECTS: Record<string, string> = {
   lark: "integrations",
+  github: "repositories",
+  composio: "mcp",
+  labels: "workspace-issue",
+  properties: "workspace-issue",
+  "quick-actions": "workspace-issue",
 };
 
 const SETTINGS_TAB_TRIGGER_CLASS =
   "h-8 shrink-0 px-2.5 hover:bg-surface-hover data-active:!bg-surface-selected data-active:!text-surface-selected-foreground data-active:hover:!bg-surface-selected md:!w-full md:px-2 md:after:hidden";
 
-export interface ExtraSettingsTab {
+export interface DesktopSettingsTab {
   value: string;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
@@ -128,11 +139,16 @@ export interface ExtraSettingsTab {
 }
 
 interface SettingsPageProps {
-  /** Additional tabs injected by platform (e.g. desktop daemon settings) */
-  extraAccountTabs?: ExtraSettingsTab[];
+  /**
+   * Desktop-only tabs, rendered as their own "Desktop (This Device)" group.
+   * The bar for this group is narrow on purpose: only settings that exist
+   * *because* this is the desktop app. Theme and shortcuts are stored locally
+   * too, but the web app has them as well, so they stay under Account.
+   */
+  desktopTabs?: DesktopSettingsTab[];
 }
 
-export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
+export function SettingsPage({ desktopTabs }: SettingsPageProps = {}) {
   const { t } = useT("settings");
   const workspaceName = useCurrentWorkspace()?.name;
   const navigation = useNavigation();
@@ -143,14 +159,21 @@ export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
     false,
   );
 
-  const visibleWorkspaceTabKeys = React.useMemo(
+  const visibleWorkspaceSegments = React.useMemo(
     () =>
-      WORKSPACE_TAB_KEYS.filter(
-        (key) =>
-          (key !== "plugins" || pluginsEnabled) &&
-          (key !== "billing" || billingEnabled),
-      ),
+      WORKSPACE_TAB_SEGMENTS.map((segment) =>
+        segment.filter(
+          (key) =>
+            (key !== "plugins" || pluginsEnabled) &&
+            (key !== "billing" || billingEnabled) &&
+            (key !== "labs" || LABS_HAS_EXPERIMENTS),
+        ),
+      ).filter((segment) => segment.length > 0),
     [billingEnabled, pluginsEnabled],
+  );
+  const visibleWorkspaceTabKeys = React.useMemo(
+    () => visibleWorkspaceSegments.flat(),
+    [visibleWorkspaceSegments],
   );
 
   // Whitelist of valid tab values; unknown ?tab=… values silently fall back to
@@ -161,9 +184,9 @@ export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
       new Set<string>([
         ...ACCOUNT_TAB_KEYS,
         ...visibleWorkspaceTabKeys.map((key) => WORKSPACE_TAB_VALUES[key]),
-        ...(extraAccountTabs?.map((tab) => tab.value) ?? []),
+        ...(desktopTabs?.map((tab) => tab.value) ?? []),
       ]),
-    [extraAccountTabs, visibleWorkspaceTabKeys],
+    [desktopTabs, visibleWorkspaceTabKeys],
   );
 
   const tabFromUrl = navigation.searchParams.get(TAB_QUERY_KEY);
@@ -182,6 +205,17 @@ export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
     params.set(TAB_QUERY_KEY, next);
     navigation.replace(`${navigation.pathname}?${params.toString()}`);
   };
+
+  const renderTrigger = (
+    value: string,
+    label: string,
+    Icon: React.ComponentType<{ className?: string }>,
+  ) => (
+    <TabsTrigger key={value} value={value} className={SETTINGS_TAB_TRIGGER_CLASS}>
+      <Icon className="h-4 w-4" />
+      {label}
+    </TabsTrigger>
+  );
 
   return (
     <Tabs
@@ -209,59 +243,61 @@ export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
           variant="line"
           className="flex w-max min-w-full flex-row items-center gap-1 p-0 md:w-full md:flex-col md:items-stretch"
         >
-          {/* My Account group */}
+          {/* Account group */}
           <span className="hidden px-2 pb-1 pt-2 text-caption font-medium text-muted-foreground md:block">
-            {t(($) => $.page.my_account)}
+            {t(($) => $.page.groups.account)}
           </span>
-          {ACCOUNT_TAB_KEYS.map((key) => {
-            const Icon = ACCOUNT_TAB_ICONS[key];
-            return (
-              <TabsTrigger
-                key={key}
-                value={key}
-                className={SETTINGS_TAB_TRIGGER_CLASS}
-              >
-                <Icon className="h-4 w-4" />
-                {t(($) => $.page.tabs[key])}
-              </TabsTrigger>
-            );
-          })}
-          {extraAccountTabs?.map((tab) => (
-            <TabsTrigger
-              key={tab.value}
-              value={tab.value}
-              className={SETTINGS_TAB_TRIGGER_CLASS}
-            >
-              <tab.icon className="h-4 w-4" />
-              {tab.label}
-            </TabsTrigger>
-          ))}
+          {ACCOUNT_TAB_KEYS.map((key) =>
+            renderTrigger(key, t(($) => $.page.tabs[key]), ACCOUNT_TAB_ICONS[key]),
+          )}
+
+          {/* Desktop group — absent on web, where the app injects no tabs */}
+          {desktopTabs?.length ? (
+            <>
+              <span className="hidden px-2 pb-1 pt-4 text-caption font-medium text-muted-foreground md:block">
+                {t(($) => $.page.groups.desktop)}
+              </span>
+              {desktopTabs.map((tab) => renderTrigger(tab.value, tab.label, tab.icon))}
+            </>
+          ) : null}
 
           {/* Workspace group */}
           <span className="hidden truncate px-2 pb-1 pt-4 text-caption font-medium text-muted-foreground md:block">
             {workspaceName ?? t(($) => $.page.workspace_fallback)}
           </span>
-          {visibleWorkspaceTabKeys.map((key) => {
-            const Icon = WORKSPACE_TAB_ICONS[key];
-            return (
-              <TabsTrigger
-                key={key}
-                value={WORKSPACE_TAB_VALUES[key]}
-                className={SETTINGS_TAB_TRIGGER_CLASS}
-              >
-                <Icon className="h-4 w-4" />
-                {t(($) => $.page.tabs[key])}
-              </TabsTrigger>
-            );
-          })}
+          {visibleWorkspaceSegments.map((segment, index) => (
+            <React.Fragment key={segment.join("-")}>
+              {/* Segment break. Horizontal-only: at mobile widths this list is
+                  a single scrolling row, where a rule would read as a column
+                  break that isn't there. */}
+              {index > 0 ? (
+                <span
+                  role="presentation"
+                  className="hidden h-px bg-surface-border md:mx-2 md:my-2 md:block"
+                />
+              ) : null}
+              {segment.map((key) =>
+                renderTrigger(
+                  WORKSPACE_TAB_VALUES[key],
+                  t(($) => $.page.tabs[WORKSPACE_TAB_LABEL_KEYS[key]]),
+                  WORKSPACE_TAB_ICONS[key],
+                ),
+              )}
+            </React.Fragment>
+          ))}
         </TabsList>
       </div>
 
       {/* Right content */}
       <div className="min-w-0 flex-1 md:overflow-y-auto">
-        <div className={`mx-auto w-full p-4 sm:p-6 md:p-8 ${activeTab === "labels" || activeTab === "properties" || activeTab === "quick-actions"
-              ? "max-w-5xl"
-              : "max-w-3xl"}`}>
+        {/* The workspace Issue tab is the one management surface here — search,
+            table, row actions — so it gets the wider measure; every other tab
+            is a form and reads better narrow. */}
+        <div
+          className={`mx-auto w-full p-4 sm:p-6 md:p-8 ${
+            activeTab === WORKSPACE_TAB_VALUES.issue ? "max-w-5xl" : "max-w-3xl"
+          }`}
+        >
           <TabsContent value="profile"><AccountTab /></TabsContent>
           <TabsContent value="preferences"><PreferencesTab /></TabsContent>
           <TabsContent value="shortcuts"><KeyboardShortcutsTab /></TabsContent>
@@ -269,23 +305,22 @@ export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
           <TabsContent value="chat"><ChatTab /></TabsContent>
           <TabsContent value="notifications"><NotificationsTab /></TabsContent>
           <TabsContent value="tokens"><TokensTab /></TabsContent>
+          {desktopTabs?.map((tab) => (
+            <TabsContent key={tab.value} value={tab.value}>{tab.content}</TabsContent>
+          ))}
           <TabsContent value="workspace"><WorkspaceTab /></TabsContent>
-          <TabsContent value="repositories"><RepositoriesTab /></TabsContent>
-          <TabsContent value="github"><GitHubTab /></TabsContent>
-          <TabsContent value="integrations"><IntegrationsTab /></TabsContent>
-          <TabsContent value="labs"><LabsTab /></TabsContent>
           <TabsContent value="members"><MembersTab /></TabsContent>
           {billingEnabled ? (
             <TabsContent value="billing"><BillingTab /></TabsContent>
           ) : null}
-          <TabsContent value="labels"><LabelsTab /></TabsContent>
-          <TabsContent value="properties"><PropertiesTab /></TabsContent>
-          <TabsContent value="quick-actions"><QuickActionsTab /></TabsContent>
+          <TabsContent value="workspace-issue"><WorkspaceIssueTab /></TabsContent>
+          <TabsContent value="repositories"><RepositoriesTab /></TabsContent>
+          <TabsContent value="integrations"><IntegrationsTab /></TabsContent>
           <TabsContent value="mcp"><McpTab /></TabsContent>
           {pluginsEnabled ? <TabsContent value="plugins"><PluginsTab /></TabsContent> : null}
-          {extraAccountTabs?.map((tab) => (
-            <TabsContent key={tab.value} value={tab.value}>{tab.content}</TabsContent>
-          ))}
+          {LABS_HAS_EXPERIMENTS ? (
+            <TabsContent value="labs"><LabsTab /></TabsContent>
+          ) : null}
         </div>
       </div>
     </Tabs>

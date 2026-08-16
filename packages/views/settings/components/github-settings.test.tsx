@@ -104,7 +104,7 @@ vi.mock("../../navigation/context", () => ({
     replace: vi.fn(),
     back: vi.fn(),
     pathname: "/acme/settings",
-    searchParams: new URLSearchParams("tab=github"),
+    searchParams: new URLSearchParams("tab=repositories"),
     getShareableUrl: (p: string) => `https://app.example${p}`,
   }),
 }));
@@ -113,7 +113,21 @@ vi.mock("sonner", () => ({
   toast: { success: mockToastSuccess, error: vi.fn() },
 }));
 
-import { GitHubTab } from "./github-tab";
+import { GitHubBehaviorCard, GitHubConnectionCard } from "./github-settings";
+
+/**
+ * Both halves mount together on the Repositories tab, with the repository list
+ * between them; the master switch gates the behavior switches across that gap,
+ * so the tests render the pair.
+ */
+function GitHubSettings() {
+  return (
+    <>
+      <GitHubConnectionCard />
+      <GitHubBehaviorCard />
+    </>
+  );
+}
 
 const TEST_RESOURCES = {
   en: { common: enCommon, settings: enSettings },
@@ -140,11 +154,11 @@ function resetFixtures() {
   installationsRef.current = { installations: [], configured: true, can_manage: true };
 }
 
-describe("GitHubTab", () => {
+describe("GitHub settings", () => {
   beforeEach(resetFixtures);
 
   it("folds the non-dev hint into the master switch description (no separate callout)", () => {
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
     expect(screen.getByText(/Not a development team\? Just turn it off here\./)).toBeTruthy();
     // The old standalone callout (title + dedicated "Turn GitHub off" button) is gone.
     expect(screen.queryByRole("button", { name: /^Turn GitHub off$/ })).toBeNull();
@@ -152,13 +166,13 @@ describe("GitHubTab", () => {
 
   it("does not show the hint once the master switch is off", () => {
     workspaceRef.current.settings = { github_enabled: false };
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
     expect(screen.queryByText(/Not a development team\?/)).toBeNull();
   });
 
   it("disables every feature switch when the master switch is off", () => {
     workspaceRef.current.settings = { github_enabled: false };
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
 
     const master = screen.getByRole("switch", { name: /enable github features/i });
     expect(master.getAttribute("aria-checked")).toBe("false");
@@ -182,7 +196,7 @@ describe("GitHubTab", () => {
       settings: { co_authored_by_enabled: true, github_enabled: false },
     });
 
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
 
     await user.click(screen.getByRole("switch", { name: /enable github features/i }));
 
@@ -205,7 +219,7 @@ describe("GitHubTab", () => {
     };
     mockDeleteInstallation.mockResolvedValue(undefined);
 
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
 
     await user.click(screen.getByRole("button", { name: /^Disconnect$/ }));
     expect(screen.getByText(/Multica will stop receiving webhooks/i)).toBeTruthy();
@@ -228,7 +242,7 @@ describe("GitHubTab", () => {
       can_manage: true,
       installations: [{ id: "inst-1", account_login: "acme", installation_id: 1 }],
     };
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
     expect(screen.getByRole("button", { name: /^Disconnect$/ })).toBeTruthy();
   });
 
@@ -239,7 +253,7 @@ describe("GitHubTab", () => {
       can_manage: false,
       installations: [{ id: "inst-1", account_login: "acme" }],
     };
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
 
     expect(screen.getByText(/Connected to acme/i)).toBeTruthy();
     expect(screen.getByText(/Read-only view\./i)).toBeTruthy();
@@ -254,7 +268,7 @@ describe("GitHubTab", () => {
       can_manage: false,
       installations: [],
     };
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
 
     expect(screen.getByText(/Ask an admin or owner/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^Connect GitHub$/ })).toBeNull();
@@ -273,14 +287,15 @@ describe("GitHubTab", () => {
         },
       ],
     };
-    render(<GitHubTab />, { wrapper: I18nWrapper });
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
     expect(screen.getByText(/Connected by Jiayuan/)).toBeTruthy();
   });
 
-  it("repositories shortcut navigates to the repositories tab", async () => {
-    const user = userEvent.setup();
-    render(<GitHubTab />, { wrapper: I18nWrapper });
-    await user.click(screen.getByRole("button", { name: /Manage repositories/ }));
-    expect(mockNavPush).toHaveBeenCalledWith("/acme/settings?tab=repositories");
+  it("no longer offers a cross-link to Repositories", () => {
+    // Both halves live inside the Repositories tab now (MUL-6232), so the
+    // round-trip link the two tabs used to point at each other is gone.
+    render(<GitHubSettings />, { wrapper: I18nWrapper });
+    expect(screen.queryByRole("button", { name: /Manage repositories/ })).toBeNull();
+    expect(mockNavPush).not.toHaveBeenCalled();
   });
 });

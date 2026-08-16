@@ -2,9 +2,12 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { configStore } from "@multica/core/config";
 import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../../locales/en/common.json";
 import enSettings from "../../locales/en/settings.json";
+
+vi.mock("./vcs-tab", () => ({ VCSTab: () => <div data-testid="vcs-tab" /> }));
 
 const mockUpdateWorkspace = vi.hoisted(() => vi.fn());
 const mockGetGitHubConnectURL = vi.hoisted(() => vi.fn());
@@ -314,7 +317,41 @@ describe("RepositoriesTab — automatic updates", () => {
     expect(screen.queryByRole("button", { name: /Add repository/ })).toBeNull();
   });
 
-  it("starts GitHub connection with the signed repository return target", async () => {
+  it("leaves connecting to the hosting section instead of offering it twice", () => {
+    // Both halves share this page now (MUL-6232). With no installation the
+    // list has nothing to import from, and a second "Connect GitHub" one card
+    // below the first would just be the same action wearing the same label.
+    githubRef.current = {
+      installations: [],
+      configured: true,
+      repository_browse_configured: true,
+      can_manage: true,
+    };
+    render(<RepositoriesTab />, { wrapper: I18nWrapper });
+
+    expect(screen.getAllByRole("button", { name: "Connect GitHub" })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /Choose from GitHub/ })).toBeNull();
+  });
+
+  it("imports from an installation the workspace already has", async () => {
+    const user = setupUser();
+    githubRef.current = {
+      installations: [{ id: "inst-1", account_login: "multica-ai" }],
+      configured: true,
+      repository_browse_configured: true,
+      can_manage: true,
+    };
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    render(<RepositoriesTab />, { wrapper: I18nWrapper });
+
+    await user.click(screen.getByRole("button", { name: /Choose from GitHub/ }));
+
+    expect(screen.getByText("Choose GitHub repositories")).toBeTruthy();
+    expect(mockGetGitHubConnectURL).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("keeps the old signed return target for the install flow", async () => {
     const user = setupUser();
     mockGetGitHubConnectURL.mockResolvedValue({
       configured: true,
@@ -341,14 +378,14 @@ describe("RepositoriesTab — automatic updates", () => {
 
   it("keeps GitHub import disabled when repository browsing is unavailable", () => {
     githubRef.current = {
-      installations: [],
+      installations: [{ id: "inst-1", account_login: "multica-ai" }],
       configured: true,
       repository_browse_configured: false,
       can_manage: true,
     };
     render(<RepositoriesTab />, { wrapper: I18nWrapper });
 
-    const button = screen.getByRole("button", { name: "Connect GitHub" });
+    const button = screen.getByRole("button", { name: /Choose from GitHub/ });
     expect(
       button.hasAttribute("disabled") ||
         button.getAttribute("aria-disabled") === "true",
@@ -467,5 +504,27 @@ describe("RepositoriesTab — automatic updates", () => {
         name: "Choose GitHub repositories",
       }),
     ).toBeNull();
+  });
+
+  // Self-hosted Git moved here from Integrations (MUL-6232): Forgejo / Gitea /
+  // GitLab are hosting platforms, so they belong beside GitHub.
+  it("hides self-hosted Git when the deployment reports it unavailable", () => {
+    configStore
+      .getState()
+      .setAuthConfig({ allowSignup: true, vcsIntegrationAvailable: false });
+
+    render(<RepositoriesTab />, { wrapper: I18nWrapper });
+
+    expect(screen.queryByTestId("vcs-tab")).toBeNull();
+  });
+
+  it("shows self-hosted Git on a deployment that enables it", () => {
+    configStore
+      .getState()
+      .setAuthConfig({ allowSignup: true, vcsIntegrationAvailable: true });
+
+    render(<RepositoriesTab />, { wrapper: I18nWrapper });
+
+    expect(screen.getByTestId("vcs-tab")).toBeTruthy();
   });
 });

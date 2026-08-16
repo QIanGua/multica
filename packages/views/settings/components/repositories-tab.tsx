@@ -51,6 +51,7 @@ import type {
   Workspace,
   WorkspaceRepo,
 } from "@multica/core/types";
+import { useConfigStore } from "@multica/core/config";
 import { useNavigation } from "../../navigation";
 import { useT } from "../../i18n";
 import {
@@ -61,6 +62,8 @@ import {
 } from "./settings-layout";
 import { useAutoSave } from "./use-auto-save";
 import { GitHubMark } from "./github-mark";
+import { GitHubBehaviorCard, GitHubConnectionCard } from "./github-settings";
+import { VCSTab } from "./vcs-tab";
 
 const EMPTY_REPOSITORIES: WorkspaceRepo[] = [];
 
@@ -110,6 +113,10 @@ export function RepositoriesTab() {
   const wsId = useWorkspaceId();
   const queryClient = useQueryClient();
   const navigation = useNavigation();
+  // Self-host-only: the managed cloud omits this from /api/config, so the
+  // whole section stays hidden there rather than showing an operator-only
+  // "missing key" message.
+  const vcsAvailable = useConfigStore((s) => s.vcsIntegrationAvailable);
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const [repositories, setRepositories] = useState<WorkspaceRepo[]>(
     workspace?.repos ?? EMPTY_REPOSITORIES,
@@ -138,7 +145,9 @@ export function RepositoriesTab() {
     () => githubData?.installations ?? [],
     [githubData?.installations],
   );
-  const githubConnectConfigured = githubData?.configured === true;
+  // Whether the deployment can *connect* an App is the Hosting section's
+  // concern; this list only needs to know whether it may browse an existing
+  // installation's repositories.
   const githubBrowseConfigured =
     githubData?.repository_browse_configured === true;
   const githubRepositoriesQuery = useInfiniteQuery({
@@ -362,8 +371,28 @@ export function RepositoriesTab() {
   if (!workspace) return null;
 
   return (
-    <SettingsTab title={t(($) => $.page.tabs.repositories)}>
+    <SettingsTab
+      title={t(($) => $.page.tabs.repositories)}
+      description={t(($) => $.repositories.page_description)}
+    >
+      {/* Hosting first: without a connection there are no repositories to
+          choose from, so the page runs connect → choose → decide what we
+          write back (MUL-6232). */}
       <SettingsSection
+        title={t(($) => $.repositories.section_hosting)}
+        description={t(($) => $.repositories.hosting_description)}
+      >
+        <GitHubConnectionCard />
+      </SettingsSection>
+
+      {vcsAvailable ? (
+        <SettingsSection title={t(($) => $.vcs.section_title)}>
+          <VCSTab />
+        </SettingsSection>
+      ) : null}
+
+      <SettingsSection
+        title={t(($) => $.repositories.section_title)}
         description={t(($) => $.repositories.description)}
         action={
           <SettingsSaveState
@@ -436,30 +465,29 @@ export function RepositoriesTab() {
                   <Plus className="size-3.5" />
                   {t(($) => $.repositories.add)}
                 </Button>
-                <Button
-                  size="sm"
-                  onClick={handleGitHubAction}
-                  disabled={
-                    connectingGitHub ||
-                    !githubBrowseConfigured ||
-                    (!githubConnectConfigured &&
-                      githubInstallations.length === 0)
-                  }
-                  title={
-                    !githubBrowseConfigured
-                      ? t(($) => $.repositories.github_browse_not_configured)
-                      : undefined
-                  }
-                >
-                  {connectingGitHub ? (
-                    <LoaderCircle className="size-3.5 animate-spin" />
-                  ) : (
-                    <GitHubMark className="size-3.5" />
-                  )}
-                  {githubInstallations.length > 0
-                    ? t(($) => $.repositories.choose_from_github)
-                    : t(($) => $.repositories.connect_github)}
-                </Button>
+                {/* Import only. Connecting the App is the Hosting section's
+                    job now that both live on this page — offering it here too
+                    put two "Connect GitHub" buttons one card apart, doing the
+                    same thing (MUL-6232). */}
+                {githubInstallations.length > 0 ? (
+                  <Button
+                    size="sm"
+                    onClick={handleGitHubAction}
+                    disabled={connectingGitHub || !githubBrowseConfigured}
+                    title={
+                      !githubBrowseConfigured
+                        ? t(($) => $.repositories.github_browse_not_configured)
+                        : undefined
+                    }
+                  >
+                    {connectingGitHub ? (
+                      <LoaderCircle className="size-3.5 animate-spin" />
+                    ) : (
+                      <GitHubMark className="size-3.5" />
+                    )}
+                    {t(($) => $.repositories.choose_from_github)}
+                  </Button>
+                ) : null}
               </div>
               {!allUrlsValid ? (
                 <span className="text-caption text-muted-foreground">
@@ -473,6 +501,13 @@ export function RepositoriesTab() {
             </div>
           )}
         </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection
+        title={t(($) => $.github.section_behavior)}
+        description={t(($) => $.github.behavior_description)}
+      >
+        <GitHubBehaviorCard />
       </SettingsSection>
 
       <Dialog

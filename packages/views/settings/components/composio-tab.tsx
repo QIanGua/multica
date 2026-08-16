@@ -17,16 +17,42 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@multica/ui/components/ui/alert-dialog";
-import { api } from "@multica/core/api";
+import { ApiError, api } from "@multica/core/api";
 import {
   composioConnectionsOptions,
   composioKeys,
   composioToolkitsOptions,
 } from "@multica/core/composio";
+import { useFeatureEnabled } from "@multica/core/config";
+import { COMPOSIO_MCP_APPS_FLAG } from "@multica/core/feature-flags";
 import type { ComposioToolkit } from "@multica/core/types";
 import { ComposioToolkitLogo } from "../../common/composio-toolkit-logo";
 import { useT, useTimeAgo } from "../../i18n";
 import { useNavigation } from "../../navigation";
+import { SettingsSection } from "./settings-layout";
+
+/**
+ * Composio, ready to mount: renders nothing unless the flag is on and the
+ * deployment has it configured. The gating lives here rather than in the host
+ * so moving the section — it sits under MCP since MUL-6232, because hosted MCP
+ * apps are the same job as the servers a workspace adds by hand — does not
+ * drag a feature flag and a 503 probe along with it.
+ */
+export function ComposioSection() {
+  const { t } = useT("settings");
+  const enabled = useFeatureEnabled(COMPOSIO_MCP_APPS_FLAG, false);
+  const toolkits = useQuery({ ...composioToolkitsOptions(), enabled });
+  const unconfigured =
+    toolkits.error instanceof ApiError && toolkits.error.status === 503;
+
+  if (!enabled || unconfigured) return null;
+
+  return (
+    <SettingsSection title={t(($) => $.composio.section_title)}>
+      <ComposioTab />
+    </SettingsSection>
+  );
+}
 
 // ComposioTab renders the connectable Composio toolkit catalog and lets the
 // user connect / disconnect the apps their agents can act on.
@@ -86,7 +112,7 @@ export function ComposioTab() {
       toast.error(t(($) => $.composio.toast_connect_failed));
     }
     // Drop only the Composio one-shot params; keep everything else (notably
-    // ?tab=integrations) so the user stays on this tab.
+    // ?tab=mcp) so the user stays on this tab.
     const params = new URLSearchParams(navigation.searchParams);
     params.delete("connected");
     params.delete("error");

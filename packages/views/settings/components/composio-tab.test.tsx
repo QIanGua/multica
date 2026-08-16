@@ -14,7 +14,7 @@ const toolkitsRef = vi.hoisted(() => ({
 const connectionsRef = vi.hoisted(() => ({
   current: { data: [] as ComposioConnection[], isError: false },
 }));
-const searchParamsRef = vi.hoisted(() => ({ current: new URLSearchParams("tab=integrations") }));
+const searchParamsRef = vi.hoisted(() => ({ current: new URLSearchParams("tab=mcp") }));
 
 const mockInvalidate = vi.hoisted(() => vi.fn());
 const mockReplace = vi.hoisted(() => vi.fn());
@@ -97,7 +97,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   toolkitsRef.current = { data: [NOTION], isLoading: false, isError: false };
   connectionsRef.current = { data: [], isError: false };
-  searchParamsRef.current = new URLSearchParams("tab=integrations");
+  searchParamsRef.current = new URLSearchParams("tab=mcp");
 });
 
 describe("ComposioTab", () => {
@@ -161,27 +161,27 @@ describe("ComposioTab", () => {
   });
 
   it("toasts success and clears the ?connected param on a successful callback", async () => {
-    searchParamsRef.current = new URLSearchParams("tab=integrations&connected=notion");
+    searchParamsRef.current = new URLSearchParams("tab=mcp&connected=notion");
     renderTab();
     await waitFor(() => {
       expect(mockToastSuccess).toHaveBeenCalledWith(enSettings.composio.toast_connected);
     });
     expect(mockInvalidate).toHaveBeenCalledWith({ queryKey: ["composio", "connections"] });
     // The one-shot param is stripped while ?tab is preserved.
-    expect(mockReplace).toHaveBeenCalledWith("/acme/settings?tab=integrations");
+    expect(mockReplace).toHaveBeenCalledWith("/acme/settings?tab=mcp");
   });
 
   it("toasts error on a failed callback", async () => {
-    searchParamsRef.current = new URLSearchParams("tab=integrations&error=composio_connect_failed");
+    searchParamsRef.current = new URLSearchParams("tab=mcp&error=composio_connect_failed");
     renderTab();
     await waitFor(() => {
       expect(mockToastError).toHaveBeenCalledWith(enSettings.composio.toast_connect_failed);
     });
-    expect(mockReplace).toHaveBeenCalledWith("/acme/settings?tab=integrations");
+    expect(mockReplace).toHaveBeenCalledWith("/acme/settings?tab=mcp");
   });
 
   it("fires the success callback exactly once under StrictMode double-invoke", async () => {
-    searchParamsRef.current = new URLSearchParams("tab=integrations&connected=notion");
+    searchParamsRef.current = new URLSearchParams("tab=mcp&connected=notion");
     renderTabStrict();
     await waitFor(() => {
       expect(mockToastSuccess).toHaveBeenCalled();

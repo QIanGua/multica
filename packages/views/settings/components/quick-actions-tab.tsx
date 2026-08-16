@@ -62,7 +62,6 @@ import {
 import { cn } from "@multica/ui/lib/utils";
 import { AgentPicker } from "../../autopilots/components/pickers/agent-picker";
 import { useT } from "../../i18n";
-import { SettingsTab } from "./settings-layout";
 
 // Quick Actions catalog (MUL-5465).
 //
@@ -185,7 +184,7 @@ function toFormState(action: QuickAction): FormState {
   };
 }
 
-export function QuickActionsTab() {
+export function QuickActionsPanel() {
   const { t } = useT("settings");
   const wsId = useWorkspaceId();
   const { data: actions = [], isLoading } = useQuery(quickActionListOptions(wsId, true));
@@ -244,10 +243,7 @@ export function QuickActionsTab() {
   };
 
   return (
-    <SettingsTab
-      title={t(($) => $.quick_actions.title)}
-      description={t(($) => $.quick_actions.description)}
-    >
+    <>
       <div className="space-y-5">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="relative w-full sm:max-w-sm">
@@ -429,7 +425,7 @@ export function QuickActionsTab() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </SettingsTab>
+    </>
   );
 }
 

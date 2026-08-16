@@ -33,6 +33,8 @@ vi.mock("@tanstack/react-query", () => ({
   useQuery: () => ({ data: data.servers, isLoading: data.isLoading }),
 }));
 
+vi.mock("./composio-tab", () => ({ ComposioSection: () => null }));
+
 vi.mock("@multica/core/workspace/queries", () => ({
   workspaceMcpServersOptions: () => ({ queryKey: ["workspaces", "workspace-1", "mcp-servers"] }),
 }));

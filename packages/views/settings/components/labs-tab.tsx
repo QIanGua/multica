@@ -11,9 +11,20 @@ import {
 import { useT } from "../../i18n";
 import { SettingsCard, SettingsTab } from "./settings-layout";
 
-// The Co-authored-by trailer toggle moved into the dedicated GitHub Settings
-// tab (see github-tab.tsx). Labs is kept as a container for future
-// experimental flags rather than removed from the IA.
+// The Co-authored-by trailer toggle moved in with the rest of the GitHub
+// settings (see github-settings.tsx). Labs stays as the container for future
+// experimental flags rather than being removed from the IA.
+
+/**
+ * Whether Labs has anything in it. There are no experiments today, so the
+ * settings nav omits the entry entirely rather than offering a route to an
+ * empty page (MUL-6232). Add the first experiment below and flip this.
+ *
+ * Typed `boolean` rather than left as the `false` literal so the tab it gates
+ * does not read as statically unreachable.
+ */
+export const LABS_HAS_EXPERIMENTS: boolean = false;
+
 export function LabsTab() {
   const { t } = useT("settings");
   return (

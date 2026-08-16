@@ -188,10 +188,10 @@
   },
   "page": {
     "title": "설정",
-    "my_account": "내 계정",
+    "groups": { "account": "계정", "desktop": "데스크톱(이 기기)" },
     "workspace_fallback": "워크스페이스",
     "tabs": {
-      "profile": "프로필",
+      "profile": "일반",
       "preferences": "환경설정",
       "shortcuts": "단축키",
       "issue": "태스크",
@@ -199,14 +199,11 @@
       "notifications": "알림",
       "tokens": "API 토큰",
       "general": "일반",
+      "workspace_issue": "태스크",
       "repositories": "저장소",
-      "github": "GitHub",
       "integrations": "연동",
       "labs": "실험실",
       "members": "멤버",
-      "labels": "레이블",
-      "properties": "속성",
-      "quick_actions": "퀵 액션",
     "plugins": "Plugins",
     "mcp": "MCP",
     "billing": "결제 및 요금제"
@@ -606,16 +603,13 @@
     "toast_failed": "설정을 업데이트하지 못했습니다"
   },
   "github": {
-    "page_description": "GitHub App을 연결하고, Pull request가 Multica 안에서 표시되는 방식을 제어하며, 에이전트가 커밋 기록에 남기는 정보를 설정합니다.",
+    "connection_hint": "태스크를 Pull request에 연결합니다. 브랜치·제목·본문에 MUL-123이 포함된 PR이 머지되면 해당 태스크가 「완료」로 바뀝니다.",
+    "section_behavior": "GitHub 동작",
+    "behavior_description": "Pull request가 Multica에 어떻게 나타나는지, 에이전트가 커밋 기록에 무엇을 남기는지 결정합니다.",
     "section_master": "GitHub 기능 사용",
     "master_description_on": "끄면 모든 GitHub UI가 숨겨지고 새로운 부수 효과가 기록되지 않습니다. 기존 데이터는 백엔드에 유지됩니다. 개발팀이 아니라면 여기서 끄면 됩니다.",
     "master_description_off": "GitHub 기능이 꺼져 있습니다. PR 사이드바, Co-authored-by 트레일러, 자동 연결이 일시 중지됩니다. 백엔드 데이터는 삭제되지 않습니다.",
-    "section_connection": "연결",
     "connection_title": "GitHub App",
-    "connection_description_prefix": "태스크를 Pull request에 자동으로 연결합니다. 브랜치, 제목 또는 본문에",
-    "connection_description_suffix": "이(가) 있는 PR이 병합되면 해당 태스크가",
-    "connection_description_done": "완료",
-    "connection_identifier_example": "MUL-123",
     "connected_to": "{{login}}에 연결됨",
     "connect_github": "GitHub 연결",
     "connect_opening": "여는 중...",
@@ -635,7 +629,6 @@
     "toast_open_failed": "GitHub 설치 화면을 열지 못했습니다",
     "toast_disconnect_failed": "GitHub App 연결을 해제하지 못했습니다",
     "toast_disconnected": "GitHub App 연결을 해제했습니다",
-    "section_features": "기능",
     "feature_pr_sidebar_label": "Pull request 사이드바",
     "feature_pr_sidebar_description": "연결된 Pull request를 태스크 상세 사이드바에 표시합니다.",
     "feature_co_author_label": "Co-authored-by 트레일러",
@@ -643,9 +636,6 @@
     "feature_co_author_description_suffix": "을(를) 추가합니다.",
     "feature_auto_link_label": "태스크와 PR 자동 연결",
     "feature_auto_link_description": "PR 제목, 본문, 브랜치 이름을 태스크 식별자와 대조해 자동으로 연결합니다.",
-    "section_repositories": "저장소",
-    "repositories_shortcut_label": "저장소 URL은 저장소 탭에 있습니다",
-    "repositories_shortcut_link": "저장소 관리 →",
     "toast_failed": "GitHub 설정을 업데이트하지 못했습니다"
   },
   "vcs": {
@@ -690,6 +680,9 @@
     "toast_rotate_failed": "Could not regenerate webhook secret"
   },
   "repositories": {
+    "page_description": "이 워크스페이스가 작업하는 Git 저장소와 저장소를 호스팅하는 플랫폼입니다. 에이전트는 여기서 클론해 작업합니다.",
+    "section_hosting": "호스팅",
+    "hosting_description": "연결하면 해당 플랫폼에서 저장소를 고를 수 있고, Pull request도 태스크에 미러링됩니다.",
     "section_title": "저장소",
     "description": "이 워크스페이스와 연결된 Git 저장소입니다. 에이전트는 이 저장소를 클론해 코드 작업을 합니다.",
     "url_placeholder": "https://git.example.com/org/repo.git 또는 git@git.example.com:org/repo.git",
@@ -1044,5 +1037,11 @@
     "byo_credentials_unverifiable": "WeCom에 연결하지 못해 이 봇을 확인할 수 없었어요. 인증 정보는 변경되지 않았어요. 잠시 후 다시 시도해 주세요.",
     "byo_install_failed": "봇을 저장하지 못했어요. 저희 쪽 문제입니다. 인증 정보는 변경되지 않았어요. 다시 시도해 보시고, 계속 실패하면 지원팀에 문의해 주세요.",
     "byo_failed_toast": "WeCom 봇을 연결하지 못했어요"
+  },
+  "workspace_issue": {
+    "description": "속성, 레이블, 퀵 액션은 모두 이 워크스페이스의 태스크에 적용됩니다. 내 생성 폼에 표시할 필드는 「계정 › 태스크」에서 바꿉니다."
+  },
+  "integrations": {
+    "page_description": "팀이 평소 대화하는 플랫폼에 워크스페이스를 연결합니다. 에이전트가 그곳에서 메시지를 받고 스레드에 답합니다."
   }
 }

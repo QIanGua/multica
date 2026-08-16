@@ -188,10 +188,10 @@
   },
   "page": {
     "title": "设置",
-    "my_account": "我的账号",
+    "groups": { "account": "账号", "desktop": "桌面端（本机）" },
     "workspace_fallback": "工作区",
     "tabs": {
-      "profile": "个人资料",
+      "profile": "常规",
       "preferences": "偏好设置",
       "shortcuts": "快捷键",
       "issue": "任务",
@@ -199,14 +199,11 @@
       "notifications": "通知",
       "tokens": "API Token",
       "general": "常规",
+      "workspace_issue": "任务",
       "repositories": "代码仓库",
-      "github": "GitHub",
       "integrations": "集成",
       "labs": "实验室",
       "members": "成员",
-      "labels": "标签",
-      "properties": "属性",
-      "quick_actions": "快捷操作",
     "plugins": "Plugins",
     "mcp": "MCP",
     "billing": "账单与套餐"
@@ -606,16 +603,13 @@
     "toast_failed": "更新设置失败"
   },
   "github": {
-    "page_description": "连接 GitHub App、控制 Pull Request 如何出现在 Multica 中，并决定智能体在 commit 记录里留下哪些痕迹。",
+    "connection_hint": "把任务关联到 Pull Request：当 PR 的分支、标题或正文中包含 MUL-123 并被合并时，对应的任务会自动转为「已完成」。",
+    "section_behavior": "GitHub 行为",
+    "behavior_description": "决定 Pull Request 如何出现在 Multica 里，以及智能体在 commit 记录中留下什么。",
     "section_master": "启用 GitHub 功能",
     "master_description_on": "关闭后，所有 GitHub 入口都会被隐藏，也不再产生新的副作用。后台已有数据不会被删除。团队不使用 GitHub？在这里直接关掉即可。",
     "master_description_off": "GitHub 功能已关闭。PR 侧栏、Co-authored-by trailer 与自动关联都已暂停。后台数据未删除。",
-    "section_connection": "连接",
     "connection_title": "GitHub App",
-    "connection_description_prefix": "自动把任务关联到 Pull Request。当 PR 的分支、标题或正文中包含",
-    "connection_description_suffix": "并被合并时，对应的任务会自动转为",
-    "connection_description_done": "已完成",
-    "connection_identifier_example": "MUL-123",
     "connected_to": "已连接到 {{login}}",
     "connect_github": "连接 GitHub",
     "connect_opening": "正在打开…",
@@ -635,7 +629,6 @@
     "toast_open_failed": "打开 GitHub 安装页失败",
     "toast_disconnect_failed": "断开 GitHub App 失败",
     "toast_disconnected": "已断开 GitHub App",
-    "section_features": "功能",
     "feature_pr_sidebar_label": "Pull Request 侧栏",
     "feature_pr_sidebar_description": "在任务详情侧栏中展示关联的 Pull Request。",
     "feature_co_author_label": "Co-authored-by trailer",
@@ -643,9 +636,6 @@
     "feature_co_author_description_suffix": "。",
     "feature_auto_link_label": "任务 ↔ PR 自动关联",
     "feature_auto_link_description": "根据 PR 标题、正文和分支名匹配任务编号并自动建立链接。",
-    "section_repositories": "代码仓库",
-    "repositories_shortcut_label": "仓库 URL 仍在\"代码仓库\"标签页中管理",
-    "repositories_shortcut_link": "前往管理 →",
     "toast_failed": "更新 GitHub 设置失败"
   },
   "vcs": {
@@ -941,6 +931,9 @@
     "byo_failed_toast": "无法连接企业微信机器人"
   },
   "repositories": {
+    "page_description": "这个工作区要处理的 Git 仓库，以及它们所在的托管平台。智能体会从这里 clone 代码并完成工作。",
+    "section_hosting": "托管平台",
+    "hosting_description": "连接后可以直接从平台选仓库，Pull Request 也会镜像回任务。",
     "section_title": "代码仓库",
     "description": "与该工作区关联的 Git 仓库。智能体会从这里 clone 代码并完成工作。",
     "url_placeholder": "https://git.example.com/org/repo.git 或 git@git.example.com:org/repo.git",
@@ -1044,5 +1037,11 @@
         "description": "创建并处理任务"
       }
     }
+  },
+  "workspace_issue": {
+    "description": "属性、标签、快捷操作都作用在这个工作区的任务上，在这里统一管理。想改自己创建任务时显示哪些字段，去「账号 › 任务」。"
+  },
+  "integrations": {
+    "page_description": "把工作区接到团队日常沟通的地方。智能体在这些平台上接收消息、回复讨论。"
   }
 }

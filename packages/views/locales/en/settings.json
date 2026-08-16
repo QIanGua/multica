@@ -188,10 +188,10 @@
   },
   "page": {
     "title": "Settings",
-    "my_account": "My Account",
+    "groups": { "account": "Account", "desktop": "Desktop (This Device)" },
     "workspace_fallback": "Workspace",
     "tabs": {
-      "profile": "Profile",
+      "profile": "General",
       "preferences": "Preferences",
       "shortcuts": "Shortcuts",
       "issue": "Issue",
@@ -199,14 +199,11 @@
       "notifications": "Notifications",
       "tokens": "API Tokens",
       "general": "General",
+      "workspace_issue": "Issue",
       "repositories": "Repositories",
-      "github": "GitHub",
       "integrations": "Integrations",
       "labs": "Labs",
       "members": "Members",
-      "labels": "Labels",
-      "properties": "Properties",
-      "quick_actions": "Quick Actions",
     "plugins": "Plugins",
     "mcp": "MCP",
     "billing": "Billing"
@@ -607,16 +604,13 @@
     "toast_failed": "Failed to update setting"
   },
   "github": {
-    "page_description": "Connect a GitHub App, control how Pull Requests show up inside Multica, and decide what your agents leave behind in commit history.",
+    "connection_hint": "Links issues to pull requests: when a PR whose branch, title, or body mentions MUL-123 is merged, that issue moves to Done.",
+    "section_behavior": "GitHub behavior",
+    "behavior_description": "How pull requests show up in Multica, and what agents leave behind in the commit history.",
     "section_master": "Enable GitHub features",
     "master_description_on": "When off, every GitHub UI affordance is hidden and no new side-effects are written. Existing data is kept on the backend. Not a development team? Just turn it off here.",
     "master_description_off": "GitHub features are turned off. The PR sidebar, co-author trailer, and auto-link are paused. Data on the backend is not deleted.",
-    "section_connection": "Connection",
     "connection_title": "GitHub App",
-    "connection_description_prefix": "Link issues to pull requests automatically. When a PR with",
-    "connection_description_suffix": "in its branch, title, or body is merged, the corresponding issue moves to",
-    "connection_description_done": "Done",
-    "connection_identifier_example": "MUL-123",
     "connected_to": "Connected to {{login}}",
     "connect_github": "Connect GitHub",
     "connect_opening": "Opening…",
@@ -636,7 +630,6 @@
     "toast_open_failed": "Failed to open GitHub install",
     "toast_disconnect_failed": "Failed to disconnect GitHub App",
     "toast_disconnected": "GitHub App disconnected",
-    "section_features": "Features",
     "feature_pr_sidebar_label": "Pull Request sidebar",
     "feature_pr_sidebar_description": "Show linked pull requests inside the issue detail sidebar.",
     "feature_co_author_label": "Co-authored-by trailer",
@@ -644,9 +637,6 @@
     "feature_co_author_description_suffix": "to commits authored by agents.",
     "feature_auto_link_label": "Auto-link issues and PRs",
     "feature_auto_link_description": "Match PR titles, bodies, and branch names against issue identifiers and create the link automatically.",
-    "section_repositories": "Repositories",
-    "repositories_shortcut_label": "Repository URLs live in the Repositories tab",
-    "repositories_shortcut_link": "Manage repositories →",
     "toast_failed": "Failed to update GitHub settings"
   },
   "vcs": {
@@ -942,6 +932,9 @@
     "byo_failed_toast": "Could not connect the WeCom bot"
   },
   "repositories": {
+    "page_description": "The Git repositories this workspace works on, and the platforms hosting them. Agents clone from here to do their work.",
+    "section_hosting": "Hosting",
+    "hosting_description": "Connect a platform to pick repositories from it and mirror its pull requests back onto issues.",
     "section_title": "Repositories",
     "description": "Git repositories associated with this workspace. Agents use these to clone and work on code.",
     "url_placeholder": "https://git.example.com/org/repo.git or git@git.example.com:org/repo.git",
@@ -1045,5 +1038,11 @@
         "description": "Create and work on issues"
       }
     }
+  },
+  "workspace_issue": {
+    "description": "Properties, labels, and quick actions all apply to issues in this workspace. To change which fields your own create form shows, go to Account › Issue."
+  },
+  "integrations": {
+    "page_description": "Connect the workspace to the platforms your team talks on. Agents read messages and reply to threads there."
   }
 }

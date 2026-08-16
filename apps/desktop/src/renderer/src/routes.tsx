@@ -38,15 +38,16 @@ import { WorkspaceRouteLayout } from "./components/workspace-route-layout";
 import { DesktopRouteErrorPage } from "./components/route-error-page";
 
 /**
- * Wraps `SettingsPage` so the desktop-only extra tabs can pull their labels
- * from i18n. The route element has to be a component (not a literal JSX
- * value) for `useT` to run.
+ * Wraps `SettingsPage` so the desktop-only tabs can pull their labels from
+ * i18n. The route element has to be a component (not a literal JSX value) for
+ * `useT` to run. These render as their own "Desktop (This Device)" nav group:
+ * only settings that exist because this is the desktop app belong here.
  */
 function DesktopSettingsRoute() {
   const { t } = useT("settings");
   return (
     <SettingsPage
-      extraAccountTabs={[
+      desktopTabs={[
         {
           value: "daemon",
           label: "Daemon",

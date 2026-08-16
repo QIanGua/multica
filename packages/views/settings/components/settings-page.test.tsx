@@ -22,16 +22,19 @@ vi.mock("./tokens-tab", stub("TokensTab"));
 vi.mock("./workspace-tab", stub("WorkspaceTab"));
 vi.mock("./members-tab", stub("MembersTab"));
 vi.mock("./repositories-tab", stub("RepositoriesTab"));
-vi.mock("./github-tab", stub("GitHubTab"));
 vi.mock("./integrations-tab", stub("IntegrationsTab"));
-vi.mock("./labs-tab", stub("LabsTab"));
 vi.mock("./notifications-tab", stub("NotificationsTab"));
-vi.mock("./labels-tab", stub("LabelsTab"));
-vi.mock("./properties-tab", stub("PropertiesTab"));
-vi.mock("./quick-actions-tab", stub("QuickActionsTab"));
+vi.mock("./workspace-issue-tab", stub("WorkspaceIssueTab"));
 vi.mock("./keyboard-shortcuts-tab", stub("KeyboardShortcutsTab"));
 vi.mock("./plugins-tab", stub("PluginsTab"));
+vi.mock("./mcp-tab", stub("McpTab"));
 vi.mock("./billing-tab", stub("BillingTab"));
+// Labs is gated on a real exported constant, so it is stubbed by hand rather
+// than through `stub()`.
+vi.mock("./labs-tab", () => ({
+  LabsTab: () => <div>LabsTab</div>,
+  LABS_HAS_EXPERIMENTS: false,
+}));
 
 vi.mock("@multica/core/paths", () => ({
   useCurrentWorkspace: () => ({ name: "Acme" }),
@@ -161,5 +164,77 @@ describe("SettingsPage workspace subscription feature flag", () => {
 
     expect(screen.getByRole("tab", { name: "Billing" })).toBeInTheDocument();
     expect(screen.getByText("BillingTab")).toBeInTheDocument();
+  });
+});
+
+describe("SettingsPage information architecture", () => {
+  it("groups the nav by scope: account, then workspace", () => {
+    renderWithI18n(<SettingsPage />);
+
+    expect(screen.getByText("Account")).toBeInTheDocument();
+    expect(screen.getByText("Acme")).toBeInTheDocument();
+    // No desktop tabs were injected, so that group must not announce itself.
+    expect(screen.queryByText("Desktop (This Device)")).not.toBeInTheDocument();
+  });
+
+  it("gives the desktop app its own group instead of appending to Account", () => {
+    renderWithI18n(
+      <SettingsPage
+        desktopTabs={[
+          {
+            value: "daemon",
+            label: "Daemon",
+            icon: () => <span />,
+            content: <div>DaemonTab</div>,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Desktop (This Device)")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Daemon" })).toBeInTheDocument();
+  });
+
+  it("hides Labs while it has no experiments", () => {
+    // An entry that leads to an empty page is worse than no entry (MUL-6232).
+    navigationState.search = "tab=labs";
+
+    renderWithI18n(<SettingsPage />);
+
+    expect(screen.queryByRole("tab", { name: "Labs" })).not.toBeInTheDocument();
+    expect(screen.queryByText("LabsTab")).not.toBeInTheDocument();
+    expect(screen.getByText("AccountTab")).toBeInTheDocument();
+  });
+});
+
+describe("SettingsPage collapsed tab redirects", () => {
+  it.each([
+    ["tab=github", "RepositoriesTab"],
+    ["tab=composio", "McpTab"],
+    ["tab=lark", "IntegrationsTab"],
+    ["tab=labels", "WorkspaceIssueTab"],
+    ["tab=properties", "WorkspaceIssueTab"],
+    ["tab=quick-actions", "WorkspaceIssueTab"],
+  ])("sends a %s bookmark to %s", (search, expected) => {
+    navigationState.search = search;
+
+    renderWithI18n(<SettingsPage />);
+
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+
+  it("keeps the account Issue tab distinct from the workspace one", () => {
+    // Both are called "Issue"; only the query value tells them apart.
+    navigationState.search = "tab=issue";
+    renderWithI18n(<SettingsPage />);
+    expect(screen.getByText("IssueTab")).toBeInTheDocument();
+    expect(screen.queryByText("WorkspaceIssueTab")).not.toBeInTheDocument();
+  });
+
+  it("mounts the workspace Issue tab under its own value", () => {
+    navigationState.search = "tab=workspace-issue";
+    renderWithI18n(<SettingsPage />);
+    expect(screen.getByText("WorkspaceIssueTab")).toBeInTheDocument();
+    expect(screen.queryByText("IssueTab")).not.toBeInTheDocument();
   });
 });

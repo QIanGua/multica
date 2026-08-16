@@ -43,7 +43,6 @@ import {
 import { cn } from "@multica/ui/lib/utils";
 import { ColorPicker, COLOR_PICKER_PRESETS } from "../../common/color-picker";
 import { useT } from "../../i18n";
-import { SettingsTab } from "./settings-layout";
 
 /**
  * Label scopes this settings tab manages. Narrower than `LabelResourceType`:
@@ -66,7 +65,7 @@ const EMPTY_DRAFT: LabelDraft = {
   color: COLOR_PICKER_PRESETS[6],
 };
 
-export function LabelsTab() {
+export function LabelsPanel() {
   const { t } = useT("settings");
   const wsId = useWorkspaceId();
 
@@ -92,10 +91,7 @@ export function LabelsTab() {
   const scopeLabel = t(($) => $.labels.scopes[resourceType]);
 
   return (
-    <SettingsTab
-      title={t(($) => $.labels.title)}
-      description={t(($) => $.labels.description)}
-    >
+    <>
       <div className="space-y-5">
         <div className="flex flex-wrap items-center gap-2 border-b border-surface-border pb-3">
           {RESOURCE_TYPES.map((type) => (
@@ -231,7 +227,7 @@ export function LabelsTab() {
         label={pendingDelete}
         onClose={() => setPendingDelete(null)}
       />
-    </SettingsTab>
+    </>
   );
 }
 

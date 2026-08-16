@@ -77,7 +77,6 @@ import {
   PropertyIconPicker,
 } from "../../common/property-icon";
 import { useT } from "../../i18n";
-import { SettingsTab } from "./settings-layout";
 
 const MAX_ACTIVE_PROPERTIES = 20;
 
@@ -107,7 +106,7 @@ function typeHasOptions(type: string): boolean {
   return type === "select" || type === "multi_select";
 }
 
-export function PropertiesTab() {
+export function PropertiesPanel() {
   const { t } = useT("settings");
   const wsId = useWorkspaceId();
   const user = useAuthStore((s) => s.user);
@@ -137,10 +136,7 @@ export function PropertiesTab() {
   }, [properties, query, showArchived]);
 
   return (
-    <SettingsTab
-      title={t(($) => $.properties.title)}
-      description={t(($) => $.properties.description)}
-    >
+    <>
       <div className="space-y-5">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="relative w-full sm:max-w-sm">
@@ -325,7 +321,7 @@ export function PropertiesTab() {
         property={pendingArchive}
         onClose={() => setPendingArchive(null)}
       />
-    </SettingsTab>
+    </>
   );
 }
 

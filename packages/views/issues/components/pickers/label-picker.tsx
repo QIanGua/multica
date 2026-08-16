@@ -198,7 +198,7 @@ export function LabelPicker({
 
   const openManage = () => {
     setOpen(false);
-    navigation.push(`${paths.settings()}?tab=labels`);
+    navigation.push(`${paths.settings()}?tab=workspace-issue&section=labels`);
   };
 
   const hasLabels = selectedLabels.length > 0;

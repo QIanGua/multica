@@ -185,7 +185,8 @@ describe("AgentMcpTab", () => {
 
     expect(screen.getByText(/No connected apps yet/i)).toBeTruthy();
     const link = screen.getByTestId("app-link");
-    expect(link.getAttribute("href")).toBe("/ws/settings?tab=integrations");
+    // Composio moved from Integrations to MCP (MUL-6232).
+    expect(link.getAttribute("href")).toBe("/ws/settings?tab=mcp");
   });
 
   it("renders a defensive hidden state when the allowlist is redacted", () => {
