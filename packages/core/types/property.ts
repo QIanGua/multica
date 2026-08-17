@@ -111,6 +111,19 @@ export function actorRefsFromValue(value: IssuePropertyValue | undefined): Issue
   return [];
 }
 
+/**
+ * True when an actor value holds at least one reference this build cannot
+ * parse — i.e. a newer backend has widened the accepted kinds.
+ *
+ * Editors must consult this before offering a normal edit. For `multi_actor`
+ * the toggle already round-trips unknown entries, but for single `actor` an
+ * unresolvable value renders as empty, and letting the user "fill in the empty
+ * field" would overwrite a value they were never shown (MUL-6286 review).
+ */
+export function hasUnknownActorRef(value: IssuePropertyValue | undefined): boolean {
+  return actorRefValuesFromValue(value).length !== actorRefsFromValue(value).length;
+}
+
 export interface IssuePropertyOption {
   id: string;
   name: string;

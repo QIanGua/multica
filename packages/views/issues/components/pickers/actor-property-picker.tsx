@@ -143,9 +143,10 @@ export function ActorPropertyPicker({
 
 /**
  * Read-only rendering of an actor property value: avatar + name per reference.
- * Falls back to the empty label when nothing resolves, so a value referencing
- * a member who has since left the workspace degrades to the same shape as an
- * unset property rather than rendering a dangling id.
+ *
+ * A value holding only references this build cannot parse renders as
+ * "unavailable", NOT as empty — showing it as empty would invite the user to
+ * "fill in" a field that already has a value they cannot see.
  */
 export function ActorPropertyDisplay({
   value,
@@ -154,9 +155,19 @@ export function ActorPropertyDisplay({
   value: IssuePropertyValue | undefined;
   emptyLabel: React.ReactNode;
 }) {
+  const { t } = useT("issues");
   const { getActorName } = useActorName();
   const refs = actorRefsFromValue(value);
-  if (refs.length === 0) return <>{emptyLabel}</>;
+  if (refs.length === 0) {
+    if (actorRefValuesFromValue(value).length > 0) {
+      return (
+        <span className="text-muted-foreground">
+          {t(($) => $.pickers.custom_property.unknown_value)}
+        </span>
+      );
+    }
+    return <>{emptyLabel}</>;
+  }
   return (
     <span className="flex min-w-0 flex-wrap items-center gap-1">
       {refs.map((ref) => (

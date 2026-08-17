@@ -1171,6 +1171,9 @@ func TestResolveAssignee(t *testing.T) {
 	}
 	agentsResp := []map[string]any{
 		{"id": "agent-3333", "name": "CodeBot"},
+		// Deliberate collision: this agent's NAME contains Alice's email, so
+		// the substring path would match it. Email must still win outright.
+		{"id": "agent-5555", "name": "Mailer for alice@example.com"},
 	}
 	squadsResp := []map[string]any{
 		{"id": "squad-4444", "name": "Super Human"},
@@ -1236,7 +1239,9 @@ func TestResolveAssignee(t *testing.T) {
 	})
 
 	// An email beats a substring collision on someone else's name, because it
-	// is ranked with id matches rather than with name matches.
+	// is ranked with id matches rather than with name matches. agentsResp
+	// carries an agent whose name embeds this exact email, so without the
+	// ranking this resolves to that agent (or errors as ambiguous).
 	t.Run("email outranks a name substring match", func(t *testing.T) {
 		aType, aID, err := resolveAssignee(ctx, client, "alice@example.com", issueAssigneeKinds)
 		if err != nil {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   actorRefsFromValue,
   actorRefValuesFromValue,
+  hasUnknownActorRef,
   formatActorRef,
   isActorPropertyType,
   isKnownPropertyType,
@@ -110,5 +111,26 @@ describe("actorRefValuesFromValue", () => {
     expect(actorRefValuesFromValue(undefined)).toEqual([]);
     expect(actorRefValuesFromValue(true)).toEqual([]);
     expect(actorRefValuesFromValue(7)).toEqual([]);
+  });
+});
+
+describe("hasUnknownActorRef", () => {
+  it("is true for a single value this build cannot parse", () => {
+    expect(hasUnknownActorRef(`agent:${AGENT}`)).toBe(true);
+    expect(hasUnknownActorRef("garbage")).toBe(true);
+  });
+
+  it("is true when a multi value mixes known and unknown kinds", () => {
+    expect(hasUnknownActorRef([`member:${MEMBER}`, `agent:${AGENT}`])).toBe(true);
+  });
+
+  it("is false for values made entirely of known kinds", () => {
+    expect(hasUnknownActorRef(`member:${MEMBER}`)).toBe(false);
+    expect(hasUnknownActorRef([`member:${MEMBER}`, `member:${SECOND_MEMBER}`])).toBe(false);
+  });
+
+  it("is false for an unset value — nothing to lose", () => {
+    expect(hasUnknownActorRef(undefined)).toBe(false);
+    expect(hasUnknownActorRef([])).toBe(false);
   });
 });

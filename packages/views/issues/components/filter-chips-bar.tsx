@@ -75,6 +75,28 @@ function IconStack({ children }: { children: ReactNode[] }) {
 }
 
 /**
+ * Name lookup for chip values, keyed the way filters actually store actors.
+ *
+ * Members are keyed by `user_id`, NOT by the membership row id: every actor
+ * filter value — assignee, creator, and actor properties — carries the user
+ * id. Keying by `Member.id` silently resolved nothing (MUL-6286 review).
+ *
+ * Returns undefined for anything unresolved so the caller can omit it, rather
+ * than rendering a placeholder like "Unknown".
+ */
+export function buildChipActorNames(
+  members: readonly { user_id: string; name: string }[],
+  agents: readonly { id: string; name: string }[],
+  squads: readonly { id: string; name: string }[],
+): (actor: ActorFilterValue) => string | undefined {
+  const byKey = new Map<string, string>();
+  for (const m of members) byKey.set(`member:${m.user_id}`, m.name);
+  for (const a of agents) byKey.set(`agent:${a.id}`, a.name);
+  for (const s of squads) byKey.set(`squad:${s.id}`, s.name);
+  return (actor: ActorFilterValue) => byKey.get(`${actor.type}:${actor.id}`);
+}
+
+/**
  * Actor-property filter values ("member:<uuid>") as actor refs, for the avatar
  * stack. Unparseable entries drop out — the chip degrades to fewer avatars
  * rather than rendering a broken one.
@@ -214,15 +236,10 @@ function useFilterChips(
     ...labelListOptions(wsId),
     enabled: enabled && labelFilters.length > 0,
   });
-  const actorName = useMemo(() => {
-    const byKey = new Map<string, string>();
-    // Keyed by user_id: every actor filter value (assignee, creator, and now
-    // actor properties) carries the user id, not the membership row id.
-    for (const m of members) byKey.set(`member:${m.user_id}`, m.name);
-    for (const a of agents) byKey.set(`agent:${a.id}`, a.name);
-    for (const s of squads) byKey.set(`squad:${s.id}`, s.name);
-    return (actor: ActorFilterValue) => byKey.get(`${actor.type}:${actor.id}`);
-  }, [members, agents, squads]);
+  const actorName = useMemo(
+    () => buildChipActorNames(members, agents, squads),
+    [members, agents, squads],
+  );
 
   // Inside a saved view chips show only the user's additions ON TOP of the
   // view; removing one returns the dimension to the view's values (never

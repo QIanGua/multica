@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { CalendarDays, Check, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 import type { Issue, IssueProperty, IssuePropertyValue } from "@multica/core/types";
+import { hasUnknownActorRef } from "@multica/core/types";
 import {
   useSetIssueProperty,
   useUnsetIssueProperty,
@@ -24,6 +25,40 @@ import { Input } from "@multica/ui/components/ui/input";
 import { useT } from "../../../i18n";
 import { PropertyPicker, PickerItem } from "./property-picker";
 import { ActorPropertyPicker, ActorPropertyDisplay } from "./actor-property-picker";
+
+const EDITABLE_PROPERTY_TYPES = [
+  "select",
+  "multi_select",
+  "date",
+  "checkbox",
+  "text",
+  "number",
+  "url",
+  "actor",
+  "multi_actor",
+];
+
+/**
+ * Whether the editor must degrade to read-only (Clear is still offered, so a
+ * stale value can always be cleaned up). Three reasons:
+ *
+ *   1. The definition is archived.
+ *   2. The definition's type is newer than this build.
+ *   3. A single `actor` value references a kind this build cannot parse. It
+ *      would otherwise render as empty and the user, believing the field is
+ *      unset, would overwrite a value they were never shown. `multi_actor` is
+ *      exempt: its toggle round-trips unknown entries instead of replacing the
+ *      whole value (MUL-6286 review).
+ */
+export function isCustomPropertyReadOnly(
+  property: IssueProperty,
+  value: IssuePropertyValue | undefined,
+): boolean {
+  if (property.archived) return true;
+  if (!EDITABLE_PROPERTY_TYPES.includes(property.type)) return true;
+  if (property.type === "actor" && hasUnknownActorRef(value)) return true;
+  return false;
+}
 
 /**
  * Value editor for one custom property on one issue. The editor shape
@@ -142,21 +177,7 @@ export function CustomPropertyValueInput({
     </PickerItem>
   );
 
-  // Archived (or unknown-type) definitions: read-only display; the only
-  // offered action is Clear so stale values can still be cleaned up.
-  const readOnly =
-    property.archived ||
-    ![
-      "select",
-      "multi_select",
-      "date",
-      "checkbox",
-      "text",
-      "number",
-      "url",
-      "actor",
-      "multi_actor",
-    ].includes(property.type);
+  const readOnly = isCustomPropertyReadOnly(property, value);
 
   if (readOnly) {
     return (
@@ -169,7 +190,9 @@ export function CustomPropertyValueInput({
       >
         {emptyRow}
         <p className="px-2 py-1.5 text-caption text-muted-foreground">
-          {t(($) => $.pickers.custom_property.archived_hint)}
+          {property.archived
+            ? t(($) => $.pickers.custom_property.archived_hint)
+            : t(($) => $.pickers.custom_property.unknown_value_hint)}
         </p>
       </PropertyPicker>
     );

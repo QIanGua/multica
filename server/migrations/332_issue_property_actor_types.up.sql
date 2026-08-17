@@ -3,9 +3,11 @@
 -- Adds 'actor' and 'multi_actor' to the type allowlist. Both store a prefixed
 -- reference string ("member:<user_id>"); multi_actor stores an array of them.
 -- The kind prefix is what lets the accepted-kind set widen later without
--- another migration or a new property type. Keeping the value a plain string (rather than an
--- object) means the existing @> containment filter, the jsonb_path_ops GIN
--- index, and the client value schema all keep working unchanged.
+-- another migration or a new property type.
+--
+-- Keeping the value a plain string (rather than an object) means the existing
+-- @> containment filter, the jsonb_path_ops GIN index, and the client value
+-- schema all keep working unchanged.
 --
 -- The type is validated again in the handler, which additionally resolves each
 -- reference against the workspace. This constraint is only the outer guard.

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   actorFilterValues,
+  buildChipActorNames,
   hasActorPropertyFilterSelection,
 } from "./filter-chips-bar";
 
@@ -60,5 +61,35 @@ describe("hasActorPropertyFilterSelection", () => {
     expect(hasActorPropertyFilterSelection({ "p-actor": [`member:${ALICE}`] }, [])).toBe(
       false,
     );
+  });
+});
+
+describe("buildChipActorNames", () => {
+  const members = [{ id: "membership-row-1", user_id: ALICE, name: "Alice" }];
+  const agents = [{ id: "agent-1", name: "CodeBot" }];
+  const squads = [{ id: "squad-1", name: "Platform" }];
+
+  // The pre-existing bug this locks: filters carry user_id, but the lookup
+  // was keyed by the membership row id, so member names never resolved — in
+  // the assignee and creator chips either, not just the new actor one.
+  it("resolves a member by user_id", () => {
+    const lookup = buildChipActorNames(members, agents, squads);
+    expect(lookup({ type: "member", id: ALICE })).toBe("Alice");
+  });
+
+  it("does not resolve a member by its membership row id", () => {
+    const lookup = buildChipActorNames(members, agents, squads);
+    expect(lookup({ type: "member", id: "membership-row-1" })).toBeUndefined();
+  });
+
+  it("resolves agents and squads by their own id", () => {
+    const lookup = buildChipActorNames(members, agents, squads);
+    expect(lookup({ type: "agent", id: "agent-1" })).toBe("CodeBot");
+    expect(lookup({ type: "squad", id: "squad-1" })).toBe("Platform");
+  });
+
+  it("returns undefined for an unknown actor so the chip can omit it", () => {
+    const lookup = buildChipActorNames(members, agents, squads);
+    expect(lookup({ type: "member", id: BOB })).toBeUndefined();
   });
 });
