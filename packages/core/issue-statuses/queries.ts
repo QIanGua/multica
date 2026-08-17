@@ -64,6 +64,24 @@ export interface IssueStatusCatalog {
 
 const BUILT_IN = new Set<string>(STATUS_ORDER);
 
+const CATEGORY_RANK = new Map<string, number>(STATUS_ORDER.map((c, i) => [c, i]));
+
+/**
+ * The server's catalog ordering, mirrored for client-side re-sorts.
+ * Category rank, then intra-category position, then key as a stable tiebreak —
+ * see `ListIssueStatusEntries` in `issue_status.sql`. An optimistic reorder has
+ * to re-sort with this or the new positions land in the cache while the list
+ * still renders in the old order.
+ */
+export function compareIssueStatusEntries(a: IssueStatusEntry, b: IssueStatusEntry): number {
+  const rank =
+    (CATEGORY_RANK.get(a.category) ?? STATUS_ORDER.length) -
+    (CATEGORY_RANK.get(b.category) ?? STATUS_ORDER.length);
+  if (rank !== 0) return rank;
+  if (a.position !== b.position) return a.position - b.position;
+  return a.key.localeCompare(b.key);
+}
+
 export function isIssueStatusCategory(value: string): value is IssueStatusCategory {
   return BUILT_IN.has(value);
 }

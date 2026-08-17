@@ -1,4 +1,54 @@
 {
+  "issue_statuses": {
+    "title": "议题状态",
+    "description": "在内置的 7 个状态之外添加自己的状态。每个状态都属于一个分类，分类决定了它的行为。",
+    "loading": "正在加载状态…",
+    "add": "添加状态",
+    "show_archived": "显示已归档（{{count}}）",
+    "archived_badge": "已归档",
+    "archived_hint": "已停止用于新的指派，已经在该状态上的议题保持不变。",
+    "built_in_locked": "内置状态，名称、颜色和分类均不可修改。",
+    "flag_off": "当前部署尚未开启自定义状态，下面的内置状态照常使用。",
+    "reorder_failed": "排序保存失败。",
+    "actions": {
+      "open": "{{name}} 的操作",
+      "edit": "编辑",
+      "archive": "归档",
+      "reorder": "拖动排序 {{name}}"
+    },
+    "editor": {
+      "create_title": "新建状态",
+      "edit_title": "编辑状态",
+      "behavior_hint": "该状态的行为与「{{category}}」完全一致。",
+      "name": "名称",
+      "name_placeholder": "例如：Code Review",
+      "category": "分类",
+      "category_locked": "分类不可修改 —— 已经处于该状态的议题依赖它。",
+      "description": "描述",
+      "description_placeholder": "这个状态对团队意味着什么",
+      "color": "颜色",
+      "cancel": "取消",
+      "save": "保存",
+      "saving": "保存中…",
+      "save_failed": "状态保存失败。"
+    },
+    "archive_dialog": {
+      "title": "归档这个状态？",
+      "description": "「{{name}}」将不再能被指派给新的议题。已经处于该状态的议题保持不变，行为也完全不变。",
+      "cancel": "取消",
+      "confirm": "归档",
+      "failed": "归档失败。"
+    },
+    "categories": {
+      "backlog": "搁置。把议题移到这里不会启动 agent。",
+      "todo": "排队中。把议题移到这里会启动指派的 agent。",
+      "in_progress": "正在进行。",
+      "in_review": "已交付，等待人工 review。会结束 autopilot 运行。",
+      "done": "已完成。",
+      "blocked": "被外部依赖阻塞。",
+      "cancelled": "决定不做。"
+    }
+  },
   "quick_actions": {
     "title": "快捷操作",
     "description": "预先配置好执行的 Agent 和提示词，之后在任意任务侧边栏一键触发。",
@@ -204,6 +254,7 @@
       "labs": "实验室",
       "members": "成员",
       "labels": "标签",
+      "issue_statuses": "议题状态",
       "properties": "属性",
       "quick_actions": "快捷操作",
     "plugins": "Plugins",

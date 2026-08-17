@@ -1,4 +1,54 @@
 {
+  "issue_statuses": {
+    "title": "イシューステータス",
+    "description": "組み込みの 7 つのステータスに加えて独自のステータスを追加できます。各ステータスはカテゴリに属し、カテゴリが挙動を決めます。",
+    "loading": "ステータスを読み込み中…",
+    "add": "ステータスを追加",
+    "show_archived": "アーカイブ済みを表示（{{count}}）",
+    "archived_badge": "アーカイブ済み",
+    "archived_hint": "新規の割り当てには使えません。すでにこのステータスのイシューはそのままです。",
+    "built_in_locked": "組み込みステータス。名前・色・カテゴリは変更できません。",
+    "flag_off": "このデプロイではカスタムステータスがまだ有効化されていません。下の組み込みステータスは通常どおり使えます。",
+    "reorder_failed": "並び順を保存できませんでした。",
+    "actions": {
+      "open": "{{name}} の操作",
+      "edit": "編集",
+      "archive": "アーカイブ",
+      "reorder": "{{name}} を並べ替え"
+    },
+    "editor": {
+      "create_title": "新しいステータス",
+      "edit_title": "ステータスを編集",
+      "behavior_hint": "このステータスは「{{category}}」とまったく同じ挙動になります。",
+      "name": "名前",
+      "name_placeholder": "例: Code Review",
+      "category": "カテゴリ",
+      "category_locked": "カテゴリは変更できません。すでにこのステータスのイシューが依存しています。",
+      "description": "説明",
+      "description_placeholder": "チームにとってこのステータスが意味すること",
+      "color": "色",
+      "cancel": "キャンセル",
+      "save": "保存",
+      "saving": "保存中…",
+      "save_failed": "ステータスを保存できませんでした。"
+    },
+    "archive_dialog": {
+      "title": "このステータスをアーカイブしますか？",
+      "description": "「{{name}}」は新しいイシューに割り当てられなくなります。すでにこのステータスのイシューはそのまま残り、挙動も変わりません。",
+      "cancel": "キャンセル",
+      "confirm": "アーカイブ",
+      "failed": "アーカイブできませんでした。"
+    },
+    "categories": {
+      "backlog": "保留。ここに移動してもエージェントは起動しません。",
+      "todo": "待機中。ここに移動すると担当エージェントが起動します。",
+      "in_progress": "作業中。",
+      "in_review": "納品済み、レビュー待ち。オートパイロットの実行を完了します。",
+      "done": "完了。",
+      "blocked": "外部依存でブロック中。",
+      "cancelled": "見送り。"
+    }
+  },
   "quick_actions": {
     "title": "クイックアクション",
     "description": "実行するエージェントとプロンプトを事前に設定し、任意のタスクのサイドバーからワンクリックで実行します。",
@@ -204,6 +254,7 @@
       "labs": "ラボ",
       "members": "メンバー",
       "labels": "ラベル",
+      "issue_statuses": "ステータス",
       "properties": "プロパティ",
       "quick_actions": "クイックアクション",
     "plugins": "Plugins",
