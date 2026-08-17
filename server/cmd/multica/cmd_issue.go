@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -369,6 +370,10 @@ var issueSearchCmd = &cobra.Command{
 	RunE: runIssueSearch,
 }
 
+// validIssueStatuses are the 7 BUILT-IN status keys, present in every
+// workspace. Since MUL-6243 a workspace may define additional custom statuses,
+// so this is the list shown in help text and error messages, not the set of
+// accepted values — see validateIssueStatus.
 var validIssueStatuses = []string{
 	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
 }
@@ -398,9 +403,30 @@ var directionalIssueSortColumns = func() []string {
 	return cols
 }()
 
+// validateIssueStatus checks the shape of a status key, not its membership.
+//
+// Since MUL-6243 a workspace can define custom statuses, so the CLI cannot know
+// the valid set without a round trip. It validates the format locally — that
+// still catches the common typo classes instantly and offline — and lets the
+// server reject an unknown key, which it does with a 400 listing that
+// workspace's actual statuses. Keeping a hard-coded list here would reject the
+// custom statuses the feature exists to enable.
 func validateIssueStatus(status string) error {
-	return validateIssueEnum("status", status, validIssueStatuses)
+	trimmed := strings.ToLower(strings.TrimSpace(status))
+	if trimmed == "" {
+		return fmt.Errorf("invalid status %q; valid values: %s",
+			status, strings.Join(validIssueStatuses, ", "))
+	}
+	if !issueStatusKeyPattern.MatchString(trimmed) {
+		return fmt.Errorf(
+			"invalid status %q; a status key is 1-32 characters of lowercase letters, digits or underscore. Built-in values: %s",
+			status, strings.Join(validIssueStatuses, ", "))
+	}
+	return nil
 }
+
+// issueStatusKeyPattern mirrors the issue_status.key storage constraint.
+var issueStatusKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_]{0,31}$`)
 
 func validateIssuePriority(priority string) error {
 	return validateIssueEnum("priority", priority, validIssuePriorities)

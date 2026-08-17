@@ -21,6 +21,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/channelmedia"
 	"github.com/multica-ai/multica/server/internal/dispatch"
 	"github.com/multica-ai/multica/server/internal/issueguard"
+	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -73,12 +74,45 @@ type IssueResponse struct {
 	Labels *[]LabelResponse `json:"labels,omitempty"`
 }
 
-// validIssueStatuses / validIssuePriorities mirror the CHECK constraints on
-// the issue table. Write handlers pre-validate these so callers get a clean
-// 400 with the allowed values instead of a database CHECK violation bubbling
-// up as a 500.
-var validIssueStatuses = []string{"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"}
+// validIssuePriorities mirrors the CHECK constraint on the issue table. Write
+// handlers pre-validate it so callers get a clean 400 with the allowed values
+// instead of a database CHECK violation bubbling up as a 500.
 var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
+
+// validIssueStatuses is the 7 BUILT-IN status keys. Since MUL-6243 it is no
+// longer the set of writable statuses — write paths validate against the
+// workspace's catalog via validateIssueStatusKey — and it survives only for the
+// issue-table grouping/filtering paths, which key their group descriptors and
+// compound cells off a fixed status list.
+//
+// KNOWN LIMITATION: a custom status is therefore not yet selectable as an
+// issue-table group or filter value. That is a self-contained follow-up (the
+// table's group descriptors and compound cell keys need to become catalog
+// driven); it is scoped out here so this change cannot alter the table view for
+// workspaces that have no custom statuses.
+var validIssueStatuses = issuestatus.Canonical()
+
+// validateIssueStatusKey checks a status against the workspace's catalog. This
+// is the application-layer replacement for the enum CHECK that migration 335
+// dropped, so every write path must route through it — a missed entrypoint is
+// how an unresolvable key would reach the column.
+func (h *Handler) validateIssueStatusKey(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, status string) bool {
+	if _, err := issuestatus.Resolve(r.Context(), h.Queries, workspaceID, status); err != nil {
+		if errors.Is(err, issuestatus.ErrUnknownStatus) {
+			allowed, listErr := issuestatus.ActiveKeys(r.Context(), h.Queries, workspaceID)
+			if listErr != nil || len(allowed) == 0 {
+				allowed = issuestatus.Canonical()
+			}
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"invalid status %q; valid values: %s", status, strings.Join(allowed, ", ")))
+			return false
+		}
+		slog.Warn("resolve issue status failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to validate status")
+		return false
+	}
+	return true
+}
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {
 	for _, a := range allowed {
@@ -2471,7 +2505,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if priority == "" {
 		priority = "none"
 	}
-	if !validateIssueEnum(w, "status", status, validIssueStatuses) {
+	if !h.validateIssueStatusKey(w, r, wsUUID, status) {
 		return
 	}
 	if !validateIssueEnum(w, "priority", priority, validIssuePriorities) {
@@ -2920,7 +2954,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		params.Description = pgtype.Text{String: *req.Description, Valid: true}
 	}
 	if req.Status != nil {
-		if !validateIssueEnum(w, "status", *req.Status, validIssueStatuses) {
+		if !h.validateIssueStatusKey(w, r, prevIssue.WorkspaceID, *req.Status) {
 			return
 		}
 		params.Status = pgtype.Text{String: *req.Status, Valid: true}
@@ -3258,7 +3292,8 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 // triggering execution. Moving out of backlog is handled separately in
 // UpdateIssue.
 func (h *Handler) shouldEnqueueAgentTask(ctx context.Context, issue db.Issue) bool {
-	if issue.Status == "backlog" {
+	// A custom status in the backlog category parks like Backlog. (MUL-6243)
+	if issuestatus.Effective(ctx, h.Queries, issue.WorkspaceID, issue.Status) == "backlog" {
 		return false
 	}
 	return h.isAgentAssigneeReady(ctx, issue)
@@ -3493,11 +3528,6 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"updated": 0})
 		return
 	}
-	if req.Updates.Status != nil {
-		if !validateIssueEnum(w, "status", *req.Updates.Status, validIssueStatuses) {
-			return
-		}
-	}
 	if req.Updates.Priority != nil {
 		if !validateIssueEnum(w, "priority", *req.Updates.Priority, validIssuePriorities) {
 			return
@@ -3508,6 +3538,15 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace_id")
 	if !ok {
 		return
+	}
+	// Status is validated against this workspace's catalog, so it has to wait
+	// for wsUUID above. One check for the whole batch — every issue in it
+	// shares the workspace — and a rejection rather than a silent skip, so a
+	// bad status cannot report `{"updated": N}`. (MUL-6243)
+	if req.Updates.Status != nil {
+		if !h.validateIssueStatusKey(w, r, wsUUID, *req.Updates.Status) {
+			return
+		}
 	}
 	// The batch shares one project_id, so it is checked once here rather than
 	// per issue, and rejected instead of skipped like the per-item guards in

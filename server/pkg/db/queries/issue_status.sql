@@ -1,0 +1,109 @@
+-- Issue status catalog (MUL-6243). Each workspace holds the 7 built-in
+-- statuses plus any custom ones. A category's value IS its canonical built-in
+-- key, so resolving a custom status to its platform behavior is a plain column
+-- read — no mapping table, no second concept.
+
+-- name: SeedIssueStatusEntries :exec
+-- Idempotent seed of the 7 built-ins. Safe to call concurrently from multiple
+-- pods during a rolling deploy: the unique (workspace_id, key) index makes a
+-- losing racer a no-op rather than an error. Positions are intra-category, and
+-- each built-in is the only member of its category at seed time, so all 0.
+INSERT INTO issue_status (workspace_id, key, name, description, category, color, is_system, position)
+VALUES
+    (sqlc.arg('workspace_id')::uuid, 'backlog', 'Backlog', 'Parked. Assigning an issue here never starts an agent run.', 'backlog', '#6b7280', TRUE, 0),
+    (sqlc.arg('workspace_id')::uuid, 'todo', 'Todo', 'Queued for work. Moving an issue here starts the assigned agent.', 'todo', '#6b7280', TRUE, 0),
+    (sqlc.arg('workspace_id')::uuid, 'in_progress', 'In Progress', 'Actively being worked on.', 'in_progress', '#f59e0b', TRUE, 0),
+    (sqlc.arg('workspace_id')::uuid, 'in_review', 'In Review', 'Work delivered, waiting on human review. Finalizes the autopilot run.', 'in_review', '#22c55e', TRUE, 0),
+    (sqlc.arg('workspace_id')::uuid, 'done', 'Done', 'Completed.', 'done', '#3b82f6', TRUE, 0),
+    (sqlc.arg('workspace_id')::uuid, 'blocked', 'Blocked', 'Stalled on an external dependency.', 'blocked', '#ef4444', TRUE, 0),
+    (sqlc.arg('workspace_id')::uuid, 'cancelled', 'Cancelled', 'Decided not to do.', 'cancelled', '#6b7280', TRUE, 0)
+ON CONFLICT DO NOTHING;
+
+-- name: ListIssueStatusEntries :many
+-- Ordered by category rank (the historical STATUS_ORDER, so the default board
+-- and picker stay pixel-identical for a workspace with no custom statuses),
+-- then intra-category position, then key as a stable tiebreak.
+SELECT * FROM issue_status
+WHERE workspace_id = sqlc.arg('workspace_id')::uuid
+  AND (sqlc.arg('include_archived')::bool OR archived_at IS NULL)
+ORDER BY
+    CASE category
+        WHEN 'backlog' THEN 0
+        WHEN 'todo' THEN 1
+        WHEN 'in_progress' THEN 2
+        WHEN 'in_review' THEN 3
+        WHEN 'done' THEN 4
+        WHEN 'blocked' THEN 5
+        WHEN 'cancelled' THEN 6
+        ELSE 7
+    END,
+    position,
+    key;
+
+-- name: GetIssueStatusEntryByKey :one
+SELECT * FROM issue_status
+WHERE workspace_id = sqlc.arg('workspace_id')::uuid
+  AND key = sqlc.arg('key')::text;
+
+-- name: GetIssueStatusEntryByID :one
+SELECT * FROM issue_status
+WHERE id = sqlc.arg('id')::uuid
+  AND workspace_id = sqlc.arg('workspace_id')::uuid;
+
+-- name: CreateIssueStatusEntry :one
+-- Custom statuses only: is_system is never set here, so the canonical-key and
+-- non-archivable CHECK constraints can only ever apply to seeded rows.
+INSERT INTO issue_status (workspace_id, key, name, description, category, color, position)
+VALUES (
+    sqlc.arg('workspace_id')::uuid,
+    sqlc.arg('key')::text,
+    sqlc.arg('name')::text,
+    sqlc.arg('description')::text,
+    sqlc.arg('category')::text,
+    sqlc.arg('color')::text,
+    COALESCE(
+        (SELECT MAX(position) + 1 FROM issue_status
+         WHERE workspace_id = sqlc.arg('workspace_id')::uuid
+           AND category = sqlc.arg('category')::text),
+        0
+    )
+)
+RETURNING *;
+
+-- name: UpdateIssueStatusEntry :one
+-- key and category are absent on purpose: both are immutable after create.
+-- The is_system guard is what enforces "built-in name and color are locked" at
+-- the storage layer, so a handler bug cannot rename a built-in.
+UPDATE issue_status SET
+    name = COALESCE(sqlc.narg('name'), name),
+    description = COALESCE(sqlc.narg('description'), description),
+    color = COALESCE(sqlc.narg('color'), color),
+    position = COALESCE(sqlc.narg('position'), position),
+    updated_at = now()
+WHERE id = sqlc.arg('id')::uuid
+  AND workspace_id = sqlc.arg('workspace_id')::uuid
+  AND is_system = FALSE
+  AND archived_at IS NULL
+RETURNING *;
+
+-- name: ArchiveIssueStatusEntry :one
+-- Built-ins are excluded by is_system: archiving one would delete its
+-- category's behavior definition. Callers must migrate issues off the status
+-- first; CountIssuesUsingStatusKey is the guard.
+UPDATE issue_status SET
+    archived_at = now(),
+    updated_at = now()
+WHERE id = sqlc.arg('id')::uuid
+  AND workspace_id = sqlc.arg('workspace_id')::uuid
+  AND is_system = FALSE
+  AND archived_at IS NULL
+RETURNING *;
+
+-- name: CountIssuesUsingStatusKey :one
+SELECT COUNT(*)::bigint FROM issue
+WHERE workspace_id = sqlc.arg('workspace_id')::uuid
+  AND status = sqlc.arg('key')::text;
+
+-- name: DeleteIssueStatusEntriesForWorkspace :exec
+-- No foreign keys by project rule, so workspace teardown cleans up here.
+DELETE FROM issue_status WHERE workspace_id = sqlc.arg('workspace_id')::uuid;

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/issuestatus"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -87,7 +88,11 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 			"parent_id", uuidToString(issue.ParentIssueID))
 		return
 	}
-	if parent.Status == "done" || parent.Status == "cancelled" {
+	// Custom statuses inherit the canonical status they name, so a custom
+	// terminal status closes this out and a custom backlog status parks it,
+	// exactly like Done/Cancelled and Backlog do. (MUL-6243)
+	parentStatus := issuestatus.Effective(ctx, h.Queries, parent.WorkspaceID, parent.Status)
+	if parentStatus == "done" || parentStatus == "cancelled" {
 		return
 	}
 	// A parent parked in backlog is deliberately held for later. Posting the
@@ -95,7 +100,7 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 	// promote sibling backlog sub-issues into todo — the surprise auto-
 	// activation reported in #4320 / MUL-3497. Skip the whole notification so
 	// a backlog parent stays inert until the user explicitly promotes it.
-	if parent.Status == "backlog" {
+	if parentStatus == "backlog" {
 		return
 	}
 	// Human-assigned parents read their own timeline; an automated system
@@ -185,10 +190,11 @@ func (h *Handler) notifyParentsOfBatchChildDone(ctx context.Context, completed [
 			continue
 		}
 		// Same parent guards as the single path (see notifyParentOfChildDone).
-		if parent.Status == "done" || parent.Status == "cancelled" {
+		parentStatus := issuestatus.Effective(ctx, h.Queries, parent.WorkspaceID, parent.Status)
+		if parentStatus == "done" || parentStatus == "cancelled" {
 			continue
 		}
-		if parent.Status == "backlog" {
+		if parentStatus == "backlog" {
 			continue
 		}
 		if parent.AssigneeType.Valid && parent.AssigneeType.String == "member" {

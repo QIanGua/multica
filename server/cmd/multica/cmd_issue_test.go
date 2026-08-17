@@ -2705,18 +2705,49 @@ func TestValidIssueStatuses(t *testing.T) {
 	}
 }
 
+// TestValidateIssueStatus pins the post-MUL-6243 contract: the CLI validates
+// the SHAPE of a status key, not its membership. A workspace can define custom
+// statuses, so only the server knows the valid set; rejecting an unknown key
+// locally would make every custom status unreachable from the CLI.
 func TestValidateIssueStatus(t *testing.T) {
 	for _, s := range validIssueStatuses {
 		if err := validateIssueStatus(s); err != nil {
-			t.Errorf("status %q should be valid, got: %v", s, err)
+			t.Errorf("built-in status %q should be valid, got: %v", s, err)
 		}
 	}
-	err := validateIssueStatus("active")
+
+	// Well-formed keys pass locally even though they are not built-ins — they
+	// may name a custom status. The server returns a 400 listing the
+	// workspace's real statuses when they do not.
+	for _, s := range []string{"human_review", "gate_approved", "rework", "active", "s1"} {
+		if err := validateIssueStatus(s); err != nil {
+			t.Errorf("well-formed custom status key %q should pass CLI validation, got: %v", s, err)
+		}
+	}
+
+	// Malformed keys are still caught locally, offline and instantly.
+	for _, s := range []string{
+		"",                      // empty
+		"   ",                   // whitespace only
+		"In Review",             // spaces
+		"in-review",             // hyphen is not in the key charset
+		"_leading",              // must start with a letter or digit
+		"Ünicode",               // non-ASCII
+		strings.Repeat("a", 33), // over the 32-character limit
+	} {
+		if err := validateIssueStatus(s); err == nil {
+			t.Errorf("malformed status key %q should be rejected", s)
+		}
+	}
+
+	// The error still names the built-ins, so a user who typo'd one is pointed
+	// back at the common set.
+	err := validateIssueStatus("In Review")
 	if err == nil {
-		t.Fatal("status \"active\" should be rejected")
+		t.Fatal("expected an error for a malformed key")
 	}
 	if !strings.Contains(err.Error(), "backlog") {
-		t.Errorf("error should list valid statuses, got: %v", err)
+		t.Errorf("error should list the built-in statuses, got: %v", err)
 	}
 }
 
