@@ -79,9 +79,26 @@ export function parseActorRef(raw: unknown): IssuePropertyActorRef | null {
 }
 
 /**
- * Reads an actor property value as a list, so single and multi render through
- * one code path. Malformed entries are dropped rather than thrown on: a
- * newer backend may ship kinds this client doesn't know yet.
+ * Raw reference strings in stored order, INCLUDING kinds this build does not
+ * know about.
+ *
+ * Editors must round-trip through this rather than through
+ * `actorRefsFromValue`: an installed desktop client talking to a newer backend
+ * would otherwise drop every unknown-kind entry the moment the user toggles
+ * one it does understand — a silent data loss the user never sees.
+ */
+export function actorRefValuesFromValue(value: IssuePropertyValue | undefined): string[] {
+  if (typeof value === "string") return value ? [value] : [];
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is string => typeof entry === "string");
+  }
+  return [];
+}
+
+/**
+ * Reads an actor property value as a list of refs this build can render.
+ * Unknown kinds are dropped rather than thrown on — see
+ * `actorRefValuesFromValue` for the edit path, which must keep them.
  */
 export function actorRefsFromValue(value: IssuePropertyValue | undefined): IssuePropertyActorRef[] {
   if (typeof value === "string") {

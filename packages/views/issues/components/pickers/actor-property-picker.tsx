@@ -5,6 +5,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { IssueProperty, IssuePropertyValue } from "@multica/core/types";
 import {
   actorRefsFromValue,
+  actorRefValuesFromValue,
   formatActorRef,
   MAX_ISSUE_PROPERTY_ACTOR_VALUES,
 } from "@multica/core/types";
@@ -15,6 +16,28 @@ import { ActorAvatar } from "../../../common/actor-avatar";
 import { useT } from "../../../i18n";
 import { matchesPinyin } from "../../../editor/extensions/pinyin-match";
 import { PropertyPicker, PickerItem, PickerSection, PickerEmpty } from "./property-picker";
+
+/**
+ * Toggles one reference inside a `multi_actor` value and returns the next
+ * value (`undefined` clears the property).
+ *
+ * Two properties this must hold, both load-bearing:
+ *
+ *   1. `current` is the RAW stored list, so entries whose kind this build does
+ *      not understand pass through untouched. An installed desktop client
+ *      talking to a newer backend must not delete them just because the user
+ *      ticked a member.
+ *   2. Insertion order survives. The server does not canonicalize actor lists
+ *      (unlike multi_select), so the order here is the order that persists.
+ */
+export function toggleActorRefValue(current: string[], key: string): string[] | undefined {
+  if (current.includes(key)) {
+    const next = current.filter((existing) => existing !== key);
+    return next.length === 0 ? undefined : next;
+  }
+  if (current.length >= MAX_ISSUE_PROPERTY_ACTOR_VALUES) return current;
+  return [...current, key];
+}
 
 /**
  * Value editor for `actor` / `multi_actor` custom properties (MUL-6286).
@@ -53,9 +76,12 @@ export function ActorPropertyPicker({
   const { data: members = [] } = useQuery(memberListOptions(wsId));
 
   const multiple = property.type === "multi_actor";
-  const selected = actorRefsFromValue(value);
-  const selectedKeys = new Set(selected.map((ref) => formatActorRef(ref.kind, ref.id)));
-  const atCapacity = multiple && selected.length >= MAX_ISSUE_PROPERTY_ACTOR_VALUES;
+  // Raw strings, not parsed refs: a kind this build doesn't recognise (a newer
+  // backend widening actorPropertyKinds) has to survive an edit here instead
+  // of being silently dropped when the user toggles a member.
+  const selectedRaw = actorRefValuesFromValue(value);
+  const selectedKeys = new Set(selectedRaw);
+  const atCapacity = multiple && selectedRaw.length >= MAX_ISSUE_PROPERTY_ACTOR_VALUES;
 
   const query = filter.trim().toLowerCase();
   const matches = (name: string) => name.toLowerCase().includes(query) || matchesPinyin(name, query);
@@ -68,18 +94,7 @@ export function ActorPropertyPicker({
       onOpenChange(false);
       return;
     }
-    // Toggle, preserving insertion order — the stored order is the order the
-    // user built, and the server keeps it rather than canonicalizing.
-    if (selectedKeys.has(key)) {
-      const next = selected
-        .map((ref) => formatActorRef(ref.kind, ref.id))
-        .filter((existing) => existing !== key);
-      if (next.length === 0) onChange(undefined);
-      else onChange(next);
-      return;
-    }
-    if (atCapacity) return;
-    onChange([...selected.map((ref) => formatActorRef(ref.kind, ref.id)), key]);
+    onChange(toggleActorRefValue(selectedRaw, key));
   };
 
   const rowsEmpty = filteredMembers.length === 0;

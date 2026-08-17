@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   actorRefsFromValue,
+  actorRefValuesFromValue,
   formatActorRef,
   isActorPropertyType,
   isKnownPropertyType,
@@ -84,5 +85,30 @@ describe("actorRefsFromValue", () => {
     expect(actorRefsFromValue(undefined)).toEqual([]);
     expect(actorRefsFromValue(true)).toEqual([]);
     expect(actorRefsFromValue(7)).toEqual([]);
+  });
+});
+
+describe("actorRefValuesFromValue", () => {
+  it("keeps kinds this build does not know", () => {
+    // The edit path must round-trip through this: a newer backend widening the
+    // kind set must not have its values deleted by an older client.
+    expect(actorRefValuesFromValue([`member:${MEMBER}`, `agent:${AGENT}`])).toEqual([
+      `member:${MEMBER}`,
+      `agent:${AGENT}`,
+    ]);
+  });
+
+  it("reads a single value as a one-item list and preserves order", () => {
+    expect(actorRefValuesFromValue(`member:${MEMBER}`)).toEqual([`member:${MEMBER}`]);
+    expect(actorRefValuesFromValue([`member:${SECOND_MEMBER}`, `member:${MEMBER}`])).toEqual([
+      `member:${SECOND_MEMBER}`,
+      `member:${MEMBER}`,
+    ]);
+  });
+
+  it("returns an empty list for unset or wrongly-typed values", () => {
+    expect(actorRefValuesFromValue(undefined)).toEqual([]);
+    expect(actorRefValuesFromValue(true)).toEqual([]);
+    expect(actorRefValuesFromValue(7)).toEqual([]);
   });
 });

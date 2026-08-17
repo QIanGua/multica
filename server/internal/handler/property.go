@@ -353,10 +353,16 @@ func parseActorRef(s string) (actorRef, error) {
 	if !valid {
 		return actorRef{}, fmt.Errorf("unknown actor kind %q; valid kinds: %s", kind, actorKindsHint())
 	}
-	if _, err := uuid.Parse(id); err != nil {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
 		return actorRef{}, fmt.Errorf("actor id in %q must be a UUID", s)
 	}
-	return actorRef{Kind: kind, ID: id}, nil
+	// Store the canonical lowercase-hyphenated form. uuid.Parse also accepts
+	// uppercase, braces and the urn: prefix; every consumer downstream (the
+	// member directory lookup in the client, the "= me" filter, @> containment)
+	// compares reference strings exactly, so an unnormalized id would store
+	// fine and then render as Unknown and never match a filter.
+	return actorRef{Kind: kind, ID: parsed.String()}, nil
 }
 
 // parseActorRefList validates a multi_actor array: every element must parse,

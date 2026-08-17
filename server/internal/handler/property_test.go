@@ -614,6 +614,25 @@ func TestParseActorRefUnit(t *testing.T) {
 		t.Fatalf("String() round-trip broken: %q", ref.String())
 	}
 
+	// uuid.Parse also accepts uppercase, braces and the urn: form. Every
+	// consumer compares reference strings exactly, so anything not stored in
+	// canonical form would render as Unknown and never match a filter.
+	canonical := "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	for _, variant := range []string{
+		strings.ToUpper(canonical),
+		"{" + canonical + "}",
+		"urn:uuid:" + canonical,
+		strings.ReplaceAll(canonical, "-", ""),
+	} {
+		got, err := parseActorRef("member:" + variant)
+		if err != nil {
+			t.Fatalf("uuid variant %q rejected: %v", variant, err)
+		}
+		if got.String() != "member:"+canonical {
+			t.Fatalf("uuid variant %q not canonicalized: %q", variant, got.String())
+		}
+	}
+
 	cases := []struct {
 		name  string
 		value string
@@ -823,6 +842,18 @@ func TestIssueActorPropertyValues(t *testing.T) {
 	}
 	if fetched.Properties[owner.ID] != memberRef {
 		t.Fatalf("actor value missing from the issue bag: %v", fetched.Properties)
+	}
+
+	// An uppercase id resolves to the same member and must land in the bag in
+	// canonical form — otherwise it renders as Unknown and the "= me" filter,
+	// which matches the reference string exactly, silently misses it.
+	upper := "member:" + strings.ToUpper(testUserID)
+	w = setIssuePropertyRaw(t, issueID, owner.ID, upper)
+	if w.Code != http.StatusOK {
+		t.Fatalf("actor set uppercase member: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := decodePropertiesBag(t, w)[owner.ID]; got != memberRef {
+		t.Fatalf("uppercase actor id not canonicalized on write: %v", got)
 	}
 
 	// Shape is valid but the referent is not in this workspace → 400.

@@ -33,8 +33,8 @@ import { ActorPropertyPicker, ActorPropertyDisplay } from "./actor-property-pick
  *   multi_select  → PropertyPicker with toggling items (stays open)
  *   date          → Calendar popover (mirrors DueDatePicker)
  *   checkbox      → Yes / No picker
- *   actor         → member/agent picker (commits and closes)
- *   multi_actor   → member/agent picker with toggling items (stays open)
+ *   actor         → member picker (commits and closes)
+ *   multi_actor   → member picker with toggling items (stays open)
  *   text/number/url → popover with an input, Enter commits
  *
  * Archived definitions render read-only: the popover only offers Clear
