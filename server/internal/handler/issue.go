@@ -2080,13 +2080,16 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 		ids[i] = child.ID
 	}
 	labelsMap := h.labelsByIssue(r.Context(), issue.WorkspaceID, ids)
+	// Sub-issue progress is computed from these rows (the CLI's `issue children`
+	// stage counts, among others), so they carry the resolved category — a
+	// custom done status must count as done. One Resolver for the whole list:
+	// built-in statuses still cost no query, and a list full of custom ones
+	// costs one catalog read rather than one per row.
+	statusResolver := issuestatus.NewResolver(issue.WorkspaceID)
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
 		resp[i] = issueToResponse(child, prefix)
-		// Sub-issue progress is computed from these rows (the CLI's
-		// `issue children` stage counts, among others), so they carry the
-		// resolved category — a custom done status must count as done.
-		resp[i].StatusCategory = issuestatus.Effective(r.Context(), h.Queries, child.WorkspaceID, child.Status)
+		resp[i].StatusCategory = statusResolver.Effective(r.Context(), h.Queries, child.Status)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2163,13 +2166,16 @@ func (h *Handler) ListChildrenByParents(w http.ResponseWriter, r *http.Request) 
 		ids[i] = child.ID
 	}
 	labelsMap := h.labelsByIssue(r.Context(), wsUUID, ids)
+	// Sub-issue progress is computed from these rows (the CLI's `issue children`
+	// stage counts, among others), so they carry the resolved category — a
+	// custom done status must count as done. One Resolver for the whole list:
+	// built-in statuses still cost no query, and a list full of custom ones
+	// costs one catalog read rather than one per row.
+	statusResolver := issuestatus.NewResolver(wsUUID)
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
 		resp[i] = issueToResponse(child, prefix)
-		// Sub-issue progress is computed from these rows (the CLI's
-		// `issue children` stage counts, among others), so they carry the
-		// resolved category — a custom done status must count as done.
-		resp[i].StatusCategory = issuestatus.Effective(r.Context(), h.Queries, child.WorkspaceID, child.Status)
+		resp[i].StatusCategory = statusResolver.Effective(r.Context(), h.Queries, child.Status)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}

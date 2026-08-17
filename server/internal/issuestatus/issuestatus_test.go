@@ -18,6 +18,7 @@ var testWorkspace = pgtype.UUID{Bytes: [16]byte{1}, Valid: true}
 type fakeQuerier struct {
 	entries map[string]db.IssueStatus
 	lookups int
+	lists   int
 	err     error
 }
 
@@ -42,6 +43,7 @@ func (f *fakeQuerier) GetIssueStatusEntryByKey(_ context.Context, arg db.GetIssu
 }
 
 func (f *fakeQuerier) ListIssueStatusEntries(_ context.Context, _ db.ListIssueStatusEntriesParams) ([]db.IssueStatus, error) {
+	f.lists++
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -246,5 +248,64 @@ func TestSlugifyKey(t *testing.T) {
 	}
 	if _, err := SlugifyKey("客户"); err == nil {
 		t.Error("a name with no slug-able characters should be rejected")
+	}
+}
+
+// TestResolverAmortizesTheCatalogRead pins the list-endpoint guarantee: built-in
+// statuses still cost nothing, and N custom rows cost ONE catalog read rather
+// than one lookup per row.
+func TestResolverAmortizesTheCatalogRead(t *testing.T) {
+	q := newFakeQuerier(
+		custom("human_review", InReview),
+		custom("gate_approved", Done),
+	)
+	r := NewResolver(testWorkspace)
+	ctx := context.Background()
+
+	// Built-ins: no catalog access at all, however many times they are seen.
+	for range 50 {
+		for _, key := range Canonical() {
+			if got := r.Effective(ctx, q, key); got != key {
+				t.Fatalf("Effective(%q) = %q, want the key unchanged", key, got)
+			}
+		}
+	}
+	if q.lists != 0 || q.lookups != 0 {
+		t.Errorf("built-in resolution touched the catalog: %d list(s), %d lookup(s)", q.lists, q.lookups)
+	}
+
+	// Custom keys: the catalog is read once and reused.
+	for range 50 {
+		if got := r.Effective(ctx, q, "human_review"); got != InReview {
+			t.Fatalf("Effective(human_review) = %q, want %q", got, InReview)
+		}
+		if got := r.Effective(ctx, q, "gate_approved"); got != Done {
+			t.Fatalf("Effective(gate_approved) = %q, want %q", got, Done)
+		}
+	}
+	if q.lists != 1 {
+		t.Errorf("catalog read %d times, want exactly 1", q.lists)
+	}
+	if q.lookups != 0 {
+		t.Errorf("Resolver made %d per-key lookups, want 0", q.lookups)
+	}
+
+	// Unknown keys stay fail-safe and do not trigger a re-read.
+	if got := r.Effective(ctx, q, "ghost"); got != "ghost" {
+		t.Errorf("Effective(ghost) = %q, want the key unchanged", got)
+	}
+	if q.lists != 1 {
+		t.Errorf("an unknown key re-read the catalog: %d reads", q.lists)
+	}
+}
+
+// A catalog read failure must degrade to the fail-safe identity rather than
+// guessing a category.
+func TestResolverFailsSafeWhenTheCatalogReadFails(t *testing.T) {
+	q := newFakeQuerier()
+	q.err = errors.New("connection refused")
+	r := NewResolver(testWorkspace)
+	if got := r.Effective(context.Background(), q, "human_review"); got != "human_review" {
+		t.Errorf("Effective on a failed catalog read = %q, want the key unchanged", got)
 	}
 }

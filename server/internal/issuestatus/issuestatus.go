@@ -265,3 +265,55 @@ func ActiveKeys(ctx context.Context, q Querier, workspaceID pgtype.UUID) ([]stri
 	}
 	return keys, nil
 }
+
+// Resolver resolves many statuses against ONE workspace's catalog using at most
+// one query, for list endpoints that would otherwise issue a lookup per row.
+//
+// The built-in fast path is unchanged: a built-in key returns itself without
+// touching the catalog, so a workspace with no custom statuses still performs
+// zero queries no matter how long the list is. The catalog is fetched lazily on
+// the first custom key and reused for every row after it.
+//
+// Not safe for concurrent use, and scoped to a single request: it caches the
+// catalog for its lifetime, so a long-lived Resolver would serve stale
+// categories after an admin edits the catalog.
+type Resolver struct {
+	workspaceID pgtype.UUID
+	categories  map[string]string
+	loaded      bool
+}
+
+// NewResolver returns a Resolver for one workspace. It performs no I/O.
+func NewResolver(workspaceID pgtype.UUID) *Resolver {
+	return &Resolver{workspaceID: workspaceID}
+}
+
+// Effective mirrors the package-level Effective, but amortizes the catalog read
+// across every call. Same fail-safe direction: an unresolvable key is returned
+// unchanged rather than guessed at.
+func (r *Resolver) Effective(ctx context.Context, q Querier, status string) string {
+	if IsBuiltIn(status) {
+		return status
+	}
+	if !r.loaded {
+		r.loaded = true
+		entries, err := q.ListIssueStatusEntries(ctx, db.ListIssueStatusEntriesParams{
+			WorkspaceID:     r.workspaceID,
+			IncludeArchived: true,
+		})
+		if err != nil {
+			// Leave the map nil; every custom key then falls back to itself,
+			// which is the same fail-safe the single-shot resolver applies.
+			return status
+		}
+		r.categories = make(map[string]string, len(entries))
+		for _, e := range entries {
+			r.categories[e.Key] = e.Category
+		}
+	}
+	category, ok := r.categories[status]
+	if !ok || !IsCategory(category) {
+		return status
+	}
+	return category
+}

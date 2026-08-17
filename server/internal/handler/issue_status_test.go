@@ -550,18 +550,16 @@ func holdExclusiveCatalogLock(t *testing.T) (release func()) {
 	}
 }
 
-// TestArchiveRaceBothOrderings is the counterexample pair for the archive TOCTOU.
-// The earlier version only held the shared lock and never wrote an issue, so it
-// missed the ordering that actually mattered: the writer resolving BEFORE the
-// archive commits. Both directions are pinned here through the real endpoints.
-func TestArchiveRaceBothOrderings(t *testing.T) {
+// TestWritesRejectAnArchivedStatus covers the SEQUENTIAL case: the status is
+// already archived before the request arrives, so the pre-flight validation
+// alone is enough to refuse it.
+//
+// This is deliberately NOT the race test — no archive is interleaved with a
+// write here, and these cases would pass even without the in-transaction
+// re-resolve. The interleaved counterexample is
+// TestArchiveCommitsInsideTheWriteRaceWindow below.
+func TestWritesRejectAnArchivedStatus(t *testing.T) {
 	ctx := context.Background()
-
-	// Ordering A — archive wins. The writer's pre-flight validation happens
-	// while the status is active, the archive then commits, and the write must
-	// still be refused rather than stranding an issue on an archived status.
-	// This is exactly the hole in the previous implementation, where the
-	// pre-flight Resolve ran outside the transaction and was never rechecked.
 	for _, tc := range []struct {
 		name  string
 		key   string
@@ -611,12 +609,10 @@ func TestArchiveRaceBothOrderings(t *testing.T) {
 			return rec.Code
 		}},
 	} {
-		t.Run("archive wins/"+tc.name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			key := tc.key
 			entry := createTestCustomStatus(t, key, issuestatus.InProgress)
 
-			// Archive commits first, standing in for an archive that lands
-			// between the writer's pre-flight check and its write.
 			if code := archiveStatusVia(t, entry); code != http.StatusOK {
 				t.Fatalf("archive setup returned %d", code)
 			}
@@ -640,8 +636,12 @@ func TestArchiveRaceBothOrderings(t *testing.T) {
 		})
 	}
 
-	// Ordering B — writer wins. Once an issue is committed on the status, the
-	// archive's census must see it and refuse with a conflict.
+}
+
+// TestArchiveRefusesAfterACommittedWrite is the other ordering: once an issue is
+// committed on the status, the archive's census must see it and refuse.
+func TestArchiveRefusesAfterACommittedWrite(t *testing.T) {
+	ctx := context.Background()
 	t.Run("writer wins: archive refuses with conflict", func(t *testing.T) {
 		entry := createTestCustomStatus(t, "race_b_writer", issuestatus.InProgress)
 
@@ -664,7 +664,8 @@ func TestArchiveRaceBothOrderings(t *testing.T) {
 	})
 
 	// The writer must genuinely BLOCK on the archive's exclusive lock rather
-	// than racing past it — otherwise ordering A would only be closed by luck.
+	// than racing past it — otherwise the interleaved case below would only be
+	// closed by luck.
 	t.Run("writer blocks while archive holds the exclusive lock", func(t *testing.T) {
 		createTestCustomStatus(t, "race_block", issuestatus.InProgress)
 		release := holdExclusiveCatalogLock(t)
@@ -700,75 +701,162 @@ func TestArchiveRaceBothOrderings(t *testing.T) {
 	})
 }
 
-// TestArchiveCommitsInsideTheWriteRaceWindow is the sharp counterexample: it
-// interleaves the two operations so the writer's PRE-FLIGHT validation observes
-// an active status and the archive commits before the write lands.
+// TestArchiveCommitsInsideTheWriteRaceWindow is the sharp counterexample, run
+// against EVERY write endpoint that can land on a custom status.
 //
-// This is the exact hole the previous implementation had. There the pre-flight
-// Resolve ran outside the transaction and was never rechecked, so the writer
-// would sail past the released lock and store an archived key. It passes now
-// only because the write re-resolves under the shared lock.
+// It interleaves the two operations so the writer's PRE-FLIGHT validation
+// observes an active status and the archive commits before the write lands.
+// That is the exact hole the first implementation had: the pre-flight Resolve
+// ran outside the transaction and was never rechecked, so the writer sailed
+// past the released lock and stored an archived key. Verified to fail without
+// the in-transaction re-resolve (the issue is left stranded) and pass with it.
+//
+// Seed issues for the update/batch cases are created BEFORE the exclusive lock
+// is taken, so the only thing racing the archive is the status write itself.
 func TestArchiveCommitsInsideTheWriteRaceWindow(t *testing.T) {
-	ctx := context.Background()
-	entry := createTestCustomStatus(t, "race_window", issuestatus.InProgress)
+	cases := []struct {
+		name  string
+		key   string
+		seed  func(t *testing.T, key string) pgtype.UUID
+		write func(t *testing.T, key string, seed pgtype.UUID) int
+	}{
+		{
+			name: "create",
+			key:  "win_create",
+			write: func(t *testing.T, key string, _ pgtype.UUID) int {
+				rec := httptest.NewRecorder()
+				testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+					"title": "race window create", "status": key,
+				}))
+				return rec.Code
+			},
+		},
+		{
+			name: "update",
+			key:  "win_update",
+			seed: func(t *testing.T, key string) pgtype.UUID {
+				return mustCreateIssue(t, "race window update "+key, "todo")
+			},
+			write: func(t *testing.T, key string, seed pgtype.UUID) int {
+				rec := httptest.NewRecorder()
+				testHandler.UpdateIssue(rec, withURLParam(
+					newRequest(http.MethodPatch, "/api/issues/"+uuidToString(seed), map[string]any{"status": key}),
+					"id", uuidToString(seed)))
+				return rec.Code
+			},
+		},
+		{
+			name: "update with description merge",
+			key:  "win_upd_merge",
+			seed: func(t *testing.T, key string) pgtype.UUID {
+				return mustCreateIssue(t, "race window merge "+key, "todo")
+			},
+			write: func(t *testing.T, key string, seed pgtype.UUID) int {
+				rec := httptest.NewRecorder()
+				testHandler.UpdateIssue(rec, withURLParam(
+					newRequest(http.MethodPatch, "/api/issues/"+uuidToString(seed), map[string]any{
+						"status": key, "description": "merged body",
+					}),
+					"id", uuidToString(seed)))
+				return rec.Code
+			},
+		},
+		{
+			name: "batch",
+			key:  "win_batch",
+			seed: func(t *testing.T, key string) pgtype.UUID {
+				return mustCreateIssue(t, "race window batch "+key, "todo")
+			},
+			write: func(t *testing.T, key string, seed pgtype.UUID) int {
+				rec := httptest.NewRecorder()
+				testHandler.BatchUpdateIssues(rec, newRequest(http.MethodPatch, "/api/issues/batch", map[string]any{
+					"issue_ids": []string{uuidToString(seed)},
+					"updates":   map[string]any{"status": key},
+				}))
+				return rec.Code
+			},
+		},
+		{
+			name: "batch with description merge",
+			key:  "win_batch_merge",
+			seed: func(t *testing.T, key string) pgtype.UUID {
+				return mustCreateIssue(t, "race window batch merge "+key, "todo")
+			},
+			write: func(t *testing.T, key string, seed pgtype.UUID) int {
+				rec := httptest.NewRecorder()
+				testHandler.BatchUpdateIssues(rec, newRequest(http.MethodPatch, "/api/issues/batch", map[string]any{
+					"issue_ids": []string{uuidToString(seed)},
+					"updates":   map[string]any{"status": key, "description": "merged body"},
+				}))
+				return rec.Code
+			},
+		},
+	}
 
-	// Take the exclusive side first so the writer is guaranteed to block AFTER
-	// its pre-flight validation (which runs outside any transaction) and BEFORE
-	// its write.
-	tx, err := testPool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':issue_status', 0))`,
-		parseUUID(testWorkspaceID)); err != nil {
-		t.Fatalf("take exclusive lock: %v", err)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			entry := createTestCustomStatus(t, tc.key, issuestatus.InProgress)
 
-	done := make(chan int, 1)
-	go func() {
-		rec := httptest.NewRecorder()
-		testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
-			"title": "write inside the race window", "status": "race_window",
-		}))
-		done <- rec.Code
-	}()
+			var seedID pgtype.UUID
+			if tc.seed != nil {
+				seedID = tc.seed(t, tc.key)
+			}
 
-	// Let the writer get past its pre-flight check and park on the lock.
-	select {
-	case code := <-done:
-		t.Fatalf("write completed (%d) before the archive released the lock", code)
-	case <-time.After(400 * time.Millisecond):
-	}
+			// Hold the archive side first, so the writer is guaranteed to park
+			// on the lock AFTER its pre-flight validation (which runs outside
+			// any transaction) and BEFORE its write.
+			tx, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin: %v", err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx,
+				`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':issue_status', 0))`,
+				parseUUID(testWorkspaceID)); err != nil {
+				t.Fatalf("take exclusive lock: %v", err)
+			}
 
-	// Archive inside the held lock, then commit: from the writer's point of
-	// view the status was active at validation time and archived by write time.
-	if _, err := tx.Exec(ctx,
-		`UPDATE issue_status SET archived_at = now() WHERE id = $1`, entry.ID); err != nil {
-		t.Fatalf("archive inside the window: %v", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit archive: %v", err)
-	}
+			done := make(chan int, 1)
+			go func() { done <- tc.write(t, tc.key, seedID) }()
 
-	select {
-	case code := <-done:
-		if code == http.StatusCreated {
-			t.Errorf("write succeeded against a status archived inside the race window")
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("write never completed after the archive committed")
-	}
+			select {
+			case code := <-done:
+				t.Fatalf("write completed (%d) before the archive released the lock", code)
+			case <-time.After(400 * time.Millisecond):
+				// Parked on the lock, as required.
+			}
 
-	var stranded int
-	if err := testPool.QueryRow(ctx,
-		`SELECT count(*) FROM issue WHERE workspace_id = $1 AND status = 'race_window'`,
-		parseUUID(testWorkspaceID)).Scan(&stranded); err != nil {
-		t.Fatalf("count stranded: %v", err)
-	}
-	if stranded != 0 {
-		t.Errorf("%d issue(s) stranded on a status archived inside the race window", stranded)
+			// Archive inside the held lock and commit: from the writer's point
+			// of view the status was active at validation time and archived by
+			// write time.
+			if _, err := tx.Exec(ctx,
+				`UPDATE issue_status SET archived_at = now() WHERE id = $1`, entry.ID); err != nil {
+				t.Fatalf("archive inside the window: %v", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatalf("commit archive: %v", err)
+			}
+
+			select {
+			case code := <-done:
+				if code == http.StatusOK || code == http.StatusCreated {
+					t.Errorf("%s succeeded (%d) against a status archived inside the race window", tc.name, code)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("write never completed after the archive committed")
+			}
+
+			var stranded int
+			if err := testPool.QueryRow(ctx,
+				`SELECT count(*) FROM issue WHERE workspace_id = $1 AND status = $2`,
+				parseUUID(testWorkspaceID), tc.key).Scan(&stranded); err != nil {
+				t.Fatalf("count stranded: %v", err)
+			}
+			if stranded != 0 {
+				t.Errorf("%d issue(s) stranded on a status archived inside the race window", stranded)
+			}
+		})
 	}
 }
 
