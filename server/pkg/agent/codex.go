@@ -968,15 +968,31 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		return nil, fmt.Errorf("codex: mcp_config is set but CODEX_HOME env var is not configured; cannot apply managed MCP")
 	}
 
+	// A custom runtime profile's fixed_args reach codex as the launch prefix.
+	// Being first does not protect the daemon's managed config from them: a
+	// `-c key=value` override wins over the task-local config.toml from any
+	// argv position, so the prefix needs the same two removals ExtraArgs and
+	// CustomArgs get below.
+	runtimeCmd := b.cfg.commandAt(execPath)
 	if codexHome != "" {
 		// The daemon owns shell_environment_policy in the task-local config.
 		// Codex -c/--config overrides are last-wins, so remove user-provided
 		// root or profile policy overrides before building the final argv.
 		opts.ExtraArgs = filterCodexShellEnvConfigOverrides(opts.ExtraArgs, b.cfg.Logger)
 		opts.CustomArgs = filterCodexShellEnvConfigOverrides(opts.CustomArgs, b.cfg.Logger)
+		runtimeCmd = runtimeCmd.withFilteredPrefix(func(prefix []string) []string {
+			return filterCodexShellEnvConfigOverrides(prefix, b.cfg.Logger)
+		})
+	}
+	if hasManagedCodexMcpConfig(opts.McpConfig) {
+		// Mirrors NormalizeCodexLaunchArgs, which applies this to ExtraArgs and
+		// CustomArgs once an agent has a managed mcp_config.
+		runtimeCmd = runtimeCmd.withFilteredPrefix(func(prefix []string) []string {
+			return filterCodexCustomConfigOverrides(prefix, b.cfg.Logger)
+		})
 	}
 	codexArgs := buildCodexArgs(opts, b.cfg.Logger)
-	cmd := exec.CommandContext(runCtx, execPath, codexArgs...)
+	cmd := runtimeCmd.exec(runCtx, codexArgs...)
 	hideAgentWindow(cmd)
 	// Run codex in its own process group so a cancel-on-stuck cleanup
 	// reaches the whole tree — the codex Node wrapper plus the native
@@ -1606,7 +1622,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 		stderrTail := sanitizeCodexDiagnostic(stderrBuf.Tail())
 		if timeoutDiagnostic.Kind != codexTimeoutNone {
-			timeoutDiagnostic.CodexVersion = detectCodexVersionForDiagnostics(context.Background(), execPath, cmd.Env, b.cfg.Logger)
+			timeoutDiagnostic.CodexVersion = detectCodexVersionForDiagnostics(context.Background(), b.cfg.commandAt(execPath), cmd.Env, b.cfg.Logger)
 			finalError = buildCodexTimeoutDiagnosticError(timeoutDiagnostic, stderrTail)
 		}
 
@@ -2022,11 +2038,11 @@ func appendCodexKnownStderrHint(msg, stderrTail string) string {
 	return msg
 }
 
-func detectCodexVersionForDiagnostics(ctx context.Context, execPath string, env []string, logger *slog.Logger) string {
+func detectCodexVersionForDiagnostics(ctx context.Context, runtimeCmd Command, env []string, logger *slog.Logger) string {
 	versionCtx, cancel := context.WithTimeout(ctx, codexVersionDiagnosticTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(versionCtx, execPath, "--version")
+	cmd := runtimeCmd.exec(versionCtx, "--version")
 	cmd.Env = env
 	data, err := cmd.Output()
 	if err != nil {
