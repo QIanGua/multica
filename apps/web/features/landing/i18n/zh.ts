@@ -305,7 +305,6 @@ export function createZhDict(allowSignup: boolean): LandingDict {
           "Slack 消息里发的文件现在会作为附件出现在对话里。",
           "手机上可以把 Multica 添加到主屏幕，像应用一样打开。",
           "浏览器标签页会显示你正打开的工作区页面名。",
-          "桌面端按 Cmd/Ctrl+, 就能打开设置。",
           "导入的技能现在会显示它来自哪里。",
           "提到你正在看的这个 Issue 时，会显示成「本 Issue」。",
         ],
@@ -328,6 +327,7 @@ export function createZhDict(allowSignup: boolean): LandingDict {
           "页面标题栏不再多出一个侧边栏开关。",
           "创建智能体时不会再闪一下错误提示。",
           "鼠标停在运行时间线的条上，图表不再抖动。",
+          "自托管升级中途被打断，重跑一次就能安全接上。",
         ],
       },
       {

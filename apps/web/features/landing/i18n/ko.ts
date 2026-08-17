@@ -280,7 +280,6 @@ export function createKoDict(allowSignup: boolean): LandingDict {
             "Slack으로 보낸 파일이 대화에 첨부로 들어옵니다.",
             "휴대폰 홈 화면에 Multica를 추가해 앱처럼 열 수 있어요.",
             "브라우저 탭에 지금 열어 둔 워크스페이스 페이지 이름이 표시됩니다.",
-            "데스크톱에서 Cmd/Ctrl+,를 누르면 설정이 열립니다.",
             "가져온 스킬이 어디서 왔는지 보여 줍니다.",
             "지금 보고 있는 Issue를 멘션하면 '이 Issue'로 표시됩니다.",
           ],
@@ -303,6 +302,7 @@ export function createKoDict(allowSignup: boolean): LandingDict {
             "페이지 머리글에 사이드바 토글이 두 개 나오지 않습니다.",
             "에이전트를 만들 때 오류가 잠깐 번쩍이지 않습니다.",
             "실행 타임라인의 막대에 마우스를 올려도 흔들리지 않습니다.",
+            "셀프호스팅 업데이트가 중간에 멈춰도 다시 실행하면 안전하게 이어집니다.",
           ],
         },
         {

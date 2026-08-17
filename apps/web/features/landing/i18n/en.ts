@@ -306,7 +306,6 @@ export function createEnDict(allowSignup: boolean): LandingDict {
           "Files sent in Slack now arrive in the conversation as attachments.",
           "You can now add Multica to your phone's home screen and open it like an app.",
           "Browser tabs are now named after the workspace page you have open.",
-          "On desktop, Cmd/Ctrl+, now opens Settings.",
           "Imported skills now show where they came from.",
           "A mention of the Issue you are reading now reads as \"This issue\".",
         ],
@@ -329,6 +328,7 @@ export function createEnDict(allowSignup: boolean): LandingDict {
           "Page headers no longer show a second sidebar toggle.",
           "Creating an agent no longer flashes an error.",
           "Hovering a bar in the run timeline no longer makes it shake.",
+          "A self-hosted upgrade that gets interrupted now carries on safely when you run it again.",
         ],
       },
       {
