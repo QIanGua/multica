@@ -365,7 +365,9 @@
       "multi_select": "Multi-select",
       "date": "Date",
       "checkbox": "Checkbox",
-      "url": "URL"
+      "url": "URL",
+      "actor": "Member or agent",
+      "multi_actor": "Members or agents"
     },
     "actions": {
       "open": "Actions for {{name}}",

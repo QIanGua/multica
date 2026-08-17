@@ -189,6 +189,10 @@ func (h *Handler) issueTableFacetQuery(w http.ResponseWriter, r *http.Request, r
 	}
 
 	query := ""
+	// Actor-property facet keys are "<kind>:<uuid>" references, so the
+	// agent-typed ones disclose agent identity and need the same visibility
+	// gate as the working-agents facet below.
+	actorPropertyFacet := false
 	switch facet.Kind {
 	case "status":
 		query = fmt.Sprintf(`SELECT i.status, COUNT(*)::bigint FROM issue i WHERE %s GROUP BY i.status`, compiled.where)
@@ -245,10 +249,11 @@ GROUP BY a.id`, compiled.where)
 			return response, false
 		}
 		propertyKey := "'" + util.UUIDToString(property.ID) + "'"
+		actorPropertyFacet = propertyTypeIsActor(property.Type)
 		switch property.Type {
-		case "select":
+		case "select", "actor":
 			query = fmt.Sprintf(`SELECT i.properties ->> %s, COUNT(*)::bigint FROM issue i WHERE %s AND jsonb_typeof(i.properties -> %s) = 'string' GROUP BY 1`, propertyKey, compiled.where, propertyKey)
-		case "multi_select":
+		case "multi_select", "multi_actor":
 			query = fmt.Sprintf(`SELECT property_value.value, COUNT(DISTINCT i.id)::bigint FROM issue i JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(i.properties -> %s) = 'array' THEN i.properties -> %s ELSE '[]'::jsonb END) AS property_value(value) ON TRUE WHERE %s GROUP BY property_value.value`, propertyKey, propertyKey, compiled.where)
 		case "checkbox":
 			query = fmt.Sprintf(`SELECT i.properties ->> %s, COUNT(*)::bigint FROM issue i WHERE %s AND jsonb_typeof(i.properties -> %s) = 'boolean' GROUP BY 1`, propertyKey, compiled.where, propertyKey)
@@ -288,6 +293,13 @@ GROUP BY a.id`, compiled.where)
 		}
 		response.Values = values
 	}
+	if actorPropertyFacet {
+		values, ok := h.filterAccessibleActorFacetValues(w, r, compiled.workspaceID, response.Values)
+		if !ok {
+			return response, false
+		}
+		response.Values = values
+	}
 	sort.Slice(response.Values, func(i, j int) bool {
 		return strings.Compare(response.Values[i].Key, response.Values[j].Key) < 0
 	})
@@ -321,6 +333,52 @@ func (h *Handler) filterAccessibleAgentFacetValues(
 	filtered := make([]issueTableFacetValueResponse, 0, len(values))
 	for _, value := range values {
 		if _, permitted := allowed[value.Key]; permitted {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered, true
+}
+
+// filterAccessibleActorFacetValues drops agent-typed actor-property facet
+// values the caller cannot see. Member-typed values pass through: workspace
+// membership is already visible to every member. Values that don't parse are
+// dropped rather than surfaced — a malformed key can only come from a value
+// written before this type existed.
+func (h *Handler) filterAccessibleActorFacetValues(
+	w http.ResponseWriter,
+	r *http.Request,
+	workspaceUUID pgtype.UUID,
+	values []issueTableFacetValueResponse,
+) ([]issueTableFacetValueResponse, bool) {
+	if len(values) == 0 {
+		return values, true
+	}
+	filtered := make([]issueTableFacetValueResponse, 0, len(values))
+	var allowed map[string]struct{}
+	for _, value := range values {
+		ref, err := parseActorRef(value.Key)
+		if err != nil {
+			continue
+		}
+		if ref.Kind != "agent" {
+			filtered = append(filtered, value)
+			continue
+		}
+		if allowed == nil {
+			workspaceID := util.UUIDToString(workspaceUUID)
+			member, ok := h.workspaceMember(w, r, workspaceID)
+			if !ok {
+				return nil, false
+			}
+			actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
+			resolved, ok := h.accessibleAgentIDs(r.Context(), workspaceID, actorType, actorID, member.Role)
+			if !ok {
+				writeIssueTableQueryFailure(w, r, "failed to resolve agent access")
+				return nil, false
+			}
+			allowed = resolved
+		}
+		if _, permitted := allowed[ref.ID]; permitted {
 			filtered = append(filtered, value)
 		}
 	}

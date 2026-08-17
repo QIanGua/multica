@@ -44,9 +44,13 @@ const (
 	maxPropertyDescriptionLen       = 500
 	maxPropertyTextValueLen         = 2000
 	maxPropertyURLValueLen          = 2048
+	// multi_actor is capped well below the select cap: the whole properties
+	// bag shares one 16KB row budget, and a property holding hundreds of
+	// actors would crowd out every other property on the same issue.
+	maxPropertyActorValues = 20
 )
 
-var validPropertyTypes = []string{"text", "number", "select", "multi_select", "date", "checkbox", "url"}
+var validPropertyTypes = []string{"text", "number", "select", "multi_select", "date", "checkbox", "url", "actor", "multi_actor"}
 
 // Property icons use stable catalog keys that the Web client maps to Lucide
 // glyphs. Keeping this allowlist at the API boundary prevents arbitrary text
@@ -297,6 +301,176 @@ func selectOptionsHint(cfg PropertyConfig) string {
 	return strings.Join(parts, ", ")
 }
 
+// ---------------------------------------------------------------------------
+// Actor values (MUL-6286)
+// ---------------------------------------------------------------------------
+
+// actorPropertyKinds is the V1 value range for actor properties. The issue
+// assignee additionally accepts "squad", but a squad is a routing target
+// rather than a person, so it stays out until a concrete use case appears.
+// The stored form carries the kind, so widening this later needs no migration.
+var actorPropertyKinds = []string{"member", "agent"}
+
+// actorRef is a parsed "<kind>:<uuid>" property value.
+type actorRef struct {
+	Kind string
+	ID   string
+}
+
+func (a actorRef) String() string { return a.Kind + ":" + a.ID }
+
+func propertyTypeIsActor(t string) bool {
+	return t == "actor" || t == "multi_actor"
+}
+
+func actorKindsHint() string {
+	return strings.Join(actorPropertyKinds, " / ")
+}
+
+// parseActorRef splits a stored actor value. Members are referenced by
+// user_id — the same id the assignee pair uses — so "who is this" resolves
+// identically everywhere in the product.
+func parseActorRef(s string) (actorRef, error) {
+	kind, id, found := strings.Cut(s, ":")
+	if !found {
+		return actorRef{}, fmt.Errorf("value must look like \"<kind>:<uuid>\" where kind is one of: %s", actorKindsHint())
+	}
+	valid := false
+	for _, k := range actorPropertyKinds {
+		if kind == k {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return actorRef{}, fmt.Errorf("unknown actor kind %q; valid kinds: %s", kind, actorKindsHint())
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return actorRef{}, fmt.Errorf("actor id in %q must be a UUID", s)
+	}
+	return actorRef{Kind: kind, ID: id}, nil
+}
+
+// parseActorRefList validates a multi_actor array: every element must parse,
+// duplicates are dropped, and the caller's order is preserved. Unlike
+// multi_select there is no config order to canonicalize against, and sorting
+// by id would make the avatar row reshuffle on every edit. @> containment is
+// order-insensitive, so filtering is unaffected either way.
+func parseActorRefList(items []any) ([]actorRef, error) {
+	if len(items) == 0 {
+		return nil, errors.New("value must be a non-empty array of actor references")
+	}
+	if len(items) > maxPropertyActorValues {
+		return nil, fmt.Errorf("value cannot list more than %d actors", maxPropertyActorValues)
+	}
+	seen := make(map[string]struct{}, len(items))
+	refs := make([]actorRef, 0, len(items))
+	for _, item := range items {
+		s, ok := item.(string)
+		if !ok {
+			return nil, errors.New("value must be an array of actor reference strings")
+		}
+		ref, err := parseActorRef(s)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := seen[ref.String()]; dup {
+			continue
+		}
+		seen[ref.String()] = struct{}{}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+// actorRefsInValue re-reads the canonical stored JSON for an actor property.
+// SetIssueProperty uses it to resolve references against the workspace after
+// the pure shape validation has run.
+func actorRefsInValue(propType string, stored []byte) ([]actorRef, error) {
+	if propType == "actor" {
+		var s string
+		if err := json.Unmarshal(stored, &s); err != nil {
+			return nil, err
+		}
+		ref, err := parseActorRef(s)
+		if err != nil {
+			return nil, err
+		}
+		return []actorRef{ref}, nil
+	}
+	var list []string
+	if err := json.Unmarshal(stored, &list); err != nil {
+		return nil, err
+	}
+	refs := make([]actorRef, 0, len(list))
+	for _, s := range list {
+		ref, err := parseActorRef(s)
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+// resolveActorRefs checks that every reference points at something real in
+// this workspace, and that the caller is allowed to see it.
+//
+// Referencing an agent is NOT an assignment: it never enqueues a task, routes
+// a squad, or notifies. It does still disclose agent identity, so it reuses
+// the same visibility set as every other workspace-wide agent aggregation —
+// a private or non-allow-listed agent must not become referenceable by id.
+func (h *Handler) resolveActorRefs(r *http.Request, workspaceID string, refs []actorRef) (int, string) {
+	ctx := r.Context()
+	wsUUID, err := util.ParseUUID(workspaceID)
+	if err != nil {
+		return http.StatusBadRequest, "invalid workspace_id"
+	}
+	var allowedAgents map[string]struct{}
+	for _, ref := range refs {
+		refUUID, err := util.ParseUUID(ref.ID)
+		if err != nil {
+			return http.StatusBadRequest, fmt.Sprintf("actor id in %q must be a UUID", ref)
+		}
+		switch ref.Kind {
+		case "member":
+			if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+				UserID:      refUUID,
+				WorkspaceID: wsUUID,
+			}); err != nil {
+				return http.StatusBadRequest, fmt.Sprintf("%q does not refer to a member of this workspace", ref)
+			}
+		case "agent":
+			agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+				ID:          refUUID,
+				WorkspaceID: wsUUID,
+			})
+			if err != nil {
+				return http.StatusBadRequest, fmt.Sprintf("%q does not refer to an agent of this workspace", ref)
+			}
+			if agent.ArchivedAt.Valid {
+				return http.StatusBadRequest, fmt.Sprintf("%q refers to an archived agent", ref)
+			}
+			if allowedAgents == nil {
+				member, err := h.getWorkspaceMember(ctx, requestUserID(r), workspaceID)
+				if err != nil {
+					return http.StatusForbidden, "not a member of this workspace"
+				}
+				actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
+				allowed, ok := h.accessibleAgentIDs(ctx, workspaceID, actorType, actorID, member.Role)
+				if !ok {
+					return http.StatusInternalServerError, "failed to resolve agent access"
+				}
+				allowedAgents = allowed
+			}
+			if _, permitted := allowedAgents[ref.ID]; !permitted {
+				return http.StatusForbidden, fmt.Sprintf("%q refers to a private agent", ref)
+			}
+		}
+	}
+	return 0, ""
+}
+
 // validatePropertyValue checks a raw JSON value against the definition's type
 // and returns the canonical JSON to store. Error strings enumerate the legal
 // values where possible — agents consume these directly to self-correct.
@@ -394,6 +568,30 @@ func validatePropertyValue(def db.IssueProperty, raw json.RawMessage) ([]byte, e
 		// (stable @> containment filtering and change detection).
 		sort.SliceStable(ids, func(a, b int) bool { return order[ids[a]] < order[ids[b]] })
 		return json.Marshal(ids)
+	case "actor":
+		s, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("value must be an actor reference string like \"member:<uuid>\" (kinds: %s)", actorKindsHint())
+		}
+		ref, err := parseActorRef(s)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(ref.String())
+	case "multi_actor":
+		items, ok := v.([]any)
+		if !ok {
+			return nil, fmt.Errorf("value must be an array of actor reference strings like \"member:<uuid>\" (kinds: %s)", actorKindsHint())
+		}
+		refs, err := parseActorRefList(items)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]string, len(refs))
+		for i, ref := range refs {
+			out[i] = ref.String()
+		}
+		return json.Marshal(out)
 	default:
 		return nil, fmt.Errorf("unsupported property type %q", def.Type)
 	}
@@ -762,6 +960,18 @@ func (h *Handler) SetIssueProperty(w http.ResponseWriter, r *http.Request) {
 		value, err := validatePropertyValue(def, req.Value)
 		if err != nil {
 			return fail(http.StatusBadRequest, err.Error())
+		}
+		// Actor values point at another entity, so shape validation isn't
+		// enough: resolve each reference against this workspace before the
+		// write, and reject references the caller isn't allowed to see.
+		if propertyTypeIsActor(def.Type) {
+			refs, err := actorRefsInValue(def.Type, value)
+			if err != nil {
+				return fail(http.StatusBadRequest, err.Error())
+			}
+			if status, msg := h.resolveActorRefs(r, uuidToString(issue.WorkspaceID), refs); status != 0 {
+				return fail(status, msg)
+			}
 		}
 		updated, err = q.SetIssuePropertyValue(r.Context(), db.SetIssuePropertyValueParams{
 			ID:          issue.ID,

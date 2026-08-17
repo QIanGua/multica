@@ -23,6 +23,7 @@ import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
 import { useT } from "../../../i18n";
 import { PropertyPicker, PickerItem } from "./property-picker";
+import { ActorPropertyPicker, ActorPropertyDisplay } from "./actor-property-picker";
 
 /**
  * Value editor for one custom property on one issue. The editor shape
@@ -32,6 +33,8 @@ import { PropertyPicker, PickerItem } from "./property-picker";
  *   multi_select  → PropertyPicker with toggling items (stays open)
  *   date          → Calendar popover (mirrors DueDatePicker)
  *   checkbox      → Yes / No picker
+ *   actor         → member/agent picker (commits and closes)
+ *   multi_actor   → member/agent picker with toggling items (stays open)
  *   text/number/url → popover with an input, Enter commits
  *
  * Archived definitions render read-only: the popover only offers Clear
@@ -143,9 +146,17 @@ export function CustomPropertyValueInput({
   // offered action is Clear so stale values can still be cleaned up.
   const readOnly =
     property.archived ||
-    !["select", "multi_select", "date", "checkbox", "text", "number", "url"].includes(
-      property.type,
-    );
+    ![
+      "select",
+      "multi_select",
+      "date",
+      "checkbox",
+      "text",
+      "number",
+      "url",
+      "actor",
+      "multi_actor",
+    ].includes(property.type);
 
   if (readOnly) {
     return (
@@ -226,6 +237,20 @@ export function CustomPropertyValueInput({
         </PropertyPicker>
       );
     }
+    case "actor":
+    case "multi_actor":
+      return (
+        <ActorPropertyPicker
+          property={property}
+          value={value}
+          onChange={onChange}
+          open={open}
+          onOpenChange={setOpen}
+          trigger={valueTrigger}
+          triggerRender={triggerRender}
+          emptyRow={emptyRow}
+        />
+      );
     case "date": {
       const date = typeof value === "string" ? dateOnlyToLocalDate(value) : undefined;
       return (
@@ -474,6 +499,18 @@ export function CustomPropertyValueDisplay({
         </span>
       );
     }
+    case "actor":
+    case "multi_actor":
+      return (
+        <ActorPropertyDisplay
+          value={value}
+          emptyLabel={
+            <span className="text-muted-foreground">
+              {t(($) => $.pickers.custom_property.empty)}
+            </span>
+          }
+        />
+      );
     case "date":
       return (
         <span className="flex items-center gap-1.5">

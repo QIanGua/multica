@@ -647,6 +647,7 @@
       "value_placeholder": "Enter value…",
       "url_placeholder": "https://…",
       "number_placeholder": "0",
+      "actor_search_placeholder": "Search members and agents…",
       "open_link": "Open link",
       "archived_hint": "Archived property — value is read-only"
     },

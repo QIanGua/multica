@@ -616,6 +616,7 @@
       "value_placeholder": "输入值…",
       "url_placeholder": "https://…",
       "number_placeholder": "0",
+      "actor_search_placeholder": "搜索成员和智能体…",
       "open_link": "打开链接",
       "archived_hint": "已归档属性——值为只读",
       "none": "无值"
