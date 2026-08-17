@@ -393,6 +393,20 @@ func TestSupervisorSkipsWhenAnotherReplicaHoldsLease(t *testing.T) {
 		t.Fatalf("loser should rely on batched held-key sweeps, acquire attempts=%d", got)
 	}
 
+	// Revoking an installation this node only observed as contended must prune
+	// its takeover-timing state; otherwise repeated install/revoke cycles leak.
+	q.mu.Lock()
+	q.installations = nil
+	q.mu.Unlock()
+	if !waitFor(200*time.Millisecond, func() bool {
+		sup.mu.Lock()
+		defer sup.mu.Unlock()
+		_, ok := sup.contendedSince[uuidString(instID)]
+		return !ok
+	}) {
+		t.Fatalf("revoked contended installation was not pruned")
+	}
+
 	cancel()
 	sup.Wait()
 }
@@ -534,6 +548,44 @@ func TestSupervisorRestartsOnCredentialsRotation(t *testing.T) {
 	}
 }
 
+func TestSupervisorRotationReplacesConnectionInSameSweep(t *testing.T) {
+	q := newFakeStore()
+	instID := uuidFromString(t, "56565656-5656-5656-5656-565656565656")
+	q.installations = []Installation{activeInst(instID, "fp-one")}
+
+	fc := &fakeChannel{typ: channel.TypeFeishu}
+	var builds int32
+	cfg := fastConfig()
+	cfg.LeaseTTL = 6 * time.Second
+	cfg.LeaseRenewInterval = 3 * time.Second
+	cfg.PollInterval = 2 * time.Second
+	cfg.LeaseErrorRetryInterval = 100 * time.Millisecond
+	cfg.LeaseExpirySafetyMargin = 500 * time.Millisecond
+	cfg.RotationWaitTimeout = 500 * time.Millisecond
+	sup := NewSupervisor(q, q, fakeRegistry(fc, &builds, nil), nil, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	go sup.Run(ctx)
+	defer func() {
+		cancel()
+		sup.Wait()
+	}()
+	if !waitFor(300*time.Millisecond, func() bool { return atomic.LoadInt32(&builds) == 1 }) {
+		t.Fatalf("initial channel never built")
+	}
+
+	q.mu.Lock()
+	q.installations[0].Fingerprint = "fp-two"
+	q.mu.Unlock()
+	started := time.Now()
+	sup.sweep(ctx)
+	if !waitFor(500*time.Millisecond, func() bool { return atomic.LoadInt32(&builds) == 2 }) {
+		t.Fatalf("rotation waited for the next %s poll instead of restarting in the same sweep", cfg.PollInterval)
+	}
+	if elapsed := time.Since(started); elapsed >= cfg.PollInterval {
+		t.Fatalf("rotation replacement took %s, poll interval is %s", elapsed, cfg.PollInterval)
+	}
+}
+
 func TestSupervisorDoesNotRestartOnUnchangedRow(t *testing.T) {
 	q := newFakeStore()
 	instID := uuidFromString(t, "66666666-6666-6666-6666-666666666666")
@@ -618,6 +670,45 @@ func TestSupervisorLeaseLossCancelsConnection(t *testing.T) {
 	case <-connectReturned:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("lease loss did not cancel the running connection")
+	}
+}
+
+func TestSupervisorClearedLeaseKeyCancelsOldOwner(t *testing.T) {
+	q := newFakeStore()
+	instID := uuidFromString(t, "8b8b8b8b-8b8b-8b8b-8b8b-8b8b8b8b8b8b")
+	q.installations = []Installation{activeInst(instID, "fp1")}
+
+	connectReturned := make(chan struct{}, 1)
+	fc := &fakeChannel{
+		typ: channel.TypeFeishu,
+		script: []func(context.Context) error{func(ctx context.Context) error {
+			<-ctx.Done()
+			connectReturned <- struct{}{}
+			return ctx.Err()
+		}},
+	}
+	var builds int32
+	sup := NewSupervisor(q, q, fakeRegistry(fc, &builds, nil), nil, fastConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	go sup.Run(ctx)
+	defer func() {
+		cancel()
+		sup.Wait()
+	}()
+	if !waitFor(300*time.Millisecond, func() bool { return fc.Connects() == 1 }) {
+		t.Fatalf("channel never connected")
+	}
+
+	// Simulate Redis losing/clearing the key. Strict renewal must treat absence
+	// as lease loss instead of recreating the key from the old owner.
+	q.mu.Lock()
+	delete(q.leaseOwner, uuidString(instID))
+	delete(q.leaseExpiresAt, uuidString(instID))
+	q.mu.Unlock()
+	select {
+	case <-connectReturned:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("cleared lease key did not tear down the old owner")
 	}
 }
 
@@ -813,11 +904,25 @@ func TestSupervisorConfigDefaults(t *testing.T) {
 	if sup.ShutdownTimeout() <= 0 {
 		t.Fatalf("shutdown timeout must default to a positive value")
 	}
+	if sup.cfg.RotationWaitTimeout <= 0 {
+		t.Fatalf("rotation wait timeout must default to a positive value")
+	}
 	if sup.cfg.Now == nil || sup.cfg.Logger == nil {
 		t.Fatalf("Now and Logger must be defaulted")
 	}
 	if sup.NodeID() == "" {
 		t.Fatalf("node id must be assigned")
+	}
+}
+
+func TestSupervisorPartialTTLConfigDerivesSafeIntervals(t *testing.T) {
+	store := newFakeStore()
+	sup := NewSupervisor(store, store, channel.NewRegistry(), nil, Config{LeaseTTL: 30 * time.Second})
+	if sup.cfg.LeaseRenewInterval != 10*time.Second {
+		t.Fatalf("renew interval = %s, want TTL/3", sup.cfg.LeaseRenewInterval)
+	}
+	if sup.cfg.PollInterval != 5*time.Second {
+		t.Fatalf("poll interval = %s, want renew/2", sup.cfg.PollInterval)
 	}
 }
 

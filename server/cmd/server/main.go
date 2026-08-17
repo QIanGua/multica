@@ -51,6 +51,13 @@ func redisClientName(existing, suffix string) string {
 	return "multica-api:" + suffix
 }
 
+func channelLeaseRedisURLFromEnv() string {
+	if dedicated := strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_REDIS_URL")); dedicated != "" {
+		return dedicated
+	}
+	return strings.TrimSpace(os.Getenv("REDIS_URL"))
+}
+
 func closeRedisClient(label string, client *redis.Client) {
 	if client == nil {
 		return
@@ -262,7 +269,8 @@ func main() {
 	// is the sole broadcaster and the server stays single-node (legacy).
 	// Runtime local-skill stores and realtime relay traffic use separate Redis
 	// clients so blocking stream consumers cannot starve request-path Redis
-	// operations.
+	// operations. Channel leases are initialized separately below so production
+	// can point them at a dedicated no-eviction Redis instance.
 	relayCtx, relayCancel := context.WithCancel(context.Background())
 	var broadcaster realtime.Broadcaster = hub
 	var storeRedis *redis.Client
@@ -296,9 +304,6 @@ func main() {
 				slog.Info("redis: CLIENT SETNAME disabled (REDIS_DISABLE_CLIENT_NAME=true) for managed Redis compatibility")
 			}
 			storeRedis = newNamedRedisClient(opts, "store")
-			if strings.EqualFold(strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_BACKEND")), "redis") {
-				channelLeaseRedis = newNamedRedisClient(opts, "channel-lease")
-			}
 			relayWriteRedis = newNamedRedisClient(opts, "realtime-write")
 
 			relayMode := realtimeRelayModeFromEnv()
@@ -340,6 +345,16 @@ func main() {
 		}
 	} else {
 		slog.Info("realtime: REDIS_URL not set — using in-memory hub (single-node mode)")
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_BACKEND")), "redis") {
+		leaseRedisURL := channelLeaseRedisURLFromEnv()
+		if leaseRedisURL == "" {
+			slog.Error("channel leases: CHANNEL_WS_LEASE_REDIS_URL and REDIS_URL are unset")
+		} else if opts, err := redis.ParseURL(leaseRedisURL); err != nil {
+			slog.Error("channel leases: invalid Redis URL; supervisor will fail closed", "error", err)
+		} else {
+			channelLeaseRedis = newNamedRedisClient(opts, "channel-lease")
+		}
 	}
 	registerListeners(bus, broadcaster)
 

@@ -9,10 +9,11 @@ import (
 // ChannelLeaseMetrics exposes the ownership signals needed to verify a Redis
 // lease cutover without putting installation IDs into metric labels.
 type ChannelLeaseMetrics struct {
-	Operations          *prometheus.CounterVec
-	ActiveOwners        prometheus.Gauge
-	LastSuccessfulRenew prometheus.Gauge
-	TakeoverLatency     prometheus.Histogram
+	Operations              *prometheus.CounterVec
+	ActiveOwners            prometheus.Gauge
+	OwnersWithRenewalErrors prometheus.Gauge
+	LastSuccessfulRenew     prometheus.Gauge
+	TakeoverLatency         prometheus.Histogram
 }
 
 func NewChannelLeaseMetrics() *ChannelLeaseMetrics {
@@ -28,6 +29,12 @@ func NewChannelLeaseMetrics() *ChannelLeaseMetrics {
 			Subsystem: "channel_lease",
 			Name:      "active_owners",
 			Help:      "Channel installations currently owned by this process.",
+		}),
+		OwnersWithRenewalErrors: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "multica",
+			Subsystem: "channel_lease",
+			Name:      "owners_with_renewal_errors",
+			Help:      "Channel lease owners whose latest renewal attempt failed.",
 		}),
 		LastSuccessfulRenew: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "multica",
@@ -57,6 +64,12 @@ func (m *ChannelLeaseMetrics) SetActiveLeaseOwners(count float64) {
 	}
 }
 
+func (m *ChannelLeaseMetrics) SetOwnersWithRenewalErrors(count float64) {
+	if m != nil {
+		m.OwnersWithRenewalErrors.Set(count)
+	}
+}
+
 func (m *ChannelLeaseMetrics) SetLastSuccessfulRenewal(at time.Time) {
 	if m != nil {
 		m.LastSuccessfulRenew.Set(float64(at.Unix()))
@@ -70,5 +83,5 @@ func (m *ChannelLeaseMetrics) ObserveTakeoverLatency(delay time.Duration) {
 }
 
 func (m *ChannelLeaseMetrics) Collectors() []prometheus.Collector {
-	return []prometheus.Collector{m.Operations, m.ActiveOwners, m.LastSuccessfulRenew, m.TakeoverLatency}
+	return []prometheus.Collector{m.Operations, m.ActiveOwners, m.OwnersWithRenewalErrors, m.LastSuccessfulRenew, m.TakeoverLatency}
 }

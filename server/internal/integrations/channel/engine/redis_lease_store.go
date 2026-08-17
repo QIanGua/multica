@@ -108,6 +108,9 @@ func (s *RedisLeaseStore) ListHeldWSLeases(ctx context.Context, ids []pgtype.UUI
 	for i, id := range ids {
 		keys[i] = s.key(id)
 	}
+	// RedisLeaseStore intentionally takes *redis.Client (standalone/sentinel),
+	// not ClusterClient. A future cluster-mode implementation must group keys by
+	// hash slot or pipeline individual GETs; cross-slot MGET is not valid.
 	values, err := s.client.MGet(ctx, keys...).Result()
 	if err != nil {
 		return nil, err

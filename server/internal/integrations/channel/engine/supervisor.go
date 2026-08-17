@@ -107,6 +107,7 @@ type LeaseStore interface {
 type LeaseMetrics interface {
 	RecordLeaseOperation(operation, outcome string)
 	SetActiveLeaseOwners(count float64)
+	SetOwnersWithRenewalErrors(count float64)
 	SetLastSuccessfulRenewal(at time.Time)
 	ObserveTakeoverLatency(delay time.Duration)
 }
@@ -155,6 +156,12 @@ type Config struct {
 	// connection ends, for the same reason as LeaseReleaseTimeout.
 	DisconnectTimeout time.Duration
 
+	// RotationWaitTimeout bounds how long one sweep waits for all cancelled
+	// credential-rotation predecessors to disconnect and release their leases.
+	// A single shared deadline covers the whole batch, so many simultaneous
+	// rotations cannot stall a sweep for N times this duration.
+	RotationWaitTimeout time.Duration
+
 	// ShutdownTimeout bounds how long Wait blocks for supervisor goroutines
 	// after their parent ctx is cancelled. Wait itself does not enforce it;
 	// callers pass it to WaitWithTimeout. Exposed so boot and tests share a
@@ -177,10 +184,10 @@ func (c Config) withDefaults() Config {
 		c.LeaseTTL = 180 * time.Second
 	}
 	if c.LeaseRenewInterval == 0 {
-		c.LeaseRenewInterval = 60 * time.Second
+		c.LeaseRenewInterval = min(60*time.Second, c.LeaseTTL/3)
 	}
 	if c.PollInterval == 0 {
-		c.PollInterval = 30 * time.Second
+		c.PollInterval = min(30*time.Second, c.LeaseRenewInterval/2)
 	}
 	if c.LeaseErrorRetryInterval == 0 {
 		c.LeaseErrorRetryInterval = min(5*time.Second, c.LeaseRenewInterval/4)
@@ -202,6 +209,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.DisconnectTimeout == 0 {
 		c.DisconnectTimeout = 5 * time.Second
+	}
+	if c.RotationWaitTimeout == 0 {
+		c.RotationWaitTimeout = c.DisconnectTimeout + c.LeaseReleaseTimeout
 	}
 	if c.ShutdownTimeout == 0 {
 		c.ShutdownTimeout = 15 * time.Second
@@ -233,6 +243,9 @@ func (c Config) Validate() error {
 	}
 	if c.LeaseExpirySafetyMargin <= 0 || c.LeaseExpirySafetyMargin >= c.LeaseTTL-c.LeaseRenewInterval {
 		return fmt.Errorf("channel engine: lease expiry safety margin must be positive and less than ttl-renew (margin=%s)", c.LeaseExpirySafetyMargin)
+	}
+	if c.RotationWaitTimeout < 0 {
+		return errors.New("channel engine: rotation wait timeout cannot be negative")
 	}
 	return nil
 }
@@ -277,6 +290,10 @@ type Supervisor struct {
 	// successful expiry takeover latency can be measured without per-ID labels.
 	contendedSince map[string]time.Time
 	activeOwners   int
+	// renewalErrors is a bounded set (active local owners only) used to expose
+	// partial renewal failure that a process-wide "last success" timestamp can
+	// otherwise hide when some other installation remains healthy.
+	renewalErrors map[string]struct{}
 	// supervisorGen is the source of the monotonic gen counter stored on
 	// each entry. Bumped under mu when a new entry is minted (initial start
 	// or rotation restart).
@@ -295,8 +312,21 @@ type Supervisor struct {
 // path already swapped in.
 type supervisorEntry struct {
 	cancel      context.CancelFunc
+	done        <-chan struct{}
 	fingerprint string
 	gen         uint64
+}
+
+type leaseCandidate struct {
+	installation Installation
+	// localRotation suppresses takeover-latency accounting if the candidate is
+	// still blocked by this process's own predecessor after the bounded wait.
+	localRotation bool
+}
+
+type rotationWait struct {
+	installationID string
+	done           <-chan struct{}
 }
 
 // NewSupervisor constructs a Supervisor bound to the supplied store,
@@ -316,6 +346,7 @@ func NewSupervisor(store InstallationStore, leaseStore LeaseStore, registry *cha
 		nodeID:         newNodeID(),
 		supervisors:    make(map[string]supervisorEntry),
 		contendedSince: make(map[string]time.Time),
+		renewalErrors:  make(map[string]struct{}),
 		stopChan:       make(chan struct{}),
 	}
 }
@@ -409,8 +440,9 @@ func (s *Supervisor) sweep(ctx context.Context) {
 		return
 	}
 	active := make(map[string]struct{}, len(rows))
-	candidates := make([]Installation, 0, len(rows))
+	candidates := make([]leaseCandidate, 0, len(rows))
 	candidateIDs := make([]pgtype.UUID, 0, len(rows))
+	rotationWaits := make([]rotationWait, 0)
 	for _, row := range rows {
 		// Skip channel types with no registered per-installation Factory. Such
 		// rows are driven outside the Supervisor (e.g. Slack's app-level Socket
@@ -424,9 +456,12 @@ func (s *Supervisor) sweep(ctx context.Context) {
 		}
 		id := uuidString(row.ID)
 		active[id] = struct{}{}
-		s.maybeRestartOnRotation(id, row)
+		done, rotated := s.cancelOnRotation(id, row)
+		if rotated {
+			rotationWaits = append(rotationWaits, rotationWait{installationID: id, done: done})
+		}
 		if !s.isSupervised(id) {
-			candidates = append(candidates, row)
+			candidates = append(candidates, leaseCandidate{installation: row, localRotation: rotated})
 			candidateIDs = append(candidateIDs, row.ID)
 		}
 	}
@@ -440,11 +475,17 @@ func (s *Supervisor) sweep(ctx context.Context) {
 			delete(s.supervisors, id)
 		}
 	}
+	for id := range s.contendedSince {
+		if _, stillActive := active[id]; !stillActive {
+			delete(s.contendedSince, id)
+		}
+	}
 	s.mu.Unlock()
 
 	if len(candidates) == 0 {
 		return
 	}
+	s.waitForRotations(ctx, rotationWaits)
 	held, err := s.leaseStore.ListHeldWSLeases(ctx, candidateIDs)
 	if err != nil {
 		s.recordLeaseOperation("list", "error")
@@ -452,10 +493,13 @@ func (s *Supervisor) sweep(ctx context.Context) {
 		return
 	}
 	s.recordLeaseOperation("list", "success")
-	for _, row := range candidates {
+	for _, candidate := range candidates {
+		row := candidate.installation
 		id := uuidString(row.ID)
 		if _, occupied := held[id]; occupied {
-			s.markContended(id)
+			if !candidate.localRotation {
+				s.markContended(id)
+			}
 			continue
 		}
 		s.startSupervisor(ctx, row)
@@ -469,18 +513,18 @@ func (s *Supervisor) isSupervised(id string) bool {
 	return ok
 }
 
-// maybeRestartOnRotation cancels an existing supervisor when its
-// fingerprint differs from the current row's. The replacement is started by
-// the subsequent startSupervisor call in the same sweep iteration. The map
-// entry is dropped inline so the startSupervisor "skip if already
-// supervised" guard does not race the cancel.
-func (s *Supervisor) maybeRestartOnRotation(id string, row Installation) {
+// cancelOnRotation cancels an existing supervisor when its fingerprint differs
+// from the current row's and returns its completion signal. sweep cancels every
+// rotated predecessor first, then waits for the batch under one bounded
+// deadline before checking held keys. A promptly-cancelled predecessor releases
+// its key in time for its replacement to start in the same sweep.
+func (s *Supervisor) cancelOnRotation(id string, row Installation) (<-chan struct{}, bool) {
 	want := row.Fingerprint
 	s.mu.Lock()
 	entry, ok := s.supervisors[id]
 	if !ok || entry.fingerprint == want {
 		s.mu.Unlock()
-		return
+		return nil, false
 	}
 	s.cfg.Logger.Info("channel engine: credentials rotated, restarting supervisor",
 		"installation_id", id,
@@ -489,6 +533,37 @@ func (s *Supervisor) maybeRestartOnRotation(id string, row Installation) {
 	entry.cancel()
 	delete(s.supervisors, id)
 	s.mu.Unlock()
+	return entry.done, true
+}
+
+func (s *Supervisor) waitForRotations(ctx context.Context, waits []rotationWait) {
+	if len(waits) == 0 {
+		return
+	}
+	deadline := time.Now().Add(s.cfg.RotationWaitTimeout)
+	for _, wait := range waits {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			s.cfg.Logger.Warn("channel engine: timed out waiting for credential rotations to stop",
+				"timeout", s.cfg.RotationWaitTimeout.String(),
+			)
+			return
+		}
+		t := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-wait.done:
+			t.Stop()
+		case <-t.C:
+			s.cfg.Logger.Warn("channel engine: timed out waiting for rotated supervisor to stop",
+				"installation_id", wait.installationID,
+				"timeout", s.cfg.RotationWaitTimeout.String(),
+			)
+			return
+		}
+	}
 }
 
 func (s *Supervisor) startSupervisor(parent context.Context, inst Installation) {
@@ -503,16 +578,18 @@ func (s *Supervisor) startSupervisor(parent context.Context, inst Installation) 
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
 	s.supervisorGen++
 	gen := s.supervisorGen
 	s.supervisors[id] = supervisorEntry{
 		cancel:      cancel,
+		done:        done,
 		fingerprint: inst.Fingerprint,
 		gen:         gen,
 	}
 	s.wg.Add(1)
 	s.mu.Unlock()
-	go s.supervise(ctx, inst, id, gen)
+	go s.supervise(ctx, inst, id, gen, done)
 }
 
 // leaseToken composes the per-supervisor lease token: the process-wide
@@ -529,8 +606,9 @@ func leaseToken(nodeID string, gen uint64) string {
 // acquire lease → build channel → run it (Connect blocks) → renew lease
 // while it runs → on exit, release + back off → repeat. Returns when ctx is
 // cancelled.
-func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string, gen uint64) {
+func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string, gen uint64, done chan<- struct{}) {
 	defer s.wg.Done()
+	defer close(done)
 	defer func() {
 		// Only clear the map entry if it still belongs to us — gen
 		// disambiguates "this entry is mine" from "the rotation path already
@@ -572,6 +650,7 @@ func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string
 		}
 		s.recordLeaseOperation("acquire", "success")
 		s.observeTakeover(id)
+		s.setRenewalError(id, false)
 		s.adjustActiveOwners(1)
 
 		// Lease acquired. Build the platform channel via the registry,
@@ -696,6 +775,7 @@ func (s *Supervisor) renewLeaseUntil(ctx context.Context, cancelRun context.Canc
 				s.leaseLost(instID, cancelRun, "lease token no longer matches")
 				return
 			}
+			s.setRenewalError(uuidString(instID), true)
 			s.recordLeaseOperation("renew", "error")
 			s.cfg.Logger.Warn("channel engine: lease renewal error",
 				"installation_id", uuidString(instID),
@@ -706,6 +786,7 @@ func (s *Supervisor) renewLeaseUntil(ctx context.Context, cancelRun context.Canc
 			continue
 		}
 		confirmedUntil = started.Add(s.cfg.LeaseTTL - s.cfg.LeaseExpirySafetyMargin)
+		s.setRenewalError(uuidString(instID), false)
 		s.recordLeaseOperation("renew", "success")
 		if s.cfg.LeaseMetrics != nil {
 			s.cfg.LeaseMetrics.SetLastSuccessfulRenewal(s.cfg.Now())
@@ -715,6 +796,7 @@ func (s *Supervisor) renewLeaseUntil(ctx context.Context, cancelRun context.Canc
 }
 
 func (s *Supervisor) leaseLost(instID pgtype.UUID, cancelRun context.CancelFunc, reason string) {
+	s.setRenewalError(uuidString(instID), false)
 	s.recordLeaseOperation("renew", "lost")
 	s.cfg.Logger.Warn("channel engine: lease lost; tearing down connection",
 		"installation_id", uuidString(instID), "reason", reason)
@@ -728,6 +810,7 @@ func (s *Supervisor) leaseLost(instID pgtype.UUID, cancelRun context.CancelFunc,
 // token used to acquire — a rotation successor's lease carries a different
 // token, so a stale release no-ops instead of clobbering it.
 func (s *Supervisor) releaseLease(instID pgtype.UUID, token string) {
+	s.setRenewalError(uuidString(instID), false)
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.LeaseReleaseTimeout)
 	defer cancel()
 	if err := s.leaseStore.ReleaseWSLease(ctx, ReleaseLeaseParams{
@@ -757,6 +840,24 @@ func (s *Supervisor) adjustActiveOwners(delta int) {
 	s.mu.Unlock()
 	if s.cfg.LeaseMetrics != nil {
 		s.cfg.LeaseMetrics.SetActiveLeaseOwners(float64(count))
+	}
+}
+
+func (s *Supervisor) setRenewalError(id string, hasError bool) {
+	s.mu.Lock()
+	_, alreadySet := s.renewalErrors[id]
+	if hasError {
+		s.renewalErrors[id] = struct{}{}
+	} else {
+		delete(s.renewalErrors, id)
+	}
+	count := len(s.renewalErrors)
+	s.mu.Unlock()
+	if alreadySet == hasError {
+		return
+	}
+	if s.cfg.LeaseMetrics != nil {
+		s.cfg.LeaseMetrics.SetOwnersWithRenewalErrors(float64(count))
 	}
 }
 
