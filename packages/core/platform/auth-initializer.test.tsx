@@ -15,6 +15,18 @@ import type { StorageAdapter, User, Workspace } from "../types";
 import { workspaceKeys } from "../workspace/queries";
 import { AuthInitializer } from "./auth-initializer";
 
+const logger = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock("../logger", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../logger")>();
+  return { ...actual, createLogger: () => logger };
+});
+
 vi.mock("../analytics", () => ({
   captureSignupSource: vi.fn(),
   identify: vi.fn(),
@@ -168,6 +180,7 @@ describe("AuthInitializer recovery", () => {
       await vi.advanceTimersByTimeAsync(30_000);
     });
     expect(getMe).toHaveBeenCalledTimes(7);
+    expect(logger.error).toHaveBeenCalledTimes(1);
     expect(onLogout).not.toHaveBeenCalled();
   });
 
@@ -230,6 +243,32 @@ describe("AuthInitializer recovery", () => {
       expect(useAuthStore.getState().status).toBe("authenticated");
       expect(getConfig).toHaveBeenCalledTimes(2);
     });
+  });
+
+  it("keeps retrying app config until it loads", async () => {
+    vi.useFakeTimers();
+    const getConfig = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("network unavailable"))
+      .mockRejectedValueOnce(new TypeError("still unavailable"))
+      .mockResolvedValue({ feature_flags: { recovered: true } });
+    const api = makeApi({ getConfig });
+    renderInitializer({ api });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(getConfig).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    expect(getConfig).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(getConfig).toHaveBeenCalledTimes(3);
   });
 
   it("publishes a definitive logout for a genuine 401", async () => {

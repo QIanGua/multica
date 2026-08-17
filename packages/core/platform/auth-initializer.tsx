@@ -50,6 +50,7 @@ export function AuthInitializer({
   const configLoadedRef = useRef(false);
   const configRequestRef = useRef<Promise<boolean> | null>(null);
   const authRecoveryPendingRef = useRef(false);
+  const retryConfigRef = useRef<() => void>(() => {});
 
   const loadConfig = useCallback((): Promise<boolean> => {
     if (configLoadedRef.current) return Promise.resolve(true);
@@ -104,8 +105,72 @@ export function AuthInitializer({
     // reads this cookie, so it has to be present before the user hits submit.
     captureSignupSource();
 
-    // Fetch app config (CDN domain, PostHog key, …) in the background — non-blocking.
-    void loadConfig();
+    // Configuration is optional for startup, but an offline boot must still
+    // self-heal once connectivity returns. Keep retries rate-limited at the
+    // same 30-second ceiling as auth and accelerate them on `online`.
+    let cancelled = false;
+    let inFlight = false;
+    let retryAfterFlight = false;
+    let retryIndex = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const attempt = async () => {
+      if (cancelled || configLoadedRef.current) return;
+      if (retryTimer !== undefined) {
+        clearTimeout(retryTimer);
+        retryTimer = undefined;
+      }
+      if (inFlight) {
+        retryAfterFlight = true;
+        return;
+      }
+
+      inFlight = true;
+      const loaded = await loadConfig();
+      inFlight = false;
+      if (cancelled) return;
+      if (loaded) {
+        window.removeEventListener("online", retryNow);
+        return;
+      }
+      if (retryAfterFlight) {
+        retryAfterFlight = false;
+        void attempt();
+        return;
+      }
+
+      const delay = AUTH_RETRY_DELAYS_MS[retryIndex];
+      retryIndex = Math.min(retryIndex + 1, AUTH_RETRY_DELAYS_MS.length - 1);
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        void attempt();
+      }, delay);
+    };
+
+    const retryNow = () => {
+      if (cancelled || configLoadedRef.current) return;
+      retryIndex = 0;
+      if (retryTimer !== undefined) {
+        clearTimeout(retryTimer);
+        retryTimer = undefined;
+      }
+      if (inFlight) {
+        retryAfterFlight = true;
+        return;
+      }
+      void attempt();
+    };
+
+    retryConfigRef.current = retryNow;
+    window.addEventListener("online", retryNow);
+    void attempt();
+
+    return () => {
+      cancelled = true;
+      retryConfigRef.current = () => {};
+      window.removeEventListener("online", retryNow);
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+    };
   }, [loadConfig]);
 
   useEffect(() => {
@@ -115,6 +180,7 @@ export function AuthInitializer({
     let inFlight = false;
     let retryAfterFlight = false;
     let retryIndex = 0;
+    let loggedTransientFailure = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
     const onAuthSuccess = (user: User) => {
@@ -127,12 +193,9 @@ export function AuthInitializer({
       identifyAnalytics(user.id, { email: user.email, name: user.name });
       if (authRecoveryPendingRef.current) {
         authRecoveryPendingRef.current = false;
-        // A network-not-ready boot can fail both auth and config requests.
-        // If the boot-scoped config request is still in flight, wait for it;
-        // when it failed, make one fresh request now that auth has recovered.
-        void loadConfig().then((loaded) => {
-          if (!loaded && !cancelled) void loadConfig();
-        });
+        // A network-not-ready boot can fail both auth and config requests;
+        // successful auth is a strong signal to accelerate config recovery.
+        retryConfigRef.current();
       }
     };
 
@@ -205,7 +268,10 @@ export function AuthInitializer({
           return;
         }
 
-        logger.error("auth init temporarily unavailable", err);
+        if (!loggedTransientFailure) {
+          logger.error("auth init temporarily unavailable", err);
+          loggedTransientFailure = true;
+        }
         authRecoveryPendingRef.current = true;
         useAuthStore.setState({
           user: null,
