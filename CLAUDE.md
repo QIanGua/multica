@@ -208,6 +208,8 @@ Tests follow the code:
 Rules:
 
 - Never test shared component behavior in an app test file.
+- Give each product behavior ONE canonical layer. Pure parsing, state transitions and boundary matrices belong in a `.test.ts` beside the helper; the component suite keeps the happy path, the wiring, accessibility and named regressions, and points at the canonical file in a comment. Do not re-run a helper's matrix through a DOM mount.
+- A `.test.ts` that needs no DOM must start with `// @vitest-environment node`. jsdom costs ~0.8s of setup per file and buys such a suite nothing. Do not add it to a test whose code under test branches on `typeof window`/`document` — under node it would silently take the SSR path and still pass.
 - `packages/views/` tests must not mock `next/*` or `react-router-dom`.
 - Mock `@multica/core` stores with the Zustand callable-store shape (`selectorFn` plus `getState`).
 - Mock `@multica/core/api` for API calls.
