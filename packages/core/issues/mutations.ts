@@ -185,7 +185,7 @@ export function useUpdateIssue() {
           (old) =>
             detachedFromParent
               ? old?.filter((c) => c.id !== id)
-              : old?.map((c) => (c.id === id ? { ...c, ...patch } : c)),
+              : old?.map((c) => (c.id === id ? { ...c, ...normalizeStatusPatch(patch) } : c)),
         );
       }
       return { change, prevChildren, parentId, id };

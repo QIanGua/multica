@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -1124,10 +1125,11 @@ func TestCreateEventCarriesCustomStatusCategory(t *testing.T) {
 	}
 }
 
-// TestListEndpointsCarryCategoryWithoutPerRowQueries covers the remaining
-// payload exits and pins the N+1: a page of custom-status rows must resolve the
-// catalog ONCE, not once per row.
-func TestListEndpointsCarryCategoryWithoutPerRowQueries(t *testing.T) {
+// TestListEndpointsCarryStatusCategory covers the remaining payload exits: every
+// row a list or get returns must carry an authoritative category, custom
+// statuses included. It deliberately does NOT assert the per-request catalog
+// read count — see the note on the resolver subtest below for why.
+func TestListEndpointsCarryStatusCategory(t *testing.T) {
 	createTestCustomStatus(t, "human_review_n", issuestatus.InReview)
 	for i := range 3 {
 		mustCreateIssue(t, fmt.Sprintf("n+1 probe %d", i), "human_review_n")
@@ -1197,4 +1199,36 @@ func TestListEndpointsCarryCategoryWithoutPerRowQueries(t *testing.T) {
 			t.Errorf("GetIssue status_category = %q, want in_review", got.StatusCategory)
 		}
 	})
+}
+
+// TestBackgroundEventCarriesCustomStatusCategory pins the background-event
+// payload. IssueToMap fills a category only for built-ins; the publishers that
+// can emit a CUSTOM status go through IssueToMapWithCategory so clients receive
+// an authoritative one instead of a blank they would have to refetch to resolve.
+func TestBackgroundEventCarriesCustomStatusCategory(t *testing.T) {
+	ctx := context.Background()
+	createTestCustomStatus(t, "human_review_bg", issuestatus.InReview)
+	id := mustCreateIssue(t, "background event category", "human_review_bg")
+
+	issue, err := testHandler.Queries.GetIssue(ctx, id)
+	if err != nil {
+		t.Fatalf("load issue: %v", err)
+	}
+
+	// Plain IssueToMap leaves a custom status uncategorized — that is why the
+	// publishers use the WithCategory form.
+	plain := service.IssueToMap(issue, "MUL")
+	if plain["status_category"] != "" {
+		t.Errorf("IssueToMap custom status_category = %v, want empty (no catalog access)",
+			plain["status_category"])
+	}
+
+	authoritative := service.IssueToMapWithCategory(ctx, testHandler.Queries, issue, "MUL")
+	if authoritative["status_category"] != "in_review" {
+		t.Errorf("IssueToMapWithCategory status_category = %v, want in_review",
+			authoritative["status_category"])
+	}
+	if authoritative["status"] != "human_review_bg" {
+		t.Errorf("status = %v, want the custom key verbatim", authoritative["status"])
+	}
 }
