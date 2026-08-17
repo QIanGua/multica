@@ -23,6 +23,7 @@ type stubInvitationRateLimiter struct {
 	allowed     bool
 	allowResult *bool
 	err         error
+	allowErr    error
 	retryAfter  time.Duration
 	checkKeys   []string
 	allowKeys   []string
@@ -36,9 +37,9 @@ func (l *stubInvitationRateLimiter) Allow(ctx context.Context, key string) bool 
 func (l *stubInvitationRateLimiter) AllowWithError(_ context.Context, key string) (bool, error) {
 	l.allowKeys = append(l.allowKeys, key)
 	if l.allowResult != nil {
-		return *l.allowResult, l.err
+		return *l.allowResult, l.allowErr
 	}
-	return l.allowed, l.err
+	return l.allowed, l.allowErr
 }
 
 func (l *stubInvitationRateLimiter) Check(ctx context.Context, key string) bool {
@@ -385,6 +386,31 @@ func TestAdmitInvitation_AllowsBoundedOvershootWhenGateFillsAfterCheck(t *testin
 	req := httptest.NewRequest(http.MethodPost, "/api/workspaces/workspace-a/members", nil)
 	if !h.admitInvitation(httptest.NewRecorder(), req, "actor-a", "workspace-a", "recipient@multica.ai") {
 		t.Fatal("concurrent fill rejected after a different gate may already have consumed")
+	}
+	for name, calls := range map[string]int{
+		"actor checks": len(actor.checkKeys), "workspace checks": len(workspace.checkKeys), "recipient checks": len(recipient.checkKeys),
+		"actor allows": len(actor.allowKeys), "workspace allows": len(workspace.allowKeys), "recipient allows": len(recipient.allowKeys),
+	} {
+		if calls != 1 {
+			t.Errorf("%s = %d, want 1", name, calls)
+		}
+	}
+}
+
+func TestAdmitInvitation_AllowsBoundedOvershootWhenBackendFailsAfterChecks(t *testing.T) {
+	actor := &stubInvitationRateLimiter{allowed: true}
+	workspace := &stubInvitationRateLimiter{allowed: true, allowErr: errors.New("redis unavailable")}
+	recipient := &stubInvitationRateLimiter{allowed: true}
+	h := *testHandler
+	h.InvitationRateLimiters = InvitationRateLimiters{Actor: actor, Workspace: workspace, Recipient: recipient}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/workspaces/workspace-a/members", nil)
+	rec := httptest.NewRecorder()
+	if !h.admitInvitation(rec, req, "actor-a", "workspace-a", "recipient@multica.ai") {
+		t.Fatalf("backend failed after successful checks: request was rejected with %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 || rec.Header().Get("Retry-After") != "" {
+		t.Fatalf("backend failure after checks wrote an error response: headers=%v body=%s", rec.Header(), rec.Body.String())
 	}
 	for name, calls := range map[string]int{
 		"actor checks": len(actor.checkKeys), "workspace checks": len(workspace.checkKeys), "recipient checks": len(recipient.checkKeys),

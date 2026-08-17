@@ -120,9 +120,12 @@ func (h *Handler) admitInvitation(w http.ResponseWriter, r *http.Request, actorI
 	for _, gate := range gates {
 		allowed, err := slidingWindowLimiterAllow(r.Context(), gate.limiter, gate.key)
 		if err != nil {
-			slog.Error("invitation rate limiter unavailable", append(logger.RequestAttrs(r), "gates", gate.name, "error", err)...)
-			writeInvitationLimiterUnavailable(w)
-			return false
+			// All gates passed the non-consuming checks, so this failure began in
+			// the narrow Check-to-Allow window. Admit this in-flight request rather
+			// than return an error after an earlier gate may have consumed. A
+			// sustained backend failure is caught by Phase 1 on later requests.
+			slog.Warn("invitation rate limiter consume failed after successful checks; allowing bounded overshoot", append(logger.RequestAttrs(r), "gate", gate.name, "error", err)...)
+			continue
 		}
 		if !allowed {
 			// Another replica filled this gate between Check and Allow. Continue
