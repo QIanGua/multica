@@ -37,6 +37,7 @@
   "filters": {
     "tooltip": "Filter",
     "placeholder": "Filter...",
+    "search_status": "Search status...",
     "no_results": "No results",
     "no_labels": "No labels yet",
     "no_assignee": "No assignee",

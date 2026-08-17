@@ -1,6 +1,7 @@
 "use client";
 
 import { statusCategoryOfKey } from "@multica/core/issues";
+import { useStatusLabel } from "../utils/status-label";
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useDefaultLayout, usePanelRef } from "react-resizable-panels";
@@ -254,9 +255,18 @@ function shortDate(date: string | null): string {
 
 type ActivityT = ReturnType<typeof useT<"issues">>["t"];
 
-function statusLabel(status: string, t: ActivityT): string {
-  // A custom status has no i18n entry of its own; label it by the category it
-  // inherits. The catalog-aware surfaces show its real name. (MUL-6243)
+/**
+ * Labels a status key from the activity feed. `resolveLabel` is the workspace
+ * catalog resolver, which names custom statuses; without it — or for a status
+ * since deleted — a built-in still gets its i18n name and anything else falls
+ * back to the raw key. (MUL-6243)
+ */
+function statusLabel(
+  status: string,
+  t: ActivityT,
+  resolveLabel?: (statusKey: string) => string,
+): string {
+  if (resolveLabel) return resolveLabel(status);
   if (status in STATUS_CONFIG) {
     return t(($) => $.status[statusCategoryOfKey(status)]);
   }
@@ -274,6 +284,7 @@ function formatActivity(
   entry: TimelineEntry,
   t: ActivityT,
   resolveActorName?: (type: string, id: string) => string,
+  resolveStatusLabel?: (statusKey: string) => string,
 ): string {
   const details = (entry.details ?? {}) as Record<string, string>;
   switch (entry.action) {
@@ -281,8 +292,8 @@ function formatActivity(
       return t(($) => $.activity.created);
     case "status_changed":
       return t(($) => $.activity.status_changed, {
-        from: statusLabel(details.from ?? "?", t),
-        to: statusLabel(details.to ?? "?", t),
+        from: statusLabel(details.from ?? "?", t, resolveStatusLabel),
+        to: statusLabel(details.to ?? "?", t, resolveStatusLabel),
       });
     case "priority_changed":
       return t(($) => $.activity.priority_changed, {
@@ -510,6 +521,7 @@ function ActivityBlock({
   showOlder,
   onToggleShowOlder,
   getActorName,
+  resolveStatusLabel,
   t,
   timeAgo,
 }: {
@@ -523,6 +535,7 @@ function ActivityBlock({
   showOlder: boolean;
   onToggleShowOlder: () => void;
   getActorName: (type: string, id: string) => string;
+  resolveStatusLabel: (statusKey: string) => string;
   t: ActivityT;
   timeAgo: (dateStr: string) => string;
 }) {
@@ -603,7 +616,7 @@ function ActivityBlock({
             </div>
             <div className="flex min-w-0 flex-1 items-center gap-1">
               <span className="shrink-0 font-medium">{getActorName(entry.actor_type, entry.actor_id)}</span>
-              <span className="truncate">{formatActivity(entry, t, getActorName)}</span>
+              <span className="truncate">{formatActivity(entry, t, getActorName, resolveStatusLabel)}</span>
               {(entry.coalesced_count ?? 1) > 1 &&
                 entry.action !== "task_completed" &&
                 entry.action !== "task_failed" && (
@@ -1098,6 +1111,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
     currentUserRole === "owner" || currentUserRole === "admin";
   const { data: allIssues = [] } = useQuery(issueListOptions(wsId));
   const { getActorName } = useActorName();
+  const resolveStatusLabel = useStatusLabel(wsId);
   // Description autosave is deliberately NOT gated (no explicit submit; the
   // editor already strips `blob:` before serializing and binds ids on the
   // later save). It still needs the failure toast, or a failed upload just
@@ -2466,6 +2480,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
         showOlder={showOlder}
         onToggleShowOlder={() => showOlderActivities(item.id)}
         getActorName={getActorName}
+        resolveStatusLabel={resolveStatusLabel}
         t={t}
         timeAgo={timeAgo}
       />

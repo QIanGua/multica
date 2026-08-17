@@ -37,6 +37,7 @@
   "filters": {
     "tooltip": "筛选",
     "placeholder": "筛选...",
+    "search_status": "搜索状态...",
     "no_results": "无结果",
     "no_labels": "还没有标签",
     "no_assignee": "无负责人",

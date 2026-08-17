@@ -1,6 +1,6 @@
 "use client";
 
-import { statusCategoryOfKey } from "@multica/core/issues";
+import { useStatusLabel } from "../utils/status-label";
 import {
   useCallback,
   useEffect,
@@ -73,7 +73,6 @@ import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { cn } from "@multica/ui/lib/utils";
 import { ApiError } from "@multica/core/api";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { ALL_STATUSES } from "@multica/core/issues/config";
 import {
   issueKeys,
   issueTableGroupsOptions,
@@ -1281,6 +1280,7 @@ export function TableView({
 }: TableViewProps) {
   const { t } = useT("issues");
   const wsId = useWorkspaceId();
+  const resolveStatusLabel = useStatusLabel(wsId);
   const queryClient = useQueryClient();
   const intentNavigate = useIntentNavigate();
   const paths = useWorkspacePaths();
@@ -1752,13 +1752,12 @@ export function TableView({
     (descriptor: IssueTableGroupDescriptor) => {
       const value = descriptor.value;
       if (value.kind === "status") {
-        if (ALL_STATUSES.includes(statusCategoryOfKey(value.status))) {
-          return t(($) => $.status[statusCategoryOfKey(value.status)]);
-        }
-        // Installed clients can receive a status introduced by a newer
-        // backend. Keep the group usable instead of collapsing the response
-        // to the schema fallback or rendering an empty label.
-        return value.status;
+        // A group is one status KEY, so it shows that status's own name — a
+        // custom status must not read as its category. `resolveStatusLabel`
+        // falls back to the raw key, which is also what keeps a status
+        // introduced by a NEWER backend usable on an installed client instead
+        // of collapsing to the schema fallback or an empty label. (MUL-6243)
+        return resolveStatusLabel(value.status);
       }
       if (value.kind === "assignee") {
         return value.actor
@@ -2309,7 +2308,7 @@ export function TableView({
             case "identifier":
               return issue.identifier;
             case "status":
-              return t(($) => $.status[statusCategoryOfKey(issue.status)]);
+              return resolveStatusLabel(issue.status);
             case "priority":
               return t(($) => $.priority[issue.priority]);
             case "assignee":
