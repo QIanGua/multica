@@ -8,6 +8,7 @@ export type {
   AgentInvocationTarget,
   AgentInvocationTargetInput,
   AgentTask,
+  TaskUsage,
   TaskAttribution,
   AttributionUser,
   TaskEvidence,
@@ -30,12 +31,6 @@ export type {
   AgentBuilderSessionSummary,
   AgentPermissionScope,
   StoredAgentDraft,
-  AgentTemplate,
-  AgentTemplateSummary,
-  AgentTemplateSkillRef,
-  CreateAgentFromTemplateRequest,
-  CreateAgentFromTemplateResponse,
-  CreateAgentFromTemplateFailure,
   UpdateAgentRequest,
   AgentEnvResponse,
   UpdateAgentEnvRequest,
@@ -78,9 +73,27 @@ export type {
   RuntimeLocalSkillsResult,
   RuntimeLocalSkillImportResult,
   IssueUsageSummary,
+  MikaBootstrapResponse,
 } from "./agent";
 export { RUNTIME_PROFILE_PROTOCOL_FAMILIES } from "./agent";
-export type { Workspace, WorkspaceRepo, Member, MemberRole, User, MemberWithUser, Invitation } from "./workspace";
+export type { Workspace, WorkspaceRepo, WorkspaceMcpServer, Member, MemberRole, User, MemberWithUser, Invitation, ShareLink, ShareLinkInfo } from "./workspace";
+export type {
+  PluginBinding,
+  PluginInstallation,
+  PluginCatalogContribution,
+  PluginCatalogRelease,
+  PluginCatalogDiagnostic,
+  PluginCatalogResponse,
+  PluginInstallationListResponse,
+  PluginReleaseRequest,
+  PluginBindingRequest,
+  PluginRemoteMCPConfig,
+  RemoteMCPConfigRequest,
+  RemoteMCPDiscoveryResponse,
+  RemoteMCPOAuthStartRequest,
+  RemoteMCPOAuthStartResponse,
+  RemoteMCPTool,
+} from "./plugin";
 export type { InboxItem, InboxSeverity, InboxItemType, InboxWorkspaceUnread } from "./inbox";
 export type { NotificationGroupKey, NotificationGroupValue, NotificationPreferences, NotificationPreferenceResponse } from "./notification-preference";
 export type { Comment, CommentType, CommentAuthorType, CommentTriggerPreview, CommentTriggerPreviewAgent, CommentTriggerSource, CommentTriggerOutcome, CommentTriggerStatus, Reaction } from "./comment";
@@ -109,7 +122,12 @@ export type { IssueSubscriber } from "./subscriber";
 export type * from "./events";
 export type * from "./api";
 export type { Attachment } from "./attachment";
-export { attachmentDownloadPath, attachmentIdFromDownloadURL, contentReferencesAttachment } from "./attachment-url";
+export {
+  attachmentDownloadPath,
+  attachmentIdFromDownloadURL,
+  contentReferencesAttachment,
+  stripChannelMediaMarkers,
+} from "./attachment-url";
 export type {
   ChatSession,
   ChatLastMessage,
@@ -120,10 +138,13 @@ export type {
   ChatQuickActionsFailureState,
   ChatMessagesPage,
   ChatPendingTask,
+  ChatQueuedTask,
+  PrioritizeQueuedChatTaskResponse,
   PendingChatTaskItem,
   PendingChatTasksResponse,
   HasPendingChatTasksResponse,
   SendChatMessageResponse,
+  StartMikaOnboardingResponse,
   CancelledChatMessage,
   CancelTaskResponse,
   ChatDraftRestore,
@@ -142,6 +163,7 @@ export type {
   ProjectResourceRef,
   GithubRepoResourceRef,
   LocalDirectoryResourceRef,
+  LocalDirectoryExecutionMode,
   CreateProjectResourceRequest,
   UpdateProjectResourceRequest,
   ListProjectResourcesResponse,
@@ -186,6 +208,21 @@ export type {
   RegisterSlackBYORequest,
   RedeemSlackBindingTokenResponse,
 } from "./slack";
+export type {
+  DingTalkInstallation,
+  DingTalkGroupRoute,
+  ListDingTalkInstallationsResponse,
+  ListDingTalkGroupRoutesResponse,
+  RegisterDingTalkBYORequest,
+  RedeemDingTalkBindingTokenResponse,
+  UpdateDingTalkGroupRouteRequest,
+} from "./dingtalk";
+export type {
+  WecomInstallation,
+  ListWecomInstallationsResponse,
+  RegisterWecomBYORequest,
+  RedeemWecomBindingTokenResponse,
+} from "./wecom";
 export type {
   Autopilot,
   AutopilotStatus,
@@ -249,4 +286,13 @@ export type {
   CreateBillingCheckoutSessionResponse,
   BillingCheckoutSessionStatus,
   CreateBillingPortalSessionResponse,
+  WorkspaceSubscriptionInterval,
+  WorkspaceSubscriptionEntitlements,
+  WorkspaceSubscriptionSummary,
+  WorkspaceSubscriptionPrice,
+  WorkspaceSubscriptionPrices,
+  CreateWorkspaceSubscriptionCheckoutRequest,
+  CreateWorkspaceSubscriptionCheckoutResponse,
+  WorkspaceSubscriptionSeatReconcileResult,
+  CreateWorkspaceSubscriptionPortalResponse,
 } from "./billing";

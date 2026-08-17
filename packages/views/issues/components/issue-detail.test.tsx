@@ -158,6 +158,11 @@ vi.mock("../../editor", async () => ({
     tryOpen: () => false,
     modal: null,
   }),
+  // Pass-through: the detail page wraps its column in the image-sequence
+  // provider, but paging between images is covered in
+  // image-sequence-context.test.tsx against the real provider.
+  ImageSequenceProvider: ({ children }: { children: React.ReactNode }) =>
+    children,
   isPreviewable: () => false,
   ReadonlyContent: ({ content }: { content: string }) => (
     <div data-testid="readonly-content">{content}</div>
@@ -175,6 +180,7 @@ vi.mock("../../editor", async () => ({
   ) {
     const initialValue = syncedValue ?? defaultValue ?? "";
     const valueRef = useRef(initialValue);
+    const baseRef = useRef(initialValue);
     const [editorValue, setEditorValue] = useState(initialValue);
     useEffect(() => {
       contentEditorMounts.count += 1;
@@ -184,6 +190,7 @@ vi.mock("../../editor", async () => ({
     useEffect(() => {
       if (syncedValue === undefined) return;
       valueRef.current = syncedValue;
+      baseRef.current = syncedValue;
       setEditorValue(syncedValue);
     }, [syncedValue]);
     useImperativeHandle(ref, () => ({
@@ -208,7 +215,7 @@ vi.mock("../../editor", async () => ({
         onChange={(e) => {
           valueRef.current = e.target.value;
           setEditorValue(e.target.value);
-          onUpdate?.(e.target.value);
+          onUpdate?.(e.target.value, baseRef.current);
         }}
         placeholder={placeholder}
         data-testid="rich-text-editor"
@@ -342,6 +349,11 @@ vi.mock("@multica/core/issues/stores", async () => ({
   ...(await vi.importActual<
     typeof import("@multica/core/issues/stores/sub-issue-display-store")
   >("@multica/core/issues/stores/sub-issue-display-store")),
+  // Real store, in-memory (no localStorage): backs the sub-issues section's
+  // collapsed state.
+  ...(await vi.importActual<
+    typeof import("@multica/core/issues/stores/sub-issues-collapse-store")
+  >("@multica/core/issues/stores/sub-issues-collapse-store")),
   useRecentIssuesStore: Object.assign(
     (selector?: any) => {
       const state = { byWorkspace: {}, recordVisit: mockRecordVisit, pruneWorkspaces: vi.fn() };
@@ -661,6 +673,38 @@ describe("IssueDetail (shared)", () => {
     ).toBe(true);
   });
 
+  it("gives the skeleton the same horizontal gutters as the loaded column", async () => {
+    // The skeleton is the loaded column's stand-in, so a gutter change has to
+    // land on both or the column jumps sideways at the moment the issue
+    // arrives. Horizontal only: the loaded column also reserves the chat
+    // launcher's corner at its bottom, which the skeleton has no scroll to
+    // reach.
+    const horizontalGutters = (el: Element | null) =>
+      (el?.className ?? "")
+        .split(/\s+/)
+        .filter((cls) => /(^|:)px-/.test(cls))
+        .sort();
+
+    mockApiObj.getIssue.mockReturnValue(new Promise(() => {}));
+    const loadingRender = renderIssueDetail();
+    const skeletonGutters = horizontalGutters(
+      loadingRender.container.querySelector(".max-w-4xl"),
+    );
+    loadingRender.unmount();
+
+    mockApiObj.getIssue.mockResolvedValue(mockIssue);
+    const { container } = renderIssueDetail();
+    await waitFor(() => {
+      expect(screen.getByText("Implement authentication")).toBeInTheDocument();
+    });
+
+    // Non-empty guard: without it a renamed column class passes vacuously.
+    expect(skeletonGutters.length).toBeGreaterThan(0);
+    expect(skeletonGutters).toEqual(
+      horizontalGutters(container.querySelector(".max-w-4xl")),
+    );
+  });
+
   it("renders comment bodies without Base UI collapsible panels", async () => {
     const { container } = renderIssueDetail();
 
@@ -847,6 +891,46 @@ describe("IssueDetail (shared)", () => {
 
     expect(screen.queryByTestId("panel-group")).not.toBeInTheDocument();
     expect(screen.queryByText("Properties")).not.toBeInTheDocument();
+  });
+
+  it("pins the comment composer to the scroll viewport on a wide screen", async () => {
+    const { container } = renderIssueDetail();
+
+    await waitFor(() => {
+      expect(screen.getByText("Implement authentication")).toBeInTheDocument();
+    });
+
+    // `bottom-0` is unique to the composer wrapper — the sticky affordances
+    // inside the timeline (comment headers, resolve bars) all pin to `top-0`.
+    expect(container.querySelector(".sticky.bottom-0")).not.toBeNull();
+  });
+
+  it("lets the composer ride the end of the timeline on mobile", async () => {
+    // A pinned composer on a phone sits on the chat launcher's corner at every
+    // scroll position, and the part it covers is its own send button.
+    mockViewport.isMobile = true;
+
+    const { container } = renderIssueDetail();
+
+    await waitFor(() => {
+      expect(screen.getByText("Implement authentication")).toBeInTheDocument();
+    });
+
+    expect(container.querySelector(".sticky.bottom-0")).toBeNull();
+  });
+
+  it("reserves the chat launcher's corner at the end of the mobile scroll", async () => {
+    mockViewport.isMobile = true;
+
+    const { container } = renderIssueDetail();
+
+    await waitFor(() => {
+      expect(screen.getByText("Implement authentication")).toBeInTheDocument();
+    });
+
+    // Unpinned, the composer lands in that corner once the reader reaches the
+    // bottom, so the column has to end above the launcher rather than under it.
+    expect(container.querySelector(".max-md\\:pb-chat-launcher")).not.toBeNull();
   });
 
   it("hides metadata content from the sidebar and shows a button when the bag has keys", async () => {
@@ -1512,7 +1596,10 @@ describe("IssueDetail (shared)", () => {
     await waitFor(() => {
       expect(mockApiObj.updateIssue).toHaveBeenCalledWith(
         "issue-1",
-        expect.objectContaining({ description: "" }),
+        expect.objectContaining({
+          description: "",
+          description_base: "Add JWT auth to the backend",
+        }),
       );
     });
   });
