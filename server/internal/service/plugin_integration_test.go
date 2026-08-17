@@ -20,6 +20,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
+	"github.com/multica-ai/multica/server/pkg/pluginruntime"
+	"github.com/multica-ai/multica/server/pkg/remotemcp"
 )
 
 func repackPluginArchive(t *testing.T, archive []byte) []byte {
@@ -452,5 +454,268 @@ func TestReferencePluginInstallEnablePinDisableAndRetry(t *testing.T) {
 	}
 	if auditCount < 5 {
 		t.Fatalf("private Plugin audit records = %d, want at least 5", auditCount)
+	}
+}
+
+// TestRemoteMCPEnableFirstNeedsSetup covers the enable-first flow (MUL-6276):
+// enabling is never blocked on Remote MCP setup, an enabled-but-unconfigured
+// installation contributes nothing to tasks (its Skills are withheld together
+// with its tools), and completing setup activates the whole installation.
+func TestRemoteMCPEnableFirstNeedsSetup(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = "postgres://multica:multica@localhost:5432/multica?sslmode=disable"
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Skipf("database unavailable: %v", err)
+	}
+	defer pool.Close()
+	var pluginTablesExist bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('plugin_capability_snapshot') IS NOT NULL`).Scan(&pluginTablesExist); err != nil || !pluginTablesExist {
+		t.Skip("plugin migrations are not applied")
+	}
+
+	suffix := time.Now().UnixNano()
+	var userID, workspaceID, runtimeID, agentID, issueID string
+	if err := pool.QueryRow(ctx, `INSERT INTO "user" (name, email) VALUES ('Plugin Setup E2E', $1) RETURNING id`, fmt.Sprintf("plugin-setup-e2e-%d@multica.ai", suffix)).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workspace (name, slug, description, issue_prefix) VALUES ('Plugin Setup E2E', $1, '', 'PS2') RETURNING id`, fmt.Sprintf("plugin-setup-e2e-%d", suffix)).Scan(&workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO member (workspace_id, user_id, role) VALUES ($1, $2, 'owner')`, workspaceID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, visibility, owner_id)
+		VALUES ($1, 'Plugin Setup E2E', 'cloud', 'plugin_e2e', 'online', 'test', '{}'::jsonb, now(), 'private', $2) RETURNING id
+	`, workspaceID, userID).Scan(&runtimeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO agent (workspace_id, name, description, runtime_mode, runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id)
+		VALUES ($1, 'Plugin Setup E2E', '', 'cloud', '{}'::jsonb, $2, 'private', 1, $3) RETURNING id
+	`, workspaceID, runtimeID, userID).Scan(&agentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'Plugin Setup E2E', 'in_progress', 'none', $2, 'member', $3, 0) RETURNING id
+	`, workspaceID, userID, suffix%100000000).Scan(&issueID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanup := context.Background()
+		pool.Exec(cleanup, `DELETE FROM plugin_execution_manifest WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_health WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_capability_snapshot WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_workspace_capability_state WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_installation_config WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_binding WHERE installation_id IN (SELECT id FROM plugin_installation WHERE workspace_id = $1)`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_grant WHERE installation_id IN (SELECT id FROM plugin_installation WHERE workspace_id = $1)`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_installation WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_contribution WHERE release_id IN (SELECT id FROM plugin_release WHERE plugin_id IN (SELECT id FROM plugin_identity WHERE owner_workspace_id = $1))`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_artifact_file WHERE release_id IN (SELECT id FROM plugin_release WHERE plugin_id IN (SELECT id FROM plugin_identity WHERE owner_workspace_id = $1))`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_release WHERE plugin_id IN (SELECT id FROM plugin_identity WHERE owner_workspace_id = $1)`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM plugin_identity WHERE owner_workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM activity_log WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM agent_task_queue WHERE agent_id = $1`, agentID)
+		pool.Exec(cleanup, `DELETE FROM issue WHERE id = $1`, issueID)
+		pool.Exec(cleanup, `DELETE FROM agent WHERE id = $1`, agentID)
+		pool.Exec(cleanup, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+		pool.Exec(cleanup, `DELETE FROM member WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM workspace WHERE id = $1`, workspaceID)
+		pool.Exec(cleanup, `DELETE FROM "user" WHERE id = $1`, userID)
+	})
+
+	mixedSource := t.TempDir()
+	mixedManifest := `{
+  "api_version": "multica.plugin/v1",
+  "kind": "Plugin",
+  "metadata": {
+    "key": "dev.multica.mixed-fixture",
+    "name": "Mixed Fixture",
+    "description": "Skill plus Remote MCP contribution for enable-first tests",
+    "version": "1.0.0",
+    "publisher": "multica.dev"
+  },
+  "compatibility": {
+    "host_api": ">=1.0.0 <2.0.0",
+    "required_daemon_features": ["execution-manifest-v1", "agent-skill-v1", "remote-mcp-v1"]
+  },
+  "requested_capabilities": ["agent.skill.contribute", "tool.remote-mcp.connect"],
+  "contributes": {
+    "agent_skills": [
+      {
+        "key": "mixed-notes",
+        "name": "Mixed notes",
+        "description": "References the fixture tools",
+        "entry": "skills/mixed-notes/SKILL.md"
+      }
+    ],
+    "remote_mcp": [
+      {
+        "key": "mixed-tools",
+        "name": "Mixed tools",
+        "description": "Deterministic fixture tool surface",
+        "transport": "streamable-http",
+        "protocol_versions": ["2025-03-26"],
+        "endpoint_policy": { "allowed_hosts": ["mcp-fixture.example.com"] },
+        "tool_intent": [
+          { "name": "fixture.read", "description": "Read a fixture value", "risk": "read" }
+        ]
+      }
+    ]
+  }
+}`
+	if err := os.WriteFile(filepath.Join(mixedSource, "multica.plugin.json"), []byte(mixedManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(mixedSource, "skills", "mixed-notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mixedSource, "skills", "mixed-notes", "SKILL.md"), []byte("# Mixed fixture notes\n\nUse fixture.read for deterministic values.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mixedArchive, _, err := plugincontract.PackDirectory(mixedSource)
+	if err != nil {
+		t.Fatalf("pack mixed Plugin: %v", err)
+	}
+
+	queries := db.New(pool)
+	pluginService := NewPluginService(queries, pool)
+	taskService := NewTaskService(queries, pool, nil, nil)
+	workspaceUUID := util.MustParseUUID(workspaceID)
+	actorUUID := util.MustParseUUID(userID)
+
+	installation, err := pluginService.InstallPrivateArchive(ctx, workspaceUUID, actorUUID, mixedArchive)
+	if err != nil {
+		t.Fatalf("install mixed Plugin: %v", err)
+	}
+	// Enable must succeed before any Remote MCP setup: it records intent.
+	installation, err = pluginService.EnablePlugin(ctx, workspaceUUID, installation.ID, actorUUID, "workspace", workspaceUUID)
+	if err != nil {
+		t.Fatalf("enable before setup: %v", err)
+	}
+	if !installation.Enabled {
+		t.Fatalf("installation not enabled: %+v", installation)
+	}
+
+	createTask := func() string {
+		var taskID string
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO agent_task_queue (agent_id, issue_id, status, priority, context, runtime_id)
+			VALUES ($1, $2, 'queued', 0, '{}'::jsonb, $3) RETURNING id
+		`, agentID, issueID, runtimeID).Scan(&taskID); err != nil {
+			t.Fatalf("create task: %v", err)
+		}
+		return taskID
+	}
+	latestHealth := func() (string, string) {
+		var state, reason string
+		if err := pool.QueryRow(ctx, `
+			SELECT state, reason_code FROM plugin_health
+			WHERE installation_id = $1 ORDER BY observed_at DESC LIMIT 1
+		`, installation.ID).Scan(&state, &reason); err != nil {
+			t.Fatalf("read plugin health: %v", err)
+		}
+		return state, reason
+	}
+	activeEntries := func() []pluginruntime.CompiledEntry {
+		var compiled []byte
+		if err := pool.QueryRow(ctx, `
+			SELECT compiled_entries FROM plugin_capability_snapshot
+			WHERE workspace_id = $1 ORDER BY revision DESC LIMIT 1
+		`, workspaceID).Scan(&compiled); err != nil {
+			t.Fatalf("read active snapshot: %v", err)
+		}
+		var entries []pluginruntime.CompiledEntry
+		if err := json.Unmarshal(compiled, &entries); err != nil {
+			t.Fatalf("decode snapshot entries: %v", err)
+		}
+		return entries
+	}
+
+	// Before setup: the whole installation stays out of the snapshot — the
+	// Skill is withheld together with the tools it references — and a new
+	// task starts cleanly instead of failing on the unconfigured connection.
+	if entries := activeEntries(); len(entries) != 0 {
+		t.Fatalf("enabled-but-unconfigured installation leaked into snapshot: %#v", entries)
+	}
+	if state, reason := latestHealth(); state != "degraded" || reason != "needs_setup" {
+		t.Fatalf("pre-setup health = %s/%s, want degraded/needs_setup", state, reason)
+	}
+	preSetupTaskID := createTask()
+	preBundles, _, _, err := taskService.LoadTaskPluginSkillBundles(ctx, util.MustParseUUID(preSetupTaskID))
+	if err != nil || len(preBundles) != 0 {
+		t.Fatalf("pre-setup task Skill bundles = %d, err = %v", len(preBundles), err)
+	}
+	preConnections, preDiagnostics, err := pluginService.ResolveTaskRemoteMCPConnections(ctx, util.MustParseUUID(preSetupTaskID))
+	if err != nil || len(preConnections) != 0 || len(preDiagnostics) != 0 {
+		t.Fatalf("pre-setup task connections = %d diagnostics = %v err = %v", len(preConnections), preDiagnostics, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, preSetupTaskID); err != nil {
+		t.Fatalf("complete pre-setup task: %v", err)
+	}
+
+	// Complete setup by writing a reviewed configuration revision directly,
+	// then recompile. The whole installation activates atomically.
+	var contributionID string
+	if err := pool.QueryRow(ctx, `
+		SELECT id FROM plugin_contribution
+		WHERE release_id = $1 AND type = 'tool.remote-mcp.v1'
+	`, installation.DesiredReleaseID).Scan(&contributionID); err != nil {
+		t.Fatalf("load remote MCP contribution: %v", err)
+	}
+	approvedTools := []pluginruntime.RemoteMCPTool{{
+		Name:        "fixture.read",
+		Description: "Read a fixture value",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Risk:        "read",
+	}}
+	toolsJSON, err := json.Marshal(approvedTools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemaDigest, err := remotemcp.ToolSetDigest(approvedTools)
+	if err != nil {
+		t.Fatalf("tool set digest: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO plugin_installation_config (
+			workspace_id, installation_id, contribution_id, revision, endpoint,
+			public_config, auth_type, approved_tools, schema_digest,
+			failure_policy, reviewed_by, reviewed_at, created_by
+		) VALUES ($1, $2, $3, 1, 'https://mcp-fixture.example.com/mcp', '{}'::jsonb, 'none', $4, $5, 'required', $6, now(), $6)
+	`, workspaceID, installation.ID, contributionID, toolsJSON, schemaDigest, userID); err != nil {
+		t.Fatalf("seed reviewed configuration: %v", err)
+	}
+	if _, err := pluginService.ReconcileWorkspace(ctx, workspaceUUID); err != nil {
+		t.Fatalf("reconcile after setup: %v", err)
+	}
+
+	entries := activeEntries()
+	if len(entries) != 2 {
+		t.Fatalf("post-setup snapshot entries = %d, want 2: %#v", len(entries), entries)
+	}
+	typesSeen := map[string]bool{}
+	for _, entry := range entries {
+		typesSeen[entry.ContributionType] = true
+	}
+	if !typesSeen[plugincontract.ContributionAgentSkillV1] || !typesSeen[plugincontract.ContributionRemoteMCPV1] {
+		t.Fatalf("post-setup snapshot is missing a contribution type: %#v", entries)
+	}
+	if state, reason := latestHealth(); state != "healthy" || reason != "snapshot_activated" {
+		t.Fatalf("post-setup health = %s/%s, want healthy/snapshot_activated", state, reason)
+	}
+	postSetupTaskID := createTask()
+	postBundles, _, _, err := taskService.LoadTaskPluginSkillBundles(ctx, util.MustParseUUID(postSetupTaskID))
+	if err != nil || len(postBundles) != 1 || !strings.Contains(postBundles[0].Content, "# Mixed fixture notes") {
+		t.Fatalf("post-setup task Skill bundles = %d err = %v", len(postBundles), err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, postSetupTaskID); err != nil {
+		t.Fatalf("complete post-setup task: %v", err)
 	}
 }

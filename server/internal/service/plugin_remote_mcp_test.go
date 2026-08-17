@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
 	"github.com/multica-ai/multica/server/pkg/pluginruntime"
 )
@@ -60,6 +63,49 @@ func TestSelectApprovedRemoteMCPToolsAllowsExplicitlyReviewedWildcard(t *testing
 	}
 	if _, err := selectApprovedRemoteMCPTools(discovered, declaration, []string{"not-discovered"}); err == nil {
 		t.Fatal("undiscovered wildcard tool was approved")
+	}
+}
+
+func TestRemoteMCPCompilationRowReady(t *testing.T) {
+	ready := db.ListPluginCompilationContributionsRow{
+		ConfigID:       pgtype.UUID{Bytes: [16]byte{1}, Valid: true},
+		ConfigRevision: pgtype.Int8{Int64: 1, Valid: true},
+		Endpoint:       pgtype.Text{String: "https://mcp.example.com/mcp", Valid: true},
+		AuthType:       pgtype.Text{String: "none", Valid: true},
+		FailurePolicy:  pgtype.Text{String: "required", Valid: true},
+		SchemaDigest:   pgtype.Text{String: "sha256:abc", Valid: true},
+		ReviewedAt:     pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		ApprovedTools:  []byte(`[{"name":"fixture.read","input_schema":{"type":"object"},"schema_digest":"","risk":"read"}]`),
+	}
+	if !remoteMCPCompilationRowReady(ready) {
+		t.Fatal("reviewed auth=none configuration reported not ready")
+	}
+
+	withSecret := ready
+	withSecret.AuthType = pgtype.Text{String: "bearer", Valid: true}
+	if remoteMCPCompilationRowReady(withSecret) {
+		t.Fatal("bearer configuration without credential reported ready")
+	}
+	withSecret.SecretRef = pgtype.UUID{Bytes: [16]byte{2}, Valid: true}
+	if !remoteMCPCompilationRowReady(withSecret) {
+		t.Fatal("bearer configuration with credential reported not ready")
+	}
+
+	unconfigured := db.ListPluginCompilationContributionsRow{}
+	if remoteMCPCompilationRowReady(unconfigured) {
+		t.Fatal("never-configured contribution reported ready")
+	}
+
+	unreviewed := ready
+	unreviewed.ReviewedAt = pgtype.Timestamptz{}
+	if remoteMCPCompilationRowReady(unreviewed) {
+		t.Fatal("unreviewed configuration reported ready")
+	}
+
+	noTools := ready
+	noTools.ApprovedTools = []byte(`[]`)
+	if remoteMCPCompilationRowReady(noTools) {
+		t.Fatal("configuration without approved tools reported ready")
 	}
 }
 

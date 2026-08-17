@@ -685,14 +685,6 @@ LEFT JOIN latest_bindings binding
 WHERE installation.workspace_id = @workspace_id
   AND installation.uninstalled_at IS NULL
   AND installation.enabled = TRUE
-  AND (
-    contribution.type = 'agent.skill.v1'
-    OR (
-      contribution.type = 'tool.remote-mcp.v1'
-      AND config.reviewed_at IS NOT NULL
-      AND jsonb_array_length(config.approved_tools) > 0
-    )
-  )
 ORDER BY identity.plugin_key, contribution.ordinal,
          contribution.contribution_key,
          binding.scope_type NULLS FIRST, binding.scope_id NULLS FIRST;

@@ -541,11 +541,9 @@ func (s *PluginService) setPluginBinding(ctx context.Context, workspaceID, insta
 	if err != nil {
 		return db.PluginInstallation{}, err
 	}
-	if enabled {
-		if err := validateRemoteMCPInstallationReady(ctx, q, workspaceID, installation, release); err != nil {
-			return db.PluginInstallation{}, err
-		}
-	}
+	// Enabling records intent and is never blocked on Remote MCP setup: an
+	// enabled installation whose setup is incomplete compiles to no snapshot
+	// entries (see reconcileWorkspaceTx) and surfaces as needs_setup health.
 	if scopeType == "workspace" && scopeID != workspaceID {
 		return db.PluginInstallation{}, newPluginError(PluginErrorNotFound, "Plugin binding target not found", nil)
 	}
@@ -601,47 +599,6 @@ func (s *PluginService) setPluginBinding(ctx context.Context, workspaceID, insta
 		return db.PluginInstallation{}, err
 	}
 	return s.Queries.GetPluginInstallation(ctx, installationID)
-}
-
-func validateRemoteMCPInstallationReady(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID, installation db.PluginInstallation, release db.PluginRelease) error {
-	contributions, err := q.ListPluginContributionsByRelease(ctx, release.ID)
-	if err != nil {
-		return err
-	}
-	configs, err := q.ListLatestPluginInstallationConfigs(ctx, db.ListLatestPluginInstallationConfigsParams{
-		WorkspaceID: workspaceID, InstallationID: installation.ID,
-	})
-	if err != nil {
-		return err
-	}
-	byContribution := make(map[string]db.PluginInstallationConfig, len(configs))
-	for _, config := range configs {
-		byContribution[util.UUIDToString(config.ContributionID)] = config
-	}
-	for _, contribution := range contributions {
-		if contribution.Type != plugincontract.ContributionRemoteMCPV1 {
-			continue
-		}
-		config, ok := byContribution[util.UUIDToString(contribution.ID)]
-		var approved []pluginruntime.RemoteMCPTool
-		if ok {
-			_ = json.Unmarshal(config.ApprovedTools, &approved)
-		}
-		if !ok || !config.ReviewedAt.Valid || len(approved) == 0 || !config.SchemaDigest.Valid {
-			return newPluginError(PluginErrorConflict, "Remote MCP configuration and tool review must be complete before enabling", nil)
-		}
-		if config.AuthType != "none" {
-			if !config.SecretRef.Valid {
-				return newPluginError(PluginErrorConflict, "Remote MCP credential must be configured before enabling", nil)
-			}
-			if _, err := q.GetActivePluginRemoteMCPSecret(ctx, db.GetActivePluginRemoteMCPSecretParams{
-				ID: config.SecretRef, WorkspaceID: workspaceID, InstallationID: installation.ID, ContributionID: contribution.ID,
-			}); err != nil {
-				return newPluginError(PluginErrorConflict, "Remote MCP credential must be configured before enabling", nil)
-			}
-		}
-	}
-	return nil
 }
 
 func (s *PluginService) RollbackPlugin(ctx context.Context, workspaceID, installationID, actorID pgtype.UUID, version string) (db.PluginInstallation, error) {
@@ -753,6 +710,24 @@ type compilationKey struct {
 	contributionID string
 }
 
+// remoteMCPCompilationRowReady reports whether a Remote MCP contribution has
+// completed workspace setup: a reviewed configuration revision with at least
+// one approved tool, and a stored credential when the auth mode needs one.
+// Credential validity is deliberately not re-checked here — a configured
+// connection that later breaks (revoked or expired credential) stays in the
+// snapshot and fails at claim time under its declared failure policy.
+func remoteMCPCompilationRowReady(row db.ListPluginCompilationContributionsRow) bool {
+	if !row.ConfigID.Valid || !row.ConfigRevision.Valid || !row.Endpoint.Valid ||
+		!row.AuthType.Valid || !row.FailurePolicy.Valid || !row.SchemaDigest.Valid || !row.ReviewedAt.Valid {
+		return false
+	}
+	var tools []pluginruntime.RemoteMCPTool
+	if err := json.Unmarshal(row.ApprovedTools, &tools); err != nil || len(tools) == 0 {
+		return false
+	}
+	return row.AuthType.String == "none" || row.SecretRef.Valid
+}
+
 func (s *PluginService) reconcileWorkspaceTx(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID) (db.PluginCapabilitySnapshot, error) {
 	if _, err := q.EnsurePluginWorkspaceCapabilityState(ctx, workspaceID); err != nil {
 		return db.PluginCapabilitySnapshot{}, fmt.Errorf("ensure plugin capability state: %w", err)
@@ -790,9 +765,25 @@ func (s *PluginService) reconcileWorkspaceTx(ctx context.Context, q *db.Queries,
 		return keys[i].contributionID < keys[j].contributionID
 	})
 
+	// An installation's contributions activate atomically: until every Remote
+	// MCP contribution on its desired release is fully set up (reviewed
+	// configuration, approved tools, credential when required), none of the
+	// installation's contributions enter the snapshot — a Skill must not ship
+	// while the tools it references are missing. Enabling only records intent;
+	// this is where that intent is checked against setup state.
+	needsSetup := make(map[string]bool)
+	for _, row := range rows {
+		if row.ContributionType == plugincontract.ContributionRemoteMCPV1 && !remoteMCPCompilationRowReady(row) {
+			needsSetup[util.UUIDToString(row.InstallationID)] = true
+		}
+	}
+
 	entries := make([]pluginruntime.CompiledEntry, 0, len(rows))
 	releaseFiles := make(map[string][]db.PluginArtifactFile)
 	for _, key := range keys {
+		if needsSetup[key.installationID] {
+			continue
+		}
 		contributionRows := grouped[key]
 		row := contributionRows[0]
 		if plugincontract.DigestBytes([]byte(row.EntryContent)) != row.EntryDigest {
@@ -957,6 +948,8 @@ func (s *PluginService) reconcileWorkspaceTx(ctx context.Context, q *db.Queries,
 		stateName, reason := "healthy", "snapshot_activated"
 		if !installation.Enabled {
 			stateName, reason = "disabled", "installation_disabled"
+		} else if needsSetup[util.UUIDToString(installation.ID)] {
+			stateName, reason = "degraded", "needs_setup"
 		}
 		if _, err := q.CreatePluginHealth(ctx, db.CreatePluginHealthParams{
 			WorkspaceID:        workspaceID,
