@@ -134,6 +134,31 @@ func hermesInsideMcpAdd(args []string, index int) bool {
 	return false
 }
 
+// StripAllHermesProfileArgs removes every profile selection from args, not just
+// the one Hermes would act on today.
+//
+// Removing only the first is not enough once the overlay exists. Hermes honours
+// the first selection and ignores the rest, so stripping that one promotes the
+// next occurrence to first — and it would re-point HERMES_HOME straight past
+// the overlay the daemon just built. That matters more since a custom runtime
+// profile's fixed_args became a launch prefix (GH #7046): the prefix and
+// custom_args are two separately-configured argv regions that concatenate into
+// one Hermes command line, so "two selections" is now an ordinary
+// configuration rather than a user mistake.
+//
+// A selection Hermes itself discards — an invalid profile value, which makes
+// ParseHermesProfileArgs report nothing found — is left in place, because it
+// redirects nothing.
+func StripAllHermesProfileArgs(args []string) []string {
+	for {
+		sel := ParseHermesProfileArgs(args)
+		if !sel.Found {
+			return args
+		}
+		args = StripHermesProfileArgs(args, sel)
+	}
+}
+
 // StripHermesProfileArgs removes exactly the argv occurrence ParseHermesProfileArgs
 // selected. The daemon calls this only when it built the per-task overlay, so
 // Hermes uses the overlay's HERMES_HOME instead of re-resolving the profile —

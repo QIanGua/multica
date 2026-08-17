@@ -24,11 +24,13 @@ import (
 //
 //	<Path> <Prefix...> <protocol args...> <ExtraArgs...> <CustomArgs...>
 //
-// Flag-style prefixes keep working because a CLI accepts its own flags in any
-// order: `agent --model composer-2.5 -p …` parses the same as `agent -p …
-// --model composer-2.5`. Subcommand-style prefixes only work in this position.
-// Prefix-first is therefore the strictly more compatible order, which is why
-// it is the only one.
+// Subcommand-style prefixes work only in this position. Flag-style prefixes
+// generally parse the same either way — `agent --model composer-2.5 -p …` and
+// `agent -p … --model composer-2.5` are equivalent to most parsers — so
+// prefix-first is the broader of the two orders, not a universally safe one: a
+// CLI that separates global flags from subcommand flags can still care where a
+// flag lands. That residual risk is why the position change is called out in
+// the runtime docs rather than treated as invisible.
 //
 // The zero Command is a bare executable with no prefix, which is what every
 // built-in runtime uses.
@@ -169,6 +171,14 @@ var launchPrefixBlockedArgs = map[string]map[string]blockedArgMode{
 	"traecli":     traecliBlockedArgs,
 }
 
+// FilterLaunchPrefix is the exported form for callers outside this package —
+// the daemon, which builds Commands for CLI probes that never reach New.
+// Without it a `--version` probe and a task launch would disagree about what
+// the runtime's prefix is.
+func FilterLaunchPrefix(agentType string, prefix []string, logger *slog.Logger) []string {
+	return filterLaunchPrefix(prefix, agentType, logger)
+}
+
 // filterLaunchPrefix drops protocol-critical flags from a launch prefix while
 // letting positional tokens through.
 //
@@ -179,18 +189,19 @@ var launchPrefixBlockedArgs = map[string]map[string]blockedArgMode{
 // fixed_args would break the daemon↔CLI stream-json channel exactly like
 // putting it in custom_args, which is already refused.
 //
-// filterCustomArgs implements both halves already — its blocklist is keyed by
-// flag, so a positional token can never match — including consuming a blocked
-// flag's separate value token. The wrapper exists to name the policy and to
-// log against the right field.
-// FilterLaunchPrefix is the exported form for callers outside this package —
-// the daemon, which builds Commands for CLI probes that never reach New.
-// Without it a `--version` probe and a task launch would disagree about what
-// the runtime's prefix is.
-func FilterLaunchPrefix(agentType string, prefix []string, logger *slog.Logger) []string {
-	return filterLaunchPrefix(prefix, agentType, logger)
-}
-
+// This deliberately does NOT delegate to filterCustomArgs, even though the two
+// share blocklists. Those maps also carry positional tokens — Hermes and
+// QwenPaw block `acp`, TRAE blocks `acp` and `serve`, Grok blocks `agent`,
+// `stdio` and `serve` — because in custom_args a bare `acp` really is someone
+// re-issuing the backend's own subcommand. In a launch prefix the same token
+// is part of the command's identity: `hermes-wrapper acp tenant` names a
+// program, and dropping `acp` from it would silently rewrite the command into
+// one the operator never configured. Only a leading `-` makes a token eligible
+// for the blocklist here.
+//
+// A blocked flag still consumes its separate value token, positional or not,
+// so `--permission-mode ask` cannot leave a stray `ask` behind to be read as a
+// subcommand.
 func filterLaunchPrefix(prefix []string, agentType string, logger *slog.Logger) []string {
 	if len(prefix) == 0 {
 		return nil
@@ -202,8 +213,31 @@ func filterLaunchPrefix(prefix []string, agentType string, logger *slog.Logger) 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	filtered := filterCustomArgs(prefix, blocked, logger)
-	return append([]string(nil), filtered...)
+	filtered := make([]string, 0, len(prefix))
+	for i := 0; i < len(prefix); i++ {
+		arg := unshellQuoteArg(prefix[i])
+		flag, isFlag := launchPrefixFlagName(arg)
+		if !isFlag {
+			// The command's own identity. Never filtered, even when it
+			// collides with a backend subcommand name.
+			filtered = append(filtered, arg)
+			continue
+		}
+		mode, isBlocked := blocked[flag]
+		if !isBlocked {
+			filtered = append(filtered, arg)
+			continue
+		}
+		logger.Warn("custom runtime fixed_args: blocked protocol-critical flag, skipping", "flag", flag)
+		hasInlineValue := strings.Contains(arg, "=")
+		if mode == blockedWithValue && !hasInlineValue {
+			i++
+		} else if mode == blockedOptionalValue && !hasInlineValue && i+1 < len(prefix) &&
+			!strings.HasPrefix(unshellQuoteArg(prefix[i+1]), "-") {
+			i++
+		}
+	}
+	return filtered
 }
 
 // warnLaunchPrefixOverlap logs the flags a launch prefix shares with the

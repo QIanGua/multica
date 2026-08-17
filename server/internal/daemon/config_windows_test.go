@@ -368,7 +368,6 @@ func TestResolveAgentEntryForLaunchFailsWhenJunctionKeepsRetargeting(t *testing.
 func TestResolveAgentEntryCanonicalizesRediscoveredJunction(t *testing.T) {
 	originalDetect := detectAgentVersion
 	detectAgentVersion = func(_ context.Context, runtimeCmd agent.Command) (string, error) {
-		path := runtimeCmd.Path
 		return "0.144.3", nil
 	}
 	t.Cleanup(func() { detectAgentVersion = originalDetect })

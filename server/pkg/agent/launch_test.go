@@ -47,11 +47,12 @@ func TestLaunchPrefixPrecedesProtocolFlags(t *testing.T) {
 	}
 }
 
-// TestLaunchPrefixKeepsFlagStyleWrappersWorking is the compatibility half of
-// the same change. A flag-style prefix parses identically before or after the
-// protocol flags, which is why prefix-first can be the single order rather
-// than a per-runtime setting.
-func TestLaunchPrefixKeepsFlagStyleWrappersWorking(t *testing.T) {
+// TestLaunchPrefixPlacesFlagStyleWrappersFirst pins where a flag-style prefix
+// lands. It asserts the argv Multica builds, not that any particular third-party
+// parser accepts the new position — most treat the two orders as equivalent,
+// but a CLI that separates global from subcommand flags may not, which is why
+// the docs call the move out instead of promising it is invisible.
+func TestLaunchPrefixPlacesFlagStyleWrappersFirst(t *testing.T) {
 	t.Parallel()
 
 	cfg := Config{ExecutablePath: "agent", LaunchPrefix: []string{"--model", "composer-2.5"}, Logger: slog.Default()}
@@ -361,5 +362,135 @@ func TestCodexLaunchPrefixCannotShadowManagedConfig(t *testing.T) {
 	if strings.Join(filtered.Prefix, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("prefix = %v, want the managed-namespace overrides dropped and %v kept",
 			filtered.Prefix, want)
+	}
+}
+
+// TestFilterLaunchPrefixKeepsPositionalCollidingWithSubcommand is Elon's
+// must-fix 2. The blocklists are shared with custom_args, and several carry
+// positional tokens — hermes/qwenpaw block `acp`, traecli blocks `acp` and
+// `serve`, grok blocks `agent`, `stdio` and `serve`. Those entries exist to
+// stop someone re-issuing the backend's own subcommand through custom_args.
+// A launch prefix is the opposite case: the token is the command's identity,
+// and dropping it rewrites the operator's command into a different one.
+func TestFilterLaunchPrefixKeepsPositionalCollidingWithSubcommand(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		family string
+		prefix []string
+		want   []string
+	}{
+		{"hermes", []string{"acp", "tenant"}, []string{"acp", "tenant"}},
+		{"qwenpaw", []string{"acp", "tenant"}, []string{"acp", "tenant"}},
+		{"traecli", []string{"serve", "acp"}, []string{"serve", "acp"}},
+		{"grok", []string{"agent", "stdio"}, []string{"agent", "stdio"}},
+		{"grok", []string{"leader", "headless"}, []string{"leader", "headless"}},
+		// Flags in the same prefix are still filtered; grok blocks -p.
+		{"grok", []string{"agent", "-p", "stdio"}, []string{"agent", "stdio"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.family+"/"+strings.Join(tc.prefix, "_"), func(t *testing.T) {
+			t.Parallel()
+			got := filterLaunchPrefix(tc.prefix, tc.family, slog.Default())
+			if strings.Join(got, "\x00") != strings.Join(tc.want, "\x00") {
+				t.Fatalf("filterLaunchPrefix(%v, %s) = %v, want %v", tc.prefix, tc.family, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFilterLaunchPrefixConsumesBlockedFlagValue: dropping a blocked flag must
+// take its value with it, or the leftover value token would be read as a
+// subcommand — precisely the kind of token this filter otherwise preserves.
+func TestFilterLaunchPrefixConsumesBlockedFlagValue(t *testing.T) {
+	t.Parallel()
+
+	got := filterLaunchPrefix(
+		[]string{"start", "--permission-mode", "ask", "q36", "--output-format=text"},
+		"claude", slog.Default())
+	want := []string{"start", "q36"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("filterLaunchPrefix = %v, want %v", got, want)
+	}
+}
+
+// TestStripAllHermesProfileArgs is Elon's must-fix 1, at the parser level.
+// Stripping only the selection hermes acts on today promotes the next one to
+// first, and the task walks straight out of the overlay the daemon built.
+func TestStripAllHermesProfileArgs(t *testing.T) {
+	t.Parallel()
+
+	got := StripAllHermesProfileArgs([]string{
+		"-p", "research", "acp", "--profile=ops", "--model", "x", "-p", "third",
+	})
+	want := []string{"acp", "--model", "x"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("StripAllHermesProfileArgs = %v, want %v", got, want)
+	}
+	if sel := ParseHermesProfileArgs(got); sel.Found {
+		t.Fatalf("a profile selection survived stripping: %+v", sel)
+	}
+}
+
+// TestHermesLaunchPrefixCannotEscapeOverlay ties must-fix 1 to the argv that
+// actually reaches hermes: prefix then custom args, with `acp` appended by the
+// backend. Nothing in the final command line may re-point HERMES_HOME.
+func TestHermesLaunchPrefixCannotEscapeOverlay(t *testing.T) {
+	t.Parallel()
+
+	prefix := StripAllHermesProfileArgs([]string{"hermes-wrapper-sub", "-p", "research"})
+	custom := StripAllHermesProfileArgs([]string{"--model", "x", "--profile=ops"})
+
+	cfg := Config{LaunchPrefix: prefix, Logger: slog.Default()}
+	argv := cfg.commandAt("wrapper").Argv(append([]string{"acp"}, custom...)...)
+
+	if sel := ParseHermesProfileArgs(argv); sel.Found {
+		t.Fatalf("final hermes argv still selects a profile (%+v): %v", sel, argv)
+	}
+	// The non-profile tokens survive: stripping must not eat the command.
+	if prefixIndex(argv, []string{"hermes-wrapper-sub", "acp"}) != 0 {
+		t.Fatalf("stripping damaged the command identity: %v", argv)
+	}
+	if prefixIndex(argv, []string{"--model", "x"}) < 0 {
+		t.Fatalf("stripping dropped an unrelated custom arg: %v", argv)
+	}
+}
+
+// TestCodexLaunchPrefixCannotOverrideExplicitFastMode is Elon's must-fix 3.
+// `--disable fast_mode` beats `--enable fast_mode` regardless of argv order and
+// `-c features.fast_mode=false` beats config.toml from any position, so being
+// first does not make the prefix lose. Both spellings have to be removed.
+func TestCodexLaunchPrefixCannotOverrideExplicitFastMode(t *testing.T) {
+	t.Parallel()
+
+	for _, prefix := range [][]string{
+		{"proxy", "run", "--disable", "fast_mode"},
+		{"proxy", "run", "--disable=fast_mode"},
+		{"proxy", "run", "-c", "features.fast_mode=false"},
+	} {
+		t.Run(strings.Join(prefix, "_"), func(t *testing.T) {
+			t.Parallel()
+			got := stripCodexFastModeConflicts(prefix, slog.Default())
+			want := []string{"proxy", "run"}
+			if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+				t.Fatalf("stripCodexFastModeConflicts(%v) = %v, want %v", prefix, got, want)
+			}
+			// The managed enable is appended once, by buildCodexArgs, not here.
+			if prefixIndex(got, []string{"--enable"}) >= 0 {
+				t.Fatalf("the strip helper must not append the managed enable: %v", got)
+			}
+		})
+	}
+}
+
+// TestEnforceCodexFastModeStillAppendsEnableOnce guards the split: pulling the
+// removal out of enforceCodexFastMode must not change what it produces.
+func TestEnforceCodexFastModeStillAppendsEnableOnce(t *testing.T) {
+	t.Parallel()
+
+	got := enforceCodexFastMode([]string{"--disable", "fast_mode", "--model", "gpt-5"}, slog.Default())
+	want := []string{"--model", "gpt-5", "--enable", "fast_mode"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("enforceCodexFastMode = %v, want %v", got, want)
 	}
 }

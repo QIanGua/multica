@@ -5563,3 +5563,48 @@ func TestBuildPromptSquadLeaderMultiThreadCarvesOutNoAction(t *testing.T) {
 		t.Fatalf("ordinary multi-thread prompt leaked the leader carve-out\n---\n%s", ordinary)
 	}
 }
+
+// TestHermesProfileChainCoversLaunchPrefix is the daemon half of GH #7046's
+// Hermes regression. A custom runtime profile's fixed_args are no longer folded
+// into custom_args — they become the launch prefix and reach hermes *ahead* of
+// custom_args. Two things follow, and both used to be wrong:
+//
+//   - The overlay's source home must be resolved from the selection hermes will
+//     actually act on, which is the first one in the combined argv. Reading
+//     custom_args alone would seed the overlay from a different profile than the
+//     process reads.
+//   - Once the overlay exists, no argv region may re-point HERMES_HOME out of
+//     it. Stripping custom_args alone left `hermes -p research` in the prefix
+//     free to redirect the task past the isolation the daemon just built.
+func TestHermesProfileChainCoversLaunchPrefix(t *testing.T) {
+	t.Parallel()
+
+	launchPrefix := []string{"tenant-wrapper", "-p", "research"}
+	customArgs := []string{"--yolo", "--profile=ops"}
+
+	// Resolution: the prefix carries the first selection, so it is the one
+	// hermes acts on and the one the overlay must be built from.
+	sel := agent.ParseHermesProfileArgs(hermesEffectiveArgs(launchPrefix, customArgs))
+	if !sel.Found || sel.Name != "research" {
+		t.Fatalf("effective profile = %+v, want the prefix's `research` selection", sel)
+	}
+
+	// Skill-less task: nothing is stripped from either region.
+	if got := hermesLaunchArgs(customArgs, false); strings.Join(got, "\x00") != strings.Join(customArgs, "\x00") {
+		t.Errorf("skill-less task must keep its custom args, got %v", got)
+	}
+
+	// Overlay active: every selection is gone from both regions, and the
+	// combined argv can no longer redirect.
+	strippedPrefix := agent.StripAllHermesProfileArgs(launchPrefix)
+	strippedCustom := hermesLaunchArgs(customArgs, true)
+	if strings.Join(strippedPrefix, "\x00") != "tenant-wrapper" {
+		t.Errorf("overlay task must strip the prefix's profile flags, got %v", strippedPrefix)
+	}
+	if strings.Join(strippedCustom, "\x00") != "--yolo" {
+		t.Errorf("overlay task must strip the custom args' profile flags, got %v", strippedCustom)
+	}
+	if sel := agent.ParseHermesProfileArgs(hermesEffectiveArgs(strippedPrefix, strippedCustom)); sel.Found {
+		t.Fatalf("the launched argv can still redirect HERMES_HOME: %+v", sel)
+	}
+}

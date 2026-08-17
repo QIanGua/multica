@@ -6367,7 +6367,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var hermesMemoryStore string
 	var hermesSessionStore string
 	if provider == "hermes" {
-		sel := agent.ParseHermesProfileArgs(agentCustomArgs)
+		// Parse the combined argv, not custom_args alone. A custom runtime
+		// profile's fixed_args become the launch prefix and are handed to
+		// hermes ahead of custom_args, so a `-p research` written there is the
+		// first selection — the one hermes itself acts on. Resolving from
+		// custom_args only would build the overlay from a different profile
+		// than the process ends up reading (GH #7046).
+		sel := agent.ParseHermesProfileArgs(hermesEffectiveArgs(profileFixedArgs, agentCustomArgs))
 		res := execenv.ResolveHermesProfile(agentEnvOverrides["HERMES_HOME"], sel.Name, sel.Found, sel.Inline)
 		if res.Err != nil {
 			return TaskResult{}, fmt.Errorf("resolve hermes profile: %w", res.Err)
@@ -6829,6 +6835,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	if err := configureCodexTaskShellEnvironment(provider, env.CodexHome, os.Environ(), agentEnv, agentCustomEnv, d.logger); err != nil {
 		return TaskResult{}, err
+	}
+	if provider == "hermes" && env != nil && env.HermesHome != "" {
+		// The overlay is authoritative once built, so no argv region may
+		// re-point HERMES_HOME out of it — the launch prefix included. Custom
+		// args get the same treatment below, where they are assembled.
+		profileFixedArgs = agent.StripAllHermesProfileArgs(profileFixedArgs)
 	}
 	// Resolve the backend through the unified runtime resolver: built-in
 	// runtime identities (e.g. "omp") dispatch through NewRuntime, protocol
@@ -8377,11 +8389,21 @@ func hermesLaunchArgs(customArgs []string, overlayActive bool) []string {
 	if !overlayActive {
 		return customArgs
 	}
-	// Strip exactly the occurrence the resolver acted on. This re-parses with the
-	// same authoritative parser used to resolve the source home, so parsing and
-	// stripping never diverge.
-	sel := agent.ParseHermesProfileArgs(customArgs)
-	return agent.StripHermesProfileArgs(customArgs, sel)
+	// Strip every occurrence, not just the one the resolver acted on: removing
+	// the first promotes the second to first, and hermes would follow it out of
+	// the overlay. Re-parses with the same authoritative parser used to resolve
+	// the source home, so parsing and stripping never diverge.
+	return agent.StripAllHermesProfileArgs(customArgs)
+}
+
+// hermesEffectiveArgs is the argv hermes actually parses for a profile
+// selection: the runtime's launch prefix followed by the agent's custom args,
+// in the order they reach the process.
+func hermesEffectiveArgs(launchPrefix, customArgs []string) []string {
+	combined := make([]string, 0, len(launchPrefix)+len(customArgs))
+	combined = append(combined, launchPrefix...)
+	combined = append(combined, customArgs...)
+	return combined
 }
 
 // hermesProviderUnconfiguredHint is appended verbatim to a "no LLM provider
