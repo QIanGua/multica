@@ -145,7 +145,8 @@ func TestBriefHasNoParentNotificationGuidance(t *testing.T) {
 // PR #2918) survive it and are pinned here:
 //
 //   - a purely conversational turn never writes status;
-//   - a run that is a guest on someone else's issue never writes status.
+//   - a turn on an issue not assigned to this agent never writes status
+//     (someone else's issue, or an unassigned one reached via @mention).
 //
 // The brief must also still carry no unconditional placeholder flip: a bare
 // `multica issue status <this-issue-id> in_review` command would fire on every
@@ -165,12 +166,14 @@ func TestReplyModeStatusRuleIsScopedToOwnedWorkTurns(t *testing.T) {
 	for _, want := range []string{
 		// The arc itself: both ends, and the ceiling that keeps `done` human.
 		"when this issue is assigned to you and this turn does substantive work on it",
-		"set `in_progress` when you start that work",
-		"delivered and awaiting acceptance is `in_review`; leave `done` to a human",
+		"set `in_progress` when you start",
+		"delivered and awaiting acceptance = `in_review`; `done` stays human",
 		// Invariant 1: conversation does not move the board.
-		"A purely conversational turn — question, discussion, acknowledgement — leaves the status untouched.",
-		// Invariant 2: no status writes on an issue owned by someone else.
-		"When the issue is assigned to someone else and you were pulled in by an @mention, its status belongs to that assignee: never run `multica issue status` on it.",
+		"Purely conversational turns (question, discussion, acknowledgement) never touch status",
+		// Invariant 2: no status writes on an issue not assigned to this agent —
+		// "not assigned to you" on purpose, so the unassigned @mention path is
+		// covered, not just issues owned by someone else.
+		"neither does any turn on an issue not assigned to you",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("reply-mode status rule missing %q\n---\n%s", want, out)
@@ -205,8 +208,8 @@ func TestCommentTriggeredSquadLeaderDefersToStatusOwnershipGrant(t *testing.T) {
 		// the parent on the turn it hands work to members.
 		"Dispatching members is not completion.",
 		// No grant → no status writes, the guest-leader path (MUL-3724).
-		"When it is absent, this issue belongs to another assignee: never run `multica issue status` on it.",
-		"A purely conversational turn — question, discussion, acknowledgement — leaves the status untouched.",
+		"When absent, this issue is not yours: never run `multica issue status` on it.",
+		"Purely conversational turns (question, discussion, acknowledgement) never touch status",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("squad-leader comment brief missing %q\n---\n%s", want, out)

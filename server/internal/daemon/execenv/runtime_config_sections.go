@@ -559,8 +559,8 @@ func writeWorkflowAutopilot(b *strings.Builder, ctx TaskContextForEnv) {
 // modes (MUL-6300) — a comment asking for rework is the same work as an
 // assignment, so gating the arc on trigger type left delivered-then-reworked
 // issues stale until a human moved the card. What stays out of the arc is
-// what never carried work: conversational turns, and turns on an issue
-// assigned to someone else.
+// what never carried work: conversational turns, and turns on an issue not
+// assigned to this agent (someone else's, or unassigned).
 //
 // Squad leaders share the opening in_progress step so the parent leaves todo
 // as soon as coordination starts, but their first assignment turn is only a
@@ -619,7 +619,7 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 		// The leader's arc is not the ordinary one: dispatch is not delivery,
 		// so the parent stays in_progress until a later re-trigger confirms
 		// the goal is met.
-		b.WriteString("- Issue status: a section in your instructions may explicitly grant you ownership of this issue's status (the Squad Operating Protocol's \"Own the parent issue status\" responsibility). That section only appears when this issue is assigned to your squad; when it is there, treat it as a standing instruction — keep the parent `in_progress` while members work, and move it to `in_review` on the turn you confirm the overall goal is met, without waiting to be asked. Dispatching members is not completion. When it is absent, this issue belongs to another assignee: never run `multica issue status` on it. A purely conversational turn — question, discussion, acknowledgement — leaves the status untouched.\n\n")
+		b.WriteString("- Issue status: your instructions may grant you ownership of this issue's status (the Squad Operating Protocol's \"Own the parent issue status\" responsibility — it only appears when this issue is assigned to your squad). When present, treat it as standing: keep the parent `in_progress` while members work, and move it to `in_review` on the turn you confirm the overall goal is met, without waiting to be asked. Dispatching members is not completion. When absent, this issue is not yours: never run `multica issue status` on it. Purely conversational turns (question, discussion, acknowledgement) never touch status.\n\n")
 	} else {
 		// MUL-6300 replaces the original "do NOT change the issue status
 		// unless the comment explicitly asks for it" (PR #205) with the arc
@@ -631,11 +631,14 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 		//
 		// Two invariants survive verbatim from #205 / #2918, and the guard
 		// tests pin both: a conversational turn never writes status, and a
-		// run that is a guest on someone else's issue (@mention pull-in)
-		// never writes status either. Whether this agent is the assignee is
-		// answerable on every turn: step 1 already reads `assignee_id`, and
-		// `## Agent Identity` carries this agent's own id.
-		b.WriteString("- Issue status: when this issue is assigned to you and this turn does substantive work on it, own the status the same way Ownership mode does — set `in_progress` when you start that work, and when your turn completes move the issue to the status the work is now in (delivered and awaiting acceptance is `in_review`; leave `done` to a human). A purely conversational turn — question, discussion, acknowledgement — leaves the status untouched. When the issue is assigned to someone else and you were pulled in by an @mention, its status belongs to that assignee: never run `multica issue status` on it.\n\n")
+		// turn on an issue not assigned to this agent never writes status
+		// either. The second is deliberately "not assigned to you", not
+		// "assigned to someone else": an @mention can also land the agent on
+		// an UNASSIGNED issue (triage), and that case must stay no-write too.
+		// Whether this agent is the assignee is answerable on every turn:
+		// step 1 already reads `assignee_id`, and `## Agent Identity` carries
+		// this agent's own id.
+		b.WriteString("- Issue status: when this issue is assigned to you and this turn does substantive work on it, own the status arc as Ownership mode does — set `in_progress` when you start, and at turn end set the status the work has reached (delivered and awaiting acceptance = `in_review`; `done` stays human). Purely conversational turns (question, discussion, acknowledgement) never touch status; neither does any turn on an issue not assigned to you.\n\n")
 	}
 }
 

@@ -218,7 +218,7 @@ func TestInjectRuntimeConfigKeepsTriggerCommentOutOfBrief(t *testing.T) {
 		"No mode line → Reply mode",
 		// The fallback is only safe because Reply mode's own status rule is
 		// conditional: no work, no status write (MUL-6300).
-		"A purely conversational turn — question, discussion, acknowledgement — leaves the status untouched.",
+		"Purely conversational turns (question, discussion, acknowledgement) never touch status",
 		"`Turn mode: Reply.`",
 		"`Turn mode: Ownership.`",
 		"Use the `--parent` value the per-turn user message gives you for this turn",

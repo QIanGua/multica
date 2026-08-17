@@ -188,8 +188,9 @@ on it. These are the contracts, not advice:
   delivered. Ownership turns open that arc unconditionally; reply turns own the
   same arc, but only when the issue is assigned to you AND the turn does
   substantive work — a question, a discussion, or an acknowledgement never
-  moves the status, and neither does a turn on an issue assigned to someone
-  else (you were pulled in by an @mention). Squad leaders share the opening
+  moves the status, and neither does a turn on an issue not assigned to you
+  (someone else's, or unassigned — you were pulled in by an @mention either
+  way). Squad leaders share the opening
   `in_progress` step on the first assignment turn, keep the parent there while
   members work, and only move to `in_review` when a later re-trigger confirms
   the overall goal is met.
