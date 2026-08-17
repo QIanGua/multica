@@ -56,6 +56,7 @@ type AcquireLeaseParams struct {
 	ID        pgtype.UUID
 	Token     string
 	ExpiresAt time.Time
+	TTL       time.Duration
 }
 
 // ReleaseLeaseParams releases a WS supervisor lease the caller still
@@ -66,29 +67,48 @@ type ReleaseLeaseParams struct {
 	Token string
 }
 
-// ErrLeaseNotAcquired is the sentinel a store returns from AcquireWSLease
+// ErrLeaseNotAcquired is the sentinel a store returns from TryAcquireWSLease
 // when the CAS predicate did not match — i.e. another replica (or an
 // in-process predecessor mid-rotation) holds a live lease. The Supervisor
 // treats it as "not ours yet, retry later", distinct from a transport
 // error. Stores wrap their backend's no-rows signal into this.
 var ErrLeaseNotAcquired = errors.New("engine: ws lease held elsewhere")
 
-// InstallationStore is the narrow data seam the Supervisor needs:
-// enumerate active installations across every channel type and manage the
-// per-installation WS lease. The application backs it with the generalized
-// channel_* tables; tests substitute a fake.
+// InstallationStore enumerates active installations across every channel
+// type. LeaseStore is deliberately separate so production can keep
+// installation metadata in PostgreSQL while using Redis for low-churn leases.
 type InstallationStore interface {
 	// ListActiveInstallations returns every active installation across ALL
 	// channel types. There is no per-platform filter here — that hard-coded
 	// "feishu" was the whole limitation MUL-3620 removes.
 	ListActiveInstallations(ctx context.Context) ([]Installation, error)
+}
 
-	// AcquireWSLease grants or renews the lease, or returns
-	// ErrLeaseNotAcquired when it is held elsewhere.
-	AcquireWSLease(ctx context.Context, arg AcquireLeaseParams) error
+// LeaseStore owns the token-fenced, per-installation WebSocket leases.
+type LeaseStore interface {
+	// ListHeldWSLeases returns the IDs that currently have any live owner.
+	// It is a sweep optimization only; TryAcquireWSLease remains the authority.
+	ListHeldWSLeases(ctx context.Context, ids []pgtype.UUID) (map[string]struct{}, error)
 
-	// ReleaseWSLease releases a lease the caller holds (token-fenced).
+	// TryAcquireWSLease grants when the lease is absent or already carries the
+	// same token (safe retry after an uncertain response); otherwise it returns
+	// ErrLeaseNotAcquired.
+	TryAcquireWSLease(ctx context.Context, arg AcquireLeaseParams) error
+
+	// RenewWSLease extends only a lease whose current value equals Token.
+	// ErrLeaseNotAcquired means ownership has been lost.
+	RenewWSLease(ctx context.Context, arg AcquireLeaseParams) error
+
+	// ReleaseWSLease deletes only a lease whose current value equals Token.
 	ReleaseWSLease(ctx context.Context, arg ReleaseLeaseParams) error
+}
+
+// LeaseMetrics is the optional, backend-agnostic observability seam.
+type LeaseMetrics interface {
+	RecordLeaseOperation(operation, outcome string)
+	SetActiveLeaseOwners(count float64)
+	SetLastSuccessfulRenewal(at time.Time)
+	ObserveTakeoverLatency(delay time.Duration)
 }
 
 // Config tunes the Supervisor's lifecycle loops. All fields have sensible
@@ -108,6 +128,13 @@ type Config struct {
 	// PollInterval is how often the Supervisor scans for installations to
 	// take over (new ones, or ones whose lease expired on another replica).
 	PollInterval time.Duration
+
+	// LeaseErrorRetryInterval is the fast retry cadence after a renewal
+	// transport error. LeaseExpirySafetyMargin is subtracted from the last
+	// confirmed TTL so a partitioned owner disconnects before Redis can grant
+	// a successor.
+	LeaseErrorRetryInterval time.Duration
+	LeaseExpirySafetyMargin time.Duration
 
 	// MinBackoff / MaxBackoff bound the per-installation reconnect
 	// schedule: start at MinBackoff, double after each consecutive failure
@@ -140,17 +167,26 @@ type Config struct {
 
 	// Logger optional; defaults to slog.Default.
 	Logger *slog.Logger
+
+	// LeaseMetrics is optional; nil disables Prometheus recording.
+	LeaseMetrics LeaseMetrics
 }
 
 func (c Config) withDefaults() Config {
 	if c.LeaseTTL == 0 {
-		c.LeaseTTL = 90 * time.Second
+		c.LeaseTTL = 180 * time.Second
 	}
 	if c.LeaseRenewInterval == 0 {
-		c.LeaseRenewInterval = 30 * time.Second
+		c.LeaseRenewInterval = 60 * time.Second
 	}
 	if c.PollInterval == 0 {
 		c.PollInterval = 30 * time.Second
+	}
+	if c.LeaseErrorRetryInterval == 0 {
+		c.LeaseErrorRetryInterval = min(5*time.Second, c.LeaseRenewInterval/4)
+	}
+	if c.LeaseExpirySafetyMargin == 0 {
+		c.LeaseExpirySafetyMargin = min(5*time.Second, c.LeaseTTL/10)
 	}
 	if c.MinBackoff == 0 {
 		c.MinBackoff = 2 * time.Second
@@ -176,7 +212,29 @@ func (c Config) withDefaults() Config {
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
+	if err := c.Validate(); err != nil {
+		panic(err)
+	}
 	return c
+}
+
+// Validate enforces the timing invariant required for safe fail-closed lease
+// renewal. Callers parsing deployment config can use it before constructing a
+// Supervisor; NewSupervisor also rejects invalid programmatic configs.
+func (c Config) Validate() error {
+	if c.PollInterval <= 0 || c.LeaseRenewInterval <= 0 || c.LeaseTTL <= 0 {
+		return errors.New("channel engine: lease intervals must be positive")
+	}
+	if c.PollInterval > c.LeaseRenewInterval || c.LeaseRenewInterval >= c.LeaseTTL {
+		return fmt.Errorf("channel engine: require poll <= renew < ttl (poll=%s renew=%s ttl=%s)", c.PollInterval, c.LeaseRenewInterval, c.LeaseTTL)
+	}
+	if c.LeaseErrorRetryInterval <= 0 {
+		return errors.New("channel engine: lease error retry interval must be positive")
+	}
+	if c.LeaseExpirySafetyMargin <= 0 || c.LeaseExpirySafetyMargin >= c.LeaseTTL-c.LeaseRenewInterval {
+		return fmt.Errorf("channel engine: lease expiry safety margin must be positive and less than ttl-renew (margin=%s)", c.LeaseExpirySafetyMargin)
+	}
+	return nil
 }
 
 // Supervisor owns the per-installation supervisor goroutines that keep a
@@ -192,15 +250,16 @@ func (c Config) withDefaults() Config {
 //
 // Lifecycle:
 //
-//	sup := NewSupervisor(store, registry, handler, engine.Config{})
+//	sup := NewSupervisor(installations, leases, registry, handler, engine.Config{})
 //	go sup.Run(ctx)             // returns when ctx is cancelled
 //	... ctx cancellation triggers ...
 //	sup.Wait()                  // joins on every per-installation goroutine
 type Supervisor struct {
-	store    InstallationStore
-	registry *channel.Registry
-	handler  channel.InboundHandler
-	cfg      Config
+	store      InstallationStore
+	leaseStore LeaseStore
+	registry   *channel.Registry
+	handler    channel.InboundHandler
+	cfg        Config
 
 	// nodeID is the per-process lease ownership token. AcquireWSLease
 	// treats matching tokens as "this is us, renew", so a stable nodeID
@@ -214,6 +273,10 @@ type Supervisor struct {
 	// next sweep tears the connection down and rebuilds it with fresh
 	// credentials.
 	supervisors map[string]supervisorEntry
+	// contendedSince tracks when this node first observed a foreign owner so
+	// successful expiry takeover latency can be measured without per-ID labels.
+	contendedSince map[string]time.Time
+	activeOwners   int
 	// supervisorGen is the source of the monotonic gen counter stored on
 	// each entry. Bumped under mu when a new entry is minted (initial start
 	// or rotation restart).
@@ -242,16 +305,18 @@ type supervisorEntry struct {
 // the inbound pipeline is written once and shared across platforms. The
 // Supervisor starts no goroutines until Run is called. A nil registry or
 // store is a programming error and will panic at Run.
-func NewSupervisor(store InstallationStore, registry *channel.Registry, handler channel.InboundHandler, cfg Config) *Supervisor {
+func NewSupervisor(store InstallationStore, leaseStore LeaseStore, registry *channel.Registry, handler channel.InboundHandler, cfg Config) *Supervisor {
 	cfg = cfg.withDefaults()
 	return &Supervisor{
-		store:       store,
-		registry:    registry,
-		handler:     handler,
-		cfg:         cfg,
-		nodeID:      newNodeID(),
-		supervisors: make(map[string]supervisorEntry),
-		stopChan:    make(chan struct{}),
+		store:          store,
+		leaseStore:     leaseStore,
+		registry:       registry,
+		handler:        handler,
+		cfg:            cfg,
+		nodeID:         newNodeID(),
+		supervisors:    make(map[string]supervisorEntry),
+		contendedSince: make(map[string]time.Time),
+		stopChan:       make(chan struct{}),
 	}
 }
 
@@ -344,6 +409,8 @@ func (s *Supervisor) sweep(ctx context.Context) {
 		return
 	}
 	active := make(map[string]struct{}, len(rows))
+	candidates := make([]Installation, 0, len(rows))
+	candidateIDs := make([]pgtype.UUID, 0, len(rows))
 	for _, row := range rows {
 		// Skip channel types with no registered per-installation Factory. Such
 		// rows are driven outside the Supervisor (e.g. Slack's app-level Socket
@@ -358,7 +425,10 @@ func (s *Supervisor) sweep(ctx context.Context) {
 		id := uuidString(row.ID)
 		active[id] = struct{}{}
 		s.maybeRestartOnRotation(id, row)
-		s.startSupervisor(ctx, row)
+		if !s.isSupervised(id) {
+			candidates = append(candidates, row)
+			candidateIDs = append(candidateIDs, row.ID)
+		}
 	}
 	// Reap supervisors whose installation is no longer active (revoked
 	// since the last sweep). The supervisor exits on the next boundary,
@@ -371,6 +441,32 @@ func (s *Supervisor) sweep(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
+
+	if len(candidates) == 0 {
+		return
+	}
+	held, err := s.leaseStore.ListHeldWSLeases(ctx, candidateIDs)
+	if err != nil {
+		s.recordLeaseOperation("list", "error")
+		s.cfg.Logger.Warn("channel engine: list held leases failed; acquisition sweep skipped", "error", err)
+		return
+	}
+	s.recordLeaseOperation("list", "success")
+	for _, row := range candidates {
+		id := uuidString(row.ID)
+		if _, occupied := held[id]; occupied {
+			s.markContended(id)
+			continue
+		}
+		s.startSupervisor(ctx, row)
+	}
+}
+
+func (s *Supervisor) isSupervised(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.supervisors[id]
+	return ok
 }
 
 // maybeRestartOnRotation cancels an existing supervisor when its
@@ -460,22 +556,23 @@ func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string
 			return
 		}
 
-		// Claim the WS lease. If another replica owns a live lease, sleep
-		// until it expires or our context is cancelled.
-		leased, err := s.acquireLease(ctx, inst.ID, leaseTok)
+		// A losing candidate exits. The next batched sweep observes Redis and
+		// starts a fresh attempt only after the key disappears, avoiding a
+		// per-installation blind retry loop on every replica.
+		leased, confirmedUntil, err := s.acquireLease(ctx, inst.ID, leaseTok)
 		if err != nil {
+			s.recordLeaseOperation("acquire", "error")
 			log.Warn("channel engine: acquire lease error", "error", err)
-			if sleep(ctx, s.cfg.LeaseRenewInterval) {
-				return
-			}
-			continue
+			return
 		}
 		if !leased {
-			if sleep(ctx, s.cfg.LeaseRenewInterval) {
-				return
-			}
-			continue
+			s.recordLeaseOperation("acquire", "contended")
+			s.markContended(id)
+			return
 		}
+		s.recordLeaseOperation("acquire", "success")
+		s.observeTakeover(id)
+		s.adjustActiveOwners(1)
 
 		// Lease acquired. Build the platform channel via the registry,
 		// run it under a child context, and renew the lease in parallel.
@@ -488,6 +585,7 @@ func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string
 		if err != nil {
 			log.Error("channel engine: build channel failed", "error", err)
 			s.releaseLease(inst.ID, leaseTok)
+			s.adjustActiveOwners(-1)
 			if sleep(ctx, backoff) {
 				return
 			}
@@ -503,7 +601,7 @@ func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string
 			// channel exits even if its wire I/O is blocked. This is what
 			// makes "at most one active connection per installation across
 			// replicas" hold under lease theft.
-			s.renewLeaseUntil(runCtx, runCancel, inst.ID, leaseTok)
+			s.renewLeaseUntil(runCtx, runCancel, inst.ID, leaseTok, confirmedUntil)
 		}()
 
 		startedAt := s.cfg.Now()
@@ -512,6 +610,7 @@ func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string
 		<-renewDone
 		s.disconnect(ch, id, log)
 		s.releaseLease(inst.ID, leaseTok)
+		s.adjustActiveOwners(-1)
 
 		if ctx.Err() != nil {
 			return
@@ -539,20 +638,22 @@ func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string
 // when owned after the call; (false, nil) when held elsewhere; (false, err)
 // for transport / DB failures. token is the per-supervisor token (see
 // leaseToken), NOT the process-wide nodeID.
-func (s *Supervisor) acquireLease(ctx context.Context, instID pgtype.UUID, token string) (bool, error) {
-	expires := s.cfg.Now().Add(s.cfg.LeaseTTL)
-	err := s.store.AcquireWSLease(ctx, AcquireLeaseParams{
+func (s *Supervisor) acquireLease(ctx context.Context, instID pgtype.UUID, token string) (bool, time.Time, error) {
+	started := s.cfg.Now()
+	expires := started.Add(s.cfg.LeaseTTL)
+	err := s.leaseStore.TryAcquireWSLease(ctx, AcquireLeaseParams{
 		ID:        instID,
 		Token:     token,
 		ExpiresAt: expires,
+		TTL:       s.cfg.LeaseTTL,
 	})
 	if err == nil {
-		return true, nil
+		return true, started.Add(s.cfg.LeaseTTL - s.cfg.LeaseExpirySafetyMargin), nil
 	}
 	if errors.Is(err, ErrLeaseNotAcquired) {
-		return false, nil
+		return false, time.Time{}, nil
 	}
-	return false, err
+	return false, time.Time{}, err
 }
 
 // renewLeaseUntil re-acquires the lease on a tight cadence so a single
@@ -563,31 +664,61 @@ func (s *Supervisor) acquireLease(ctx context.Context, instID pgtype.UUID, token
 // the same installation" failure mode. cancelRun forces the channel's ctx
 // done immediately, so Connect returns in bounded time even on a silent
 // socket. token MUST be the same per-supervisor token used to acquire.
-func (s *Supervisor) renewLeaseUntil(ctx context.Context, cancelRun context.CancelFunc, instID pgtype.UUID, token string) {
-	t := time.NewTicker(s.cfg.LeaseRenewInterval)
-	defer t.Stop()
+func (s *Supervisor) renewLeaseUntil(ctx context.Context, cancelRun context.CancelFunc, instID pgtype.UUID, token string, confirmedUntil time.Time) {
+	nextDelay := renewalJitter(s.cfg.LeaseRenewInterval)
 	for {
+		remaining := confirmedUntil.Sub(s.cfg.Now())
+		if remaining <= 0 {
+			s.leaseLost(instID, cancelRun, "last confirmed lease expired")
+			return
+		}
+		wait := min(nextDelay, remaining)
+		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return
 		case <-t.C:
-			leased, err := s.acquireLease(ctx, instID, token)
-			if err != nil {
-				s.cfg.Logger.Warn("channel engine: lease renewal error",
-					"installation_id", uuidString(instID),
-					"error", err,
-				)
-				continue
-			}
-			if !leased {
-				s.cfg.Logger.Warn("channel engine: lease lost; tearing down connection",
-					"installation_id", uuidString(instID),
-				)
-				cancelRun()
+		}
+		if !s.cfg.Now().Before(confirmedUntil) {
+			s.leaseLost(instID, cancelRun, "last confirmed lease expired")
+			return
+		}
+
+		started := s.cfg.Now()
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, confirmedUntil.Sub(started))
+		err := s.leaseStore.RenewWSLease(attemptCtx, AcquireLeaseParams{
+			ID: instID, Token: token, ExpiresAt: started.Add(s.cfg.LeaseTTL), TTL: s.cfg.LeaseTTL,
+		})
+		attemptCancel()
+		if err != nil {
+			if errors.Is(err, ErrLeaseNotAcquired) {
+				s.leaseLost(instID, cancelRun, "lease token no longer matches")
 				return
 			}
+			s.recordLeaseOperation("renew", "error")
+			s.cfg.Logger.Warn("channel engine: lease renewal error",
+				"installation_id", uuidString(instID),
+				"error", err,
+				"confirmed_until", confirmedUntil,
+			)
+			nextDelay = s.cfg.LeaseErrorRetryInterval
+			continue
 		}
+		confirmedUntil = started.Add(s.cfg.LeaseTTL - s.cfg.LeaseExpirySafetyMargin)
+		s.recordLeaseOperation("renew", "success")
+		if s.cfg.LeaseMetrics != nil {
+			s.cfg.LeaseMetrics.SetLastSuccessfulRenewal(s.cfg.Now())
+		}
+		nextDelay = renewalJitter(s.cfg.LeaseRenewInterval)
 	}
+}
+
+func (s *Supervisor) leaseLost(instID pgtype.UUID, cancelRun context.CancelFunc, reason string) {
+	s.recordLeaseOperation("renew", "lost")
+	s.cfg.Logger.Warn("channel engine: lease lost; tearing down connection",
+		"installation_id", uuidString(instID), "reason", reason)
+	cancelRun()
 }
 
 // releaseLease writes a token-fenced release so the next supervisor (this
@@ -599,14 +730,53 @@ func (s *Supervisor) renewLeaseUntil(ctx context.Context, cancelRun context.Canc
 func (s *Supervisor) releaseLease(instID pgtype.UUID, token string) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.LeaseReleaseTimeout)
 	defer cancel()
-	if err := s.store.ReleaseWSLease(ctx, ReleaseLeaseParams{
+	if err := s.leaseStore.ReleaseWSLease(ctx, ReleaseLeaseParams{
 		ID:    instID,
 		Token: token,
 	}); err != nil {
+		s.recordLeaseOperation("release", "error")
 		s.cfg.Logger.Warn("channel engine: release lease failed",
 			"installation_id", uuidString(instID),
 			"error", err,
 		)
+		return
+	}
+	s.recordLeaseOperation("release", "success")
+}
+
+func (s *Supervisor) recordLeaseOperation(operation, outcome string) {
+	if s.cfg.LeaseMetrics != nil {
+		s.cfg.LeaseMetrics.RecordLeaseOperation(operation, outcome)
+	}
+}
+
+func (s *Supervisor) adjustActiveOwners(delta int) {
+	s.mu.Lock()
+	s.activeOwners += delta
+	count := s.activeOwners
+	s.mu.Unlock()
+	if s.cfg.LeaseMetrics != nil {
+		s.cfg.LeaseMetrics.SetActiveLeaseOwners(float64(count))
+	}
+}
+
+func (s *Supervisor) markContended(id string) {
+	s.mu.Lock()
+	if _, ok := s.contendedSince[id]; !ok {
+		s.contendedSince[id] = s.cfg.Now()
+	}
+	s.mu.Unlock()
+}
+
+func (s *Supervisor) observeTakeover(id string) {
+	s.mu.Lock()
+	started, ok := s.contendedSince[id]
+	if ok {
+		delete(s.contendedSince, id)
+	}
+	s.mu.Unlock()
+	if ok && s.cfg.LeaseMetrics != nil {
+		s.cfg.LeaseMetrics.ObserveTakeoverLatency(s.cfg.Now().Sub(started))
 	}
 }
 
@@ -661,6 +831,16 @@ func jitter(d time.Duration) time.Duration {
 		return d
 	}
 	delta := d / 2
+	return d - delta + time.Duration(mathrand.Int64N(int64(2*delta)+1))
+}
+
+// renewalJitter uses a narrow [0.9d, 1.1d] window so replicas spread their
+// Redis calls without eroding the configured TTL safety budget.
+func renewalJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	delta := d / 10
 	return d - delta + time.Duration(mathrand.Int64N(int64(2*delta)+1))
 }
 

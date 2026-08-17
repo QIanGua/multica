@@ -266,6 +266,7 @@ func main() {
 	relayCtx, relayCancel := context.WithCancel(context.Background())
 	var broadcaster realtime.Broadcaster = hub
 	var storeRedis *redis.Client
+	var channelLeaseRedis *redis.Client
 	var relayWriteRedis *redis.Client
 	var relayReadRedis *redis.Client
 	var shardedReadRedis *redis.Client
@@ -283,6 +284,7 @@ func main() {
 		closeRedisClient("realtime-read-sharded", shardedReadRedis)
 		closeRedisClient("realtime-read", relayReadRedis)
 		closeRedisClient("realtime-write", relayWriteRedis)
+		closeRedisClient("channel-lease", channelLeaseRedis)
 		closeRedisClient("store", storeRedis)
 	}()
 	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
@@ -294,6 +296,9 @@ func main() {
 				slog.Info("redis: CLIENT SETNAME disabled (REDIS_DISABLE_CLIENT_NAME=true) for managed Redis compatibility")
 			}
 			storeRedis = newNamedRedisClient(opts, "store")
+			if strings.EqualFold(strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_BACKEND")), "redis") {
+				channelLeaseRedis = newNamedRedisClient(opts, "channel-lease")
+			}
 			relayWriteRedis = newNamedRedisClient(opts, "realtime-write")
 
 			relayMode := realtimeRelayModeFromEnv()
@@ -356,6 +361,7 @@ func main() {
 	var businessMetrics *obsmetrics.BusinessMetrics
 	var samplerPool *pgxpool.Pool
 	var channelMediaMetrics *obsmetrics.ChannelMediaReconcilerMetrics
+	var channelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
 	var wecomMetrics *obsmetrics.WecomMetrics
 	if metricsConfig.Enabled() {
 		// Build a dedicated tiny pool for the BusinessSamplerCollector
@@ -385,6 +391,7 @@ func main() {
 		httpMetrics = metricsRegistry.HTTP
 		businessMetrics = metricsRegistry.Business
 		channelMediaMetrics = metricsRegistry.ChannelMedia
+		channelLeaseMetrics = metricsRegistry.ChannelLease
 		wecomMetrics = metricsRegistry.Wecom
 		// Forward inbound daemon WS frames into the per-kind counter so
 		// dashboards can split heartbeat / unknown / invalid traffic.
@@ -410,13 +417,15 @@ func main() {
 	heartbeatScheduler := handler.NewBatchedHeartbeatScheduler(queries, handler.DefaultHeartbeatBatchInterval)
 
 	r, h := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
-		HTTPMetrics:        httpMetrics,
-		BusinessMetrics:    businessMetrics,
-		WecomMetrics:       wecomMetrics,
-		DaemonHub:          daemonHub,
-		DaemonWakeup:       daemonWakeup,
-		FeatureFlags:       flags,
-		HeartbeatScheduler: heartbeatScheduler,
+		HTTPMetrics:         httpMetrics,
+		BusinessMetrics:     businessMetrics,
+		ChannelLeaseMetrics: channelLeaseMetrics,
+		ChannelLeaseRedis:   channelLeaseRedis,
+		WecomMetrics:        wecomMetrics,
+		DaemonHub:           daemonHub,
+		DaemonWakeup:        daemonWakeup,
+		FeatureFlags:        flags,
+		HeartbeatScheduler:  heartbeatScheduler,
 	})
 
 	srv := &http.Server{
@@ -457,10 +466,10 @@ func main() {
 	h.PRRefresh.Start(sweepCtx)
 
 	// Channel inbound supervisor (MUL-3620): holds the §4.4 WS lease per
-	// installation and drives each channel.Channel. It is built
-	// unconditionally (it is channel-agnostic, not Lark-specific), so it
-	// always exists here; with no platform registered or no installation
-	// rows it simply idles. Lifecycle is bound to sweepCtx so it winds down
+	// installation and drives each channel.Channel. It is channel-agnostic,
+	// not Lark-specific, but remains nil when lease startup validation fails
+	// (notably Redis fail-closed readiness). With no platform registered or no
+	// installation rows it simply idles. Lifecycle is bound to sweepCtx so it winds down
 	// alongside the other long-running workers, AFTER the HTTP server has
 	// drained.
 	if h.ChannelSupervisor != nil {
