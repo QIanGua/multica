@@ -992,6 +992,12 @@ export const IssueSchema = z.object({
   title: z.string(),
   description: z.string().nullable(),
   status: z.string(),
+  // The canonical status whose platform behavior `status` carries — equal to
+  // `status` for the 7 built-ins, and the inherited category for a custom
+  // status. Optional because only endpoints that resolve it emit it, so
+  // consumers must fall back to `status` rather than treat "" as a category.
+  // (MUL-6243)
+  status_category: z.string().optional(),
   priority: z.string(),
   assignee_type: z.string().nullable(),
   assignee_id: z.string().nullable(),

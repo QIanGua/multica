@@ -981,7 +981,7 @@ func runIssueChildren(cmd *cobra.Command, args []string) error {
 		}
 		stages[gi].Issues = append(stages[gi].Issues, c)
 		stages[gi].Total++
-		if st := strVal(c, "status"); st == "done" || st == "cancelled" {
+		if isTerminalChildIssue(c) {
 			stages[gi].Done++
 		}
 	}
@@ -990,6 +990,22 @@ func runIssueChildren(cmd *cobra.Command, args []string) error {
 		"stages":   stages,
 		"unstaged": unstaged,
 	})
+}
+
+// isTerminalChildIssue reports whether a child issue counts as finished for
+// stage progress.
+//
+// Prefers `status_category`, which the server resolves for custom statuses: a
+// workspace can define its own statuses, and one in the `done` category must
+// count as done here or an agent reads the wrong progress. Falls back to the
+// raw status when the field is absent, so an older backend still reports the
+// built-in statuses correctly. (MUL-6243)
+func isTerminalChildIssue(c map[string]any) bool {
+	status := strVal(c, "status_category")
+	if status == "" {
+		status = strVal(c, "status")
+	}
+	return status == "done" || status == "cancelled"
 }
 
 // isHTTPURL reports whether path is an http:// or https:// URL.

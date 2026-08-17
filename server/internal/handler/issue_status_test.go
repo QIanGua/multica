@@ -419,57 +419,6 @@ func TestIssueWriteStoresCanonicalStatusKey(t *testing.T) {
 	}
 }
 
-// TestArchiveIsSerializedAgainstIssueWrites is the counterexample for the
-// archive TOCTOU race: with the exclusive catalog lock held, an archive cannot
-// run its in-use census while an issue write targeting a custom status is in
-// flight, so it can never observe zero usage and strand that issue.
-func TestArchiveIsSerializedAgainstIssueWrites(t *testing.T) {
-	ctx := context.Background()
-	entry := createTestCustomStatus(t, "race_status", issuestatus.InProgress)
-
-	// Hold the SHARED lock exactly as an in-flight issue write would.
-	tx, err := testPool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1::uuid::text || ':issue_status', 0))`,
-		parseUUID(testWorkspaceID)); err != nil {
-		t.Fatalf("take shared lock: %v", err)
-	}
-
-	done := make(chan int, 1)
-	go func() {
-		rec := httptest.NewRecorder()
-		testHandler.ArchiveIssueStatus(rec, withURLParam(
-			newRequest(http.MethodDelete, "/api/issue-statuses/"+uuidToString(entry.ID), nil),
-			"id", uuidToString(entry.ID)))
-		done <- rec.Code
-	}()
-
-	// The archive must be BLOCKED while the writer holds the shared lock.
-	select {
-	case code := <-done:
-		t.Fatalf("archive completed (%d) while a status write was in flight; the exclusive lock is not held", code)
-	case <-time.After(400 * time.Millisecond):
-		// Blocked as required.
-	}
-
-	// Releasing the writer lets the archive proceed.
-	if err := tx.Rollback(ctx); err != nil {
-		t.Fatalf("release writer: %v", err)
-	}
-	select {
-	case code := <-done:
-		if code != http.StatusOK {
-			t.Fatalf("archive after the writer released = %d, want 200", code)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("archive never completed after the writer released its lock")
-	}
-}
-
 // TestCustomTerminalStatusCountsAsTerminalInSQL covers the SQL-side consumers
 // the Go resolver cannot reach. Before issue_effective_status existed, each of
 // these read the status literal, so a custom status in the `done` category
@@ -565,4 +514,356 @@ func TestCustomTerminalStatusCountsAsTerminalInSQL(t *testing.T) {
 		}
 		t.Error("no progress row for the parent issue")
 	})
+}
+
+// archiveStatusVia runs the real archive endpoint and returns its status code.
+func archiveStatusVia(t *testing.T, entry db.IssueStatus) int {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	testHandler.ArchiveIssueStatus(rec, withURLParam(
+		newRequest(http.MethodDelete, "/api/issue-statuses/"+uuidToString(entry.ID), nil),
+		"id", uuidToString(entry.ID)))
+	return rec.Code
+}
+
+// holdExclusiveCatalogLock takes the archive side of the catalog lock and holds
+// it until the returned release func runs, so a test can pin one ordering.
+func holdExclusiveCatalogLock(t *testing.T) (release func()) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock holder: %v", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':issue_status', 0))`,
+		parseUUID(testWorkspaceID)); err != nil {
+		t.Fatalf("take exclusive lock: %v", err)
+	}
+	released := false
+	return func() {
+		if released {
+			return
+		}
+		released = true
+		tx.Rollback(ctx)
+	}
+}
+
+// TestArchiveRaceBothOrderings is the counterexample pair for the archive TOCTOU.
+// The earlier version only held the shared lock and never wrote an issue, so it
+// missed the ordering that actually mattered: the writer resolving BEFORE the
+// archive commits. Both directions are pinned here through the real endpoints.
+func TestArchiveRaceBothOrderings(t *testing.T) {
+	ctx := context.Background()
+
+	// Ordering A — archive wins. The writer's pre-flight validation happens
+	// while the status is active, the archive then commits, and the write must
+	// still be refused rather than stranding an issue on an archived status.
+	// This is exactly the hole in the previous implementation, where the
+	// pre-flight Resolve ran outside the transaction and was never rechecked.
+	for _, tc := range []struct {
+		name  string
+		key   string
+		write func(t *testing.T, key string) int
+	}{
+		{"create", "race_a_create", func(t *testing.T, key string) int {
+			rec := httptest.NewRecorder()
+			testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+				"title": "race create " + key, "status": key,
+			}))
+			return rec.Code
+		}},
+		{"update", "race_a_update", func(t *testing.T, key string) int {
+			seed := mustCreateIssue(t, "race update seed "+key, "todo")
+			rec := httptest.NewRecorder()
+			testHandler.UpdateIssue(rec, withURLParam(
+				newRequest(http.MethodPatch, "/api/issues/"+uuidToString(seed), map[string]any{"status": key}),
+				"id", uuidToString(seed)))
+			return rec.Code
+		}},
+		{"update with description merge", "race_a_upd_merge", func(t *testing.T, key string) int {
+			seed := mustCreateIssue(t, "race merge seed "+key, "todo")
+			rec := httptest.NewRecorder()
+			testHandler.UpdateIssue(rec, withURLParam(
+				newRequest(http.MethodPatch, "/api/issues/"+uuidToString(seed), map[string]any{
+					"status": key, "description": "merged body",
+				}),
+				"id", uuidToString(seed)))
+			return rec.Code
+		}},
+		{"batch", "race_a_batch", func(t *testing.T, key string) int {
+			seed := mustCreateIssue(t, "race batch seed "+key, "todo")
+			rec := httptest.NewRecorder()
+			testHandler.BatchUpdateIssues(rec, newRequest(http.MethodPatch, "/api/issues/batch", map[string]any{
+				"issue_ids": []string{uuidToString(seed)},
+				"updates":   map[string]any{"status": key},
+			}))
+			return rec.Code
+		}},
+		{"batch with description merge", "race_a_batch_merge", func(t *testing.T, key string) int {
+			seed := mustCreateIssue(t, "race batch merge seed "+key, "todo")
+			rec := httptest.NewRecorder()
+			testHandler.BatchUpdateIssues(rec, newRequest(http.MethodPatch, "/api/issues/batch", map[string]any{
+				"issue_ids": []string{uuidToString(seed)},
+				"updates":   map[string]any{"status": key, "description": "merged body"},
+			}))
+			return rec.Code
+		}},
+	} {
+		t.Run("archive wins/"+tc.name, func(t *testing.T) {
+			key := tc.key
+			entry := createTestCustomStatus(t, key, issuestatus.InProgress)
+
+			// Archive commits first, standing in for an archive that lands
+			// between the writer's pre-flight check and its write.
+			if code := archiveStatusVia(t, entry); code != http.StatusOK {
+				t.Fatalf("archive setup returned %d", code)
+			}
+
+			code := tc.write(t, key)
+			if code == http.StatusOK || code == http.StatusCreated {
+				t.Fatalf("%s succeeded (%d) against an archived status", tc.name, code)
+			}
+
+			// Whatever the code, the invariant is that nothing references the
+			// archived status.
+			var stranded int
+			if err := testPool.QueryRow(ctx,
+				`SELECT count(*) FROM issue WHERE workspace_id = $1 AND status = $2`,
+				parseUUID(testWorkspaceID), key).Scan(&stranded); err != nil {
+				t.Fatalf("count stranded: %v", err)
+			}
+			if stranded != 0 {
+				t.Errorf("%d issue(s) left referencing archived status %q", stranded, key)
+			}
+		})
+	}
+
+	// Ordering B — writer wins. Once an issue is committed on the status, the
+	// archive's census must see it and refuse with a conflict.
+	t.Run("writer wins: archive refuses with conflict", func(t *testing.T) {
+		entry := createTestCustomStatus(t, "race_b_writer", issuestatus.InProgress)
+
+		rec := httptest.NewRecorder()
+		testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+			"title": "race writer wins", "status": "race_b_writer",
+		}))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create on custom status: %d %s", rec.Code, rec.Body.String())
+		}
+		var created struct {
+			ID string `json:"id"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &created)
+		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(created.ID)) })
+
+		if code := archiveStatusVia(t, entry); code != http.StatusConflict {
+			t.Fatalf("archive after a committed write = %d, want 409", code)
+		}
+	})
+
+	// The writer must genuinely BLOCK on the archive's exclusive lock rather
+	// than racing past it — otherwise ordering A would only be closed by luck.
+	t.Run("writer blocks while archive holds the exclusive lock", func(t *testing.T) {
+		createTestCustomStatus(t, "race_block", issuestatus.InProgress)
+		release := holdExclusiveCatalogLock(t)
+		defer release()
+
+		done := make(chan int, 1)
+		go func() {
+			rec := httptest.NewRecorder()
+			testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+				"title": "race blocked writer", "status": "race_block",
+			}))
+			done <- rec.Code
+		}()
+
+		select {
+		case code := <-done:
+			t.Fatalf("write completed (%d) while the archive lock was held", code)
+		case <-time.After(400 * time.Millisecond):
+			// Blocked as required.
+		}
+
+		release()
+		select {
+		case code := <-done:
+			if code != http.StatusCreated {
+				t.Fatalf("write after the lock released = %d, want 201", code)
+			}
+			testPool.Exec(ctx, `DELETE FROM issue WHERE workspace_id = $1 AND status = 'race_block'`,
+				parseUUID(testWorkspaceID))
+		case <-time.After(10 * time.Second):
+			t.Fatal("write never completed after the archive lock released")
+		}
+	})
+}
+
+// TestArchiveCommitsInsideTheWriteRaceWindow is the sharp counterexample: it
+// interleaves the two operations so the writer's PRE-FLIGHT validation observes
+// an active status and the archive commits before the write lands.
+//
+// This is the exact hole the previous implementation had. There the pre-flight
+// Resolve ran outside the transaction and was never rechecked, so the writer
+// would sail past the released lock and store an archived key. It passes now
+// only because the write re-resolves under the shared lock.
+func TestArchiveCommitsInsideTheWriteRaceWindow(t *testing.T) {
+	ctx := context.Background()
+	entry := createTestCustomStatus(t, "race_window", issuestatus.InProgress)
+
+	// Take the exclusive side first so the writer is guaranteed to block AFTER
+	// its pre-flight validation (which runs outside any transaction) and BEFORE
+	// its write.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':issue_status', 0))`,
+		parseUUID(testWorkspaceID)); err != nil {
+		t.Fatalf("take exclusive lock: %v", err)
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+			"title": "write inside the race window", "status": "race_window",
+		}))
+		done <- rec.Code
+	}()
+
+	// Let the writer get past its pre-flight check and park on the lock.
+	select {
+	case code := <-done:
+		t.Fatalf("write completed (%d) before the archive released the lock", code)
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	// Archive inside the held lock, then commit: from the writer's point of
+	// view the status was active at validation time and archived by write time.
+	if _, err := tx.Exec(ctx,
+		`UPDATE issue_status SET archived_at = now() WHERE id = $1`, entry.ID); err != nil {
+		t.Fatalf("archive inside the window: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit archive: %v", err)
+	}
+
+	select {
+	case code := <-done:
+		if code == http.StatusCreated {
+			t.Errorf("write succeeded against a status archived inside the race window")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("write never completed after the archive committed")
+	}
+
+	var stranded int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM issue WHERE workspace_id = $1 AND status = 'race_window'`,
+		parseUUID(testWorkspaceID)).Scan(&stranded); err != nil {
+		t.Fatalf("count stranded: %v", err)
+	}
+	if stranded != 0 {
+		t.Errorf("%d issue(s) stranded on a status archived inside the race window", stranded)
+	}
+}
+
+// mustCreateIssue creates an issue through the real endpoint and returns its id.
+func mustCreateIssue(t *testing.T, title, status string) pgtype.UUID {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+		"title": title, "status": status,
+	}))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("seed issue %q: %d %s", title, rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &created)
+	id := parseUUID(created.ID)
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, id) })
+	return id
+}
+
+// TestBatchCustomTerminalStatusEntersStageBarrier is the regression guard for
+// the batch stage-barrier prefilter. It compared status literals, so a batch
+// that moved the last child onto a CUSTOM done status left childDoneCompleted
+// empty and skipped the parent notification entirely — the already-fixed
+// barrier logic downstream never ran.
+func TestBatchCustomTerminalStatusEntersStageBarrier(t *testing.T) {
+	ctx := context.Background()
+	createTestCustomStatus(t, "batch_done_s", issuestatus.Done)
+
+	parent := mustCreateIssue(t, "batch barrier parent", "in_progress")
+	child := mustCreateIssue(t, "batch barrier child", "todo")
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET parent_issue_id = $1 WHERE id = $2`, parent, child); err != nil {
+		t.Fatalf("attach child: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	testHandler.BatchUpdateIssues(rec, newRequest(http.MethodPatch, "/api/issues/batch", map[string]any{
+		"issue_ids": []string{uuidToString(child)},
+		"updates":   map[string]any{"status": "batch_done_s"},
+	}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("batch update: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The observable effect of entering the barrier is the system comment on
+	// the parent. Without the fix the batch is silent.
+	var comments int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM comment WHERE issue_id = $1`, parent).Scan(&comments); err != nil {
+		t.Fatalf("count parent comments: %v", err)
+	}
+	if comments == 0 {
+		t.Error("moving the last child to a custom done status did not close the stage barrier")
+	}
+}
+
+// TestChildrenResponseCarriesStatusCategory pins the field the CLI's
+// `issue children` stage progress reads. Without it the CLI counts only literal
+// done/cancelled and reports wrong progress to an agent.
+func TestChildrenResponseCarriesStatusCategory(t *testing.T) {
+	ctx := context.Background()
+	createTestCustomStatus(t, "children_done_s", issuestatus.Done)
+
+	parent := mustCreateIssue(t, "children category parent", "in_progress")
+	child := mustCreateIssue(t, "children category child", "children_done_s")
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET parent_issue_id = $1 WHERE id = $2`, parent, child); err != nil {
+		t.Fatalf("attach child: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	testHandler.ListChildIssues(rec, withURLParam(
+		newRequest(http.MethodGet, "/api/issues/"+uuidToString(parent)+"/children", nil),
+		"id", uuidToString(parent)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list children: %d %s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Issues []struct {
+			Status         string `json:"status"`
+			StatusCategory string `json:"status_category"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Issues) != 1 {
+		t.Fatalf("expected 1 child, got %d: %s", len(payload.Issues), rec.Body.String())
+	}
+	if payload.Issues[0].Status != "children_done_s" {
+		t.Errorf("status = %q, want the custom key", payload.Issues[0].Status)
+	}
+	if payload.Issues[0].StatusCategory != "done" {
+		t.Errorf("status_category = %q, want %q", payload.Issues[0].StatusCategory, "done")
+	}
 }

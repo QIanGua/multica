@@ -3865,3 +3865,61 @@ func TestRunIssueCommentListCompactWiring(t *testing.T) {
 		}
 	}
 }
+
+// TestIsTerminalChildIssue pins the stage-progress terminal test used by
+// `multica issue children --output json`. Since MUL-6243 a workspace can define
+// custom statuses, so counting only the literal done/cancelled would report
+// wrong progress to an agent reading the stage summary.
+func TestIsTerminalChildIssue(t *testing.T) {
+	cases := []struct {
+		name  string
+		issue map[string]any
+		want  bool
+	}{
+		{
+			name:  "built-in done",
+			issue: map[string]any{"status": "done", "status_category": "done"},
+			want:  true,
+		},
+		{
+			name:  "built-in cancelled",
+			issue: map[string]any{"status": "cancelled", "status_category": "cancelled"},
+			want:  true,
+		},
+		{
+			name:  "built-in in_progress",
+			issue: map[string]any{"status": "in_progress", "status_category": "in_progress"},
+			want:  false,
+		},
+		{
+			// The case the literal comparison got wrong.
+			name:  "custom status in the done category",
+			issue: map[string]any{"status": "gate_approved", "status_category": "done"},
+			want:  true,
+		},
+		{
+			name:  "custom status in the in_review category is not terminal",
+			issue: map[string]any{"status": "human_review", "status_category": "in_review"},
+			want:  false,
+		},
+		{
+			// Older backend: no status_category at all. Falling back to the raw
+			// status keeps the built-ins correct rather than reporting zero.
+			name:  "no category from an older backend falls back to status",
+			issue: map[string]any{"status": "done"},
+			want:  true,
+		},
+		{
+			name:  "unknown custom status with no category is not counted",
+			issue: map[string]any{"status": "gate_approved"},
+			want:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTerminalChildIssue(tc.issue); got != tc.want {
+				t.Errorf("isTerminalChildIssue(%v) = %v, want %v", tc.issue, got, tc.want)
+			}
+		})
+	}
+}

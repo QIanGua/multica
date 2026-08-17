@@ -33,21 +33,27 @@ import (
 
 // IssueResponse is the JSON response for an issue.
 type IssueResponse struct {
-	ID            string  `json:"id"`
-	WorkspaceID   string  `json:"workspace_id"`
-	Number        int32   `json:"number"`
-	Identifier    string  `json:"identifier"`
-	Title         string  `json:"title"`
-	Description   *string `json:"description"`
-	Status        string  `json:"status"`
-	Priority      string  `json:"priority"`
-	AssigneeType  *string `json:"assignee_type"`
-	AssigneeID    *string `json:"assignee_id"`
-	CreatorType   string  `json:"creator_type"`
-	CreatorID     string  `json:"creator_id"`
-	ParentIssueID *string `json:"parent_issue_id"`
-	ProjectID     *string `json:"project_id"`
-	Position      float64 `json:"position"`
+	ID          string  `json:"id"`
+	WorkspaceID string  `json:"workspace_id"`
+	Number      int32   `json:"number"`
+	Identifier  string  `json:"identifier"`
+	Title       string  `json:"title"`
+	Description *string `json:"description"`
+	Status      string  `json:"status"`
+	// StatusCategory is the canonical status whose platform behavior Status
+	// carries — identical to Status for the 7 built-ins, and the inherited
+	// category for a custom status. Omitted when the endpoint does not resolve
+	// it, so consumers must fall back to Status rather than assume a blank
+	// value means "no category". (MUL-6243)
+	StatusCategory string  `json:"status_category,omitempty"`
+	Priority       string  `json:"priority"`
+	AssigneeType   *string `json:"assignee_type"`
+	AssigneeID     *string `json:"assignee_id"`
+	CreatorType    string  `json:"creator_type"`
+	CreatorID      string  `json:"creator_id"`
+	ParentIssueID  *string `json:"parent_issue_id"`
+	ProjectID      *string `json:"project_id"`
+	Position       float64 `json:"position"`
 	// Stage groups sub-issues under the same parent into ordered barrier
 	// groups (null = unstaged). See issue_child_done.go for how a closed
 	// stage gates the child-done -> parent wake.
@@ -130,17 +136,55 @@ func (h *Handler) resolveIssueStatusKeyKind(w http.ResponseWriter, r *http.Reque
 	return entry.Key, !entry.IsSystem, true
 }
 
-// runWithIssueStatusGuard runs an issue write that lands on a custom status
-// inside a transaction holding the SHARED catalog lock, closing the archive
-// race: ArchiveIssueStatus takes the EXCLUSIVE lock around its in-use census,
-// so it can no longer observe zero usage while this write is in flight and
-// strand the issue on an archived status.
+// errIssueStatusArchivedRace signals that the target custom status was archived
+// between the request's pre-flight validation and the write itself. Callers map
+// it to 409: the request was valid when it arrived, and retrying against the
+// refreshed catalog is the right remedy.
+var errIssueStatusArchivedRace = errors.New("issue status was archived while the write was in flight")
+
+// assertIssueStatusStillActive is the write half of the archive race guard. It
+// takes the SHARED catalog lock and RE-RESOLVES the status inside the caller's
+// transaction.
 //
-// A built-in target skips the transaction entirely — a built-in can never be
-// archived, so there is nothing to race with, and the common path keeps its
-// current cost. (MUL-6243)
-func (h *Handler) runWithIssueStatusGuard(ctx context.Context, workspaceID pgtype.UUID, custom bool, fn func(q *db.Queries) error) error {
-	if !custom {
+// The re-resolve is the part that actually closes the race. Handlers resolve a
+// status up front, before any transaction, to answer a bad request with a clean
+// 400 — but an archive can commit between that pre-flight check and the write.
+// Re-checking here, under the lock, means the status is provably active at the
+// moment the row is written. ArchiveIssueStatus holds the EXCLUSIVE side around
+// its in-use census, so the two orderings are both covered:
+//
+//   - archive first: it commits, this re-resolve then fails and the write is
+//     rejected, so no issue is stranded on an archived status;
+//   - writer first: the census blocks until this transaction commits, then sees
+//     the issue and refuses the archive with a conflict.
+//
+// A built-in status is a no-op: it can never be archived (enforced by
+// issue_status_system_not_archivable), so the common path takes no lock and
+// pays nothing. (MUL-6243)
+func assertIssueStatusStillActive(ctx context.Context, qtx *db.Queries, workspaceID pgtype.UUID, statusKey string) error {
+	if statusKey == "" || issuestatus.IsBuiltIn(statusKey) {
+		return nil
+	}
+	// Catalog lock before any row lock, everywhere, so the two write paths
+	// cannot deadlock against each other.
+	if err := qtx.LockIssueStatusCatalogShared(ctx, workspaceID); err != nil {
+		return err
+	}
+	if _, err := issuestatus.Resolve(ctx, qtx, workspaceID, statusKey); err != nil {
+		if errors.Is(err, issuestatus.ErrUnknownStatus) {
+			return errIssueStatusArchivedRace
+		}
+		return err
+	}
+	return nil
+}
+
+// runWithIssueStatusGuard runs an issue write that lands on a custom status
+// inside a transaction that re-verifies the status under the shared catalog
+// lock (see assertIssueStatusStillActive). A built-in target skips the
+// transaction entirely.
+func (h *Handler) runWithIssueStatusGuard(ctx context.Context, workspaceID pgtype.UUID, statusKey string, fn func(q *db.Queries) error) error {
+	if statusKey == "" || issuestatus.IsBuiltIn(statusKey) {
 		return fn(h.Queries)
 	}
 	tx, err := h.TxStarter.Begin(ctx)
@@ -150,13 +194,24 @@ func (h *Handler) runWithIssueStatusGuard(ctx context.Context, workspaceID pgtyp
 	defer tx.Rollback(ctx)
 
 	qtx := h.Queries.WithTx(tx)
-	if err := qtx.LockIssueStatusCatalogShared(ctx, workspaceID); err != nil {
+	if err := assertIssueStatusStillActive(ctx, qtx, workspaceID, statusKey); err != nil {
 		return err
 	}
 	if err := fn(qtx); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// writeIssueStatusRaceError renders errIssueStatusArchivedRace as a 409 and
+// reports whether it handled the error.
+func writeIssueStatusRaceError(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, errIssueStatusArchivedRace) {
+		writeError(w, http.StatusConflict,
+			"the target status was archived while this request was in flight; reload the status list and retry")
+		return true
+	}
+	return false
 }
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {
@@ -2028,6 +2083,10 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
 		resp[i] = issueToResponse(child, prefix)
+		// Sub-issue progress is computed from these rows (the CLI's
+		// `issue children` stage counts, among others), so they carry the
+		// resolved category — a custom done status must count as done.
+		resp[i].StatusCategory = issuestatus.Effective(r.Context(), h.Queries, child.WorkspaceID, child.Status)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2107,6 +2166,10 @@ func (h *Handler) ListChildrenByParents(w http.ResponseWriter, r *http.Request) 
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
 		resp[i] = issueToResponse(child, prefix)
+		// Sub-issue progress is computed from these rows (the CLI's
+		// `issue children` stage counts, among others), so they carry the
+		// resolved category — a custom done status must count as done.
+		resp[i].StatusCategory = issuestatus.Effective(r.Context(), h.Queries, child.WorkspaceID, child.Status)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2771,6 +2834,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "one or more labels not found in this workspace")
 		return
 	}
+	if errors.Is(err, service.ErrIssueStatusUnavailable) {
+		writeError(w, http.StatusConflict,
+			"the target status was archived while this request was in flight; reload the status list and retry")
+		return
+	}
 	if err != nil {
 		slog.Warn("create issue failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to create issue: "+err.Error())
@@ -2904,7 +2972,7 @@ func refreshUntouchedNullableIssueParams(params *db.UpdateIssueParams, current d
 	}
 }
 
-func (h *Handler) updateIssueWithDescriptionMerge(ctx context.Context, workspaceID pgtype.UUID, params db.UpdateIssueParams, rawFields map[string]json.RawMessage, base *string) (db.Issue, db.Issue, error) {
+func (h *Handler) updateIssueWithDescriptionMerge(ctx context.Context, workspaceID pgtype.UUID, params db.UpdateIssueParams, rawFields map[string]json.RawMessage, base *string, statusKey string) (db.Issue, db.Issue, error) {
 	if h.TxStarter == nil {
 		return db.Issue{}, db.Issue{}, errors.New("issue description update requires transaction starter")
 	}
@@ -2915,6 +2983,12 @@ func (h *Handler) updateIssueWithDescriptionMerge(ctx context.Context, workspace
 	defer tx.Rollback(ctx)
 
 	qtx := h.Queries.WithTx(tx)
+	// This path opens its own transaction, so it carries the archive-race guard
+	// itself rather than going through runWithIssueStatusGuard. Taken before the
+	// row lock below to keep the global catalog-then-row lock order. (MUL-6243)
+	if err := assertIssueStatusStillActive(ctx, qtx, workspaceID, statusKey); err != nil {
+		return db.Issue{}, db.Issue{}, err
+	}
 	current, err := qtx.LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{
 		ID:          params.ID,
 		WorkspaceID: workspaceID,
@@ -2999,13 +3073,16 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.Description != nil {
 		params.Description = pgtype.Text{String: *req.Description, Valid: true}
 	}
-	statusIsCustom := false
+	// statusKeyForGuard is the resolved key when this request sets a status, and
+	// empty otherwise. Empty means "this write does not touch status", which the
+	// guard treats as nothing to protect.
+	statusKeyForGuard := ""
 	if req.Status != nil {
-		statusKey, custom, ok := h.resolveIssueStatusKeyKind(w, r, prevIssue.WorkspaceID, *req.Status)
+		statusKey, _, ok := h.resolveIssueStatusKeyKind(w, r, prevIssue.WorkspaceID, *req.Status)
 		if !ok {
 			return
 		}
-		statusIsCustom = custom
+		statusKeyForGuard = statusKey
 		params.Status = pgtype.Text{String: statusKey, Valid: true}
 	}
 	if req.Priority != nil {
@@ -3156,19 +3233,22 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.Description != nil {
 		var lockedPrev db.Issue
 		issue, lockedPrev, err = h.updateIssueWithDescriptionMerge(
-			r.Context(), prevIssue.WorkspaceID, params, rawFields, req.DescriptionBase,
+			r.Context(), prevIssue.WorkspaceID, params, rawFields, req.DescriptionBase, statusKeyForGuard,
 		)
 		if err == nil {
 			prevIssue = lockedPrev
 		}
 	} else {
-		err = h.runWithIssueStatusGuard(r.Context(), prevIssue.WorkspaceID, statusIsCustom, func(q *db.Queries) error {
+		err = h.runWithIssueStatusGuard(r.Context(), prevIssue.WorkspaceID, statusKeyForGuard, func(q *db.Queries) error {
 			var innerErr error
 			issue, innerErr = q.UpdateIssue(r.Context(), params)
 			return innerErr
 		})
 	}
 	if err != nil {
+		if writeIssueStatusRaceError(w, err) {
+			return
+		}
 		slog.Warn("update issue failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to update issue: "+err.Error())
 		return
@@ -3597,9 +3677,8 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	// shares the workspace — and a rejection rather than a silent skip, so a
 	// bad status cannot report `{"updated": N}`. (MUL-6243)
 	batchStatusKey := ""
-	batchStatusIsCustom := false
 	if req.Updates.Status != nil {
-		batchStatusKey, batchStatusIsCustom, ok = h.resolveIssueStatusKeyKind(w, r, wsUUID, *req.Updates.Status)
+		batchStatusKey, _, ok = h.resolveIssueStatusKeyKind(w, r, wsUUID, *req.Updates.Status)
 		if !ok {
 			return
 		}
@@ -3785,19 +3864,25 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			// legacy single-update clients that omit description_base.
 			var lockedPrev db.Issue
 			issue, lockedPrev, err = h.updateIssueWithDescriptionMerge(
-				r.Context(), prevIssue.WorkspaceID, params, rawUpdates, nil,
+				r.Context(), prevIssue.WorkspaceID, params, rawUpdates, nil, batchStatusKey,
 			)
 			if err == nil {
 				prevIssue = lockedPrev
 			}
 		} else {
-			err = h.runWithIssueStatusGuard(r.Context(), wsUUID, batchStatusIsCustom, func(q *db.Queries) error {
+			err = h.runWithIssueStatusGuard(r.Context(), wsUUID, batchStatusKey, func(q *db.Queries) error {
 				var innerErr error
 				issue, innerErr = q.UpdateIssue(r.Context(), params)
 				return innerErr
 			})
 		}
 		if err != nil {
+			// The archive race is a property of the batch's shared target
+			// status, not of one issue, so every remaining item would fail the
+			// same way. Abort with 409 instead of reporting a partial update.
+			if writeIssueStatusRaceError(w, err) {
+				return
+			}
 			slog.Warn("batch update issue failed", "issue_id", issueID, "error", err)
 			continue
 		}
@@ -3849,9 +3934,19 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		// notifyParentsOfBatchChildDone below evaluate each parent once against
 		// the batch's final committed state. Same transition guard as
 		// notifyParentOfChildDone: a non-terminal -> terminal move on a child.
-		if statusChanged && issue.ParentIssueID.Valid &&
-			!isTerminalChildStatus(prevIssue.Status) && isTerminalChildStatus(issue.Status) {
-			childDoneCompleted = append(childDoneCompleted, issue)
+		// Resolve both sides to the canonical status they inherit before the
+		// terminal test, so a batch that moves the last child onto a CUSTOM
+		// done/cancelled status still enters the stage barrier below. A literal
+		// comparison here left childDoneCompleted empty and silently skipped
+		// notifyParentsOfBatchChildDone entirely. (MUL-6243)
+		if statusChanged && issue.ParentIssueID.Valid {
+			prevTerminal := isTerminalChildStatus(
+				issuestatus.Effective(r.Context(), h.Queries, prevIssue.WorkspaceID, prevIssue.Status))
+			nowTerminal := isTerminalChildStatus(
+				issuestatus.Effective(r.Context(), h.Queries, issue.WorkspaceID, issue.Status))
+			if !prevTerminal && nowTerminal {
+				childDoneCompleted = append(childDoneCompleted, issue)
+			}
 		}
 
 		updated++

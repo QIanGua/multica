@@ -149,6 +149,12 @@ var ErrProjectNotFound = errors.New("project not found in this workspace")
 // label set. Callers translate this into their transport's 400.
 var ErrIssueLabelNotFound = errors.New("issue label not found in this workspace")
 
+// ErrIssueStatusUnavailable signals that the requested custom status was
+// archived between the caller's pre-flight validation and the create
+// transaction. Callers translate this into a 409 — the request was valid when
+// it arrived, so retrying against the refreshed catalog is the remedy.
+var ErrIssueStatusUnavailable = errors.New("issue status is no longer available")
+
 // IssueCreateResult is the typed return from IssueService.Create.
 //
 //   - On the happy path: Issue is the new row, Attachments lists the
@@ -201,13 +207,21 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
 
-	// A create that lands on a CUSTOM status takes the shared catalog lock, so
-	// it cannot interleave with an archive's in-use census and leave the new
-	// issue stranded on a status archived a moment later. Built-in statuses skip
-	// it: they can never be archived, so the common path is unchanged.
-	// (MUL-6243)
+	// A create landing on a CUSTOM status takes the shared catalog lock AND
+	// re-resolves the status inside this transaction. The caller validated the
+	// status before the transaction opened, which is early enough to return a
+	// clean 400 but too early to be safe: an archive can commit in between.
+	// Re-checking under the lock is what makes the status provably active at
+	// the moment the row is written. Built-in statuses skip both — they can
+	// never be archived, so the common path is unchanged. (MUL-6243)
 	if !issuestatus.IsBuiltIn(p.Status) {
 		if err := qtx.LockIssueStatusCatalogShared(ctx, p.WorkspaceID); err != nil {
+			return IssueCreateResult{}, err
+		}
+		if _, err := issuestatus.Resolve(ctx, qtx, p.WorkspaceID, p.Status); err != nil {
+			if errors.Is(err, issuestatus.ErrUnknownStatus) {
+				return IssueCreateResult{}, ErrIssueStatusUnavailable
+			}
 			return IssueCreateResult{}, err
 		}
 	}
