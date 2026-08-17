@@ -2,13 +2,14 @@
 
 import { useMemo, useState } from "react";
 import type { IssueStatus, UpdateIssueRequest } from "@multica/core/types";
-import { ALL_STATUSES, STATUS_CONFIG } from "@multica/core/issues/config";
+import { STATUS_CONFIG } from "@multica/core/issues/config";
 import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { StatusIcon } from "../status-icon";
 import { PropertyPicker, PickerItem, PickerGroupLabel } from "./property-picker";
 import { useT } from "../../../i18n";
 import { useStatusLabel } from "../../utils/status-label";
+import { useStatusOptions } from "../../utils/status-options";
 
 /** Above this many options the flat list stops being scannable. */
 const SEARCH_THRESHOLD = 9;
@@ -45,7 +46,7 @@ export function StatusPicker({
   // detail, table, board batch toolbar, create-issue modal), so the provider
   // is guaranteed here.
   const wsId = useWorkspaceId();
-  const { activeStatuses, categoryOf, entryOf } = useIssueStatuses(wsId);
+  const { categoryOf, entryOf } = useIssueStatuses(wsId);
   const labelOf = useStatusLabel(wsId);
 
   /**
@@ -56,35 +57,24 @@ export function StatusPicker({
    * the 7 built-ins until the catalog lands, so a cold render offers exactly
    * what it always did instead of an empty popover. (MUL-6243)
    */
+  const { groups: allGroups, options: allOptions, hasCustom } = useStatusOptions(wsId);
+
   const groups = useMemo(() => {
     const q = query.trim().toLowerCase();
+    if (!q) return allGroups;
+    return allGroups
+      .map((g) => ({
+        ...g,
+        options: g.options.filter((o) => o.label.toLowerCase().includes(q)),
+      }))
+      .filter((g) => g.options.length > 0);
+  }, [allGroups, query]);
 
-    return ALL_STATUSES.map((category) => {
-      const entries = activeStatuses.filter((e) => e.category === category);
-      const options =
-        entries.length > 0
-          ? entries.map((e) => ({
-              key: e.key as IssueStatus,
-              label: labelOf(e.key),
-              color: e.is_system ? null : e.color,
-            }))
-          : // No catalog row for this category yet — the catalog is still in
-            // flight, or this pod predates the seed. Offer the built-in, whose
-            // key IS the category, so the picker is never short a lifecycle step.
-            [{ key: category as IssueStatus, label: labelOf(category), color: null }];
-      return {
-        category,
-        options: q ? options.filter((o) => o.label.toLowerCase().includes(q)) : options,
-      };
-    }).filter((g) => g.options.length > 0);
-  }, [activeStatuses, query, labelOf]);
-
-  const optionCount = groups.reduce((n, g) => n + g.options.length, 0);
   // Category headings only earn their space once a category holds more than
   // one status. A workspace that never customized anything sees the same flat
   // 7-row list as before.
-  const showGroupLabels = groups.some((g) => g.options.length > 1);
-  const searchable = optionCount > SEARCH_THRESHOLD;
+  const showGroupLabels = hasCustom;
+  const searchable = allOptions.length > SEARCH_THRESHOLD;
 
   return (
     <PropertyPicker
