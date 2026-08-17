@@ -5,7 +5,7 @@ import { hashKey, keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api } from "@multica/core/api";
 import type {
   Issue,
-  IssueStatus,
+  IssueStatusCategory,
   IssueTableFacetSpec,
   IssueTableFacetsResponse,
   IssueTableGroupsRequest,
@@ -81,8 +81,8 @@ export interface IssueSurfaceController {
   filteredGanttIssues: Issue[];
   sort: IssueSortParam;
   ganttIssues: Issue[];
-  visibleStatuses: IssueStatus[];
-  hiddenStatuses: IssueStatus[];
+  visibleStatuses: IssueStatusCategory[];
+  hiddenStatuses: IssueStatusCategory[];
   /** Exact server counts plus cursor controls for List/status Board. */
   statusPagination?: IssueStatusPagination;
   /** Exact group catalog plus independent row cursors for Assignee/Property
@@ -319,7 +319,7 @@ export function useIssueSurfaceController({
     effectiveViewMode === "swimlane";
   const usesServerFacets =
     usesTable || usesServerStatusSurface || usesServerGroupSurface;
-  const serverStatuses = useMemo<IssueStatus[]>(
+  const serverStatuses = useMemo<IssueStatusCategory[]>(
     () => {
       const visible =
         statusFilters.length > 0

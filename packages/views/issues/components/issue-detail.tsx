@@ -1,5 +1,6 @@
 "use client";
 
+import { statusCategoryOfKey } from "@multica/core/issues";
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useDefaultLayout, usePanelRef } from "react-resizable-panels";
@@ -254,8 +255,10 @@ function shortDate(date: string | null): string {
 type ActivityT = ReturnType<typeof useT<"issues">>["t"];
 
 function statusLabel(status: string, t: ActivityT): string {
+  // A custom status has no i18n entry of its own; label it by the category it
+  // inherits. The catalog-aware surfaces show its real name. (MUL-6243)
   if (status in STATUS_CONFIG) {
-    return t(($) => $.status[status as IssueStatus]);
+    return t(($) => $.status[statusCategoryOfKey(status)]);
   }
   return status;
 }

@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { workspaceKeys } from "@multica/core/workspace/queries";
 import { issueKeys, PAGINATED_CATEGORIES } from "@multica/core/issues/queries";
 import { I18nProvider } from "@multica/core/i18n/react";
-import type { IssueStatus, ListIssuesCache } from "@multica/core/types";
+import type { IssueStatusCategory, ListIssuesCache } from "@multica/core/types";
 import type { QueryClient } from "@tanstack/react-query";
 import enCommon from "../../locales/en/common.json";
 import enAuth from "../../locales/en/auth.json";
@@ -117,7 +117,7 @@ function fakeQc(data: {
   const byStatus: ListIssuesCache["byStatus"] = {};
   for (const status of PAGINATED_CATEGORIES) {
     const bucket = (data.issues ?? []).filter((i) => i.status === status);
-    byStatus[status as IssueStatus] = { issues: bucket as never, total: bucket.length };
+    byStatus[status as IssueStatusCategory] = { issues: bucket as never, total: bucket.length };
   }
   map.set(
     JSON.stringify(issueKeys.list("ws-1")),

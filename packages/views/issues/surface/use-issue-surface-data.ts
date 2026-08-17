@@ -8,7 +8,8 @@ import { projectListOptions } from "@multica/core/projects/queries";
 import { childIssueProgressOptions } from "@multica/core/issues/queries";
 import { issueSurfaceGanttOptions } from "@multica/core/issues/surface/repository";
 import type { IssueSurfaceQueryPlan } from "@multica/core/issues/surface/query-plan";
-import type { IssueStatus } from "@multica/core/types";
+import type { IssueStatus, IssueStatusCategory } from "@multica/core/types";
+import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
 import {
   applyIssueFilters,
   type IssueFilterState,
@@ -58,8 +59,8 @@ export interface IssueSurfaceData {
   ganttWorkingScopeIssues: Issue[] | undefined;
   filteredGanttIssues: Issue[];
   ganttIssues: Issue[];
-  visibleStatuses: IssueStatus[];
-  hiddenStatuses: IssueStatus[];
+  visibleStatuses: IssueStatusCategory[];
+  hiddenStatuses: IssueStatusCategory[];
   statusPagination: IssueStatusPagination;
   activeFilters: Omit<IssueFilters, "statusFilters">;
   childProgressMap: Map<string, ChildProgress>;
@@ -316,20 +317,25 @@ export function useIssueSurfaceData({
     ],
   );
 
-  const visibleStatuses = useMemo<IssueStatus[]>(() => {
-    // Default view shows every lifecycle status, `cancelled` last (its
-    // canonical position in ALL_STATUSES). An active status filter narrows to
-    // the selected subset while preserving that order.
+  const { categoryOf } = useIssueStatuses(wsId);
+
+  const visibleStatuses = useMemo<IssueStatusCategory[]>(() => {
+    // Board columns are CATEGORIES, not status keys — adding a custom status
+    // must never add a column. A status filter is expressed in concrete keys
+    // (that is the point of custom statuses), so narrow by mapping each
+    // selected key back to the column it lands in. Default view shows every
+    // category, `cancelled` last (its canonical position in ALL_STATUSES).
     if (statusFilters.length > 0) {
-      return ALL_STATUSES.filter((s) => statusFilters.includes(s));
+      const selected = new Set(statusFilters.map(categoryOf));
+      return ALL_STATUSES.filter((s) => selected.has(s));
     }
     return ALL_STATUSES;
-  }, [statusFilters]);
+  }, [statusFilters, categoryOf]);
 
   // Hidden columns are the lifecycle statuses not currently visible, so
   // `cancelled` participates in the board show/hide controls exactly like the
   // rest of the statuses.
-  const hiddenStatuses = useMemo<IssueStatus[]>(
+  const hiddenStatuses = useMemo<IssueStatusCategory[]>(
     () => ALL_STATUSES.filter((s) => !visibleStatuses.includes(s)),
     [visibleStatuses],
   );

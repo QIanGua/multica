@@ -9,7 +9,7 @@ import { setApiInstance } from "@multica/core/api";
 import type { ApiClient } from "@multica/core/api/client";
 import type {
   Issue,
-  IssueStatus,
+  IssueStatusCategory,
   IssueTableQuerySpec,
   IssueTableRowsRequest,
 } from "@multica/core/types";
@@ -88,7 +88,7 @@ describe("useIssueStatusBranches", () => {
     });
 
     const { result, rerender } = renderHook(
-      ({ statuses }: { statuses: IssueStatus[] }) =>
+      ({ statuses }: { statuses: IssueStatusCategory[] }) =>
         useIssueStatusBranches({
           wsId: "ws-1",
           query,

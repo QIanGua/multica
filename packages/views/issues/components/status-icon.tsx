@@ -167,9 +167,11 @@ export function StatusIcon({
   className?: string;
   inheritColor?: boolean;
 }) {
-  const knownStatus = status in STATUS_RENDERERS ? (status as IssueStatus) : null;
-  const cfg = knownStatus ? STATUS_CONFIG[statusCategoryOfKey(knownStatus)] : null;
-  const Renderer = knownStatus ? STATUS_RENDERERS[knownStatus] : TodoIcon;
+  // The glyph set is per CATEGORY: a custom status renders with its category's
+  // icon, which is what makes it read as "the same kind of thing". (MUL-6243)
+  const category = statusCategoryOfKey(status);
+  const cfg = STATUS_CONFIG[category];
+  const Renderer = STATUS_RENDERERS[category] ?? TodoIcon;
 
   return (
     <svg

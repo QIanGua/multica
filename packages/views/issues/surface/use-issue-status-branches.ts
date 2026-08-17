@@ -19,7 +19,7 @@ import {
 } from "@multica/core/issues/queries";
 import type {
   Issue,
-  IssueStatus,
+  IssueStatusCategory,
   IssueTableFacetsResponse,
   IssueTableQuerySpec,
   IssueTableRowsResponse,
@@ -37,17 +37,17 @@ export interface IssueStatusPageState {
 }
 
 export type IssueStatusPagination = Record<
-  IssueStatus,
+  IssueStatusCategory,
   IssueStatusPageState
 >;
 
 interface StatusCursorState {
   identity: string;
-  cursors: Record<IssueStatus, Array<string | null>>;
+  cursors: Record<IssueStatusCategory, Array<string | null>>;
 }
 
 interface StatusPageTarget {
-  status: IssueStatus;
+  status: IssueStatusCategory;
   cursor: string | null;
 }
 
@@ -65,13 +65,16 @@ interface StatusBranchData {
   headPending: boolean;
 }
 
-function statusGroupKey(status: IssueStatus) {
+// Every "status" in this hook is a board COLUMN, and columns are categories:
+// a workspace's custom statuses live inside their category's column rather than
+// adding one of their own. (MUL-6243)
+function statusGroupKey(status: IssueStatusCategory) {
   return `status:${status}`;
 }
 
 function initialCursorState(
   identity: string,
-  statuses: readonly IssueStatus[],
+  statuses: readonly IssueStatusCategory[],
 ): StatusCursorState {
   const cursors = Object.fromEntries(
     ALL_STATUSES.map((status) => [
@@ -85,7 +88,7 @@ function initialCursorState(
 function rebaseCursorState(
   state: StatusCursorState,
   identity: string,
-  statuses: readonly IssueStatus[],
+  statuses: readonly IssueStatusCategory[],
 ) {
   const current =
     state.identity === identity ? state : initialCursorState(identity, statuses);
@@ -101,11 +104,11 @@ function rebaseCursorState(
 function statusCountsFromFacets(
   facets: IssueTableFacetsResponse | undefined,
 ) {
-  const counts = new Map<IssueStatus, number>();
+  const counts = new Map<IssueStatusCategory, number>();
   const statusFacet = facets?.facets.find((facet) => facet.kind === "status");
   for (const value of statusFacet?.values ?? []) {
-    if (ALL_STATUSES.includes(value.key as IssueStatus)) {
-      counts.set(value.key as IssueStatus, value.count);
+    if (ALL_STATUSES.includes(value.key as IssueStatusCategory)) {
+      counts.set(value.key as IssueStatusCategory, value.count);
     }
   }
   return counts;
@@ -138,7 +141,7 @@ export function useIssueStatusBranches({
 }: {
   wsId: string;
   query: IssueTableQuerySpec;
-  statuses: readonly IssueStatus[];
+  statuses: readonly IssueStatusCategory[];
   facets: IssueTableFacetsResponse | undefined;
   facetsPending: boolean;
   facetsFetching: boolean;
@@ -174,7 +177,7 @@ export function useIssueStatusBranches({
     [activeCursorState.cursors, enabled, statuses],
   );
   const headPlaceholderRef = useRef(
-    new Map<IssueStatus, IssueTableRowsResponse>(),
+    new Map<IssueStatusCategory, IssueTableRowsResponse>(),
   );
   const pageQueries = useMemo(
     () =>
@@ -222,7 +225,7 @@ export function useIssueStatusBranches({
   }, [pageResults, pageTargets]);
 
   const branchData = useMemo(() => {
-    const result = new Map<IssueStatus, StatusBranchData>();
+    const result = new Map<IssueStatusCategory, StatusBranchData>();
     for (const status of statuses) {
       result.set(status, {
         rows: [],
@@ -236,7 +239,7 @@ export function useIssueStatusBranches({
       });
     }
 
-    const headFetching = new Set<IssueStatus>();
+    const headFetching = new Set<IssueStatusCategory>();
     for (let index = 0; index < pageTargets.length; index += 1) {
       const target = pageTargets[index];
       const queryResult = pageResults[index];
@@ -249,7 +252,7 @@ export function useIssueStatusBranches({
       }
     }
 
-    const seenByStatus = new Map<IssueStatus, Set<string>>();
+    const seenByStatus = new Map<IssueStatusCategory, Set<string>>();
     for (let index = 0; index < pageTargets.length; index += 1) {
       const target = pageTargets[index];
       const queryResult = pageResults[index];
@@ -297,15 +300,15 @@ export function useIssueStatusBranches({
   // current snapshot. Match Table's branch behavior by dropping every tail.
   const headRevisionRef = useRef<{
     identity: string;
-    revisions: Partial<Record<IssueStatus, number>>;
+    revisions: Partial<Record<IssueStatusCategory, number>>;
   }>({ identity, revisions: {} });
   useEffect(() => {
     const previous =
       headRevisionRef.current.identity === identity
         ? headRevisionRef.current.revisions
         : {};
-    const next: Partial<Record<IssueStatus, number>> = {};
-    const trim = new Set<IssueStatus>();
+    const next: Partial<Record<IssueStatusCategory, number>> = {};
+    const trim = new Set<IssueStatusCategory>();
     for (const status of statuses) {
       const branch = branchData.get(status);
       if (!branch || branch.headUpdatedAt === 0) continue;
@@ -336,7 +339,7 @@ export function useIssueStatusBranches({
 
   const counts = useMemo(() => statusCountsFromFacets(facets), [facets]);
   const loadMore = useCallback(
-    (status: IssueStatus) => {
+    (status: IssueStatusCategory) => {
       const cursor = branchData.get(status)?.nextCursor;
       if (!cursor) return;
       setCursorState((previous) => {
@@ -355,7 +358,7 @@ export function useIssueStatusBranches({
     [branchData, identity],
   );
   const retry = useCallback(
-    (status: IssueStatus) => {
+    (status: IssueStatusCategory) => {
       void queryClient.refetchQueries({
         queryKey: issueKeys.tableRows(
           wsId,

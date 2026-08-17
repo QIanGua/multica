@@ -1,5 +1,6 @@
 "use client";
 
+import { statusCategoryOfKey } from "@multica/core/issues";
 import {
   useCallback,
   useEffect,
@@ -98,7 +99,6 @@ import type {
   Issue,
   IssueProperty,
   IssuePropertyValue,
-  IssueStatus,
   IssueTableGroupDescriptor,
   IssueTableGroupSpec,
   IssueTableQuerySpec,
@@ -1752,8 +1752,8 @@ export function TableView({
     (descriptor: IssueTableGroupDescriptor) => {
       const value = descriptor.value;
       if (value.kind === "status") {
-        if (ALL_STATUSES.includes(value.status as IssueStatus)) {
-          return t(($) => $.status[value.status as IssueStatus]);
+        if (ALL_STATUSES.includes(statusCategoryOfKey(value.status))) {
+          return t(($) => $.status[statusCategoryOfKey(value.status)]);
         }
         // Installed clients can receive a status introduced by a newer
         // backend. Keep the group usable instead of collapsing the response
@@ -2309,7 +2309,7 @@ export function TableView({
             case "identifier":
               return issue.identifier;
             case "status":
-              return t(($) => $.status[issue.status]);
+              return t(($) => $.status[statusCategoryOfKey(issue.status)]);
             case "priority":
               return t(($) => $.priority[issue.priority]);
             case "assignee":
