@@ -31,7 +31,7 @@ func DefaultInvitationRateLimits() InvitationRateLimits {
 	return InvitationRateLimits{
 		Actor:     SlidingWindowRateLimit{Limit: 10, Window: 10 * time.Minute},
 		Workspace: SlidingWindowRateLimit{Limit: 50, Window: 24 * time.Hour},
-		Recipient: SlidingWindowRateLimit{Limit: 3, Window: 24 * time.Hour},
+		Recipient: SlidingWindowRateLimit{Limit: 6, Window: 24 * time.Hour},
 	}
 }
 

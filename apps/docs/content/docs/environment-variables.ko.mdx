@@ -148,7 +148,7 @@ allowlist의 정확한 판단 순서는 [로그인과 가입](/auth-setup#가입
 | `RATE_LIMIT_AUTH_VERIFY` | `20` | IP당 1분에 인증 코드 검증 허용 횟수 |
 | `RATE_LIMIT_INVITATION_ACTOR_10M` | `10` | 초대자별 10분 슬라이딩 윈도 내 워크스페이스 초대 생성 횟수. `0`이면 이 제한을 비활성화 |
 | `RATE_LIMIT_INVITATION_WORKSPACE_24H` | `50` | 워크스페이스의 모든 관리자가 24시간 슬라이딩 윈도 내 생성할 수 있는 총 초대 수. `0`이면 이 제한을 비활성화 |
-| `RATE_LIMIT_INVITATION_RECIPIENT_24H` | `3` | 정규화된 동일 수신 이메일이 워크스페이스 전체에서 24시간 슬라이딩 윈도 내 받을 수 있는 초대 수. `0`이면 이 제한을 비활성화 |
+| `RATE_LIMIT_INVITATION_RECIPIENT_24H` | `6` | 정규화된 동일 수신 이메일이 워크스페이스 전체에서 24시간 슬라이딩 윈도 내 받을 수 있는 초대 수. `0`이면 이 제한을 비활성화 |
 | `RATE_LIMIT_TRUSTED_PROXIES` | 비어 있음 | `X-Forwarded-For`를 제공하도록 허용할 proxy CIDR, 쉼표로 구분 |
 | `MULTICA_TRUSTED_PROXIES` | 비어 있음 | 자동화 webhook과 실시간 연결에서 사용할 신뢰 proxy CIDR |
 
