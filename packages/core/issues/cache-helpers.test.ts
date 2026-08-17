@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Issue, ListIssuesCache } from "../types";
+import type { Issue, IssueStatusCategory, ListIssuesCache } from "../types";
 import { insertByPosition, patchIssueInBuckets } from "./cache-helpers";
 
 const WS_ID = "ws-1";
@@ -36,8 +36,9 @@ function cache(byStatus: ListIssuesCache["byStatus"]): ListIssuesCache {
   return { byStatus };
 }
 
-function ids(c: ListIssuesCache, status: Issue["status"]): string[] {
-  return (c.byStatus[status]?.issues ?? []).map((i) => i.id);
+// The cache is bucketed by CATEGORY (MUL-6243), so tests index it with one.
+function ids(c: ListIssuesCache, status: IssueStatusCategory): string[] {
+  return (c.byStatus[status]?.issues ?? []).map((i: Issue) => i.id);
 }
 
 describe("insertByPosition", () => {

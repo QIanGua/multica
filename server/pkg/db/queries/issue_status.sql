@@ -88,8 +88,11 @@ RETURNING *;
 
 -- name: ArchiveIssueStatusEntry :one
 -- Built-ins are excluded by is_system: archiving one would delete its
--- category's behavior definition. Callers must migrate issues off the status
--- first; CountIssuesUsingStatusKey is the guard.
+-- category's behavior definition.
+--
+-- Archiving retires a status from future use only. Issues already on it keep
+-- it — Effective ignores archived_at, so their behavior is unchanged — while
+-- Resolve rejects it, so nothing new can be assigned to it.
 UPDATE issue_status SET
     archived_at = now(),
     updated_at = now()
@@ -100,6 +103,9 @@ WHERE id = sqlc.arg('id')::uuid
 RETURNING *;
 
 -- name: CountIssuesUsingStatusKey :one
+-- Reported alongside a status so the UI can say how many issues still carry an
+-- archived one. NOT an archive precondition: archiving never requires migrating
+-- issues off the status.
 SELECT COUNT(*)::bigint FROM issue
 WHERE workspace_id = sqlc.arg('workspace_id')::uuid
   AND status = sqlc.arg('key')::text;

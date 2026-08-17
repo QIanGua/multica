@@ -1,3 +1,4 @@
+import { issueStatusCategory } from "./status-category";
 import {
   hashKey,
   type InfiniteData,
@@ -350,7 +351,11 @@ export function applyIssueChange(
         // buckets; anything else (e.g. member→member reassignment) leaves
         // this list's pages and counts untouched.
         if (!changed.status || patch.status === undefined) continue;
-        const next = moveBucketTotal(data, baseIssue.status, patch.status);
+        // Bucket totals are per category (MUL-6243).
+        const fromCategory = issueStatusCategory(baseIssue);
+        const toCategory = issueStatusCategory({ status: patch.status, status_category: undefined });
+        if (!fromCategory || !toCategory) continue;
+        const next = moveBucketTotal(data, fromCategory, toCategory);
         if (next !== data) {
           prevLists.push([key, data]);
           qc.setQueryData<ListIssuesCache>(key, next);
@@ -364,7 +369,9 @@ export function applyIssueChange(
       }
       if (isMember === false) {
         // Left the list entirely — the bucket it was counted in loses one.
-        const next = decrementBucketTotal(data, baseIssue.status);
+        const leavingCategory = issueStatusCategory(baseIssue);
+        if (!leavingCategory) continue;
+        const next = decrementBucketTotal(data, leavingCategory);
         if (next !== data) {
           prevLists.push([key, data]);
           qc.setQueryData<ListIssuesCache>(key, next);

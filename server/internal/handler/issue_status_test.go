@@ -282,48 +282,41 @@ func TestBuiltInStatusesAreImmutable(t *testing.T) {
 	})
 }
 
-// TestArchiveRefusesWhileIssuesStillUseTheStatus is the decision recorded on
-// the issue: migrate the issues first rather than silently rewriting them.
-func TestArchiveRefusesWhileIssuesStillUseTheStatus(t *testing.T) {
+// TestArchiveRetiresStatusWithoutTouchingExistingIssues pins the archive rule:
+// archiving retires a status from FUTURE use only. Issues already on it keep it
+// and keep behaving as their category prescribes — retiring a label must not
+// rewrite history.
+func TestArchiveRetiresStatusWithoutTouchingExistingIssues(t *testing.T) {
 	ctx := context.Background()
 	entry := createTestCustomStatus(t, "in_use_a", issuestatus.InProgress)
+	issueID := mustCreateIssue(t, "occupies the status", "in_use_a")
 
-	req := newRequest(http.MethodPost, "/api/issues", map[string]any{
-		"title":  "occupies the status",
-		"status": "in_use_a",
-	})
+	if code := archiveStatusVia(t, entry); code != http.StatusOK {
+		t.Fatalf("archiving an in-use status should succeed, got %d", code)
+	}
+
+	// The existing issue keeps the archived status verbatim.
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, issueID).Scan(&status); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if status != "in_use_a" {
+		t.Errorf("existing issue status = %q, want it left on the archived status", status)
+	}
+
+	// And it still resolves to its category, so its platform behavior is
+	// unchanged — Effective deliberately ignores archived_at.
+	if got := issuestatus.Effective(ctx, testHandler.Queries, parseUUID(testWorkspaceID), "in_use_a"); got != issuestatus.InProgress {
+		t.Errorf("Effective on an archived status = %q, want %q", got, issuestatus.InProgress)
+	}
+
+	// But nothing NEW can be assigned to it.
 	rec := httptest.NewRecorder()
-	testHandler.CreateIssue(rec, req)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create issue: %d %s", rec.Code, rec.Body.String())
-	}
-	var created struct {
-		ID string `json:"id"`
-	}
-	json.Unmarshal(rec.Body.Bytes(), &created)
-	t.Cleanup(func() {
-		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(created.ID))
-	})
-
-	archiveReq := withURLParam(
-		newRequest(http.MethodDelete, "/api/issue-statuses/"+uuidToString(entry.ID), nil),
-		"id", uuidToString(entry.ID))
-	archiveRec := httptest.NewRecorder()
-	testHandler.ArchiveIssueStatus(archiveRec, archiveReq)
-	if archiveRec.Code != http.StatusConflict {
-		t.Fatalf("expected 409 while the status is in use, got %d: %s", archiveRec.Code, archiveRec.Body.String())
-	}
-
-	// After moving the issue off it, archiving succeeds.
-	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'todo' WHERE id = $1`, parseUUID(created.ID)); err != nil {
-		t.Fatalf("move issue: %v", err)
-	}
-	retryRec := httptest.NewRecorder()
-	testHandler.ArchiveIssueStatus(retryRec, withURLParam(
-		newRequest(http.MethodDelete, "/api/issue-statuses/"+uuidToString(entry.ID), nil),
-		"id", uuidToString(entry.ID)))
-	if retryRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 once the status is unused, got %d: %s", retryRec.Code, retryRec.Body.String())
+	testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+		"title": "should be refused", "status": "in_use_a",
+	}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 assigning an archived status to a new issue, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -638,11 +631,12 @@ func TestWritesRejectAnArchivedStatus(t *testing.T) {
 
 }
 
-// TestArchiveRefusesAfterACommittedWrite is the other ordering: once an issue is
-// committed on the status, the archive's census must see it and refuse.
-func TestArchiveRefusesAfterACommittedWrite(t *testing.T) {
+// TestArchiveSucceedsAfterACommittedWrite is the other ordering: an issue
+// committed on the status does not block archiving it, because archiving only
+// retires it from future use.
+func TestArchiveSucceedsAfterACommittedWrite(t *testing.T) {
 	ctx := context.Background()
-	t.Run("writer wins: archive refuses with conflict", func(t *testing.T) {
+	t.Run("writer wins: archive still succeeds and leaves the issue alone", func(t *testing.T) {
 		entry := createTestCustomStatus(t, "race_b_writer", issuestatus.InProgress)
 
 		rec := httptest.NewRecorder()
@@ -658,8 +652,16 @@ func TestArchiveRefusesAfterACommittedWrite(t *testing.T) {
 		json.Unmarshal(rec.Body.Bytes(), &created)
 		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(created.ID)) })
 
-		if code := archiveStatusVia(t, entry); code != http.StatusConflict {
-			t.Fatalf("archive after a committed write = %d, want 409", code)
+		if code := archiveStatusVia(t, entry); code != http.StatusOK {
+			t.Fatalf("archive after a committed write = %d, want 200", code)
+		}
+		var status string
+		if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`,
+			parseUUID(created.ID)).Scan(&status); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if status != "race_b_writer" {
+			t.Errorf("issue status = %q, want it untouched by the archive", status)
 		}
 	})
 

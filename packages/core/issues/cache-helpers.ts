@@ -1,23 +1,24 @@
 import type {
   Issue,
-  IssueStatus,
+  IssueStatusCategory,
   IssueStatusBucket,
   ListIssuesCache,
 } from "../types";
-import { PAGINATED_STATUSES } from "./queries";
+import { PAGINATED_CATEGORIES } from "./queries";
+import { issueStatusCategory } from "./status-category";
 
 const EMPTY_BUCKET: IssueStatusBucket = { issues: [], total: 0 };
 
 export function getBucket(
   resp: ListIssuesCache,
-  status: IssueStatus,
+  status: IssueStatusCategory,
 ): IssueStatusBucket {
   return resp.byStatus[status] ?? EMPTY_BUCKET;
 }
 
 export function setBucket(
   resp: ListIssuesCache,
-  status: IssueStatus,
+  status: IssueStatusCategory,
   bucket: IssueStatusBucket,
 ): ListIssuesCache {
   return { ...resp, byStatus: { ...resp.byStatus, [status]: bucket } };
@@ -27,10 +28,10 @@ export function setBucket(
 export function findIssueLocation(
   resp: ListIssuesCache,
   id: string,
-): { status: IssueStatus; issue: Issue } | null {
-  for (const status of PAGINATED_STATUSES) {
+): { status: IssueStatusCategory; issue: Issue } | null {
+  for (const status of PAGINATED_CATEGORIES) {
     const bucket = resp.byStatus[status];
-    const found = bucket?.issues.find((i) => i.id === id);
+    const found = bucket?.issues.find((i: Issue) => i.id === id);
     if (found) return { status, issue: found };
   }
   return null;
@@ -41,9 +42,14 @@ export function addIssueToBuckets(
   resp: ListIssuesCache,
   issue: Issue,
 ): ListIssuesCache {
-  const bucket = getBucket(resp, issue.status);
-  if (bucket.issues.some((i) => i.id === issue.id)) return resp;
-  return setBucket(resp, issue.status, {
+  // An unresolvable custom status has no column to go in; leaving the cache
+  // untouched is better than inventing a bucket. The catalog-aware surfaces
+  // refetch and place it correctly.
+  const category = issueStatusCategory(issue);
+  if (!category) return resp;
+  const bucket = getBucket(resp, category);
+  if (bucket.issues.some((i: Issue) => i.id === issue.id)) return resp;
+  return setBucket(resp, category, {
     issues: [...bucket.issues, issue],
     total: bucket.total + 1,
   });
@@ -71,8 +77,8 @@ export function removeIssueFromBuckets(
  */
 export function moveBucketTotal(
   resp: ListIssuesCache,
-  from: IssueStatus,
-  to: IssueStatus,
+  from: IssueStatusCategory,
+  to: IssueStatusCategory,
 ): ListIssuesCache {
   if (from === to) return resp;
   const fromBucket = getBucket(resp, from);
@@ -91,7 +97,7 @@ export function moveBucketTotal(
  */
 export function decrementBucketTotal(
   resp: ListIssuesCache,
-  status: IssueStatus,
+  status: IssueStatusCategory,
 ): ListIssuesCache {
   const bucket = getBucket(resp, status);
   return setBucket(resp, status, {
@@ -155,13 +161,16 @@ export function patchIssueInBuckets(
     });
   }
 
+  // nextStatus is a status KEY; the cache is bucketed by category.
+  const nextCategory = issueStatusCategory({ status: nextStatus, status_category: merged.status_category });
+  if (!nextCategory) return resp;
   const fromBucket = getBucket(resp, loc.status);
-  const toBucket = getBucket(resp, nextStatus);
+  const toBucket = getBucket(resp, nextCategory);
   let next = setBucket(resp, loc.status, {
-    issues: fromBucket.issues.filter((i) => i.id !== id),
+    issues: fromBucket.issues.filter((i: Issue) => i.id !== id),
     total: Math.max(0, fromBucket.total - 1),
   });
-  next = setBucket(next, nextStatus, {
+  next = setBucket(next, nextCategory, {
     issues: insertByPosition(toBucket.issues, merged),
     total: toBucket.total + 1,
   });
