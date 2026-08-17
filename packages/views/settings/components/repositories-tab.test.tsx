@@ -9,6 +9,7 @@ import enSettings from "../../locales/en/settings.json";
 const mockUpdateWorkspace = vi.hoisted(() => vi.fn());
 const mockGetGitHubConnectURL = vi.hoisted(() => vi.fn());
 const mockFetchNextPage = vi.hoisted(() => vi.fn());
+const mockNavPush = vi.hoisted(() => vi.fn());
 const mockNavReplace = vi.hoisted(() => vi.fn());
 const mockToastSuccess = vi.hoisted(() => vi.fn());
 const workspaceRef = vi.hoisted(() => ({
@@ -118,7 +119,7 @@ vi.mock("sonner", () => ({
 
 vi.mock("../../navigation", () => ({
   useNavigation: () => ({
-    push: vi.fn(),
+    push: mockNavPush,
     replace: mockNavReplace,
     back: vi.fn(),
     pathname: "/acme/settings",
@@ -370,6 +371,25 @@ describe("RepositoriesTab — automatic updates", () => {
     open.mockRestore();
   });
 
+  it("routes an already-installed organization through the secure claim form", async () => {
+    githubRef.current = {
+      installations: [{ id: "installation-row-1", account_login: "personal" }],
+      configured: true,
+      repository_browse_configured: true,
+      can_manage: true,
+    };
+    const user = setupUser();
+    render(<RepositoriesTab />, { wrapper: I18nWrapper });
+
+    await user.click(
+      screen.getByRole("button", { name: "Connect existing installation" }),
+    );
+
+    expect(mockNavPush).toHaveBeenCalledWith(
+      "/acme/settings?tab=github&github_claim=1",
+    );
+  });
+
   it("keeps GitHub import disabled when repository browsing is unavailable", () => {
     githubRef.current = {
       installations: [],
@@ -426,6 +446,11 @@ describe("RepositoriesTab — automatic updates", () => {
     await user.click(
       screen.getByRole("button", { name: "Choose from GitHub" }),
     );
+    expect(
+      screen.getByRole("button", {
+        name: "Connect existing installation",
+      }),
+    ).toBeTruthy();
     expect(
       screen.getByText("Only repositories authorized for multica-ai are shown."),
     ).toBeTruthy();

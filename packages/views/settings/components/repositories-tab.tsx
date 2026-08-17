@@ -327,6 +327,11 @@ export function RepositoriesTab() {
     void startGitHubConnection();
   };
 
+  const openExistingGitHubClaim = () => {
+    closeGitHubPicker();
+    navigation.push(`${navigation.pathname}?tab=github&github_claim=1`);
+  };
+
   const closeGitHubPicker = () => {
     setGitHubPickerOpen(false);
     setSelectedRepositories(new Map());
@@ -486,6 +491,11 @@ export function RepositoriesTab() {
                     size="sm"
                     onClick={() => void startGitHubConnection()}
                     disabled={connectingGitHub || !githubConnectConfigured}
+                    title={
+                      !githubConnectConfigured
+                        ? t(($) => $.repositories.github_not_configured)
+                        : undefined
+                    }
                   >
                     {t(
                       ($) =>
@@ -493,6 +503,19 @@ export function RepositoriesTab() {
                     )}
                   </Button>
                 ) : null}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={openExistingGitHubClaim}
+                  disabled={!githubConnectConfigured}
+                  title={
+                    !githubConnectConfigured
+                      ? t(($) => $.repositories.github_not_configured)
+                      : undefined
+                  }
+                >
+                  {t(($) => $.repositories.github_claim_existing)}
+                </Button>
               </div>
               {!allUrlsValid ? (
                 <span className="text-caption text-muted-foreground">
@@ -553,24 +576,27 @@ export function RepositoriesTab() {
                     ))}
                   </SelectContent>
                 </Select>
-              ) : selectedInstallation ? (
-                <p className="text-caption text-muted-foreground">
-                  {t(($) => $.repositories.github_account)}:{" "}
-                  <span className="font-medium text-foreground">
-                    {selectedInstallation.account_login}
-                  </span>
-                </p>
               ) : null}
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => void startGitHubConnection()}
-                disabled={connectingGitHub || !githubConnectConfigured}
-              >
-                {t(
-                  ($) => $.repositories.github_add_account_or_organization,
-                )}
-              </Button>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void startGitHubConnection()}
+                  disabled={connectingGitHub || !githubConnectConfigured}
+                >
+                  {t(
+                    ($) => $.repositories.github_add_account_or_organization,
+                  )}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={openExistingGitHubClaim}
+                  disabled={!githubConnectConfigured}
+                >
+                  {t(($) => $.repositories.github_claim_existing)}
+                </Button>
+              </div>
             </div>
 
             {selectedInstallation ? (
