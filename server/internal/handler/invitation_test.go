@@ -13,16 +13,19 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
 )
 
 const invitationTestEmail = "invitation-test@multica.ai"
 
 type stubInvitationRateLimiter struct {
-	allowed    bool
-	err        error
-	retryAfter time.Duration
-	keys       []string
+	allowed     bool
+	allowResult *bool
+	err         error
+	retryAfter  time.Duration
+	checkKeys   []string
+	allowKeys   []string
 }
 
 func (l *stubInvitationRateLimiter) Allow(ctx context.Context, key string) bool {
@@ -31,12 +34,21 @@ func (l *stubInvitationRateLimiter) Allow(ctx context.Context, key string) bool 
 }
 
 func (l *stubInvitationRateLimiter) AllowWithError(_ context.Context, key string) (bool, error) {
-	l.keys = append(l.keys, key)
+	l.allowKeys = append(l.allowKeys, key)
+	if l.allowResult != nil {
+		return *l.allowResult, l.err
+	}
 	return l.allowed, l.err
 }
 
-func (l *stubInvitationRateLimiter) Check(_ context.Context, _ string) bool {
-	return l.allowed
+func (l *stubInvitationRateLimiter) Check(ctx context.Context, key string) bool {
+	allowed, _ := l.CheckWithError(ctx, key)
+	return allowed
+}
+
+func (l *stubInvitationRateLimiter) CheckWithError(_ context.Context, key string) (bool, error) {
+	l.checkKeys = append(l.checkKeys, key)
+	return l.allowed, l.err
 }
 
 func (l *stubInvitationRateLimiter) RetryAfter(_ context.Context, _ string) time.Duration {
@@ -99,7 +111,8 @@ func TestCreateInvitation_BlocksWhilePending(t *testing.T) {
 		t.Fatalf("second invite: expected 409 while still pending, got %d: %s", w2.Code, w2.Body.String())
 	}
 	for name, calls := range map[string]int{
-		"actor": len(actor.keys), "workspace": len(workspace.keys), "recipient": len(recipient.keys),
+		"actor checks": len(actor.checkKeys), "workspace checks": len(workspace.checkKeys), "recipient checks": len(recipient.checkKeys),
+		"actor allows": len(actor.allowKeys), "workspace allows": len(workspace.allowKeys), "recipient allows": len(recipient.allowKeys),
 	} {
 		if calls != 1 {
 			t.Errorf("%s limiter calls = %d, want 1; a pending retry must not consume budget", name, calls)
@@ -212,17 +225,24 @@ func TestCreateInvitation_RateLimitChecksEveryGateBeforeWrite(t *testing.T) {
 		got  []string
 		want string
 	}{
-		{name: "actor", got: actor.keys, want: testUserID},
-		{name: "workspace", got: workspace.keys, want: testWorkspaceID},
-		{name: "recipient", got: recipient.keys, want: invitationRecipientKey(normalizedEmail)},
+		{name: "actor", got: actor.checkKeys, want: testUserID},
+		{name: "workspace", got: workspace.checkKeys, want: testWorkspaceID},
+		{name: "recipient", got: recipient.checkKeys, want: invitationRecipientKey(normalizedEmail)},
 	}
 	for _, check := range checks {
 		if len(check.got) != 1 || check.got[0] != check.want {
 			t.Errorf("%s limiter keys = %v, want [%s]", check.name, check.got, check.want)
 		}
 	}
-	if len(recipient.keys) == 1 && (recipient.keys[0] == normalizedEmail || strings.Contains(recipient.keys[0], "@")) {
-		t.Errorf("recipient limiter key contains the email instead of a digest: %q", recipient.keys[0])
+	if len(recipient.checkKeys) == 1 && (recipient.checkKeys[0] == normalizedEmail || strings.Contains(recipient.checkKeys[0], "@")) {
+		t.Errorf("recipient limiter key contains the email instead of a digest: %q", recipient.checkKeys[0])
+	}
+	for name, calls := range map[string]int{
+		"actor": len(actor.allowKeys), "workspace": len(workspace.allowKeys), "recipient": len(recipient.allowKeys),
+	} {
+		if calls != 0 {
+			t.Errorf("%s limiter consumed %d times, want 0 after a rejected check", name, calls)
+		}
 	}
 
 	var pendingCount int
@@ -239,10 +259,15 @@ func TestCreateInvitation_RateLimitChecksEveryGateBeforeWrite(t *testing.T) {
 
 func TestCreateInvitation_RateLimiterFailureReturnsServiceUnavailable(t *testing.T) {
 	clearInvitationsForTestWorkspace(t)
-	actor := &stubInvitationRateLimiter{allowed: false, err: errors.New("redis unavailable")}
-	workspace := &stubInvitationRateLimiter{allowed: true}
+	actor := &stubInvitationRateLimiter{allowed: false, retryAfter: 10 * time.Minute}
+	workspace := &stubInvitationRateLimiter{allowed: true, err: errors.New("redis unavailable")}
 	recipient := &stubInvitationRateLimiter{allowed: true}
 	useInvitationRateLimiters(t, InvitationRateLimiters{Actor: actor, Workspace: workspace, Recipient: recipient})
+	previousMetrics := testHandler.Metrics
+	testHandler.Metrics = obsmetrics.NewBusinessMetrics()
+	t.Cleanup(func() {
+		testHandler.Metrics = previousMetrics
+	})
 
 	req := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/members", CreateMemberRequest{
 		Email: "invitation-limiter-error@multica.ai",
@@ -265,11 +290,24 @@ func TestCreateInvitation_RateLimiterFailureReturnsServiceUnavailable(t *testing
 	if body["code"] != "invitation_rate_limiter_unavailable" {
 		t.Errorf("code = %q, want invitation_rate_limiter_unavailable", body["code"])
 	}
+	metricFamily := obsmetrics.GatherForTest(t, testHandler.Metrics)["multica_email_rate_limited_total"]
+	for _, metric := range metricFamily.GetMetric() {
+		if metric.GetCounter().GetValue() != 0 {
+			t.Errorf("rate-limit metric = %v, want 0 when the final response is 503", metric.GetCounter().GetValue())
+		}
+	}
 	for name, calls := range map[string]int{
-		"actor": len(actor.keys), "workspace": len(workspace.keys), "recipient": len(recipient.keys),
+		"actor checks": len(actor.checkKeys), "workspace checks": len(workspace.checkKeys), "recipient checks": len(recipient.checkKeys),
 	} {
 		if calls != 1 {
-			t.Errorf("%s limiter calls = %d, want 1 even when another gate errors", name, calls)
+			t.Errorf("%s = %d, want 1 even when another gate errors", name, calls)
+		}
+	}
+	for name, calls := range map[string]int{
+		"actor": len(actor.allowKeys), "workspace": len(workspace.allowKeys), "recipient": len(recipient.allowKeys),
+	} {
+		if calls != 0 {
+			t.Errorf("%s limiter consumed %d times, want 0 after a backend error", name, calls)
 		}
 	}
 	var pendingCount int
@@ -281,6 +319,80 @@ func TestCreateInvitation_RateLimiterFailureReturnsServiceUnavailable(t *testing
 	}
 	if pendingCount != 0 {
 		t.Fatalf("pending invitation count = %d, want 0 after limiter backend failure", pendingCount)
+	}
+}
+
+func TestAdmitInvitation_RejectedActorDoesNotConsumeWorkspaceBudget(t *testing.T) {
+	limits := InvitationRateLimits{
+		Actor:     SlidingWindowRateLimit{Limit: 1, Window: time.Hour},
+		Workspace: SlidingWindowRateLimit{Limit: 2, Window: time.Hour},
+		Recipient: SlidingWindowRateLimit{Limit: 10, Window: time.Hour},
+	}
+	h := *testHandler
+	h.InvitationRateLimiters = NewMemoryInvitationRateLimiters(limits)
+
+	admit := func(actorID, email string) bool {
+		req := httptest.NewRequest(http.MethodPost, "/api/workspaces/workspace-a/members", nil)
+		return h.admitInvitation(httptest.NewRecorder(), req, actorID, "workspace-a", email)
+	}
+
+	if !admit("actor-a", "first@multica.ai") {
+		t.Fatal("first invitation was unexpectedly rejected")
+	}
+	for i := 0; i < 3; i++ {
+		if admit("actor-a", fmt.Sprintf("rejected-%d@multica.ai", i)) {
+			t.Fatalf("actor-limited invitation %d was unexpectedly admitted", i)
+		}
+	}
+	if !admit("actor-b", "second@multica.ai") {
+		t.Fatal("actor-limited retries consumed the shared workspace budget")
+	}
+}
+
+func TestAdmitInvitation_RejectedActorDoesNotConsumeRecipientBudget(t *testing.T) {
+	limits := InvitationRateLimits{
+		Actor:     SlidingWindowRateLimit{Limit: 1, Window: time.Hour},
+		Workspace: SlidingWindowRateLimit{Limit: 10, Window: time.Hour},
+		Recipient: SlidingWindowRateLimit{Limit: 2, Window: time.Hour},
+	}
+	h := *testHandler
+	h.InvitationRateLimiters = NewMemoryInvitationRateLimiters(limits)
+
+	admit := func(actorID, workspaceID string) bool {
+		req := httptest.NewRequest(http.MethodPost, "/api/workspaces/"+workspaceID+"/members", nil)
+		return h.admitInvitation(httptest.NewRecorder(), req, actorID, workspaceID, "shared@multica.ai")
+	}
+
+	if !admit("actor-a", "workspace-a") {
+		t.Fatal("first invitation was unexpectedly rejected")
+	}
+	if admit("actor-a", "workspace-a") {
+		t.Fatal("actor-limited retry was unexpectedly admitted")
+	}
+	if !admit("actor-b", "workspace-b") {
+		t.Fatal("actor-limited retry consumed the global recipient budget")
+	}
+}
+
+func TestAdmitInvitation_AllowsBoundedOvershootWhenGateFillsAfterCheck(t *testing.T) {
+	allowDenied := false
+	actor := &stubInvitationRateLimiter{allowed: true, allowResult: &allowDenied}
+	workspace := &stubInvitationRateLimiter{allowed: true}
+	recipient := &stubInvitationRateLimiter{allowed: true}
+	h := *testHandler
+	h.InvitationRateLimiters = InvitationRateLimiters{Actor: actor, Workspace: workspace, Recipient: recipient}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/workspaces/workspace-a/members", nil)
+	if !h.admitInvitation(httptest.NewRecorder(), req, "actor-a", "workspace-a", "recipient@multica.ai") {
+		t.Fatal("concurrent fill rejected after a different gate may already have consumed")
+	}
+	for name, calls := range map[string]int{
+		"actor checks": len(actor.checkKeys), "workspace checks": len(workspace.checkKeys), "recipient checks": len(recipient.checkKeys),
+		"actor allows": len(actor.allowKeys), "workspace allows": len(workspace.allowKeys), "recipient allows": len(recipient.allowKeys),
+	} {
+		if calls != 1 {
+			t.Errorf("%s = %d, want 1", name, calls)
+		}
 	}
 }
 

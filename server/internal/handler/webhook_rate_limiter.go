@@ -49,12 +49,11 @@ func DefaultWebhookAbsoluteIPRateLimit() WebhookRateLimit {
 // SlidingWindowRateLimiter is the contract implemented by both the in-memory
 // and Redis-backed limiters.
 //
-// Check is non-consuming and is used to reject an IP that has already built
-// up bad-credential debt. Allow consumes one unit. RetryAfter returns a safe
-// client retry interval after either gate rejects.
+// Implementations may expose non-consuming checks and retry hints through the
+// optional interfaces below. Allow consumes one unit.
 type SlidingWindowRateLimiter interface {
 	Allow(ctx context.Context, key string) bool
-	// Implementations may also satisfy webhookRateLimiterInspector. Keeping
+	// Implementations may also satisfy slidingWindowRateLimiterInspector. Keeping
 	// the base contract at Allow preserves compatibility with billing and
 	// tests that inject simple one-method safety gates.
 }
@@ -66,20 +65,39 @@ type slidingWindowRateLimiterWithError interface {
 	AllowWithError(ctx context.Context, key string) (bool, error)
 }
 
-type webhookRateLimiterInspector interface {
+type slidingWindowRateLimiterInspector interface {
 	Check(ctx context.Context, key string) bool
 	RetryAfter(ctx context.Context, key string) time.Duration
 }
 
-func webhookLimiterCheck(ctx context.Context, limiter WebhookRateLimiter, key string) bool {
-	if inspector, ok := limiter.(webhookRateLimiterInspector); ok {
-		return inspector.Check(ctx, key)
-	}
-	return true
+type slidingWindowRateLimiterCheckWithError interface {
+	CheckWithError(ctx context.Context, key string) (bool, error)
 }
 
-func webhookLimiterRetryAfter(ctx context.Context, limiter WebhookRateLimiter, key string) time.Duration {
-	if inspector, ok := limiter.(webhookRateLimiterInspector); ok {
+// slidingWindowLimiterCheck keeps webhook ingress fail-open when an optional
+// backend-backed check is unavailable.
+func slidingWindowLimiterCheck(ctx context.Context, limiter SlidingWindowRateLimiter, key string) bool {
+	allowed, err := slidingWindowLimiterCheckWithError(ctx, limiter, key)
+	return err != nil || allowed
+}
+
+// slidingWindowLimiterCheckWithError exposes check failures to callers, such
+// as invitation admission, that must fail closed without consuming a budget.
+func slidingWindowLimiterCheckWithError(ctx context.Context, limiter SlidingWindowRateLimiter, key string) (bool, error) {
+	if limiter == nil {
+		return true, nil
+	}
+	if withError, ok := limiter.(slidingWindowRateLimiterCheckWithError); ok {
+		return withError.CheckWithError(ctx, key)
+	}
+	if inspector, ok := limiter.(slidingWindowRateLimiterInspector); ok {
+		return inspector.Check(ctx, key), nil
+	}
+	return true, nil
+}
+
+func slidingWindowLimiterRetryAfter(ctx context.Context, limiter SlidingWindowRateLimiter, key string) time.Duration {
+	if inspector, ok := limiter.(slidingWindowRateLimiterInspector); ok {
 		return inspector.RetryAfter(ctx, key)
 	}
 	return time.Minute
@@ -128,8 +146,13 @@ func (l *memoryWebhookRateLimiter) AllowWithError(_ context.Context, key string)
 	return l.evaluate(key, true), nil
 }
 
-func (l *memoryWebhookRateLimiter) Check(_ context.Context, key string) bool {
-	return l.evaluate(key, false)
+func (l *memoryWebhookRateLimiter) Check(ctx context.Context, key string) bool {
+	allowed, _ := l.CheckWithError(ctx, key)
+	return allowed
+}
+
+func (l *memoryWebhookRateLimiter) CheckWithError(_ context.Context, key string) (bool, error) {
+	return l.evaluate(key, false), nil
 }
 
 func (l *memoryWebhookRateLimiter) evaluate(key string, consume bool) bool {
@@ -339,8 +362,16 @@ func (l *redisWebhookRateLimiter) AllowWithError(ctx context.Context, key string
 }
 
 func (l *redisWebhookRateLimiter) Check(ctx context.Context, key string) bool {
-	if l.cfg.Limit <= 0 || l.rdb == nil {
+	allowed, err := l.CheckWithError(ctx, key)
+	if err != nil {
 		return true
+	}
+	return allowed
+}
+
+func (l *redisWebhookRateLimiter) CheckWithError(ctx context.Context, key string) (bool, error) {
+	if l.cfg.Limit <= 0 || l.rdb == nil {
+		return true, nil
 	}
 	cutoff := time.Now().Add(-l.cfg.Window).UnixNano()
 	prefix := l.keyPrefix
@@ -354,9 +385,9 @@ func (l *redisWebhookRateLimiter) Check(ctx context.Context, key string) bool {
 		cutoff, l.cfg.Limit,
 	).Int()
 	if err != nil {
-		return true
+		return false, err
 	}
-	return res == 1
+	return res == 1, nil
 }
 
 func (l *redisWebhookRateLimiter) RetryAfter(_ context.Context, _ string) time.Duration {

@@ -81,39 +81,66 @@ func (h *Handler) admitInvitation(w http.ResponseWriter, r *http.Request, actorI
 		{name: "recipient", key: invitationRecipientKey(email), limiter: h.InvitationRateLimiters.Recipient},
 	}
 
-	var backendErr error
-	var backendErrorGates []string
+	var checkErr error
+	var checkErrorGates []string
+	var deniedGates []invitationRateLimitGate
 	var retryAfter time.Duration
 	for _, gate := range gates {
-		allowed, err := slidingWindowLimiterAllow(r.Context(), gate.limiter, gate.key)
+		allowed, err := slidingWindowLimiterCheckWithError(r.Context(), gate.limiter, gate.key)
 		if err != nil {
-			if backendErr == nil {
-				backendErr = err
+			if checkErr == nil {
+				checkErr = err
 			}
-			backendErrorGates = append(backendErrorGates, gate.name)
+			checkErrorGates = append(checkErrorGates, gate.name)
 			continue
 		}
 		if allowed {
 			continue
 		}
 
-		h.Metrics.RecordEmailRateLimited("workspace_invitation", gate.name)
-		if retry := webhookLimiterRetryAfter(r.Context(), gate.limiter, gate.key); retry > retryAfter {
+		deniedGates = append(deniedGates, gate)
+		if retry := slidingWindowLimiterRetryAfter(r.Context(), gate.limiter, gate.key); retry > retryAfter {
 			retryAfter = retry
 		}
 	}
 
-	if backendErr != nil {
-		slog.Error("invitation rate limiter unavailable", append(logger.RequestAttrs(r), "gates", strings.Join(backendErrorGates, ","), "error", backendErr)...)
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Retry-After", "5")
-		writeErrorCode(w, http.StatusServiceUnavailable, "invitation_rate_limiter_unavailable", "invitation service temporarily unavailable")
+	if checkErr != nil {
+		slog.Error("invitation rate limiter unavailable", append(logger.RequestAttrs(r), "gates", strings.Join(checkErrorGates, ","), "error", checkErr)...)
+		writeInvitationLimiterUnavailable(w)
 		return false
 	}
-	if retryAfter <= 0 {
-		return true
+	if len(deniedGates) > 0 {
+		for _, gate := range deniedGates {
+			h.Metrics.RecordEmailRateLimited("workspace_invitation", gate.name)
+		}
+		writeInvitationRateLimited(w, retryAfter)
+		return false
 	}
 
+	for _, gate := range gates {
+		allowed, err := slidingWindowLimiterAllow(r.Context(), gate.limiter, gate.key)
+		if err != nil {
+			slog.Error("invitation rate limiter unavailable", append(logger.RequestAttrs(r), "gates", gate.name, "error", err)...)
+			writeInvitationLimiterUnavailable(w)
+			return false
+		}
+		if !allowed {
+			// Another replica filled this gate between Check and Allow. Continue
+			// instead of rejecting after earlier gates may already have consumed;
+			// this permits only a bounded overshoot of a safety budget.
+			continue
+		}
+	}
+	return true
+}
+
+func writeInvitationLimiterUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Retry-After", "5")
+	writeErrorCode(w, http.StatusServiceUnavailable, "invitation_rate_limiter_unavailable", "invitation service temporarily unavailable")
+}
+
+func writeInvitationRateLimited(w http.ResponseWriter, retryAfter time.Duration) {
 	retryAfterSeconds := int64((retryAfter + time.Second - 1) / time.Second)
 	if retryAfterSeconds < 1 {
 		retryAfterSeconds = 1
@@ -125,5 +152,4 @@ func (h *Handler) admitInvitation(w http.ResponseWriter, r *http.Request, actorI
 		"code":                "invitation_rate_limited",
 		"retry_after_seconds": retryAfterSeconds,
 	})
-	return false
 }
