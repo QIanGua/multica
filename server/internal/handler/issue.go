@@ -2702,9 +2702,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 
 	resp := issueToResponse(issue, prefix)
 	resp.Attachments = buildAttachmentResponses(res.Attachments)
-	// Echo the authoritative labels attached in the create transaction. Always
-	// non-nil (empty slice when none) so a newer client can tell the backend
-	// understood label_ids and skip its legacy post-create attach fallback.
+	// Echo the authoritative labels attached in the create transaction.
 	labelResponses := labelsToResponse(res.Labels)
 	resp.Labels = &labelResponses
 	writeJSON(w, http.StatusCreated, resp)

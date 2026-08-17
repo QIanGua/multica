@@ -31,7 +31,6 @@ function I18nWrapper({ children }: { children: ReactNode }) {
 
 const mockPush = vi.hoisted(() => vi.fn());
 const mockCreateIssue = vi.hoisted(() => vi.fn());
-const mockAttachLabel = vi.hoisted(() => vi.fn());
 const mockListProperties = vi.hoisted(() => vi.fn());
 const mockSetIssueProperty = vi.hoisted(() => vi.fn());
 const mockSetShared = vi.hoisted(() => vi.fn());
@@ -221,10 +220,6 @@ vi.mock("@multica/core/issues/stores/issue-create-settings-store", () => ({
 vi.mock("@multica/core/issues/mutations", () => ({
   useCreateIssue: () => ({ mutateAsync: mockCreateIssue }),
   useUpdateIssue: () => ({ mutate: vi.fn() }),
-}));
-
-vi.mock("@multica/core/labels", () => ({
-  useAttachLabelToIssue: () => ({ mutateAsync: mockAttachLabel }),
 }));
 
 vi.mock("@multica/core/properties", async (importOriginal) => {
@@ -622,12 +617,8 @@ describe("CreateIssueModal", () => {
       identifier: "TES-123",
       title: "Ship create issue regression coverage",
       status: "todo",
-      // Current backend echoes the attached labels, so the create flow skips
-      // the legacy per-label attach fallback. Empty is enough — what matters
-      // is that the field is present (not undefined).
       labels: [],
     });
-    mockAttachLabel.mockResolvedValue({ labels: [] });
     mockListProperties.mockResolvedValue({
       properties: [
         {
@@ -724,44 +715,6 @@ describe("CreateIssueModal", () => {
           ],
         }),
       );
-    });
-    // Backend echoed `labels`, so the atomic path handled it — no legacy
-    // per-label attach fallback should run.
-    expect(mockAttachLabel).not.toHaveBeenCalled();
-  });
-
-  it("falls back to per-label attach when an older backend omits labels from the create response", async () => {
-    const user = userEvent.setup();
-    // Older backend: ignores label_ids and returns an issue with no `labels`
-    // field (the rolling-deploy window where web is ahead of the backend).
-    mockCreateIssue.mockResolvedValueOnce({
-      id: "issue-123",
-      identifier: "TES-123",
-      title: "Labeled issue",
-      status: "todo",
-    });
-    mockDraftStore.draft.manual.labelIds = [
-      "aaaaaaaa-1111-2222-3333-444444444444",
-      "bbbbbbbb-1111-2222-3333-444444444444",
-    ];
-
-    renderModal(<CreateIssueModal onClose={vi.fn()} />);
-
-    fireEvent.change(screen.getByPlaceholderText("Issue title"), {
-      target: { value: "Labeled issue" },
-    });
-    await user.click(screen.getByRole("button", { name: "Create Issue" }));
-
-    await waitFor(() => {
-      expect(mockAttachLabel).toHaveBeenCalledTimes(2);
-    });
-    expect(mockAttachLabel).toHaveBeenCalledWith({
-      issueId: "issue-123",
-      labelId: "aaaaaaaa-1111-2222-3333-444444444444",
-    });
-    expect(mockAttachLabel).toHaveBeenCalledWith({
-      issueId: "issue-123",
-      labelId: "bbbbbbbb-1111-2222-3333-444444444444",
     });
   });
 

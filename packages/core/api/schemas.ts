@@ -969,23 +969,12 @@ export const ListIssuesResponseSchema = z.object({
   total: z.number().default(0),
 }).loose();
 
-// Response schema for POST /api/issues. Two tightenings over IssueSchema:
-//
-//   - `id` must be non-empty. A created issue always carries a real id, so an
-//     empty/absent id means the create effectively failed. createIssue turns a
-//     schema failure into a rejection (not a fabricated success), so tightening
-//     id here routes an id-less body to that same failure path.
-//   - `labels` is the backend-compatibility signal the create modal reads to
-//     decide whether the backend attached labels in the create transaction
-//     (present) or predates that (absent → fall back to per-label attach).
-//     Validate it strictly as Label[] and degrade a malformed value to
-//     `undefined` — the same as an absent field — so a wrong shape (null,
-//     object, a garbage array) can never masquerade as "handled" and suppress
-//     the fallback. Unlike the loose IssueSchema.labels (z.array(z.unknown())),
-//     the elements are fully validated. See packages/views/modals/create-issue.tsx.
+// A successful create always returns a real id and the authoritative label
+// snapshot attached in the same transaction. Treat either field being absent
+// or malformed as a failed mutation so the modal keeps the user's draft.
 export const CreateIssueResponseSchema = IssueSchema.extend({
   id: z.string().min(1),
-  labels: z.array(LabelSchema).optional().catch(undefined),
+  labels: z.array(LabelSchema),
 }).loose();
 
 export const EMPTY_LIST_ISSUES_RESPONSE: ListIssuesResponse = {

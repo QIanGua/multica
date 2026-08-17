@@ -33,13 +33,6 @@ type ExecuteToolRequest struct {
 	// version; setting this avoids unintended drift when Composio promotes
 	// a new latest.
 	Version string `json:"version,omitempty"`
-
-	// AllowTracing is the upstream-deprecated debug-tracing flag.
-	//
-	// Deprecated: marked deprecated on the Composio side (v3.1) — kept here
-	// only for backward compatibility with existing callers. Will be removed
-	// once Composio drops the field.
-	AllowTracing bool `json:"allow_tracing,omitempty"`
 }
 
 // ExecuteToolResponse is the typed result. The upstream wire shape varies by

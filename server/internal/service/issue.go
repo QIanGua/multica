@@ -163,8 +163,7 @@ type IssueCreateResult struct {
 	// Labels is the authoritative set of labels attached to the new issue in
 	// the create transaction (empty when none were requested). Callers echo it
 	// on the create response + issue:created event so every client renders the
-	// new issue already labeled and a new client can detect that the backend
-	// understood label_ids (see the create handler's compatibility contract).
+	// new issue already labeled.
 	Labels         []db.IssueLabel
 	DuplicateIssue *db.Issue
 }

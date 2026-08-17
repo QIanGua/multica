@@ -4,7 +4,6 @@ export {
   useUpdateLabel,
   useDeleteLabel,
   useAttachLabel,
-  useAttachLabelToIssue,
   useDetachLabel,
   useAttachResourceLabel,
   useDetachResourceLabel,

@@ -156,7 +156,6 @@
     "toast_duplicate_view": "查看已有任务",
     "toast_link_subissues_all_failed": "关联子任务失败",
     "toast_link_subissues_partial": "{{total}} 个子任务中有 {{failed}} 个关联失败",
-    "toast_link_labels_failed": "关联标签失败",
     "toast_set_properties_failed": "有 {{count}} 个自定义属性设置失败",
     "switch_to_agent": "切换到智能体",
     "switch_to_agent_tooltip": "切换到通过智能体创建——一句话描述，让它替你建",
