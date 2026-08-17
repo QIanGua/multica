@@ -13,6 +13,8 @@ const state = vi.hoisted(() => ({
   workspaceSeen: true,
   modalRenders: 0,
   modalAriaLabel: "source-backfill-modal-marker",
+  currentSlug: null as string | null,
+  pendingDeletes: new Set<string>(),
 }));
 
 vi.mock("@multica/core/auth", () => {
@@ -24,8 +26,18 @@ vi.mock("@multica/core/auth", () => {
   return { useAuthStore };
 });
 
+// A real-enough stand-in for the platform singleton: the layout both writes
+// and reads it (the clear paths check `getCurrentSlug()` before wiping), so a
+// bare vi.fn() would make every guard trivially true.
 vi.mock("@multica/core/platform", () => ({
-  setCurrentWorkspace: vi.fn(),
+  setCurrentWorkspace: vi.fn((slug: string | null) => {
+    state.currentSlug = slug;
+  }),
+  getCurrentSlug: () => state.currentSlug,
+}));
+
+vi.mock("@multica/core/workspace/pending-delete", () => ({
+  isWorkspaceDeletePending: (id: string) => state.pendingDeletes.has(id),
 }));
 
 vi.mock("@multica/core/workspace", async () => {
@@ -129,6 +141,8 @@ beforeEach(() => {
   state.wsList = [{ id: "ws-1", slug: "acme" }];
   state.workspaceSeen = true;
   state.modalRenders = 0;
+  state.currentSlug = null;
+  state.pendingDeletes = new Set<string>();
 });
 
 describe("WorkspaceRouteLayout", () => {
@@ -143,5 +157,63 @@ describe("WorkspaceRouteLayout", () => {
     const { queryByTestId } = renderLayout();
     expect(queryByTestId(state.modalAriaLabel)).toBeNull();
     expect(state.modalRenders).toBe(0);
+  });
+});
+
+/**
+ * MUL-6231 / #7021. This layout is the only owner of the platform workspace
+ * singleton, and it used to only ever SET it. Deleting the active workspace
+ * therefore left the singleton pointing at a workspace that no longer existed,
+ * which is what kept the desktop shell mounting workspace-scoped chrome over
+ * nothing until a `useWorkspaceId()` throw blanked the whole renderer.
+ */
+describe("WorkspaceRouteLayout workspace singleton lifecycle", () => {
+  it("adopts the workspace while it resolves", () => {
+    renderLayout();
+    expect(state.currentSlug).toBe("acme");
+  });
+
+  it("releases the singleton once the workspace stops resolving", () => {
+    state.currentSlug = "acme";
+    state.workspace = null;
+    state.wsList = [];
+
+    renderLayout();
+
+    expect(state.currentSlug).toBeNull();
+  });
+
+  it("does not re-adopt a workspace whose delete this client started", () => {
+    // The exact post-delete window: useDeleteWorkspace has cleared the
+    // singleton and navigated, but its list invalidation is still in flight so
+    // the deleted workspace is very much still in the cache. Re-adopting here
+    // would stamp the dead slug back over the delete flow's own cleanup.
+    state.currentSlug = null;
+    state.pendingDeletes = new Set(["ws-1"]);
+
+    renderLayout();
+
+    expect(state.currentSlug).toBeNull();
+  });
+
+  it("releases the singleton on unmount", () => {
+    const { unmount } = renderLayout();
+    expect(state.currentSlug).toBe("acme");
+
+    unmount();
+
+    expect(state.currentSlug).toBeNull();
+  });
+
+  it("leaves the singleton alone when it already points at another workspace", () => {
+    // Workspace switch: React renders the incoming layout (which adopts the
+    // new slug) before running the outgoing layout's cleanup. An unguarded
+    // clear would wipe the workspace context that just arrived.
+    const { unmount } = renderLayout();
+    state.currentSlug = "other";
+
+    unmount();
+
+    expect(state.currentSlug).toBe("other");
   });
 });

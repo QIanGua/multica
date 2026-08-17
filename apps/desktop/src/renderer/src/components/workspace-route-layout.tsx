@@ -6,7 +6,8 @@ import {
   workspaceBySlugOptions,
   workspaceListOptions,
 } from "@multica/core/workspace";
-import { setCurrentWorkspace } from "@multica/core/platform";
+import { getCurrentSlug, setCurrentWorkspace } from "@multica/core/platform";
+import { isWorkspaceDeletePending } from "@multica/core/workspace/pending-delete";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceSeen } from "@multica/views/workspace/use-workspace-seen";
 import { WelcomeAfterOnboarding } from "@multica/views/workspace/welcome-after-onboarding";
@@ -65,7 +66,19 @@ export function WorkspaceRouteLayout() {
   // Feed the URL slug into the platform singleton so the API client's
   // X-Workspace-Slug header and persist namespace follow the active tab.
   // setCurrentWorkspace self-dedupes on slug equality.
-  if (workspace && workspaceSlug) {
+  //
+  // Stays in render (not an effect) on purpose: children mount below this
+  // one and their queries fire in effects, which run bottom-up — an effect
+  // here would set the header AFTER the first child query already used it.
+  //
+  // The pending-delete guard exists because this write would otherwise undo
+  // the delete flow's own cleanup (MUL-6231 / #7021). useDeleteWorkspace
+  // clears the singleton and navigates away, but this layout is subscribed to
+  // the overlay store, so opening the new-workspace overlay re-renders it
+  // while the deleted workspace is STILL in the list cache (the invalidation
+  // refetch is a network round-trip). Without the guard we write the dead slug
+  // straight back over the cleanup.
+  if (workspace && workspaceSlug && !isWorkspaceDeletePending(workspace.id)) {
     setCurrentWorkspace(workspaceSlug, workspace.id);
   }
 
@@ -87,6 +100,30 @@ export function WorkspaceRouteLayout() {
     const validSlugs = new Set(wsList.map((w) => w.slug));
     useTabStore.getState().validateWorkspaceSlugs(validSlugs);
   }, [user, listFetched, workspace, hasBeenSeen, wsList]);
+
+  // Release the platform singleton when this layout's workspace stops
+  // resolving, and again when the layout unmounts. Nothing else owned that
+  // lifecycle: the singleton used to keep pointing at a deleted workspace
+  // indefinitely, which is how the shell ended up holding workspace-scoped
+  // chrome over a workspace that no longer existed (MUL-6231 / #7021).
+  //
+  // Both paths check `getCurrentSlug() === workspaceSlug` first. On a
+  // workspace switch React renders the incoming layout — which sets the
+  // singleton to the NEW slug — before running the outgoing one's cleanup, so
+  // an unguarded clear would wipe the workspace context that just arrived.
+  useEffect(() => {
+    if (!listFetched) return;
+    if (workspace) return;
+    if (getCurrentSlug() !== workspaceSlug) return;
+    setCurrentWorkspace(null, null);
+  }, [listFetched, workspace, workspaceSlug]);
+
+  useEffect(() => {
+    return () => {
+      if (getCurrentSlug() !== workspaceSlug) return;
+      setCurrentWorkspace(null, null);
+    };
+  }, [workspaceSlug]);
 
   if (isAuthLoading) return null;
   if (!user) return null;
