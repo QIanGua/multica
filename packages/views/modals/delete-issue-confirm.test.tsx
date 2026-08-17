@@ -36,11 +36,10 @@ vi.mock("../i18n", () => ({
     ) => {
       const raw = sel({
         delete_issue: {
-          title: "Delete issue?",
-          description: "This cannot be undone.",
-          description_named: "Permanently delete {{identifier}}.",
+          title: "Delete this issue?",
+          title_named: "Delete {{identifier}}?",
+          description: "Comments and attachments go with it.",
           sub_issues_detached: "{{count}} sub-issues become standalone.",
-          hint: "Any member can delete issues.",
           cancel: "Cancel",
           confirm: "Delete",
           deleting: "Deleting...",
@@ -143,7 +142,11 @@ describe("DeleteIssueConfirmModal", () => {
     mockDelete.mockRejectedValueOnce(new Error("nope"));
     const adapter = makeAdapter({ canGoBack: () => true });
 
-    renderModal(makeAdapter({ canGoBack: () => true }), {
+    // The adapter under assertion must be the one the component got: rendering
+    // a second `makeAdapter()` here left the assertions below pointing at an
+    // object no component ever touched, so they passed no matter what the
+    // failure path did.
+    renderModal(adapter, {
       issueId: "issue-1",
       onDeletedFallbackPath: "/acme/issues",
     });
@@ -155,18 +158,19 @@ describe("DeleteIssueConfirmModal", () => {
   });
 
   // Opened as often from a row's context menu as from the issue's own page,
-  // where a generic sentence gives the user nothing to check their aim
-  // against before a permanent delete.
-  it("names the issue being deleted", () => {
+  // where a generic heading gives the user nothing to check their aim against
+  // before a permanent delete. It goes in the title so naming the subject
+  // costs no extra line of prose.
+  it("names the issue being deleted in the title", () => {
     renderModal(makeAdapter(), { issueId: "issue-1", identifier: "TST-1" });
 
-    expect(screen.getByText("Permanently delete TST-1.")).toBeInTheDocument();
+    expect(screen.getByText("Delete TST-1?")).toBeInTheDocument();
   });
 
-  it("falls back to the unnamed copy when no identifier came through", () => {
+  it("falls back to the unnamed title when no identifier came through", () => {
     renderModal(makeAdapter(), { issueId: "issue-1" });
 
-    expect(screen.getByText("This cannot be undone.")).toBeInTheDocument();
+    expect(screen.getByText("Delete this issue?")).toBeInTheDocument();
   });
 
   // The server clears the children's parent link rather than deleting them, so

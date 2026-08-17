@@ -75,22 +75,22 @@ export function DeleteIssueConfirmModal({
     <AlertDialog open onOpenChange={(v) => { if (!v && !deleting) onClose(); }}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>{t(($) => $.delete_issue.title)}</AlertDialogTitle>
-          <AlertDialogDescription>
-            {/* Name the issue. This dialog is opened from row context menus as
-                often as from the issue's own page, where the generic sentence
-                gives the user nothing to check their aim against. */}
+          {/* The identifier belongs in the title, not repeated in the body: this
+              dialog is opened from row context menus as often as from the
+              issue's own page, so it has to name its subject — but naming it in
+              the heading costs no extra line of prose. */}
+          <AlertDialogTitle>
             {identifier
-              ? t(($) => $.delete_issue.description_named, { identifier })
-              : t(($) => $.delete_issue.description)}
+              ? t(($) => $.delete_issue.title_named, { identifier })
+              : t(($) => $.delete_issue.title)}
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            {t(($) => $.delete_issue.description)}
             {childCount > 0 && (
               <span className="mt-2 block">
                 {t(($) => $.delete_issue.sub_issues_detached, { count: childCount })}
               </span>
             )}
-            <span className="mt-2 block text-caption text-muted-foreground">
-              {t(($) => $.delete_issue.hint)}
-            </span>
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>

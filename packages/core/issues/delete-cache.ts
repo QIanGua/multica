@@ -64,7 +64,29 @@ export function collectDeletedIssueCacheMetadata(
     identifier ??= issue.identifier || null;
   };
 
-  collectFromRow(qc.getQueryData<Issue>(issueKeys.detail(wsId, issueId)));
+  // Every detail entry, not just the UUID-keyed one: `useCanonicalIssue`
+  // mirrors the row into an identifier-keyed alias, and that alias can be the
+  // only detail entry a session holds.
+  for (const [, data] of qc.getQueriesData<Issue>({
+    queryKey: [...issueKeys.all(wsId), "detail"],
+  })) {
+    if (data?.id === issueId) collectFromRow(data);
+  }
+
+  // The identifier resolver caches the whole Issue under the identifier key, so
+  // it can be the ONLY cache in the client that knows this issue exists — a page
+  // whose single reference to it is a `MUL-123` autolink inside a comment. A
+  // cross-client delete carries just the UUID, so without this scan the metadata
+  // has no identifier, nothing gets removed, and the chip resolves as a live
+  // link for the rest of the session.
+  for (const [key, data] of qc.getQueriesData<Issue | null>({
+    queryKey: [...issueKeys.all(wsId), "identifier"],
+  })) {
+    if (data?.id !== issueId) continue;
+    collectFromRow(data);
+    const fromKey = key[key.length - 1];
+    if (!identifier && typeof fromKey === "string") identifier = fromKey;
+  }
 
   for (const [, data] of qc.getQueriesData<ListIssuesCache>({
     queryKey: issueKeys.list(wsId),

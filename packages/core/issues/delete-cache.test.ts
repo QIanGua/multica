@@ -144,14 +144,57 @@ describe("cleanupDeletedIssueCaches — identifier-keyed entries", () => {
     expect(qc.getQueryData(issueKeys.identifier(WS_ID, "MUL-2"))).toBeDefined();
   });
 
-  it("cleans up without an identifier when no cache held the row", () => {
+  // The autolink resolver caches the whole Issue, so it can be the only cache
+  // that knows the issue exists: a page whose single reference to it is a
+  // `MUL-1` chip in a comment, deleted from another client (the WS event carries
+  // only the UUID). Nothing else can supply the identifier here.
+  it("finds the identifier from the resolver cache alone", () => {
     const qc = new QueryClient();
     qc.setQueryData(issueKeys.identifier(WS_ID, IDENTIFIER), issue());
 
+    expect(collectDeletedIssueCacheMetadata(qc, WS_ID, "issue-1").identifier)
+      .toBe(IDENTIFIER);
+
+    cleanupDeletedIssueCaches(qc, WS_ID, "issue-1");
+    expect(qc.getQueryData(issueKeys.identifier(WS_ID, IDENTIFIER))).toBeUndefined();
+  });
+
+  // Same for the identifier-keyed detail alias on its own.
+  it("finds the identifier from the detail alias alone", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(issueKeys.detail(WS_ID, IDENTIFIER), issue());
+
+    cleanupDeletedIssueCaches(qc, WS_ID, "issue-1");
+    expect(qc.getQueryData(issueKeys.detail(WS_ID, IDENTIFIER))).toBeUndefined();
+  });
+
+  it("ignores a resolver entry that resolved to a different issue", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(issueKeys.detail(WS_ID, "issue-1"), issue());
+    qc.setQueryData(
+      issueKeys.identifier(WS_ID, "MUL-9"),
+      issue({ id: "issue-9", identifier: "MUL-9" }),
+    );
+
+    cleanupDeletedIssueCaches(qc, WS_ID, "issue-1");
+
+    expect(qc.getQueryData(issueKeys.identifier(WS_ID, "MUL-9"))).toBeDefined();
+  });
+
+  it("cleans up without an identifier when no cache held the row at all", () => {
+    const qc = new QueryClient();
+
+    expect(collectDeletedIssueCacheMetadata(qc, WS_ID, "issue-1").identifier).toBeNull();
     expect(() => cleanupDeletedIssueCaches(qc, WS_ID, "issue-1")).not.toThrow();
-    // Nothing knew the identifier, so the resolver entry is out of reach here.
-    // It is the miss this metadata exists to make rare, not a claim it cannot
-    // happen — the entry still ages out via gc.
-    expect(qc.getQueryData(issueKeys.identifier(WS_ID, IDENTIFIER))).toBeDefined();
+  });
+
+  // A resolver entry that answered "no such issue" is a null payload; it must
+  // not be mistaken for the deleted row.
+  it("tolerates a null resolver payload", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(issueKeys.identifier(WS_ID, "MUL-404"), null);
+    qc.setQueryData(issueKeys.detail(WS_ID, "issue-1"), issue());
+
+    expect(() => cleanupDeletedIssueCaches(qc, WS_ID, "issue-1")).not.toThrow();
   });
 });
