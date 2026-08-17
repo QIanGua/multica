@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Crown, Shield, User, Plus, MoreHorizontal, UserMinus, Clock, X, Mail, Link, Copy, Trash2 } from "lucide-react";
+import { Crown, Shield, User, MoreHorizontal, UserMinus, Clock, X, Mail, Link, Copy, Trash2 } from "lucide-react";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { useOptionalNavigation } from "../../navigation";
 import type { MemberWithUser, MemberRole, Invitation, ShareLink } from "@multica/core/types";
@@ -9,6 +9,7 @@ import { Input } from "@multica/ui/components/ui/input";
 import { Button } from "@multica/ui/components/ui/button";
 import { Card, CardContent } from "@multica/ui/components/ui/card";
 import { Badge } from "@multica/ui/components/ui/badge";
+import { cn } from "@multica/ui/lib/utils";
 import {
   AlertDialog,
   AlertDialogContent,
@@ -51,6 +52,14 @@ const ROLE_ICONS: Record<MemberRole, typeof Crown> = {
   admin: Shield,
   member: User,
 };
+
+/** Share-link lifetimes offered in the UI, in hours; "0" means never expires. */
+const EXPIRY_OPTIONS = [
+  { value: "24", key: "expiry_24h" },
+  { value: "168", key: "expiry_7d" },
+  { value: "720", key: "expiry_30d" },
+  { value: "0", key: "expiry_never" },
+] as const;
 
 // Builds the shareable URL for a share-link invite. Prefers the navigation
 // adapter's getShareableUrl (works on desktop where window.location.origin is
@@ -242,6 +251,22 @@ function InvitationRow({
   );
 }
 
+/** Human-readable expiry for a share link: "Never expires", "Expired", or a
+ *  compact countdown matching the `{{count}}d ago` style used elsewhere. */
+function useShareLinkExpiry() {
+  const { t } = useT("settings");
+  return (expiresAt: string | null): string => {
+    if (!expiresAt) return t(($) => $.members.share_link_never_expires);
+    const ms = new Date(expiresAt).getTime() - Date.now();
+    if (ms <= 0) return t(($) => $.members.share_link_expired);
+    // Round up, so a link created moments ago with a 7-day lifetime reads as
+    // 7d rather than 6d.
+    const hours = Math.ceil(ms / 3_600_000);
+    if (hours < 24) return t(($) => $.members.share_link_expires_in_hours, { count: hours });
+    return t(($) => $.members.share_link_expires_in_days, { count: Math.max(1, Math.round(hours / 24)) });
+  };
+}
+
 function ShareLinkRow({
   link,
   onRevoke,
@@ -255,42 +280,47 @@ function ShareLinkRow({
 }) {
   const { t } = useT("settings");
   const roleConfig = useRoleLabels();
+  const formatExpiry = useShareLinkExpiry();
   const rc = roleConfig[link.role];
   const navigation = useOptionalNavigation();
   const joinUrl = buildShareLinkUrl(navigation, link.code);
 
   return (
-    <div className="flex items-center gap-3 px-4 py-3">
-      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted">
-        <Link className="h-4 w-4 text-muted-foreground" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="text-body font-medium truncate">{joinUrl}</div>
-        <div className="flex items-center gap-1 text-caption text-muted-foreground">
-          <span>{t(($) => $.members.share_link_uses, { used: link.use_count, max: link.max_uses ?? "∞" })}</span>
-          {link.expires_at && <span>· {t(($) => $.members.share_link_expires, { date: new Date(link.expires_at).toLocaleDateString() })}</span>}
+    <div className="space-y-2">
+      <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+        <Input
+          readOnly
+          value={joinUrl}
+          aria-label={t(($) => $.members.share_link_url_label)}
+          className="font-mono text-caption text-muted-foreground"
+          onFocus={(e) => e.currentTarget.select()}
+        />
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={onCopy} className="flex-1 sm:flex-none">
+            <Copy className="h-4 w-4" />
+            {t(($) => $.members.share_link_copy_button)}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled={busy}
+            onClick={onRevoke}
+            aria-label={t(($) => $.members.share_link_revoke_tooltip)}
+            title={t(($) => $.members.share_link_revoke_tooltip)}
+          >
+            <Trash2 className="h-4 w-4 text-muted-foreground" />
+          </Button>
         </div>
       </div>
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        onClick={onCopy}
-        title={t(($) => $.members.share_link_copy_tooltip)}
-      >
-        <Copy className="h-4 w-4 text-muted-foreground" />
-      </Button>
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        disabled={busy}
-        onClick={onRevoke}
-        title={t(($) => $.members.share_link_revoke_tooltip)}
-      >
-        <Trash2 className="h-4 w-4 text-muted-foreground" />
-      </Button>
-      <Badge variant="outline">
-        {rc.label}
-      </Badge>
+      <p className="text-caption text-muted-foreground">
+        <span className={cn(link.role === "admin" && "text-warning")}>
+          {t(($) => $.members.share_link_joins_as, { role: rc.label })}
+        </span>
+        {" · "}
+        {formatExpiry(link.expires_at)}
+        {" · "}
+        {t(($) => $.members.share_link_joined, { count: link.use_count })}
+      </p>
     </div>
   );
 }
@@ -329,6 +359,13 @@ export function MembersTab() {
   // Only owners/admins may list share links; skip the request for plain
   // members (the server would 403) once the current member's role is known.
   const { data: shareLinks = [] } = useQuery(shareLinkListOptions(wsId, canManageWorkspace));
+  // The server keeps a single active link per workspace, so creating one while
+  // another exists replaces it — the button says so.
+  const activeShareLink = shareLinks.length > 0;
+  const expiryLabel = (value: string) => {
+    const option = EXPIRY_OPTIONS.find((o) => o.value === value);
+    return option ? t(($) => $.members[option.key]) : value;
+  };
 
   const handleInviteMember = async () => {
     if (!workspace) return;
@@ -421,16 +458,23 @@ export function MembersTab() {
 
   const handleRevokeShareLink = (link: ShareLink) => {
     if (!workspace) return;
-    setShareLinkActionId(link.id);
-    api.revokeShareLink(workspace.id, link.id)
-      .then(() => {
-        qc.invalidateQueries({ queryKey: workspaceKeys.shareLinks(wsId) });
-        toast.success(t(($) => $.members.toast_share_link_revoked));
-      })
-      .catch((e) => {
-        toast.error(e instanceof Error ? e.message : t(($) => $.members.toast_share_link_revoke_failed));
-      })
-      .finally(() => setShareLinkActionId(null));
+    setConfirmAction({
+      title: t(($) => $.members.revoke_share_link_title),
+      description: t(($) => $.members.revoke_share_link_description),
+      variant: "destructive",
+      onConfirm: async () => {
+        setShareLinkActionId(link.id);
+        try {
+          await api.revokeShareLink(workspace.id, link.id);
+          qc.invalidateQueries({ queryKey: workspaceKeys.shareLinks(wsId) });
+          toast.success(t(($) => $.members.toast_share_link_revoked));
+        } catch (e) {
+          toast.error(e instanceof Error ? e.message : t(($) => $.members.toast_share_link_revoke_failed));
+        } finally {
+          setShareLinkActionId(null);
+        }
+      },
+    });
   };
 
   const handleCopyShareLink = (link: ShareLink) => {
@@ -465,47 +509,130 @@ export function MembersTab() {
 
         {canManageWorkspace && (
           <Card>
-            <CardContent className="space-y-3">
-              <div className="flex items-center gap-2">
-                <Plus className="h-4 w-4 text-muted-foreground" />
-                <h3 className="text-body font-medium">{t(($) => $.members.invite_title)}</h3>
+            <CardContent className="space-y-6">
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <Mail className="h-4 w-4 text-muted-foreground" />
+                  <h3 className="text-body font-medium">{t(($) => $.members.invite_title)}</h3>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-[1fr_120px_auto]">
+                  <Input
+                    type="email"
+                    name="invite-email"
+                    autoComplete="email"
+                    spellCheck={false}
+                    aria-label={t(($) => $.members.invite_email_placeholder)}
+                    value={inviteEmail}
+                    onChange={(e) => setInviteEmail(e.target.value)}
+                    placeholder={t(($) => $.members.invite_email_placeholder)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && inviteEmail.trim()) handleInviteMember();
+                    }}
+                  />
+                  <Select
+                    items={(["member", "admin"] as const).map((value) => ({
+                      value,
+                      label: roleConfig[value].label,
+                    }))}
+                    value={inviteRole}
+                    onValueChange={(value) => setInviteRole(value as MemberRole)}
+                  >
+                    <SelectTrigger aria-label={t(($) => $.members.invite_role_label)}>
+                      <SelectValue>{() => roleConfig[inviteRole].label}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="member">{roleConfig.member.label}</SelectItem>
+                      <SelectItem value="admin">{roleConfig.admin.label}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Button
+                    onClick={handleInviteMember}
+                    disabled={inviteLoading || !inviteEmail.trim()}
+                  >
+                    {inviteLoading ? t(($) => $.members.inviting) : t(($) => $.members.invite_button)}
+                  </Button>
+                </div>
               </div>
-              <div className="grid gap-3 sm:grid-cols-[1fr_120px_auto]">
-                <Input
-                  type="email"
-                  name="invite-email"
-                  autoComplete="email"
-                  spellCheck={false}
-                  aria-label={t(($) => $.members.invite_email_placeholder)}
-                  value={inviteEmail}
-                  onChange={(e) => setInviteEmail(e.target.value)}
-                  placeholder={t(($) => $.members.invite_email_placeholder)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && inviteEmail.trim()) handleInviteMember();
-                  }}
-                />
-                <Select
-                  items={(["member", "admin"] as const).map((value) => ({
-                    value,
-                    label: roleConfig[value].label,
-                  }))}
-                  value={inviteRole}
-                  onValueChange={(value) => setInviteRole(value as MemberRole)}
-                >
-                  <SelectTrigger size="sm">
-                    <SelectValue>{() => roleConfig[inviteRole].label}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="member">{roleConfig.member.label}</SelectItem>
-                    <SelectItem value="admin">{roleConfig.admin.label}</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Button
-                  onClick={handleInviteMember}
-                  disabled={inviteLoading || !inviteEmail.trim()}
-                >
-                  {inviteLoading ? t(($) => $.members.inviting) : t(($) => $.members.invite_button)}
-                </Button>
+
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <Link className="h-4 w-4 text-muted-foreground" />
+                  <h3 className="text-body font-medium">{t(($) => $.members.share_link_title)}</h3>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
+                  <p
+                    className={cn(
+                      "self-center text-caption",
+                      shareLinkRole === "admin" ? "text-warning" : "text-muted-foreground",
+                    )}
+                  >
+                    {shareLinkRole === "admin"
+                      ? t(($) => $.members.share_link_admin_warning)
+                      : t(($) => $.members.share_link_description)}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Select
+                      items={(["member", "admin"] as const).map((value) => ({
+                        value,
+                        label: roleConfig[value].label,
+                      }))}
+                      value={shareLinkRole}
+                      onValueChange={(value) => setShareLinkRole(value as MemberRole)}
+                    >
+                      <SelectTrigger
+                        className="w-[120px]"
+                        aria-label={t(($) => $.members.share_link_role_label)}
+                      >
+                        <SelectValue>{() => roleConfig[shareLinkRole].label}</SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="member">{roleConfig.member.label}</SelectItem>
+                        <SelectItem value="admin">{roleConfig.admin.label}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Select
+                      items={EXPIRY_OPTIONS.map(({ value, key }) => ({
+                        value,
+                        label: t(($) => $.members[key]),
+                      }))}
+                      value={shareLinkExpiry}
+                      onValueChange={(v) => v && setShareLinkExpiry(v)}
+                    >
+                      <SelectTrigger
+                        className="w-[120px]"
+                        aria-label={t(($) => $.members.share_link_expiry_label)}
+                      >
+                        <SelectValue>{() => expiryLabel(shareLinkExpiry)}</SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {EXPIRY_OPTIONS.map(({ value, key }) => (
+                          <SelectItem key={value} value={value}>{t(($) => $.members[key])}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      variant={activeShareLink ? "outline" : "default"}
+                      onClick={handleCreateShareLink}
+                      disabled={shareLinkLoading}
+                      className="shrink-0"
+                    >
+                      {shareLinkLoading
+                        ? t(($) => $.members.share_link_creating)
+                        : activeShareLink
+                          ? t(($) => $.members.share_link_replace_button)
+                          : t(($) => $.members.share_link_create_button)}
+                    </Button>
+                  </div>
+                </div>
+                {shareLinks.map((link) => (
+                  <ShareLinkRow
+                    key={link.id}
+                    link={link}
+                    onRevoke={() => handleRevokeShareLink(link)}
+                    busy={shareLinkActionId === link.id}
+                    onCopy={() => handleCopyShareLink(link)}
+                  />
+                ))}
               </div>
             </CardContent>
           </Card>
@@ -547,88 +674,6 @@ export function MembersTab() {
               </div>
             ))}
           </SettingsCard>
-        </SettingsSection>
-      )}
-
-      {canManageWorkspace && (
-        <SettingsSection title={t(($) => $.members.share_links_title, { count: shareLinks.length })}>
-          <Card>
-            <CardContent className="space-y-3">
-              <div className="flex items-center gap-2">
-                <Link className="h-4 w-4 text-muted-foreground" />
-                <h3 className="text-body font-medium">{t(($) => $.members.share_links_create_title)}</h3>
-              </div>
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                <div className="flex min-w-0 flex-1 basis-40 items-center gap-2">
-                  <span className="text-body text-muted-foreground shrink-0">{t(($) => $.members.role_field)}</span>
-                  <Select
-                    items={(["member", "admin"] as const).map((value) => ({
-                      value,
-                      label: roleConfig[value].label,
-                    }))}
-                    value={shareLinkRole}
-                    onValueChange={(value) => setShareLinkRole(value as MemberRole)}
-                  >
-                    <SelectTrigger size="sm">
-                      <SelectValue>{() => roleConfig[shareLinkRole].label}</SelectValue>
-                    </SelectTrigger>
-                    <SelectContent className="min-w-0">
-                      <SelectItem value="member">{roleConfig.member.label}</SelectItem>
-                      <SelectItem value="admin">{roleConfig.admin.label}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="flex min-w-0 flex-1 basis-40 items-center gap-2">
-                  <span className="text-body text-muted-foreground shrink-0">{t(($) => $.members.expiry_field)}</span>
-                  <Select
-                    items={[
-                      { value: "24", label: t(($) => $.members.expiry_24h) },
-                      { value: "168", label: t(($) => $.members.expiry_7d) },
-                      { value: "720", label: t(($) => $.members.expiry_30d) },
-                      { value: "0", label: t(($) => $.members.expiry_never) },
-                    ]}
-                    value={shareLinkExpiry}
-                    onValueChange={(v) => v && setShareLinkExpiry(v)}
-                  >
-                    <SelectTrigger size="sm">
-                      <SelectValue>{() => {
-                        const opts: Record<string, string> = {
-                          "24": t(($) => $.members.expiry_24h),
-                          "168": t(($) => $.members.expiry_7d),
-                          "720": t(($) => $.members.expiry_30d),
-                          "0": t(($) => $.members.expiry_never),
-                        };
-                        return opts[shareLinkExpiry] || shareLinkExpiry;
-                      }}</SelectValue>
-                    </SelectTrigger>
-                    <SelectContent className="min-w-0">
-                      <SelectItem value="24">{t(($) => $.members.expiry_24h)}</SelectItem>
-                      <SelectItem value="168">{t(($) => $.members.expiry_7d)}</SelectItem>
-                      <SelectItem value="720">{t(($) => $.members.expiry_30d)}</SelectItem>
-                      <SelectItem value="0">{t(($) => $.members.expiry_never)}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <Button onClick={handleCreateShareLink} disabled={shareLinkLoading} className="shrink-0">
-                  {shareLinkLoading ? t(($) => $.members.share_links_creating) : t(($) => $.members.share_links_create_button)}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-          {shareLinks.length > 0 && (
-            <SettingsCard>
-              {shareLinks.map((link) => (
-                <div key={link.id}>
-                  <ShareLinkRow
-                    link={link}
-                    onRevoke={() => handleRevokeShareLink(link)}
-                    busy={shareLinkActionId === link.id}
-                    onCopy={() => handleCopyShareLink(link)}
-                  />
-                </div>
-              ))}
-            </SettingsCard>
-          )}
         </SettingsSection>
       )}
 
