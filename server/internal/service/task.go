@@ -4794,7 +4794,7 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 							// it here too. Without it the board / status-filter
 							// caches keep showing the issue as in_progress until
 							// the next write touches it (#4648 / MUL-3782).
-							s.broadcastIssueUpdated(updatedIssue, issue.Status)
+							s.broadcastIssueUpdated(ctx, updatedIssue, issue.Status)
 						}
 					}
 				}
@@ -5403,7 +5403,7 @@ func (s *TaskService) broadcastChatDone(ctx context.Context, task db.AgentTaskQu
 // emit status-change activity / notifications. That is intentional for the
 // realtime-staleness fix (#4648 / MUL-3782); folding those side effects in
 // would mean unifying the payload type and is left as a follow-up.
-func (s *TaskService) broadcastIssueUpdated(issue db.Issue, prevStatus string) {
+func (s *TaskService) broadcastIssueUpdated(ctx context.Context, issue db.Issue, prevStatus string) {
 	prefix := s.getIssuePrefix(issue.WorkspaceID)
 	s.Bus.Publish(events.Event{
 		Type:        protocol.EventIssueUpdated,
@@ -5411,7 +5411,7 @@ func (s *TaskService) broadcastIssueUpdated(issue db.Issue, prevStatus string) {
 		ActorType:   "system",
 		ActorID:     "",
 		Payload: map[string]any{
-			"issue":          IssueToMap(issue, prefix),
+			"issue":          IssueToMapWithCategory(ctx, s.Queries, issue, prefix),
 			"status_changed": prevStatus != issue.Status,
 			"prev_status":    prevStatus,
 		},
@@ -5546,6 +5546,16 @@ func builtInStatusCategory(status string) string {
 		return status
 	}
 	return ""
+}
+
+// IssueToMapWithCategory is IssueToMap with an AUTHORITATIVE status_category,
+// resolved through the catalog so a custom status is not emitted with a blank
+// one. Background events go through here; clients treat this payload as a
+// complete issue and bucket it by category. (MUL-6243)
+func IssueToMapWithCategory(ctx context.Context, q issuestatus.Querier, issue db.Issue, issuePrefix string) map[string]any {
+	m := IssueToMap(issue, issuePrefix)
+	m["status_category"] = issuestatus.Effective(ctx, q, issue.WorkspaceID, issue.Status)
+	return m
 }
 
 func IssueToMap(issue db.Issue, issuePrefix string) map[string]any {

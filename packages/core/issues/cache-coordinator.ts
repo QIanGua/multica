@@ -1,4 +1,4 @@
-import { issueStatusCategory } from "./status-category";
+import { issueStatusCategory, normalizeStatusPatch } from "./status-category";
 import {
   hashKey,
   type InfiniteData,
@@ -265,7 +265,7 @@ export function applyIssueChange(
   qc: QueryClient,
   wsId: string,
   id: string,
-  patch: Partial<Issue>,
+  rawPatch: Partial<Issue>,
   opts: {
     /** Which membership dimensions this change actually moved — compute via
      *  `issueChangedDims` (mutations) or the server's WS flags. */
@@ -277,6 +277,10 @@ export function applyIssueChange(
   },
 ): IssueCacheChangeResult {
   const { changed, baseIssue } = opts;
+  // Normalize ONCE, at the door. Every write below is a `{...entity, ...patch}`
+  // spread, and an optimistic `{status}` patch would otherwise leave the stale
+  // status_category on the entity while the card moves buckets. (MUL-6243)
+  const patch = normalizeStatusPatch(rawPatch);
   const prevLists: [QueryKey, ListIssuesCache][] = [];
   const prevFlatLists: [QueryKey, IssueFlatCache][] = [];
   const prevTableRows: [QueryKey, IssueTableRowCache][] = [];

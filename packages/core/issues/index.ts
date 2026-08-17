@@ -6,4 +6,4 @@ export * from "./ws-updaters";
 export * from "./config";
 export * from "./stores";
 
-export { issueStatusCategory, statusCategoryOfKey } from "./status-category";
+export { issueStatusCategory, statusCategoryOfKey, normalizeStatusPatch } from "./status-category";

@@ -1128,7 +1128,6 @@ func TestCreateEventCarriesCustomStatusCategory(t *testing.T) {
 // payload exits and pins the N+1: a page of custom-status rows must resolve the
 // catalog ONCE, not once per row.
 func TestListEndpointsCarryCategoryWithoutPerRowQueries(t *testing.T) {
-	ctx := context.Background()
 	createTestCustomStatus(t, "human_review_n", issuestatus.InReview)
 	for i := range 3 {
 		mustCreateIssue(t, fmt.Sprintf("n+1 probe %d", i), "human_review_n")
@@ -1161,11 +1160,20 @@ func TestListEndpointsCarryCategoryWithoutPerRowQueries(t *testing.T) {
 		}
 	})
 
-	// The Resolver amortizes the catalog read; a per-row filler would issue one
-	// query per custom row. Asserted on the resolver directly because the
-	// handler's query count is not observable from here.
-	t.Run("one resolver serves a whole page", func(t *testing.T) {
+	// NOTE ON COVERAGE: there is deliberately no assertion here that the handler
+	// reads the catalog only once per page. pg_stat_user_tables counters lag
+	// behind the queries that produced them, so a delta around one request does
+	// not reliably distinguish one read from N — a threshold written against it
+	// passes even with a per-row filler, which would make this test claim more
+	// than it proves. Observing it properly needs a counting Querier injected
+	// into the handler, which it does not support today.
+	//
+	// What IS pinned: the Resolver amortizes reads (below), and every list site
+	// constructs its filler OUTSIDE the loop, which is what makes that
+	// amortization reach the handler.
+	t.Run("the resolver amortizes repeated lookups", func(t *testing.T) {
 		r := issuestatus.NewResolver(parseUUID(testWorkspaceID))
+		ctx := context.Background()
 		for range 10 {
 			if got := r.Effective(ctx, testHandler.Queries, "human_review_n"); got != "in_review" {
 				t.Fatalf("Effective = %q, want in_review", got)

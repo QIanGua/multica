@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 import type { Issue, IssueStatusCategory, ListIssuesCache } from "../types";
 import { insertByPosition, patchIssueInBuckets, patchNeedsInvalidation } from "./cache-helpers";
+import { statusCategoryOfKey, normalizeStatusPatch } from "./status-category";
 
 const WS_ID = "ws-1";
 
+// The server now sends status_category on EVERY issue, built-ins included, so
+// fixtures must carry it. Without it a patch that leaves a stale category on the
+// entity looks correct here while being wrong in production. (MUL-6243)
 function mk(id: string, status: Issue["status"], position: number): Issue {
   return {
     id,
+    status_category: statusCategoryOfKey(status),
     workspace_id: WS_ID,
     number: 1,
     identifier: `MUL-${id}`,
@@ -221,5 +226,42 @@ describe("patchIssueInBuckets — status key changes within a category", () => {
     expect(patchNeedsInvalidation({ status: "done" })).toBe(false);
     expect(patchNeedsInvalidation({ title: "no status change" })).toBe(false);
     expect(patchNeedsInvalidation({ status: key("x"), status_category: cat("done") })).toBe(false);
+  });
+});
+
+// The entity must never disagree with the bucket it sits in. A bare
+// `{...issue, ...patch}` kept the previous status_category, and because the
+// batch API returns only `{updated: n}` and does not refetch bucketed lists,
+// that inconsistency was permanent — the next off-window count then decremented
+// the wrong bucket.
+describe("patchIssueInBuckets — status_category follows status", () => {
+  it("built-in -> built-in rewrites the category on the entity", () => {
+    const start = cache({ todo: { issues: [mk("a", "todo", 100)], total: 1 } });
+    expect(start.byStatus.todo?.issues[0]?.status_category).toBe("todo");
+
+    const next = patchIssueInBuckets(start, "a", { status: "done" });
+    const moved = next.byStatus.done?.issues[0];
+    expect(moved?.status).toBe("done");
+    expect(moved?.status_category).toBe("done");
+    expect(ids(next, "todo")).toEqual([]);
+  });
+
+  it("built-in -> custom takes the authoritative category from the patch", () => {
+    const start = cache({ todo: { issues: [mk("a", "todo", 100)], total: 1 } });
+    const next = patchIssueInBuckets(start, "a", {
+      status: key("human_review"),
+      status_category: cat("in_review"),
+    });
+    const moved = next.byStatus.in_review?.issues[0];
+    expect(moved?.status).toBe("human_review");
+    expect(moved?.status_category).toBe("in_review");
+  });
+
+  it("never leaves the previous category on an unresolvable status", () => {
+    expect(normalizeStatusPatch({ status: key("mystery") }).status_category).toBeUndefined();
+    expect(normalizeStatusPatch({ status: "done" }).status_category).toBe("done");
+    // A patch that does not touch status is passed through untouched.
+    const untouched = { title: "renamed" };
+    expect(normalizeStatusPatch(untouched)).toBe(untouched);
   });
 });

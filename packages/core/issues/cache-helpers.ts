@@ -5,7 +5,7 @@ import type {
   ListIssuesCache,
 } from "../types";
 import { PAGINATED_CATEGORIES } from "./queries";
-import { issueStatusCategory } from "./status-category";
+import { issueStatusCategory, normalizeStatusPatch } from "./status-category";
 
 const EMPTY_BUCKET: IssueStatusBucket = { issues: [], total: 0 };
 
@@ -133,10 +133,13 @@ export function insertByPosition(issues: Issue[], issue: Issue): Issue[] {
 export function patchIssueInBuckets(
   resp: ListIssuesCache,
   id: string,
-  patch: Partial<Issue>,
+  rawPatch: Partial<Issue>,
 ): ListIssuesCache {
   const loc = findIssueLocation(resp, id);
   if (!loc) return resp;
+  // Normalized so the merged entity's status_category matches the bucket it
+  // lands in; a bare spread would keep the previous category. (MUL-6243)
+  const patch = normalizeStatusPatch(rawPatch);
   const merged: Issue = { ...loc.issue, ...patch };
 
   // Resolve the DESTINATION category before comparing anything. `loc.status` is

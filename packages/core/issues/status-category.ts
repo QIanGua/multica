@@ -33,3 +33,32 @@ export function issueStatusCategory(issue: Pick<Issue, "status" | "status_catego
 export function statusCategoryOfKey(statusKey: string): IssueStatusCategory {
   return isIssueStatusCategory(statusKey) ? statusKey : "todo";
 }
+
+/**
+ * Rewrites a patch's `status_category` to match its `status`, before the patch
+ * reaches any cache (MUL-6243).
+ *
+ * The server now sends a category on every issue, so a cached entity looks like
+ * `{status: "todo", status_category: "todo"}`. An optimistic patch carries only
+ * `{status: "done"}`, and a bare `{...issue, ...patch}` therefore keeps the
+ * STALE `status_category: "todo"` while the card moves to the done bucket. A
+ * single update self-heals when the full server response lands, but the batch
+ * API returns only `{updated: n}` and does not refetch bucketed lists — so
+ * without this the entity stays permanently inconsistent with the bucket it
+ * sits in, and the next off-window count decrements the wrong bucket.
+ *
+ * A patch that does not touch `status` is returned unchanged. A custom key with
+ * no authoritative category is left alone too: it is unresolvable, and
+ * `patchNeedsInvalidation` routes it to a refetch rather than a guess — but the
+ * stale inherited value is dropped so nothing downstream trusts it.
+ */
+export function normalizeStatusPatch(patch: Partial<Issue>): Partial<Issue> {
+  if (patch.status === undefined) return patch;
+  const category = issueStatusCategory({
+    status: patch.status,
+    status_category: patch.status_category,
+  });
+  // Undefined rather than the inherited value: an unresolvable status must not
+  // silently keep the previous category.
+  return { ...patch, status_category: category ?? undefined };
+}

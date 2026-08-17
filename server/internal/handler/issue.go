@@ -2864,6 +2864,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	// payload builder and the HTTP response share the same value.
 	prefix := h.getIssuePrefix(r.Context(), wsUUID)
 
+	// One filler for this create, shared by the broadcast payload and the HTTP
+	// response below, so a custom-status create reads the catalog once per
+	// request rather than once per payload. (MUL-6243)
+	fillCreated := h.newStatusCategoryFiller(r.Context(), wsUUID)
+
 	// Analytics agent ID: assignee agent when the issue is being assigned
 	// to an agent, otherwise the creator agent for agent-authored issues.
 	// Resolved here (not in the service) because creator identity is HTTP-side.
@@ -2915,8 +2920,10 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			payload := issueToResponse(issue, prefix)
 			// The event other tabs receive must carry the category too — filling
 			// only the HTTP response below is too late for them, and a create
-			// they cannot bucket forces a full refetch. (MUL-6243)
-			h.fillStatusCategory(r.Context(), issue.WorkspaceID, &payload)
+			// they cannot bucket forces a full refetch. Shares one filler with
+			// the HTTP response so a custom-status create reads the catalog once
+			// per request, not once per payload. (MUL-6243)
+			fillCreated(&payload)
 			payload.Attachments = buildAttachmentResponses(atts)
 			// Carry the authoritative label snapshot so every online client
 			// renders the new issue already labeled. Non-nil (even empty)
@@ -2966,7 +2973,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 
 	resp := issueToResponse(issue, prefix)
-	h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
+	fillCreated(&resp)
 	resp.Attachments = buildAttachmentResponses(res.Attachments)
 	// Echo the authoritative labels attached in the create transaction. Always
 	// non-nil (empty slice when none) so a newer client can tell the backend
