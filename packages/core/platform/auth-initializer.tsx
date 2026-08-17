@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { getApi } from "../api";
 import { ApiError } from "../api/client";
@@ -12,10 +12,7 @@ import {
   resetAnalytics,
 } from "../analytics";
 import { configStore } from "../config";
-import {
-  workspaceKeys,
-  workspaceListOptions,
-} from "../workspace/queries";
+import { workspaceListOptions } from "../workspace/queries";
 import { createLogger } from "../logger";
 import { defaultStorage } from "./storage";
 import { setCurrentWorkspace } from "./workspace-storage";
@@ -24,8 +21,14 @@ import type { StorageAdapter } from "../types/storage";
 import type { User } from "../types";
 
 const logger = createLogger("auth");
-const AUTH_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
-const noopRetry = () => {};
+const AUTH_RETRY_DELAYS_MS = [
+  1_000,
+  2_000,
+  4_000,
+  8_000,
+  16_000,
+  30_000,
+] as const;
 
 export function AuthInitializer({
   children,
@@ -43,17 +46,16 @@ export function AuthInitializer({
   identity?: ClientIdentity;
 }) {
   const qc = useQueryClient();
-  const [retryGeneration, setRetryGeneration] = useState(0);
+  const retryGeneration = useAuthStore((state) => state.retryGeneration);
+  const configLoadedRef = useRef(false);
+  const configRequestRef = useRef<Promise<boolean> | null>(null);
+  const authRecoveryPendingRef = useRef(false);
 
-  useEffect(() => {
-    const api = getApi();
+  const loadConfig = useCallback((): Promise<boolean> => {
+    if (configLoadedRef.current) return Promise.resolve(true);
+    if (configRequestRef.current) return configRequestRef.current;
 
-    // Stamp attribution before anything else — the signup event (server-side)
-    // reads this cookie, so it has to be present before the user hits submit.
-    captureSignupSource();
-
-    // Fetch app config (CDN domain, PostHog key, …) in the background — non-blocking.
-    api
+    const request = getApi()
       .getConfig()
       .then((cfg) => {
         if (cfg.cdn_domain) {
@@ -86,30 +88,25 @@ export function AuthInitializer({
             environment: cfg.analytics_environment,
           });
         }
+        configLoadedRef.current = true;
+        return true;
       })
-      .catch(() => {
-        /* config is optional — legacy file card matching degrades gracefully */
+      .catch(() => false)
+      .finally(() => {
+        configRequestRef.current = null;
       });
-  // Configuration is boot-scoped; auth retries must not restart this request.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    configRequestRef.current = request;
+    return request;
+  }, [identity?.version]);
 
   useEffect(() => {
-    const retry = () => {
-      useAuthStore.setState({
-        isLoading: true,
-        status: "authenticating",
-      });
-      setRetryGeneration((generation) => generation + 1);
-    };
-    useAuthStore.setState({ retryAuthentication: retry });
+    // Stamp attribution before anything else — the signup event (server-side)
+    // reads this cookie, so it has to be present before the user hits submit.
+    captureSignupSource();
 
-    return () => {
-      if (useAuthStore.getState().retryAuthentication === retry) {
-        useAuthStore.setState({ retryAuthentication: noopRetry });
-      }
-    };
-  }, []);
+    // Fetch app config (CDN domain, PostHog key, …) in the background — non-blocking.
+    void loadConfig();
+  }, [loadConfig]);
 
   useEffect(() => {
     const api = getApi();
@@ -128,6 +125,15 @@ export function AuthInitializer({
         status: "authenticated",
       });
       identifyAnalytics(user.id, { email: user.email, name: user.name });
+      if (authRecoveryPendingRef.current) {
+        authRecoveryPendingRef.current = false;
+        // A network-not-ready boot can fail both auth and config requests.
+        // If the boot-scoped config request is still in flight, wait for it;
+        // when it failed, make one fresh request now that auth has recovered.
+        void loadConfig().then((loaded) => {
+          if (!loaded && !cancelled) void loadConfig();
+        });
+      }
     };
 
     const onAuthFailure = () => {
@@ -142,6 +148,7 @@ export function AuthInitializer({
 
     const rejectSession = () => {
       settled = true;
+      window.removeEventListener("online", retryNow);
       if (retryTimer !== undefined) clearTimeout(retryTimer);
       if (!cookieAuth) {
         setCurrentWorkspace(null, null);
@@ -150,27 +157,25 @@ export function AuthInitializer({
     };
 
     const scheduleRetry = (attempt: () => Promise<void>) => {
-      if (cancelled || settled || retryIndex >= AUTH_RETRY_DELAYS_MS.length) {
-        return;
-      }
+      if (cancelled || settled) return;
       const delay = AUTH_RETRY_DELAYS_MS[retryIndex];
-      retryIndex += 1;
+      retryIndex = Math.min(retryIndex + 1, AUTH_RETRY_DELAYS_MS.length - 1);
       retryTimer = setTimeout(() => {
         retryTimer = undefined;
         void attempt();
       }, delay);
     };
 
-    const warmDesktopWorkspaces = () => {
+    const warmWorkspaces = () => {
       void qc.fetchQuery(workspaceListOptions()).catch((err: unknown) => {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
           rejectSession();
           return;
         }
-        // The authenticated desktop shell observes this query directly.
-        // React Query owns its retry and refetch-on-reconnect behavior.
-        logger.error("desktop workspace bootstrap failed", err);
+        // Workspace consumers observe this query directly. React Query owns
+        // retries and refetch-on-reconnect independently from identity auth.
+        logger.error("workspace bootstrap failed", err);
       });
     };
 
@@ -186,25 +191,13 @@ export function AuthInitializer({
         const user = await api.getMe();
         if (cancelled) return;
 
-        if (identity?.platform === "desktop") {
-          // Desktop consumers own the workspace-list query and explicitly
-          // gate destructive tab/overlay decisions on query success. Publish
-          // the verified user immediately, then let React Query recover the
-          // independent workspace request.
-          settled = true;
-          onAuthSuccess(user);
-          warmDesktopWorkspaces();
-          return;
-        }
-
-        // Web routes currently rely on this cache being seeded before auth is
-        // published. Preserve that ordering while still treating a transient
-        // workspace failure as recoverable rather than as a logout.
-        const wsList = await api.listWorkspaces();
-        if (cancelled) return;
-        qc.setQueryData(workspaceKeys.list(), wsList);
+        // Identity verification and workspace loading are separate concerns
+        // on both platforms. Publish the verified user immediately; route and
+        // shell consumers own the shared workspace query and its recovery.
         settled = true;
+        window.removeEventListener("online", retryNow);
         onAuthSuccess(user);
+        warmWorkspaces();
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -213,6 +206,7 @@ export function AuthInitializer({
         }
 
         logger.error("auth init temporarily unavailable", err);
+        authRecoveryPendingRef.current = true;
         useAuthStore.setState({
           user: null,
           isLoading: true,
@@ -242,8 +236,6 @@ export function AuthInitializer({
       void attempt();
     };
 
-    window.addEventListener("online", retryNow);
-
     if (!cookieAuth) {
       const token = storage.getItem("multica_token");
       if (!token) {
@@ -256,9 +248,11 @@ export function AuthInitializer({
         });
       } else {
         api.setToken(token);
+        window.addEventListener("online", retryNow);
         void attempt();
       }
     } else {
+      window.addEventListener("online", retryNow);
       void attempt();
     }
 

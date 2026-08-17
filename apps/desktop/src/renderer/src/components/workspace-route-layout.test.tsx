@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render } from "@testing-library/react";
+import { act, render, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
 // vi.hoisted shared state for all the stores / hooks the layout consumes.
@@ -8,6 +8,7 @@ const state = vi.hoisted(() => ({
   isAuthLoading: false,
   overlay: null as { type: string } | null,
   workspace: null as { id: string; slug: string } | null,
+  workspaceError: false,
   listFetched: true,
   wsList: [] as { id: string; slug: string }[],
   workspaceSeen: true,
@@ -36,7 +37,10 @@ vi.mock("@multica/core/workspace", async () => {
     ...actual,
     workspaceBySlugOptions: () => ({
       queryKey: ["workspace-by-slug"],
-      queryFn: async () => state.workspace,
+      queryFn: async () => {
+        if (state.workspaceError) throw new Error("temporary failure");
+        return state.workspace;
+      },
     }),
     workspaceListOptions: () => ({
       queryKey: ["workspace-list"],
@@ -107,7 +111,7 @@ function renderLayout() {
   // synchronously — the real hook reads from cache.
   qc.setQueryData(["workspace-by-slug"], state.workspace);
   qc.setQueryData(["workspace-list"], state.wsList);
-  return render(
+  const result = render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={["/acme/issues"]}>
         <Routes>
@@ -118,6 +122,7 @@ function renderLayout() {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...result, queryClient: qc };
 }
 
 beforeEach(() => {
@@ -125,6 +130,7 @@ beforeEach(() => {
   state.isAuthLoading = false;
   state.overlay = null;
   state.workspace = { id: "ws-1", slug: "acme" };
+  state.workspaceError = false;
   state.listFetched = true;
   state.wsList = [{ id: "ws-1", slug: "acme" }];
   state.workspaceSeen = true;
@@ -143,5 +149,26 @@ describe("WorkspaceRouteLayout", () => {
     const { queryByTestId } = renderLayout();
     expect(queryByTestId(state.modalAriaLabel)).toBeNull();
     expect(state.modalRenders).toBe(0);
+  });
+
+  it("keeps workspace content mounted when a background refetch fails", async () => {
+    const { queryByTestId, queryClient } = renderLayout();
+    expect(queryByTestId("outlet")).not.toBeNull();
+
+    state.workspaceError = true;
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: ["workspace-by-slug"] });
+    });
+
+    await waitFor(() => {
+      expect(queryClient.getQueryState(["workspace-by-slug"])?.status).toBe(
+        "error",
+      );
+    });
+    expect(queryClient.getQueryData(["workspace-by-slug"])).toEqual({
+      id: "ws-1",
+      slug: "acme",
+    });
+    expect(queryByTestId("outlet")).not.toBeNull();
   });
 });

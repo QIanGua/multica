@@ -148,7 +148,7 @@ describe("AuthInitializer recovery", () => {
     expect(onLogout).not.toHaveBeenCalled();
   });
 
-  it("stops automatic retries after the bounded backoff budget", async () => {
+  it("continues automatic retries at the capped backoff interval", async () => {
     vi.useFakeTimers();
     const getMe = vi.fn().mockRejectedValue(new TypeError("still offline"));
     const api = makeApi({ getMe });
@@ -165,9 +165,9 @@ describe("AuthInitializer recovery", () => {
     expect(getMe).toHaveBeenCalledTimes(6);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(30_000);
     });
-    expect(getMe).toHaveBeenCalledTimes(6);
+    expect(getMe).toHaveBeenCalledTimes(7);
     expect(onLogout).not.toHaveBeenCalled();
   });
 
@@ -188,11 +188,10 @@ describe("AuthInitializer recovery", () => {
     expect(onLogout).not.toHaveBeenCalled();
   });
 
-  it("retries cookie auth without publishing a false logout", async () => {
+  it("publishes web auth independently when workspace loading fails", async () => {
     const listWorkspaces = vi
       .fn()
-      .mockRejectedValueOnce(new TypeError("backend restarting"))
-      .mockResolvedValue(fakeWorkspaces);
+      .mockRejectedValue(new TypeError("backend restarting"));
     const api = makeApi({ listWorkspaces });
     const { onLogout, queryClient } = renderInitializer({
       api,
@@ -201,20 +200,36 @@ describe("AuthInitializer recovery", () => {
     });
 
     await waitFor(() => {
+      expect(useAuthStore.getState().status).toBe("authenticated");
+      expect(queryClient.getQueryState(workspaceKeys.list())?.status).toBe(
+        "error",
+      );
+    });
+    expect(useAuthStore.getState().user).toEqual(fakeUser);
+    expect(onLogout).not.toHaveBeenCalled();
+  });
+
+  it("reloads app config after auth recovers from a transient failure", async () => {
+    const getConfig = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("network unavailable"))
+      .mockResolvedValue({ feature_flags: { recovered: true } });
+    const getMe = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("network unavailable"))
+      .mockResolvedValue(fakeUser);
+    const api = makeApi({ getConfig, getMe });
+    renderInitializer({ api });
+
+    await waitFor(() => {
       expect(useAuthStore.getState().status).toBe("recovering");
     });
-    expect(useAuthStore.getState().user).toBeNull();
-    expect(onLogout).not.toHaveBeenCalled();
-
-    act(() => window.dispatchEvent(new Event("online")));
+    act(() => useAuthStore.getState().retryAuthentication());
 
     await waitFor(() => {
       expect(useAuthStore.getState().status).toBe("authenticated");
+      expect(getConfig).toHaveBeenCalledTimes(2);
     });
-    expect(queryClient.getQueryData(workspaceKeys.list())).toEqual(
-      fakeWorkspaces,
-    );
-    expect(onLogout).not.toHaveBeenCalled();
   });
 
   it("publishes a definitive logout for a genuine 401", async () => {

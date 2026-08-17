@@ -52,10 +52,13 @@ export function WorkspaceRouteLayout() {
   // code and violated MUL-4741 invariant 1 (only the Coordinator navigates).
   // The `!user` early return below keeps the defense without navigating.
 
-  const { data: workspace, isSuccess: listReady } = useQuery({
+  const { data: workspace } = useQuery({
     ...workspaceBySlugOptions(workspaceSlug ?? ""),
     enabled: !!user && !!workspaceSlug,
   });
+  // A failed background refetch retains the last authoritative selection.
+  // Only undefined means the shared workspace list has never resolved.
+  const listReady = workspace !== undefined;
 
   const { data: wsList } = useQuery({
     ...workspaceListOptions(),

@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { User, StorageAdapter } from "../types";
 import { identify as identifyAnalytics, resetAnalytics } from "../analytics";
-import { ApiError, type ApiClient } from "../api/client";
+import type { ApiClient } from "../api/client";
 import { setCurrentWorkspace } from "../platform/workspace-storage";
 
 export interface AuthStoreOptions {
@@ -23,8 +23,8 @@ export interface AuthState {
   user: User | null;
   isLoading: boolean;
   status: AuthStatus;
+  retryGeneration: number;
 
-  initialize: () => Promise<void>;
   retryAuthentication: () => void;
   sendCode: (email: string) => Promise<void>;
   verifyCode: (email: string, code: string) => Promise<User>;
@@ -42,58 +42,15 @@ export function createAuthStore(options: AuthStoreOptions) {
     user: null,
     isLoading: true,
     status: "authenticating",
+    retryGeneration: 0,
 
-    initialize: async () => {
-      if (cookieAuth) {
-        // In cookie mode, the HttpOnly cookie is sent automatically.
-        // Try to fetch the current user — if the cookie exists the server will accept it.
-        try {
-          const user = await api.getMe();
-          set({ user, isLoading: false, status: "authenticated" });
-        } catch (err) {
-          const unauthorized = err instanceof ApiError && err.status === 401;
-          set({
-            user: null,
-            isLoading: !unauthorized,
-            status: unauthorized ? "unauthenticated" : "recovering",
-          });
-        }
-        return;
-      }
-
-      // Token mode: read from localStorage (Electron / legacy).
-      const token = storage.getItem("multica_token");
-      if (!token) {
-        set({ isLoading: false, status: "unauthenticated" });
-        return;
-      }
-
-      api.setToken(token);
-
-      try {
-        const user = await api.getMe();
-        set({ user, isLoading: false, status: "authenticated" });
-      } catch (err) {
-        // Only clear the stored token on a genuine auth failure (401). For
-        // transient errors — network blips, backend rolling restarts, 5xx,
-        // aborted fetches — keep the token so the next initialize() (next
-        // page load or focus-refresh) can retry. The 401 path's token
-        // cleanup is handled upstream by ApiClient.handleUnauthorized via
-        // the onUnauthorized callback; we only need to reset the in-memory
-        // user + workspace state here.
-        if (err instanceof ApiError && err.status === 401) {
-          setCurrentWorkspace(null, null);
-          set({ user: null, isLoading: false, status: "unauthenticated" });
-          return;
-        }
-        set({ user: null, isLoading: true, status: "recovering" });
-      }
+    retryAuthentication: () => {
+      set((state) => ({
+        isLoading: true,
+        status: "authenticating",
+        retryGeneration: state.retryGeneration + 1,
+      }));
     },
-
-    // AuthInitializer installs the live retry callback while it is mounted.
-    // Keeping the action in the store lets platform UIs request recovery
-    // without importing browser-specific retry machinery into this module.
-    retryAuthentication: () => {},
 
     sendCode: async (email: string) => {
       await api.sendCode(email);

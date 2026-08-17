@@ -28,6 +28,10 @@ import { DesktopClientUsageReporter } from "./platform/client-usage-reporter";
 import { DiagnosticRouteReporter } from "./platform/diagnostic-route-reporter";
 import { flushFreezeBreadcrumb } from "./freeze-flush";
 import { DesktopAuthSessionBridge } from "./platform/auth-session-bridge";
+import {
+  hasAuthoritativeWorkspaceList,
+  shouldShowWorkspaceListRecovery,
+} from "./workspace-list-gate";
 
 // BCP-47 region tags for the <html lang> attribute, mirroring
 // apps/web/app/layout.tsx HTML_LANG. index.html ships a static lang="en";
@@ -185,14 +189,22 @@ function AppContent() {
   // daemon restart here — daemon-manager already restarts on user change
   // via syncToken.
   const {
-    data: workspaces = [],
-    isSuccess: workspaceListReady,
+    data: workspaceList,
     isError: workspaceListFailed,
     isFetching: workspaceListRetrying,
     refetch: retryWorkspaceList,
   } = useQuery({
     ...workspaceListOptions(),
     enabled: !!user,
+  });
+  const workspaces = useMemo(() => workspaceList ?? [], [workspaceList]);
+  // Cached data remains authoritative when a background refetch fails.
+  // Only the initial no-data state may block or drive destructive cleanup.
+  const workspaceListReady = hasAuthoritativeWorkspaceList(workspaceList);
+  const workspaceListUnavailable = shouldShowWorkspaceListRecovery({
+    authenticated: !!user,
+    workspaces: workspaceList,
+    failed: workspaceListFailed,
   });
   const wsCount = workspaces.length;
   const hasOnboarded = useHasOnboarded();
@@ -276,9 +288,8 @@ function AppContent() {
   // TabBar is subscribed to. useLayoutEffect flushes both renders before
   // the user sees anything, so there's no visible flicker.
   //
-  // Gate on query success, not merely completion: both pending and failed
-  // queries expose the `[]` fallback above. Treating a failed request as an
-  // authoritative empty list would wipe every persisted workspace tab.
+  // Gate on authoritative data: pending and initial errors expose no data,
+  // while a failed background refetch retains the last successful list.
   useLayoutEffect(() => {
     if (!workspaceListReady) return;
     const validSlugs = new Set(workspaces.map((w) => w.slug));
@@ -320,7 +331,7 @@ function AppContent() {
     );
   }
 
-  if (user && workspaceListFailed) {
+  if (workspaceListUnavailable) {
     return (
       <DesktopAuthRecoveryPage
         isRetrying={workspaceListRetrying}
