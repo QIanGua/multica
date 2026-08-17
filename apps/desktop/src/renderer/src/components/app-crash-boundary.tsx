@@ -1,7 +1,8 @@
 import type { ReactNode } from "react";
 import { ErrorBoundary } from "@multica/ui/components/common/error-boundary";
 import { Button } from "@multica/ui/components/ui/button";
-import { captureEvent } from "@multica/core/analytics";
+import { captureException } from "@multica/core/analytics";
+import { DragStrip } from "@multica/views/platform";
 
 /**
  * Last-resort boundary around the entire desktop renderer.
@@ -27,11 +28,15 @@ import { captureEvent } from "@multica/core/analytics";
 export function AppCrashBoundary({ children }: { children: ReactNode }) {
   return (
     <ErrorBoundary
+      // captureException, not captureEvent: only `$exception` events pass
+      // through initAnalytics' before_send hook, which drops known-benign
+      // noise, runs redactExceptionProperties over the message and stack, and
+      // fuses repeats via shouldDropException. A plain event would ship a raw
+      // message and stack — which can carry emails, tokenised URLs or typed
+      // user input — straight to storage. Same entry point the web
+      // global-error route uses.
       onError={(error) => {
-        captureEvent("desktop_renderer_crash", {
-          message: error.message,
-          stack: error.stack?.slice(0, 2000),
-        });
+        captureException(error, { source: "desktop-renderer-boundary" });
       }}
       fallback={({ error }) => <CrashFallback error={error} />}
     >
@@ -40,24 +45,40 @@ export function AppCrashBoundary({ children }: { children: ReactNode }) {
   );
 }
 
+/**
+ * Full-window view outside the dashboard shell, so it owes the same window
+ * chrome every other one does: `<DragStrip />` as the first flex child, or the
+ * user loses the draggable top edge exactly when the app is least usable. The
+ * Reload button sits inside the centred `flex-1` region, well clear of the top
+ * 48px, so it needs no `WebkitAppRegion: "no-drag"` opt-out.
+ *
+ * Everything rendered here has to be safe under a broken tree: an error thrown
+ * while rendering a fallback is NOT caught by its own boundary and would blank
+ * the window all over again. DragStrip and Button are static markup with no
+ * hooks, stores or workspace context.
+ */
 function CrashFallback({ error }: { error: Error }) {
   return (
-    <div
-      role="alert"
-      className="flex h-screen items-center justify-center bg-background p-8 text-foreground"
-    >
-      <div className="max-w-xl rounded-lg border bg-card p-6 shadow-sm">
-        <h1 className="text-title font-semibold">Something went wrong</h1>
-        <p className="mt-3 text-body text-muted-foreground">
-          Multica Desktop hit an unexpected error and could not keep rendering.
-          Reloading usually recovers — your work is stored on the server.
-        </p>
-        <pre className="mt-4 max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 text-caption text-muted-foreground">
-          {error.message || "An unexpected error occurred."}
-        </pre>
-        <Button className="mt-4" onClick={() => window.location.reload()}>
-          Reload
-        </Button>
+    <div className="flex h-screen flex-col bg-background text-foreground">
+      <DragStrip />
+      <div
+        role="alert"
+        className="flex flex-1 items-center justify-center overflow-auto p-8"
+      >
+        <div className="max-w-xl rounded-lg border bg-card p-6 shadow-sm">
+          <h1 className="text-title font-semibold">Something went wrong</h1>
+          <p className="mt-3 text-body text-muted-foreground">
+            Multica Desktop hit an unexpected error and could not keep
+            rendering. Reloading usually recovers — your work is stored on the
+            server.
+          </p>
+          <pre className="mt-4 max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 text-caption text-muted-foreground">
+            {error.message || "An unexpected error occurred."}
+          </pre>
+          <Button className="mt-4" onClick={() => window.location.reload()}>
+            Reload
+          </Button>
+        </div>
       </div>
     </div>
   );
