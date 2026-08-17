@@ -134,28 +134,94 @@ func hermesInsideMcpAdd(args []string, index int) bool {
 	return false
 }
 
-// StripAllHermesProfileArgs removes every profile selection from args, not just
-// the one Hermes would act on today.
+// hermesACPSubcommand is the subcommand the backend always launches with. It
+// sits between the runtime's launch prefix and the agent's custom args, and it
+// is an ordinary argv token to Hermes' own parser — which is why the daemon
+// cannot reason about a profile selection without it.
+const hermesACPSubcommand = "acp"
+
+// hermesCLIArgsFrom assembles the argv the backend passes after the executable
+// and its launch prefix, from custom args that are already filtered.
+func hermesCLIArgsFrom(filteredCustomArgs []string) []string {
+	args := make([]string, 0, 1+len(filteredCustomArgs))
+	args = append(args, hermesACPSubcommand)
+	return append(args, filteredCustomArgs...)
+}
+
+// hermesCLIArgs is what hermesBackend.Execute passes to the launch boundary.
+func hermesCLIArgs(customArgs []string, logger *slog.Logger) []string {
+	return hermesCLIArgsFrom(filterCustomArgs(customArgs, hermesBlockedArgs, logger))
+}
+
+// HermesLaunchArgv returns the exact argv Hermes will parse: the runtime's
+// launch prefix, then `acp`, then the agent's custom args after the same
+// blocked-flag filtering the backend applies.
 //
-// Removing only the first is not enough once the overlay exists. Hermes honours
-// the first selection and ignores the rest, so stripping that one promotes the
-// next occurrence to first — and it would re-point HERMES_HOME straight past
-// the overlay the daemon just built. That matters more since a custom runtime
-// profile's fixed_args became a launch prefix (GH #7046): the prefix and
-// custom_args are two separately-configured argv regions that concatenate into
-// one Hermes command line, so "two selections" is now an ordinary
-// configuration rather than a user mistake.
+// The daemon resolves the profile selection from this rather than from a
+// hand-assembled approximation. Concatenating prefix and custom args alone
+// silently disagrees with the real command line, because the `acp` token
+// participates in Hermes' scan: with fixed_args `--model` and custom_args
+// `-p research`, the approximation reads `-p` as `--model`'s value and finds
+// no selection, while the real `--model acp -p research` skips `--model acp`
+// and selects `research`. The overlay would then be seeded from the default
+// home while the process runs under a different profile's config.
+func HermesLaunchArgv(launchPrefix, customArgs []string, logger *slog.Logger) []string {
+	return Command{Prefix: launchPrefix}.Argv(hermesCLIArgs(customArgs, logger)...)
+}
+
+// StripHermesProfileSelectors removes every profile selection from the argv
+// Hermes will parse and hands each surviving token back to the region it came
+// from — launch prefix or custom args.
 //
-// A selection Hermes itself discards — an invalid profile value, which makes
-// ParseHermesProfileArgs report nothing found — is left in place, because it
-// redirects nothing.
-func StripAllHermesProfileArgs(args []string) []string {
+// The daemon calls this only when it built the per-task overlay, where the
+// overlay's HERMES_HOME is authoritative and nothing on the command line may
+// re-point out of it.
+//
+// It works on the assembled argv rather than on each region separately for two
+// reasons, both of which leave a live selector behind if ignored:
+//
+//   - A selection can straddle the boundary. A launch prefix ending in a bare
+//     `-p` takes the backend's own `acp` token as its value, and neither region
+//     contains a complete selection to strip.
+//   - Removing one selection promotes the next. Hermes honours the first and
+//     ignores the rest, so a single pass can hand the job to a later
+//     occurrence — and with the prefix and custom args configured separately,
+//     two selections is ordinary configuration rather than a user mistake.
+//
+// Tokens Hermes itself discards — an invalid profile value, which makes
+// ParseHermesProfileArgs report nothing found — are left alone: they redirect
+// nothing. The `acp` token is never removed, because the backend re-adds it at
+// launch; dropping the flag that captured it is what breaks the selection.
+func StripHermesProfileSelectors(launchPrefix, customArgs []string, logger *slog.Logger) ([]string, []string) {
+	prefix := append([]string(nil), launchPrefix...)
+	custom := append([]string(nil), filterCustomArgs(customArgs, hermesBlockedArgs, logger)...)
 	for {
-		sel := ParseHermesProfileArgs(args)
+		sel := ParseHermesProfileArgs(Command{Prefix: prefix}.Argv(hermesCLIArgsFrom(custom)...))
 		if !sel.Found {
-			return args
+			return prefix, custom
 		}
-		args = StripHermesProfileArgs(args, sel)
+		acpIndex := len(prefix)
+		removed := false
+		// Walk back to front so earlier indices stay valid as tokens go.
+		for i := sel.ArgFrom + sel.ArgLen - 1; i >= sel.ArgFrom; i-- {
+			switch {
+			case i < acpIndex:
+				prefix = append(prefix[:i], prefix[i+1:]...)
+				removed = true
+			case i == acpIndex:
+				// Backend-owned; re-added at launch.
+			default:
+				if j := i - acpIndex - 1; j < len(custom) {
+					custom = append(custom[:j], custom[j+1:]...)
+					removed = true
+				}
+			}
+		}
+		if !removed {
+			// Defensive: a selection always contains a flag from one of the two
+			// regions, so this cannot loop forever. Bail rather than spin.
+			return prefix, custom
+		}
 	}
 }
 
@@ -217,7 +283,9 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	timeout := opts.Timeout
 	runCtx, cancel := runContext(ctx, timeout)
 
-	hermesArgs := append([]string{"acp"}, filterCustomArgs(opts.CustomArgs, hermesBlockedArgs, b.cfg.Logger)...)
+	// Same assembly HermesLaunchArgv reproduces for the daemon, so the profile
+	// the overlay is seeded from is the one this argv actually selects.
+	hermesArgs := hermesCLIArgs(opts.CustomArgs, b.cfg.Logger)
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, hermesArgs...)
 	hideAgentWindow(cmd)
 	b.cfg.Logger.Info("agent command", "exec", execPath, "args", hermesArgs)

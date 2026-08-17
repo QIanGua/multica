@@ -414,45 +414,97 @@ func TestFilterLaunchPrefixConsumesBlockedFlagValue(t *testing.T) {
 	}
 }
 
-// TestStripAllHermesProfileArgs is Elon's must-fix 1, at the parser level.
-// Stripping only the selection hermes acts on today promotes the next one to
-// first, and the task walks straight out of the overlay the daemon built.
-func TestStripAllHermesProfileArgs(t *testing.T) {
+// TestHermesLaunchArgvMatchesBackendAssembly is the root of the second-round
+// Hermes finding: the daemon must resolve the profile from the argv the backend
+// actually builds, not from a concatenation that leaves out `acp`.
+//
+// With fixed_args `--model` and custom_args `-p research`, the two disagree.
+// `--model` is a value-taking flag, so the approximation `--model -p research`
+// consumes `-p` as its value and finds no selection at all, while the real
+// `--model acp -p research` skips `--model acp` and selects `research`. Seeding
+// the overlay from the first answer while the process runs the second is a
+// silent config mismatch.
+func TestHermesLaunchArgvMatchesBackendAssembly(t *testing.T) {
 	t.Parallel()
 
-	got := StripAllHermesProfileArgs([]string{
-		"-p", "research", "acp", "--profile=ops", "--model", "x", "-p", "third",
-	})
-	want := []string{"acp", "--model", "x"}
-	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("StripAllHermesProfileArgs = %v, want %v", got, want)
+	prefix := []string{"--model"}
+	custom := []string{"-p", "research"}
+
+	argv := HermesLaunchArgv(prefix, custom, slog.Default())
+	if want := []string{"--model", "acp", "-p", "research"}; strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("HermesLaunchArgv = %v, want %v", argv, want)
 	}
-	if sel := ParseHermesProfileArgs(got); sel.Found {
-		t.Fatalf("a profile selection survived stripping: %+v", sel)
+	// It must equal what the backend hands the launch boundary.
+	backend := Command{Prefix: prefix}.Argv(hermesCLIArgs(custom, slog.Default())...)
+	if strings.Join(argv, "\x00") != strings.Join(backend, "\x00") {
+		t.Fatalf("resolver argv %v diverges from backend argv %v", argv, backend)
+	}
+	sel := ParseHermesProfileArgs(argv)
+	if !sel.Found || sel.Name != "research" {
+		t.Fatalf("selection = %+v, want research — the profile the process really reads", sel)
+	}
+	// The approximation this replaced is what got it wrong.
+	if naive := ParseHermesProfileArgs(append(append([]string{}, prefix...), custom...)); naive.Found {
+		t.Fatalf("expected the prefix++custom approximation to disagree, got %+v", naive)
 	}
 }
 
-// TestHermesLaunchPrefixCannotEscapeOverlay ties must-fix 1 to the argv that
-// actually reaches hermes: prefix then custom args, with `acp` appended by the
-// backend. Nothing in the final command line may re-point HERMES_HOME.
-func TestHermesLaunchPrefixCannotEscapeOverlay(t *testing.T) {
+// TestStripHermesProfileSelectorsSpansRegionBoundary: a launch prefix ending in
+// a bare `-p` captures the backend's own `acp` token as its profile value.
+// Neither region holds a complete selection, so stripping them separately
+// leaves the selector live and the task walks out of the overlay.
+func TestStripHermesProfileSelectorsSpansRegionBoundary(t *testing.T) {
 	t.Parallel()
 
-	prefix := StripAllHermesProfileArgs([]string{"hermes-wrapper-sub", "-p", "research"})
-	custom := StripAllHermesProfileArgs([]string{"--model", "x", "--profile=ops"})
+	prefix, custom := StripHermesProfileSelectors([]string{"-p"}, []string{"research", "--yolo"}, slog.Default())
 
-	cfg := Config{LaunchPrefix: prefix, Logger: slog.Default()}
-	argv := cfg.commandAt("wrapper").Argv(append([]string{"acp"}, custom...)...)
+	if sel := ParseHermesProfileArgs(Command{Prefix: prefix}.Argv(hermesCLIArgsFrom(custom)...)); sel.Found {
+		t.Fatalf("launched argv still selects %q: prefix=%v custom=%v", sel.Name, prefix, custom)
+	}
+	if len(prefix) != 0 {
+		t.Fatalf("the straddling `-p` must be removed from the prefix, got %v", prefix)
+	}
+	if strings.Join(custom, "\x00") != strings.Join([]string{"research", "--yolo"}, "\x00") {
+		t.Fatalf("custom args must survive intact, got %v", custom)
+	}
+}
 
+// TestStripHermesProfileSelectorsRemovesEveryOccurrence: hermes honours the
+// first selection and ignores the rest, so removing one promotes the next.
+// With prefix and custom args configured separately, several selections is
+// ordinary configuration rather than a user mistake.
+func TestStripHermesProfileSelectorsRemovesEveryOccurrence(t *testing.T) {
+	t.Parallel()
+
+	prefix, custom := StripHermesProfileSelectors(
+		[]string{"wrapper-sub", "-p", "research"},
+		[]string{"--profile=ops", "--model", "x", "-p", "third"},
+		slog.Default())
+
+	argv := Command{Prefix: prefix}.Argv(hermesCLIArgsFrom(custom)...)
 	if sel := ParseHermesProfileArgs(argv); sel.Found {
-		t.Fatalf("final hermes argv still selects a profile (%+v): %v", sel, argv)
+		t.Fatalf("a selection survived: %+v in %v", sel, argv)
 	}
-	// The non-profile tokens survive: stripping must not eat the command.
-	if prefixIndex(argv, []string{"hermes-wrapper-sub", "acp"}) != 0 {
-		t.Fatalf("stripping damaged the command identity: %v", argv)
+	if strings.Join(prefix, "\x00") != "wrapper-sub" {
+		t.Fatalf("prefix = %v, want the command identity kept and the selector gone", prefix)
 	}
-	if prefixIndex(argv, []string{"--model", "x"}) < 0 {
-		t.Fatalf("stripping dropped an unrelated custom arg: %v", argv)
+	if strings.Join(custom, "\x00") != strings.Join([]string{"--model", "x"}, "\x00") {
+		t.Fatalf("custom = %v, want unrelated args kept", custom)
+	}
+}
+
+// TestStripHermesProfileSelectorsLeavesInvalidSelectionAlone: a value hermes
+// itself discards redirects nothing, so removing it would only mangle the
+// user's argv.
+func TestStripHermesProfileSelectorsLeavesInvalidSelectionAlone(t *testing.T) {
+	t.Parallel()
+
+	prefix, custom := StripHermesProfileSelectors(nil, []string{"-p", "NOT_A_PROFILE"}, slog.Default())
+	if len(prefix) != 0 {
+		t.Fatalf("prefix = %v, want empty", prefix)
+	}
+	if strings.Join(custom, "\x00") != strings.Join([]string{"-p", "NOT_A_PROFILE"}, "\x00") {
+		t.Fatalf("custom = %v, want the discarded selection left untouched", custom)
 	}
 }
 

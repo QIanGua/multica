@@ -6367,13 +6367,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var hermesMemoryStore string
 	var hermesSessionStore string
 	if provider == "hermes" {
-		// Parse the combined argv, not custom_args alone. A custom runtime
-		// profile's fixed_args become the launch prefix and are handed to
-		// hermes ahead of custom_args, so a `-p research` written there is the
-		// first selection — the one hermes itself acts on. Resolving from
-		// custom_args only would build the overlay from a different profile
-		// than the process ends up reading (GH #7046).
-		sel := agent.ParseHermesProfileArgs(hermesEffectiveArgs(profileFixedArgs, agentCustomArgs))
+		// Resolve from the argv hermes will actually parse — launch prefix,
+		// `acp`, then the filtered custom args — which agent.HermesLaunchArgv
+		// assembles the same way the backend does. A custom runtime profile's
+		// fixed_args are the launch prefix now, so they are scanned before
+		// custom_args, and the backend's own `acp` token sits between them and
+		// participates in the scan. Approximating that argv reads a different
+		// profile than the process does, and the overlay ends up seeded from
+		// the wrong home (GH #7046).
+		sel := agent.ParseHermesProfileArgs(agent.HermesLaunchArgv(profileFixedArgs, agentCustomArgs, d.logger))
 		res := execenv.ResolveHermesProfile(agentEnvOverrides["HERMES_HOME"], sel.Name, sel.Found, sel.Inline)
 		if res.Err != nil {
 			return TaskResult{}, fmt.Errorf("resolve hermes profile: %w", res.Err)
@@ -6836,11 +6838,20 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err := configureCodexTaskShellEnvironment(provider, env.CodexHome, os.Environ(), agentEnv, agentCustomEnv, d.logger); err != nil {
 		return TaskResult{}, err
 	}
-	if provider == "hermes" && env != nil && env.HermesHome != "" {
-		// The overlay is authoritative once built, so no argv region may
-		// re-point HERMES_HOME out of it — the launch prefix included. Custom
-		// args get the same treatment below, where they are assembled.
-		profileFixedArgs = agent.StripAllHermesProfileArgs(profileFixedArgs)
+	// The overlay is authoritative once built, so nothing on the command line
+	// may re-point HERMES_HOME out of it. Both argv regions are stripped
+	// together, against the same assembled argv the resolver read: a selection
+	// can straddle them (a prefix ending in a bare `-p` captures the backend's
+	// `acp`), which per-region stripping cannot see.
+	var hermesOverlayCustomArgs []string
+	hermesOverlayActive := provider == "hermes" && env != nil && env.HermesHome != ""
+	if hermesOverlayActive {
+		var rawCustomArgs []string
+		if task.Agent != nil {
+			rawCustomArgs = task.Agent.CustomArgs
+		}
+		profileFixedArgs, hermesOverlayCustomArgs = agent.StripHermesProfileSelectors(
+			profileFixedArgs, rawCustomArgs, d.logger)
 	}
 	// Resolve the backend through the unified runtime resolver: built-in
 	// runtime identities (e.g. "omp") dispatch through NewRuntime, protocol
@@ -6887,8 +6898,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		customArgs = task.Agent.CustomArgs
 		mcpConfig = effectiveMcpConfig
 	}
-	if provider == "hermes" {
-		customArgs = hermesLaunchArgs(customArgs, env != nil && env.HermesHome != "")
+	if hermesOverlayActive {
+		// Stripped above, alongside the launch prefix. A skill-less hermes task
+		// has no overlay to protect and keeps its flags untouched.
+		customArgs = hermesOverlayCustomArgs
 	}
 	// Two-tier model resolution: an explicit agent.model wins,
 	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
@@ -8378,32 +8391,6 @@ func sanitizeAgentEnv(customEnv map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
-}
-
-// hermesLaunchArgs decides the final Hermes custom_args: with the per-task
-// overlay active, the -p/--profile flags are stripped (the overlay was seeded
-// from that profile's home and exports its own HERMES_HOME, so the flag must not
-// re-resolve the profile past it); with no overlay, the flags pass through so a
-// skill-less task's profile behavior is unchanged.
-func hermesLaunchArgs(customArgs []string, overlayActive bool) []string {
-	if !overlayActive {
-		return customArgs
-	}
-	// Strip every occurrence, not just the one the resolver acted on: removing
-	// the first promotes the second to first, and hermes would follow it out of
-	// the overlay. Re-parses with the same authoritative parser used to resolve
-	// the source home, so parsing and stripping never diverge.
-	return agent.StripAllHermesProfileArgs(customArgs)
-}
-
-// hermesEffectiveArgs is the argv hermes actually parses for a profile
-// selection: the runtime's launch prefix followed by the agent's custom args,
-// in the order they reach the process.
-func hermesEffectiveArgs(launchPrefix, customArgs []string) []string {
-	combined := make([]string, 0, len(launchPrefix)+len(customArgs))
-	combined = append(combined, launchPrefix...)
-	combined = append(combined, customArgs...)
-	return combined
 }
 
 // hermesProviderUnconfiguredHint is appended verbatim to a "no LLM provider
