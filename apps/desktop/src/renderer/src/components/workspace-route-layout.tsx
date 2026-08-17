@@ -115,11 +115,11 @@ export function WorkspaceRouteLayout() {
   // singleton to the NEW slug — before running the outgoing one's cleanup, so
   // an unguarded clear would wipe the workspace context that just arrived.
   useEffect(() => {
-    if (!listFetched) return;
+    if (!listReady) return;
     if (workspace) return;
     if (getCurrentSlug() !== workspaceSlug) return;
     setCurrentWorkspace(null, null);
-  }, [listFetched, workspace, workspaceSlug]);
+  }, [listReady, workspace, workspaceSlug]);
 
   useEffect(() => {
     return () => {
