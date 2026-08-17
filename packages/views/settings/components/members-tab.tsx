@@ -270,7 +270,7 @@ function ShareLinkRow({
           {link.expires_at && <span>· {t(($) => $.members.share_link_expires, { date: new Date(link.expires_at).toLocaleDateString() })}</span>}
         </div>
         <div
-          className="truncate font-mono text-caption text-muted-foreground/70"
+          className="truncate font-mono text-caption text-muted-foreground"
           title={joinUrl}
         >
           {joinUrl}
