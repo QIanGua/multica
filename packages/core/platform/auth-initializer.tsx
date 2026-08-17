@@ -21,7 +21,7 @@ import type { StorageAdapter } from "../types/storage";
 import type { User } from "../types";
 
 const logger = createLogger("auth");
-const AUTH_RETRY_DELAYS_MS = [
+const RECOVERY_RETRY_DELAYS_MS = [
   1_000,
   2_000,
   4_000,
@@ -139,8 +139,11 @@ export function AuthInitializer({
         return;
       }
 
-      const delay = AUTH_RETRY_DELAYS_MS[retryIndex];
-      retryIndex = Math.min(retryIndex + 1, AUTH_RETRY_DELAYS_MS.length - 1);
+      const delay = RECOVERY_RETRY_DELAYS_MS[retryIndex];
+      retryIndex = Math.min(
+        retryIndex + 1,
+        RECOVERY_RETRY_DELAYS_MS.length - 1,
+      );
       retryTimer = setTimeout(() => {
         retryTimer = undefined;
         void attempt();
@@ -221,8 +224,11 @@ export function AuthInitializer({
 
     const scheduleRetry = (attempt: () => Promise<void>) => {
       if (cancelled || settled) return;
-      const delay = AUTH_RETRY_DELAYS_MS[retryIndex];
-      retryIndex = Math.min(retryIndex + 1, AUTH_RETRY_DELAYS_MS.length - 1);
+      const delay = RECOVERY_RETRY_DELAYS_MS[retryIndex];
+      retryIndex = Math.min(
+        retryIndex + 1,
+        RECOVERY_RETRY_DELAYS_MS.length - 1,
+      );
       retryTimer = setTimeout(() => {
         retryTimer = undefined;
         void attempt();

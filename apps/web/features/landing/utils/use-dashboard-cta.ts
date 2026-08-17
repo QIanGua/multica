@@ -26,11 +26,11 @@ export function resolveDashboardCtaHref({
 }: {
   isAuthenticated: boolean;
   workspaceListReady: boolean;
-  workspaces: Workspace[] | undefined;
+  workspaces: Workspace[];
   hasOnboarded: boolean;
 }): string {
   if (!isAuthenticated) return paths.login();
-  if (!workspaceListReady || !workspaces) return LOADING_FALLBACK_HREF;
+  if (!workspaceListReady) return LOADING_FALLBACK_HREF;
   return resolvePostAuthDestination(workspaces, hasOnboarded);
 }
 
