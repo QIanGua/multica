@@ -19,6 +19,7 @@ import {
   findIssueLocation,
   moveBucketTotal,
   patchIssueInBuckets,
+  patchNeedsInvalidation,
   removeIssueFromBuckets,
 } from "./cache-helpers";
 import {
@@ -302,6 +303,11 @@ export function applyIssueChange(
 
     if (loc) {
       if (!prevIssue) prevIssue = loc.issue;
+      // A status this client cannot resolve to a category makes
+      // patchIssueInBuckets a no-op. The row DID move on the server, so
+      // treating that as "nothing to do" would leave the card in its old
+      // column forever — force a refetch instead. (MUL-6243)
+      if (patchNeedsInvalidation(patch)) staleKeys.push(key);
       let next: ListIssuesCache;
       if (filterTouched) {
         const membership = issueMatchesListFilter(

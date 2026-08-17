@@ -138,33 +138,49 @@ export function patchIssueInBuckets(
   const loc = findIssueLocation(resp, id);
   if (!loc) return resp;
   const merged: Issue = { ...loc.issue, ...patch };
-  const nextStatus = patch.status ?? loc.status;
 
-  if (nextStatus === loc.status) {
+  // Resolve the DESTINATION category before comparing anything. `loc.status` is
+  // a CATEGORY (the bucket key) while `patch.status` is a status KEY, so
+  // comparing them directly treats a same-category key change — `in_review` to
+  // a custom `human_review` — as a cross-bucket move. That path then deletes
+  // from and inserts into the same bucket using a pre-delete snapshot, leaving
+  // the card duplicated and the total one too high.
+  //
+  // Resolved from `patch` alone, never from `merged`: merged inherits the
+  // PREVIOUS issue's status_category, which would silently keep the old column
+  // after a real move.
+  const nextCategory =
+    patch.status === undefined
+      ? loc.status
+      : issueStatusCategory({ status: patch.status, status_category: patch.status_category });
+
+  // Unresolvable custom status: no bucket to move it to. Leave the cache alone
+  // and let the caller invalidate — see patchNeedsInvalidation.
+  if (!nextCategory) return resp;
+
+  if (nextCategory === loc.status) {
     const bucket = getBucket(resp, loc.status);
     const positionChanged =
       patch.position !== undefined && patch.position !== loc.issue.position;
     if (!positionChanged) {
-      // Plain field update (labels, metadata, title, …): keep the slot so a
-      // remote edit never reorders an otherwise-untouched column.
+      // Plain field update (labels, metadata, title, a same-category status
+      // key change …): keep the slot so a remote edit never reorders an
+      // otherwise-untouched column, and never change the total.
       return setBucket(resp, loc.status, {
         ...bucket,
-        issues: bucket.issues.map((i) => (i.id === id ? merged : i)),
+        issues: bucket.issues.map((i: Issue) => (i.id === id ? merged : i)),
       });
     }
     // Same-column reorder: lift the card out and re-insert at its new slot.
     return setBucket(resp, loc.status, {
       ...bucket,
       issues: insertByPosition(
-        bucket.issues.filter((i) => i.id !== id),
+        bucket.issues.filter((i: Issue) => i.id !== id),
         merged,
       ),
     });
   }
 
-  // nextStatus is a status KEY; the cache is bucketed by category.
-  const nextCategory = issueStatusCategory({ status: nextStatus, status_category: merged.status_category });
-  if (!nextCategory) return resp;
   const fromBucket = getBucket(resp, loc.status);
   const toBucket = getBucket(resp, nextCategory);
   let next = setBucket(resp, loc.status, {
@@ -176,4 +192,17 @@ export function patchIssueInBuckets(
     total: toBucket.total + 1,
   });
   return next;
+}
+
+/**
+ * True when a status patch names a status this client cannot resolve to a
+ * category, so `patchIssueInBuckets` will no-op. Callers must invalidate rather
+ * than treat that as "nothing to do" — the row moved on the server, and leaving
+ * the cache untouched drifts the column and its total permanently.
+ */
+export function patchNeedsInvalidation(patch: Partial<Issue>): boolean {
+  if (patch.status === undefined) return false;
+  return (
+    issueStatusCategory({ status: patch.status, status_category: patch.status_category }) === null
+  );
 }

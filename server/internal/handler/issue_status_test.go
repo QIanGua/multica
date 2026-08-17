@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -10,8 +11,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // Issue status catalog tests (MUL-6243).
@@ -1066,4 +1069,124 @@ func TestListFilterByCategoryReturnsCustomStatusIssues(t *testing.T) {
 	if c := got[uuidToString(customID)]; c != "in_review" {
 		t.Errorf("custom-status row status_category = %q, want %q", c, "in_review")
 	}
+}
+
+// TestCreateEventCarriesCustomStatusCategory is the regression guard for the
+// websocket path: filling the category only on the HTTP response is too late
+// for other tabs, which receive the broadcast payload. Without it they cannot
+// bucket the new issue and must fall back to a full refetch.
+func TestCreateEventCarriesCustomStatusCategory(t *testing.T) {
+	createTestCustomStatus(t, "human_review_ev", issuestatus.InReview)
+
+	gotEvent := make(chan events.Event, 1)
+	testHandler.Bus.Subscribe(protocol.EventIssueCreated, func(e events.Event) {
+		select {
+		case gotEvent <- e:
+		default:
+		}
+	})
+
+	rec := httptest.NewRecorder()
+	testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+		"title": "custom status event", "status": "human_review_ev",
+	}))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID             string `json:"id"`
+		StatusCategory string `json:"status_category"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &created)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, parseUUID(created.ID))
+	})
+	if created.StatusCategory != "in_review" {
+		t.Errorf("HTTP response status_category = %q, want in_review", created.StatusCategory)
+	}
+
+	select {
+	case e := <-gotEvent:
+		payload, ok := e.Payload.(map[string]any)
+		if !ok {
+			t.Fatalf("event payload shape: %T", e.Payload)
+		}
+		issue, ok := payload["issue"].(IssueResponse)
+		if !ok {
+			t.Fatalf("event issue shape: %T", payload["issue"])
+		}
+		if issue.StatusCategory != "in_review" {
+			t.Errorf("event status_category = %q, want in_review — other tabs cannot "+
+				"bucket the new issue without it", issue.StatusCategory)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no issue:created event")
+	}
+}
+
+// TestListEndpointsCarryCategoryWithoutPerRowQueries covers the remaining
+// payload exits and pins the N+1: a page of custom-status rows must resolve the
+// catalog ONCE, not once per row.
+func TestListEndpointsCarryCategoryWithoutPerRowQueries(t *testing.T) {
+	ctx := context.Background()
+	createTestCustomStatus(t, "human_review_n", issuestatus.InReview)
+	for i := range 3 {
+		mustCreateIssue(t, fmt.Sprintf("n+1 probe %d", i), "human_review_n")
+	}
+
+	t.Run("list carries category for every custom row", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		testHandler.ListIssues(rec, newRequest(http.MethodGet, "/api/issues?status_category=in_review&limit=100", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+		}
+		var payload struct {
+			Issues []struct {
+				Status         string `json:"status"`
+				StatusCategory string `json:"status_category"`
+			} `json:"issues"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &payload)
+		seen := 0
+		for _, i := range payload.Issues {
+			if i.Status == "human_review_n" {
+				seen++
+				if i.StatusCategory != "in_review" {
+					t.Errorf("custom row status_category = %q, want in_review", i.StatusCategory)
+				}
+			}
+		}
+		if seen < 3 {
+			t.Errorf("expected the 3 custom-status rows in the in_review category, saw %d", seen)
+		}
+	})
+
+	// The Resolver amortizes the catalog read; a per-row filler would issue one
+	// query per custom row. Asserted on the resolver directly because the
+	// handler's query count is not observable from here.
+	t.Run("one resolver serves a whole page", func(t *testing.T) {
+		r := issuestatus.NewResolver(parseUUID(testWorkspaceID))
+		for range 10 {
+			if got := r.Effective(ctx, testHandler.Queries, "human_review_n"); got != "in_review" {
+				t.Fatalf("Effective = %q, want in_review", got)
+			}
+		}
+	})
+
+	t.Run("get carries category", func(t *testing.T) {
+		id := mustCreateIssue(t, "get carries category", "human_review_n")
+		rec := httptest.NewRecorder()
+		testHandler.GetIssue(rec, withURLParam(
+			newRequest(http.MethodGet, "/api/issues/"+uuidToString(id), nil), "id", uuidToString(id)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("get: %d %s", rec.Code, rec.Body.String())
+		}
+		var got struct {
+			StatusCategory string `json:"status_category"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &got)
+		if got.StatusCategory != "in_review" {
+			t.Errorf("GetIssue status_category = %q, want in_review", got.StatusCategory)
+		}
+	})
 }

@@ -234,21 +234,31 @@ func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []str
 // Resolver includes ARCHIVED statuses, because an issue left on an archived
 // status still belongs in its category's column. (MUL-6243)
 func (h *Handler) fillStatusCategories(ctx context.Context, wsID pgtype.UUID, resps []IssueResponse) {
-	resolver := issuestatus.NewResolver(wsID)
+	fill := h.newStatusCategoryFiller(ctx, wsID)
 	for i := range resps {
-		if resps[i].StatusCategory != "" {
-			continue
-		}
-		resps[i].StatusCategory = resolver.Effective(ctx, h.Queries, resps[i].Status)
+		fill(&resps[i])
 	}
 }
 
-// fillStatusCategory is the single-response form of fillStatusCategories.
-func (h *Handler) fillStatusCategory(ctx context.Context, wsID pgtype.UUID, resp *IssueResponse) {
-	if resp.StatusCategory != "" {
-		return
+// newStatusCategoryFiller returns a request-scoped filler backed by ONE
+// Resolver. Reuse it across every response a request builds: the Resolver reads
+// the catalog at most once, so a page of custom-status rows costs one query
+// rather than one per row. Creating a filler per row would reintroduce the N+1
+// this exists to avoid. (MUL-6243)
+func (h *Handler) newStatusCategoryFiller(ctx context.Context, wsID pgtype.UUID) func(*IssueResponse) {
+	resolver := issuestatus.NewResolver(wsID)
+	return func(resp *IssueResponse) {
+		if resp == nil || resp.StatusCategory != "" {
+			return
+		}
+		resp.StatusCategory = resolver.Effective(ctx, h.Queries, resp.Status)
 	}
-	resp.StatusCategory = issuestatus.Effective(ctx, h.Queries, wsID, resp.Status)
+}
+
+// fillStatusCategory is the single-response form. Only for endpoints that build
+// exactly ONE response; anything looping must use newStatusCategoryFiller.
+func (h *Handler) fillStatusCategory(ctx context.Context, wsID pgtype.UUID, resp *IssueResponse) {
+	h.newStatusCategoryFiller(ctx, wsID)(resp)
 }
 
 func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
@@ -934,12 +944,14 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prefix := h.getIssuePrefix(ctx, wsUUID)
+	fillSearch := h.newStatusCategoryFiller(ctx, wsUUID)
 	resp := make([]SearchIssueResponse, len(results))
 	for i, sr := range results {
 		sir := SearchIssueResponse{
 			IssueResponse: issueToResponse(sr.issue, prefix),
 			MatchSource:   sr.matchSource,
 		}
+		fillSearch(&sir.IssueResponse)
 		// Always populate comment snippet when a matching comment exists
 		if sr.matchedCommentContent != "" {
 			snippet := extractSnippet(sr.matchedCommentContent, q)
@@ -1100,9 +1112,11 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 			ids[i] = issue.ID
 		}
 		labelsMap := h.labelsByIssue(ctx, wsUUID, ids)
+		fillOpen := h.newStatusCategoryFiller(ctx, wsUUID)
 		resp := make([]IssueResponse, len(issues))
 		for i, issue := range issues {
 			resp[i] = openIssueRowToResponse(issue, prefix)
+			fillOpen(&resp[i])
 			labels := labelsMap[resp[i].ID]
 			if labels == nil {
 				labels = []LabelResponse{}
@@ -2081,6 +2095,9 @@ ORDER BY
 	}
 	labelsMap := h.labelsByIssue(ctx, wsUUID, ids)
 	prefix := h.getIssuePrefix(ctx, wsUUID)
+	// One Resolver for the whole page — a per-row filler would query the
+	// catalog once per custom-status row. (MUL-6243)
+	fillGrouped := h.newStatusCategoryFiller(ctx, wsUUID)
 
 	groups := []IssueAssigneeGroupResponse{}
 	groupIndex := map[string]int{}
@@ -2100,7 +2117,7 @@ ORDER BY
 		}
 
 		issue := issueListRowToResponse(row.ListIssuesRow, prefix)
-		h.fillStatusCategory(r.Context(), wsUUID, &issue)
+		fillGrouped(&issue)
 		labels := labelsMap[issue.ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2120,6 +2137,7 @@ func (h *Handler) GetIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
 	resp := issueToResponse(issue, prefix)
+	h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
 	detailLabels := h.labelsByIssue(r.Context(), issue.WorkspaceID, []pgtype.UUID{issue.ID})[uuidToString(issue.ID)]
 	if detailLabels == nil {
 		detailLabels = []LabelResponse{}
@@ -2895,6 +2913,10 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		Platform:         func() string { p, _, _ := middleware.ClientMetadataFromContext(r.Context()); return p }(),
 		BroadcastPayload: func(issue db.Issue, atts []db.Attachment, labels []db.IssueLabel) map[string]any {
 			payload := issueToResponse(issue, prefix)
+			// The event other tabs receive must carry the category too — filling
+			// only the HTTP response below is too late for them, and a create
+			// they cannot bucket forces a full refetch. (MUL-6243)
+			h.fillStatusCategory(r.Context(), issue.WorkspaceID, &payload)
 			payload.Attachments = buildAttachmentResponses(atts)
 			// Carry the authoritative label snapshot so every online client
 			// renders the new issue already labeled. Non-nil (even empty)
@@ -2909,6 +2931,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, service.ErrActiveDuplicate) {
 		dup := *res.DuplicateIssue
 		existing := issueToResponse(dup, h.getIssuePrefix(r.Context(), dup.WorkspaceID))
+		h.fillStatusCategory(r.Context(), dup.WorkspaceID, &existing)
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"code":  "active_duplicate_issue",
 			"error": duplicateIssueMessage(existing),
@@ -3805,6 +3828,9 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updated := 0
+	// One Resolver for the whole batch — a per-issue filler would query the
+	// catalog once per custom-status row. (MUL-6243)
+	fillBatch := h.newStatusCategoryFiller(r.Context(), wsUUID)
 	// Children that transitioned into a terminal status this batch, collected so
 	// the parent/stage notification is evaluated once against the final state
 	// after the loop (MUL-4155) rather than per-child mid-batch.
@@ -3987,7 +4013,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		resp := issueToResponse(issue, prefix)
 		actorType, actorID := h.resolveActor(r, userID, workspaceID)
 
-		h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
+		fillBatch(&resp)
 		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&
 			(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
 		statusChanged := req.Updates.Status != nil && prevIssue.Status != issue.Status
