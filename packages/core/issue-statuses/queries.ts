@@ -21,7 +21,12 @@ export const issueStatusKeys = {
 export function issueStatusListOptions(wsId: string) {
   return queryOptions({
     queryKey: issueStatusKeys.list(wsId),
-    queryFn: () => api.listIssueStatuses(),
+    // ARCHIVED entries included on purpose. Archiving retires a status from
+    // future assignment but leaves existing issues on it, and those issues must
+    // keep their real name, color and category. Dropping archived rows here
+    // would degrade them to a raw key with a guessed category. Pickers use
+    // `activeStatuses`, which excludes them. (MUL-6243)
+    queryFn: () => api.listIssueStatuses(true),
     select: (data) => data.statuses,
     // The catalog changes only when an admin edits it, which is rare, so a
     // generous stale time keeps this off the critical path of every render
@@ -37,15 +42,21 @@ export function issueStatusListOptions(wsId: string) {
  * catalog fetch has not landed yet.
  */
 export interface IssueStatusCatalog {
-  /** Active statuses in display order (category order, then position). */
+  /**
+   * Every status in display order, ARCHIVED INCLUDED, so an issue left on an
+   * archived status still resolves to its real name, color and category.
+   * For anything that offers a status to pick, use `activeStatuses`.
+   */
   statuses: IssueStatusEntry[];
+  /** Assignable statuses — `statuses` minus archived ones. */
+  activeStatuses: IssueStatusEntry[];
   /** Category for a status key; falls back to the key when it is a built-in, else "todo". */
   categoryOf: (statusKey: string) => IssueStatusCategory;
   /** Human label for a status key; falls back to the category label, then the raw key. */
   labelOf: (statusKey: string) => string;
   /** Catalog entry for a status key, when the catalog knows it. */
   entryOf: (statusKey: string) => IssueStatusEntry | undefined;
-  /** Statuses belonging to one category, in display order. */
+  /** ACTIVE statuses belonging to one category, in display order. */
   inCategory: (category: IssueStatusCategory) => IssueStatusEntry[];
   /** True once the catalog has loaded; false while it is still in flight. */
   isLoaded: boolean;
@@ -80,6 +91,7 @@ export function buildIssueStatusCatalog(
 
   return {
     statuses: list,
+    activeStatuses: list.filter((e) => !e.archived_at),
     categoryOf,
     entryOf: (statusKey) => byKey.get(statusKey),
     labelOf: (statusKey) => {
@@ -88,7 +100,7 @@ export function buildIssueStatusCatalog(
       if (isIssueStatusCategory(statusKey)) return STATUS_CONFIG[statusKey]?.label ?? statusKey;
       return statusKey;
     },
-    inCategory: (category) => list.filter((e) => e.category === category),
+    inCategory: (category) => list.filter((e) => e.category === category && !e.archived_at),
     isLoaded: entries !== undefined,
   };
 }

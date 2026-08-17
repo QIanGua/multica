@@ -352,9 +352,20 @@ export function applyIssueChange(
         // this list's pages and counts untouched.
         if (!changed.status || patch.status === undefined) continue;
         // Bucket totals are per category (MUL-6243).
+        // patch.status_category is authoritative when the server sent it; the
+        // key-only fallback covers built-ins.
         const fromCategory = issueStatusCategory(baseIssue);
-        const toCategory = issueStatusCategory({ status: patch.status, status_category: undefined });
-        if (!fromCategory || !toCategory) continue;
+        const toCategory = issueStatusCategory({
+          status: patch.status,
+          status_category: patch.status_category,
+        });
+        if (!fromCategory || !toCategory) {
+          // An unresolvable custom status must NOT be a silent no-op: the row
+          // moved on the server, so leaving this cache untouched drifts the
+          // off-window totals permanently. Force a refetch instead.
+          staleKeys.push(key);
+          continue;
+        }
         const next = moveBucketTotal(data, fromCategory, toCategory);
         if (next !== data) {
           prevLists.push([key, data]);
@@ -370,7 +381,10 @@ export function applyIssueChange(
       if (isMember === false) {
         // Left the list entirely — the bucket it was counted in loses one.
         const leavingCategory = issueStatusCategory(baseIssue);
-        if (!leavingCategory) continue;
+        if (!leavingCategory) {
+          staleKeys.push(key);
+          continue;
+        }
         const next = decrementBucketTotal(data, leavingCategory);
         if (next !== data) {
           prevLists.push([key, data]);

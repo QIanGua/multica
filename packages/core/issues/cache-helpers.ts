@@ -42,9 +42,10 @@ export function addIssueToBuckets(
   resp: ListIssuesCache,
   issue: Issue,
 ): ListIssuesCache {
-  // An unresolvable custom status has no column to go in; leaving the cache
-  // untouched is better than inventing a bucket. The catalog-aware surfaces
-  // refetch and place it correctly.
+  // An unresolvable custom status has no column to place the issue in. The
+  // caller is responsible for invalidating instead — silently dropping it would
+  // leave the board missing a row that exists on the server. Callers use
+  // `issueStatusCategory(issue) === null` to detect this before calling.
   const category = issueStatusCategory(issue);
   if (!category) return resp;
   const bucket = getBucket(resp, category);

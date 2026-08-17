@@ -130,3 +130,16 @@ SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg('workspace_id')::uuid::te
 -- archived (enforced by issue_status_system_not_archivable), so there is nothing
 -- to race with, and the overwhelmingly common write path stays lock-free.
 SELECT pg_advisory_xact_lock_shared(hashtextextended(sqlc.arg('workspace_id')::uuid::text || ':issue_status', 0));
+
+-- name: ListIssueStatusKeysByCategories :many
+-- Expands a set of categories to the status keys that belong to them, so a
+-- category filter can be applied as an INDEXED `status = ANY(...)` predicate
+-- instead of wrapping the column in issue_effective_status(), which makes
+-- (workspace_id, status) unusable and forces a full workspace scan.
+--
+-- ARCHIVED statuses are included on purpose: archiving retires a status from
+-- future assignment but leaves existing issues on it, and those issues must
+-- still appear in their category's column.
+SELECT key FROM issue_status
+WHERE workspace_id = sqlc.arg('workspace_id')::uuid
+  AND category = ANY(sqlc.arg('categories')::text[]);

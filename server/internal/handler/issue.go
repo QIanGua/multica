@@ -224,6 +224,33 @@ func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []str
 	return false
 }
 
+// fillStatusCategories resolves status_category for responses whose status is
+// CUSTOM. The pure builders below fill it for built-in keys — where key IS the
+// category — and leave it empty otherwise, so this is the step that makes the
+// field authoritative on every payload a client caches or buckets by.
+//
+// Uses one Resolver for the whole slice: built-in statuses cost no query, and a
+// page full of custom ones costs one catalog read rather than one per row. The
+// Resolver includes ARCHIVED statuses, because an issue left on an archived
+// status still belongs in its category's column. (MUL-6243)
+func (h *Handler) fillStatusCategories(ctx context.Context, wsID pgtype.UUID, resps []IssueResponse) {
+	resolver := issuestatus.NewResolver(wsID)
+	for i := range resps {
+		if resps[i].StatusCategory != "" {
+			continue
+		}
+		resps[i].StatusCategory = resolver.Effective(ctx, h.Queries, resps[i].Status)
+	}
+}
+
+// fillStatusCategory is the single-response form of fillStatusCategories.
+func (h *Handler) fillStatusCategory(ctx context.Context, wsID pgtype.UUID, resp *IssueResponse) {
+	if resp.StatusCategory != "" {
+		return
+	}
+	resp.StatusCategory = issuestatus.Effective(ctx, h.Queries, wsID, resp.Status)
+}
+
 func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
 	// A built-in status IS its own category, so this costs no catalog lookup and
@@ -1209,8 +1236,17 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(statusCategoriesFilter) > 0 {
-		where = append(where, fmt.Sprintf(
-			"issue_effective_status(i.workspace_id, i.status) = ANY(%s::text[])", addArg(statusCategoriesFilter)))
+		// Expanded to concrete status keys rather than filtered through
+		// issue_effective_status(): wrapping the column in a function makes the
+		// (workspace_id, status) index unusable and turns a two-page index read
+		// into a full workspace scan. (MUL-6243)
+		keys, err := issuestatus.ExpandCategories(r.Context(), h.Queries, wsUUID, statusCategoriesFilter)
+		if err != nil {
+			slog.Warn("expand status categories failed", append(logger.RequestAttrs(r), "error", err)...)
+			writeError(w, http.StatusInternalServerError, "failed to resolve status categories")
+			return
+		}
+		where = append(where, fmt.Sprintf("i.status = ANY(%s::text[])", addArg(keys)))
 	}
 	if len(statusesFilter) > 0 {
 		where = append(where, fmt.Sprintf("i.status = ANY(%s::text[])", addArg(statusesFilter)))
@@ -1461,6 +1497,7 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 		}
 		resp[i].Labels = &labels
 	}
+	h.fillStatusCategories(ctx, wsUUID, resp)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issues": resp,
@@ -1682,8 +1719,15 @@ func (h *Handler) ListGroupedIssues(w http.ResponseWriter, r *http.Request) {
 		statusCategories = splitCommaParam(r.URL.Query().Get("status_category"))
 	}
 	if len(statusCategories) > 0 {
-		where = append(where, fmt.Sprintf(
-			"issue_effective_status(i.workspace_id, i.status) = ANY(%s::text[])", addArg(statusCategories)))
+		// See ListIssues: expanded to keys so the (workspace_id, status) index
+		// still drives the scan. (MUL-6243)
+		keys, err := issuestatus.ExpandCategories(r.Context(), h.Queries, wsUUID, statusCategories)
+		if err != nil {
+			slog.Warn("expand status categories failed", append(logger.RequestAttrs(r), "error", err)...)
+			writeError(w, http.StatusInternalServerError, "failed to resolve status categories")
+			return
+		}
+		where = append(where, fmt.Sprintf("i.status = ANY(%s::text[])", addArg(keys)))
 	}
 
 	priorities := splitCommaParam(r.URL.Query().Get("priorities"))
@@ -2056,6 +2100,7 @@ ORDER BY
 		}
 
 		issue := issueListRowToResponse(row.ListIssuesRow, prefix)
+		h.fillStatusCategory(r.Context(), wsUUID, &issue)
 		labels := labelsMap[issue.ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2898,6 +2943,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 
 	resp := issueToResponse(issue, prefix)
+	h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
 	resp.Attachments = buildAttachmentResponses(res.Attachments)
 	// Echo the authoritative labels attached in the create transaction. Always
 	// non-nil (empty slice when none) so a newer client can tell the backend
@@ -3311,6 +3357,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	resp := issueToResponse(issue, prefix)
 	slog.Info("issue updated", append(logger.RequestAttrs(r), "issue_id", id, "workspace_id", workspaceID)...)
 
+	h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
 	assigneeChanged := (req.AssigneeType != nil || req.AssigneeID != nil) &&
 		(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
 	statusChanged := req.Status != nil && prevIssue.Status != issue.Status
@@ -3940,6 +3987,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		resp := issueToResponse(issue, prefix)
 		actorType, actorID := h.resolveActor(r, userID, workspaceID)
 
+		h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
 		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&
 			(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
 		statusChanged := req.Updates.Status != nil && prevIssue.Status != issue.Status

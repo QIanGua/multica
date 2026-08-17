@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -955,5 +956,114 @@ func TestChildrenResponseCarriesStatusCategory(t *testing.T) {
 	}
 	if payload.Issues[0].StatusCategory != "done" {
 		t.Errorf("status_category = %q, want %q", payload.Issues[0].StatusCategory, "done")
+	}
+}
+
+// TestCategoryFilterExpandsToIndexedStatusKeys is the regression guard for the
+// performance fix: filtering by category must expand to concrete status keys so
+// `status = ANY(...)` can use the (workspace_id, status) index. Wrapping the
+// column in issue_effective_status() made that index unusable and turned a
+// two-page index read into a full workspace scan.
+func TestCategoryFilterExpandsToIndexedStatusKeys(t *testing.T) {
+	ctx := context.Background()
+	seedTestCatalog(t)
+	ws := parseUUID(testWorkspaceID)
+
+	t.Run("built-in category expands to exactly its own key", func(t *testing.T) {
+		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{"blocked"})
+		if err != nil {
+			t.Fatalf("expand: %v", err)
+		}
+		if len(keys) != 1 || keys[0] != "blocked" {
+			t.Errorf("expand(blocked) = %v, want exactly [blocked] — a workspace with no "+
+				"custom statuses must produce the pre-feature query", keys)
+		}
+	})
+
+	t.Run("category includes its custom statuses", func(t *testing.T) {
+		createTestCustomStatus(t, "human_review_x", issuestatus.InReview)
+		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{"in_review"})
+		if err != nil {
+			t.Fatalf("expand: %v", err)
+		}
+		if !slices.Contains(keys, "in_review") || !slices.Contains(keys, "human_review_x") {
+			t.Errorf("expand(in_review) = %v, want both the canonical and the custom key", keys)
+		}
+	})
+
+	// An issue left on an archived status still belongs in its category's
+	// column, so the expansion must keep archived keys.
+	t.Run("archived statuses stay in their category", func(t *testing.T) {
+		entry := createTestCustomStatus(t, "retired_x", issuestatus.Done)
+		if code := archiveStatusVia(t, entry); code != http.StatusOK {
+			t.Fatalf("archive: %d", code)
+		}
+		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{"done"})
+		if err != nil {
+			t.Fatalf("expand: %v", err)
+		}
+		if !slices.Contains(keys, "retired_x") {
+			t.Errorf("expand(done) = %v, want the archived key included so issues on it "+
+				"still appear in the Done column", keys)
+		}
+	})
+
+	// A workspace whose seed has not landed must still filter correctly.
+	t.Run("unseeded workspace falls back to the canonical keys", func(t *testing.T) {
+		if _, err := testPool.Exec(ctx, `DELETE FROM issue_status WHERE workspace_id = $1`, ws); err != nil {
+			t.Fatalf("clear catalog: %v", err)
+		}
+		t.Cleanup(func() { seedTestCatalog(t) })
+		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{"todo", "done"})
+		if err != nil {
+			t.Fatalf("expand: %v", err)
+		}
+		if len(keys) != 2 || !slices.Contains(keys, "todo") || !slices.Contains(keys, "done") {
+			t.Errorf("expand on an unseeded workspace = %v, want [todo done]", keys)
+		}
+	})
+}
+
+// TestListFilterByCategoryReturnsCustomStatusIssues exercises the real endpoint.
+func TestListFilterByCategoryReturnsCustomStatusIssues(t *testing.T) {
+	ctx := context.Background()
+	createTestCustomStatus(t, "human_review_l", issuestatus.InReview)
+	customID := mustCreateIssue(t, "custom in review", "human_review_l")
+	builtinID := mustCreateIssue(t, "builtin in review", "in_review")
+	otherID := mustCreateIssue(t, "unrelated todo", "todo")
+	_ = ctx
+
+	rec := httptest.NewRecorder()
+	testHandler.ListIssues(rec, newRequest(http.MethodGet, "/api/issues?status_category=in_review&limit=100", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Issues []struct {
+			ID             string `json:"id"`
+			Status         string `json:"status"`
+			StatusCategory string `json:"status_category"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := map[string]string{}
+	for _, i := range payload.Issues {
+		got[i.ID] = i.StatusCategory
+	}
+	if _, ok := got[uuidToString(customID)]; !ok {
+		t.Error("the in_review category must include issues on a custom in_review status")
+	}
+	if _, ok := got[uuidToString(builtinID)]; !ok {
+		t.Error("the in_review category must include issues on the built-in status")
+	}
+	if _, ok := got[uuidToString(otherID)]; ok {
+		t.Error("the in_review category must not include a todo issue")
+	}
+	// Every row carries an authoritative category, custom statuses included —
+	// this is what the client buckets and caches by.
+	if c := got[uuidToString(customID)]; c != "in_review" {
+		t.Errorf("custom-status row status_category = %q, want %q", c, "in_review")
 	}
 }

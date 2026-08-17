@@ -3,11 +3,11 @@ import { describe, expect, it } from "vitest";
 import { buildIssueStatusCatalog, isIssueStatusCategory } from "./queries";
 import type { IssueStatusEntry } from "../types";
 
-function entry(key: string, category: string, name = key): IssueStatusEntry {
+function entry(key: string, category: string, name = key, archivedAt: string | null = null): IssueStatusEntry {
   return {
     id: key, workspace_id: "ws-1", key, name, description: "",
     category: category as IssueStatusEntry["category"], color: "#123456",
-    is_system: false, position: 0, archived_at: null,
+    is_system: false, position: 0, archived_at: archivedAt,
     created_at: "", updated_at: "",
   };
 }
@@ -59,5 +59,31 @@ describe("buildIssueStatusCatalog", () => {
   it("isIssueStatusCategory accepts exactly the 7", () => {
     expect(isIssueStatusCategory("in_review")).toBe(true);
     expect(isIssueStatusCategory("human_review")).toBe(false);
+  });
+});
+
+// Archiving retires a status from FUTURE assignment but leaves existing issues
+// on it. Those issues must keep their real name, colour and category — dropping
+// archived rows from resolution would degrade them to a raw key with a guessed
+// category, which is exactly what the product decision rules out.
+describe("archived statuses stay resolvable", () => {
+  const archived = entry("gate_approved", "done", "Gate Approved", "2026-01-01T00:00:00Z");
+  const active = entry("human_review", "in_review", "Human Review");
+  const c = buildIssueStatusCatalog([active, archived]);
+
+  it("keeps name and category for an issue left on an archived status", () => {
+    expect(c.labelOf("gate_approved")).toBe("Gate Approved");
+    expect(c.categoryOf("gate_approved")).toBe("done");
+    expect(c.entryOf("gate_approved")?.color).toBe("#123456");
+  });
+
+  it("excludes archived from the assignable set", () => {
+    expect(c.activeStatuses.map((e) => e.key)).toEqual(["human_review"]);
+    expect(c.statuses.map((e) => e.key)).toEqual(["human_review", "gate_approved"]);
+  });
+
+  it("excludes archived from a category's pickable list", () => {
+    expect(c.inCategory("done")).toEqual([]);
+    expect(c.inCategory("in_review").map((e) => e.key)).toEqual(["human_review"]);
   });
 });
