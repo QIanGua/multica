@@ -2779,16 +2779,20 @@ func TestValidateIssuePriority(t *testing.T) {
 	}
 }
 
+// The status must be MALFORMED, not merely unknown: since MUL-6243 a workspace
+// can define custom statuses, so an unknown-but-well-formed key is the server's
+// call, not the CLI's. What still has to hold is that a malformed one never
+// costs a network round trip.
 func TestRunIssueCreateRejectsInvalidStatusBeforeRequest(t *testing.T) {
 	cmd := newIssueCreateTestCmd()
 	_ = cmd.Flags().Set("title", "Invalid status")
-	_ = cmd.Flags().Set("status", "active")
+	_ = cmd.Flags().Set("status", "not a status")
 	err := runIssueCreate(cmd, nil)
 	if err == nil {
-		t.Fatal("runIssueCreate should reject invalid status")
+		t.Fatal("runIssueCreate should reject a malformed status")
 	}
-	if !strings.Contains(err.Error(), "valid values") {
-		t.Fatalf("expected valid values error, got: %v", err)
+	if !strings.Contains(err.Error(), "valid values") && !strings.Contains(err.Error(), "status key") {
+		t.Fatalf("expected a local validation error, got: %v", err)
 	}
 }
 
@@ -2809,13 +2813,13 @@ func TestRunIssueUpdateRejectsInvalidStatusBeforeRequest(t *testing.T) {
 	cmd := &cobra.Command{Use: "update"}
 	cmd.Flags().String("status", "", "")
 	cmd.Flags().String("priority", "", "")
-	_ = cmd.Flags().Set("status", "active")
+	_ = cmd.Flags().Set("status", "not a status")
 	err := runIssueUpdate(cmd, []string{"MUL-1"})
 	if err == nil {
-		t.Fatal("runIssueUpdate should reject invalid status")
+		t.Fatal("runIssueUpdate should reject a malformed status")
 	}
-	if !strings.Contains(err.Error(), "valid values") {
-		t.Fatalf("expected valid values error, got: %v", err)
+	if !strings.Contains(err.Error(), "valid values") && !strings.Contains(err.Error(), "status key") {
+		t.Fatalf("expected a local validation error, got: %v", err)
 	}
 }
 

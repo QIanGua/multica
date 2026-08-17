@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -124,6 +125,15 @@ func (h *Handler) CreateIssueStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := h.requireWorkspaceRole(w, r, workspaceID, "workspace not found", "owner", "admin"); !ok {
+		return
+	}
+
+	// Rollout gate (see featureflags.CustomIssueStatuses). Creating the first
+	// custom status mints a value older pods cannot interpret, so it stays
+	// closed until the whole fleet is running code that resolves categories.
+	// Only creation is gated — reading and resolving are safe unconditionally.
+	if !featureflags.CustomIssueStatusesEnabled(r.Context(), h.FeatureFlags) {
+		writeError(w, http.StatusForbidden, "custom issue statuses are not enabled for this deployment")
 		return
 	}
 
@@ -285,7 +295,29 @@ func (h *Handler) ArchiveIssueStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inUse, err := h.Queries.CountIssuesUsingStatusKey(r.Context(), db.CountIssuesUsingStatusKeyParams{
+	// The census and the archive run in ONE transaction under the EXCLUSIVE
+	// catalog lock. Without it the two steps race: a concurrent issue write can
+	// pass its active-status check, this handler can then observe zero usage and
+	// archive, and the write lands afterwards — stranding an issue on an
+	// archived status. Issue writes that target a custom status take the shared
+	// side of this lock (runWithIssueStatusGuard), so they cannot interleave
+	// with the census. (MUL-6243)
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		slog.Warn("ArchiveIssueStatus begin failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to archive issue status")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+
+	if err := qtx.LockIssueStatusCatalog(r.Context(), wsUUID); err != nil {
+		slog.Warn("ArchiveIssueStatus lock failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to archive issue status")
+		return
+	}
+
+	inUse, err := qtx.CountIssuesUsingStatusKey(r.Context(), db.CountIssuesUsingStatusKeyParams{
 		WorkspaceID: wsUUID,
 		Key:         entry.Key,
 	})
@@ -300,7 +332,7 @@ func (h *Handler) ArchiveIssueStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	archived, err := h.Queries.ArchiveIssueStatusEntry(r.Context(), db.ArchiveIssueStatusEntryParams{
+	archived, err := qtx.ArchiveIssueStatusEntry(r.Context(), db.ArchiveIssueStatusEntryParams{
 		ID:          entry.ID,
 		WorkspaceID: wsUUID,
 	})
@@ -310,6 +342,11 @@ func (h *Handler) ArchiveIssueStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Warn("ArchiveIssueStatus failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to archive issue status")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Warn("ArchiveIssueStatus commit failed", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to archive issue status")
 		return
 	}

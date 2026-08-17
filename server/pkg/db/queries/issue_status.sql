@@ -107,3 +107,20 @@ WHERE workspace_id = sqlc.arg('workspace_id')::uuid
 -- name: DeleteIssueStatusEntriesForWorkspace :exec
 -- No foreign keys by project rule, so workspace teardown cleans up here.
 DELETE FROM issue_status WHERE workspace_id = sqlc.arg('workspace_id')::uuid;
+
+-- name: LockIssueStatusCatalog :exec
+-- EXCLUSIVE transaction lock over a workspace's status catalog, held by archive
+-- so no issue can be written onto a status between the in-use census and the
+-- archive itself. pg_advisory_xact_lock (not pg_try_) so a concurrent archive
+-- queues instead of failing.
+SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg('workspace_id')::uuid::text || ':issue_status', 0));
+
+-- name: LockIssueStatusCatalogShared :exec
+-- SHARED counterpart, taken by a write that puts an issue ON a custom status.
+-- Shared holders do not block each other, so concurrent issue writes keep their
+-- current throughput; they only block against archive's exclusive lock.
+--
+-- Built-in statuses deliberately do NOT take this lock: a built-in can never be
+-- archived (enforced by issue_status_system_not_archivable), so there is nothing
+-- to race with, and the overwhelmingly common write path stays lock-free.
+SELECT pg_advisory_xact_lock_shared(hashtextextended(sqlc.arg('workspace_id')::uuid::text || ':issue_status', 0));

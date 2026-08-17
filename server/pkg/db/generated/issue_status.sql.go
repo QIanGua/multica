@@ -257,6 +257,35 @@ func (q *Queries) ListIssueStatusEntries(ctx context.Context, arg ListIssueStatu
 	return items, nil
 }
 
+const lockIssueStatusCatalog = `-- name: LockIssueStatusCatalog :exec
+SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':issue_status', 0))
+`
+
+// EXCLUSIVE transaction lock over a workspace's status catalog, held by archive
+// so no issue can be written onto a status between the in-use census and the
+// archive itself. pg_advisory_xact_lock (not pg_try_) so a concurrent archive
+// queues instead of failing.
+func (q *Queries) LockIssueStatusCatalog(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockIssueStatusCatalog, workspaceID)
+	return err
+}
+
+const lockIssueStatusCatalogShared = `-- name: LockIssueStatusCatalogShared :exec
+SELECT pg_advisory_xact_lock_shared(hashtextextended($1::uuid::text || ':issue_status', 0))
+`
+
+// SHARED counterpart, taken by a write that puts an issue ON a custom status.
+// Shared holders do not block each other, so concurrent issue writes keep their
+// current throughput; they only block against archive's exclusive lock.
+//
+// Built-in statuses deliberately do NOT take this lock: a built-in can never be
+// archived (enforced by issue_status_system_not_archivable), so there is nothing
+// to race with, and the overwhelmingly common write path stays lock-free.
+func (q *Queries) LockIssueStatusCatalogShared(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockIssueStatusCatalogShared, workspaceID)
+	return err
+}
+
 const seedIssueStatusEntries = `-- name: SeedIssueStatusEntries :exec
 
 INSERT INTO issue_status (workspace_id, key, name, description, category, color, is_system, position)

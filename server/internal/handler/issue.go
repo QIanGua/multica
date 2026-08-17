@@ -92,12 +92,28 @@ var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
 // workspaces that have no custom statuses.
 var validIssueStatuses = issuestatus.Canonical()
 
-// validateIssueStatusKey checks a status against the workspace's catalog. This
-// is the application-layer replacement for the enum CHECK that migration 335
-// dropped, so every write path must route through it — a missed entrypoint is
-// how an unresolvable key would reach the column.
-func (h *Handler) validateIssueStatusKey(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, status string) bool {
-	if _, err := issuestatus.Resolve(r.Context(), h.Queries, workspaceID, status); err != nil {
+// resolveIssueStatusKey checks a status against the workspace's catalog and
+// returns the CANONICAL key to store. This is the application-layer replacement
+// for the enum CHECK that migration 337 dropped, so every write path must route
+// through it — a missed entrypoint is how an unresolvable key would reach the
+// column.
+//
+// Returning the resolved key (rather than a bare bool) is load-bearing:
+// resolution is case- and whitespace-insensitive, so `"  HUMAN_REVIEW "` and
+// `"human_review"` both validate. Writing the caller's raw string back would
+// then store a value the column's format constraint rejects, turning an input
+// the API just accepted into a 500. Callers must persist what this returns.
+func (h *Handler) resolveIssueStatusKey(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, status string) (string, bool) {
+	key, _, ok := h.resolveIssueStatusKeyKind(w, r, workspaceID, status)
+	return key, ok
+}
+
+// resolveIssueStatusKeyKind is resolveIssueStatusKey plus whether the target is
+// a CUSTOM status. Callers use that to decide whether the write needs the
+// shared catalog lock — see runWithIssueStatusGuard.
+func (h *Handler) resolveIssueStatusKeyKind(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, status string) (string, bool, bool) {
+	entry, err := issuestatus.Resolve(r.Context(), h.Queries, workspaceID, status)
+	if err != nil {
 		if errors.Is(err, issuestatus.ErrUnknownStatus) {
 			allowed, listErr := issuestatus.ActiveKeys(r.Context(), h.Queries, workspaceID)
 			if listErr != nil || len(allowed) == 0 {
@@ -105,13 +121,42 @@ func (h *Handler) validateIssueStatusKey(w http.ResponseWriter, r *http.Request,
 			}
 			writeError(w, http.StatusBadRequest, fmt.Sprintf(
 				"invalid status %q; valid values: %s", status, strings.Join(allowed, ", ")))
-			return false
+			return "", false, false
 		}
 		slog.Warn("resolve issue status failed", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to validate status")
-		return false
+		return "", false, false
 	}
-	return true
+	return entry.Key, !entry.IsSystem, true
+}
+
+// runWithIssueStatusGuard runs an issue write that lands on a custom status
+// inside a transaction holding the SHARED catalog lock, closing the archive
+// race: ArchiveIssueStatus takes the EXCLUSIVE lock around its in-use census,
+// so it can no longer observe zero usage while this write is in flight and
+// strand the issue on an archived status.
+//
+// A built-in target skips the transaction entirely — a built-in can never be
+// archived, so there is nothing to race with, and the common path keeps its
+// current cost. (MUL-6243)
+func (h *Handler) runWithIssueStatusGuard(ctx context.Context, workspaceID pgtype.UUID, custom bool, fn func(q *db.Queries) error) error {
+	if !custom {
+		return fn(h.Queries)
+	}
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := h.Queries.WithTx(tx)
+	if err := qtx.LockIssueStatusCatalogShared(ctx, workspaceID); err != nil {
+		return err
+	}
+	if err := fn(qtx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {
@@ -509,7 +554,7 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	whereClause := "(" + strings.Join(whereParts, " OR ") + ")"
 
 	if !includeClosed {
-		whereClause += " AND i.status NOT IN ('done', 'cancelled')"
+		whereClause += " AND issue_effective_status(i.workspace_id, i.status) NOT IN ('done', 'cancelled')"
 	}
 
 	// --- ORDER BY clause ---
@@ -2505,7 +2550,8 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if priority == "" {
 		priority = "none"
 	}
-	if !h.validateIssueStatusKey(w, r, wsUUID, status) {
+	status, ok = h.resolveIssueStatusKey(w, r, wsUUID, status)
+	if !ok {
 		return
 	}
 	if !validateIssueEnum(w, "priority", priority, validIssuePriorities) {
@@ -2953,11 +2999,14 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.Description != nil {
 		params.Description = pgtype.Text{String: *req.Description, Valid: true}
 	}
+	statusIsCustom := false
 	if req.Status != nil {
-		if !h.validateIssueStatusKey(w, r, prevIssue.WorkspaceID, *req.Status) {
+		statusKey, custom, ok := h.resolveIssueStatusKeyKind(w, r, prevIssue.WorkspaceID, *req.Status)
+		if !ok {
 			return
 		}
-		params.Status = pgtype.Text{String: *req.Status, Valid: true}
+		statusIsCustom = custom
+		params.Status = pgtype.Text{String: statusKey, Valid: true}
 	}
 	if req.Priority != nil {
 		if !validateIssueEnum(w, "priority", *req.Priority, validIssuePriorities) {
@@ -3113,7 +3162,11 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 			prevIssue = lockedPrev
 		}
 	} else {
-		issue, err = h.Queries.UpdateIssue(r.Context(), params)
+		err = h.runWithIssueStatusGuard(r.Context(), prevIssue.WorkspaceID, statusIsCustom, func(q *db.Queries) error {
+			var innerErr error
+			issue, innerErr = q.UpdateIssue(r.Context(), params)
+			return innerErr
+		})
 	}
 	if err != nil {
 		slog.Warn("update issue failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
@@ -3543,8 +3596,11 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	// for wsUUID above. One check for the whole batch — every issue in it
 	// shares the workspace — and a rejection rather than a silent skip, so a
 	// bad status cannot report `{"updated": N}`. (MUL-6243)
+	batchStatusKey := ""
+	batchStatusIsCustom := false
 	if req.Updates.Status != nil {
-		if !h.validateIssueStatusKey(w, r, wsUUID, *req.Updates.Status) {
+		batchStatusKey, batchStatusIsCustom, ok = h.resolveIssueStatusKeyKind(w, r, wsUUID, *req.Updates.Status)
+		if !ok {
 			return
 		}
 	}
@@ -3609,7 +3665,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			params.Description = pgtype.Text{String: *req.Updates.Description, Valid: true}
 		}
 		if req.Updates.Status != nil {
-			params.Status = pgtype.Text{String: *req.Updates.Status, Valid: true}
+			params.Status = pgtype.Text{String: batchStatusKey, Valid: true}
 		}
 		if req.Updates.Priority != nil {
 			params.Priority = pgtype.Text{String: *req.Updates.Priority, Valid: true}
@@ -3735,7 +3791,11 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 				prevIssue = lockedPrev
 			}
 		} else {
-			issue, err = h.Queries.UpdateIssue(r.Context(), params)
+			err = h.runWithIssueStatusGuard(r.Context(), wsUUID, batchStatusIsCustom, func(q *db.Queries) error {
+				var innerErr error
+				issue, innerErr = q.UpdateIssue(r.Context(), params)
+				return innerErr
+			})
 		}
 		if err != nil {
 			slog.Warn("batch update issue failed", "issue_id", issueID, "error", err)

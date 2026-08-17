@@ -193,13 +193,13 @@ func Effective(ctx context.Context, q Querier, workspaceID pgtype.UUID, status s
 
 // Resolve validates that status is usable in this workspace, returning the
 // catalog entry. Write paths use this; it is the application-layer replacement
-// for the enum CHECK that migration 335 dropped.
+// for the enum CHECK that migration 337 dropped.
 //
 // The 7 built-in keys resolve even when the workspace has no catalog row for
 // them. The catalog EXTENDS the built-in statuses; it does not define them, and
 // a workspace has always been able to use all 7. Requiring a row would mean a
 // workspace whose seed has not landed yet — created by a pod that predates this
-// feature, or mid-rollout before migration 337 runs — could not create or
+// feature, or mid-rollout before migration 339 runs — could not create or
 // update an issue at all. Failing open here is limited precisely to the set
 // that was valid before this feature existed; anything else still needs a row.
 func Resolve(ctx context.Context, q Querier, workspaceID pgtype.UUID, status string) (db.IssueStatus, error) {

@@ -77,7 +77,12 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 	// last open child of a stage is cancelled. Keying on the transition also
 	// makes a later cancelled -> done edit a no-op (terminal -> terminal), which
 	// avoids a lagging duplicate wake.
-	if isTerminalChildStatus(prev.Status) || !isTerminalChildStatus(issue.Status) {
+	// Both sides of the transition are resolved to the canonical status they
+	// inherit, so a move into a custom done/cancelled status fires the barrier
+	// exactly like a move into Done or Cancelled. (MUL-6243)
+	prevTerminal := isTerminalChildStatus(issuestatus.Effective(ctx, h.Queries, prev.WorkspaceID, prev.Status))
+	nowTerminal := isTerminalChildStatus(issuestatus.Effective(ctx, h.Queries, issue.WorkspaceID, issue.Status))
+	if prevTerminal || !nowTerminal {
 		return
 	}
 	parent, err := h.Queries.GetIssue(ctx, issue.ParentIssueID)
@@ -126,7 +131,7 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 			"parent_id", uuidToString(parent.ID))
 		return
 	}
-	if !stageBarrierClosed(children, issue) {
+	if !stageBarrierClosed(children, issue, h.terminalChildPredicate(ctx)) {
 		return
 	}
 	staged := siblingsAreStaged(children)
@@ -208,12 +213,13 @@ func (h *Handler) notifyParentsOfBatchChildDone(ctx context.Context, completed [
 			continue
 		}
 
+		isTerminal := h.terminalChildPredicate(ctx)
 		batch := len(g.children) > 1
 		if !siblingsAreStaged(children) {
 			// Unstaged: one implicit stage. Fire once iff every child is terminal
 			// in the final state. stageBarrierClosed ignores `completed` on the
 			// unstaged path, so any completed child stands in for the barrier check.
-			if !stageBarrierClosed(children, g.children[0]) {
+			if !stageBarrierClosed(children, g.children[0], isTerminal) {
 				continue
 			}
 			h.postChildDoneComment(ctx, parent, g.children[0], children, false, 0, batch)
@@ -235,7 +241,7 @@ func (h *Handler) notifyParentsOfBatchChildDone(ctx context.Context, completed [
 			if !c.Stage.Valid {
 				continue // an unstaged child in a staged set closes no stage
 			}
-			if !stageBarrierClosed(children, c) {
+			if !stageBarrierClosed(children, c, isTerminal) {
 				continue
 			}
 			if !found || c.Stage.Int32 > bestStage {
@@ -276,7 +282,7 @@ func (h *Handler) postChildDoneComment(ctx context.Context, parent, completed db
 
 	var content string
 	if staged {
-		summary, nextStage := stageProgressSummary(children, closedStage)
+		summary, nextStage := stageProgressSummary(children, closedStage, h.terminalChildPredicate(ctx))
 		advance := stageAdvanceInstruction(nextStage, parentID)
 		if batch {
 			content = fmt.Sprintf(
@@ -343,8 +349,26 @@ func (h *Handler) postChildDoneComment(ctx context.Context, parent, completed db
 // isTerminalChildStatus reports whether a child issue status counts as
 // "finished" for stage-barrier purposes. Cancelled counts as terminal: a
 // cancelled sibling will never complete, so it must not hold a stage open.
+//
+// Takes a CANONICAL status. Callers that hold a raw `issue.status` must pass it
+// through terminalChildPredicate first, so a custom status in the done or
+// cancelled category closes a stage exactly like Done and Cancelled do.
 func isTerminalChildStatus(status string) bool {
 	return status == "done" || status == "cancelled"
+}
+
+// terminalChildPredicate returns the terminal test for a sibling set, resolving
+// each child's status to the canonical status it inherits. Built-in keys
+// resolve to themselves without a query, so this is free for every workspace
+// that has not defined a custom status. (MUL-6243)
+//
+// A predicate rather than a rewritten []db.Issue on purpose: the same slice is
+// also rendered into the stage-progress comment, and mutating Status there
+// would show the category instead of the status the user actually picked.
+func (h *Handler) terminalChildPredicate(ctx context.Context) func(db.Issue) bool {
+	return func(c db.Issue) bool {
+		return isTerminalChildStatus(issuestatus.Effective(ctx, h.Queries, c.WorkspaceID, c.Status))
+	}
 }
 
 // siblingsAreStaged reports whether any child in the set carries an explicit
@@ -373,10 +397,10 @@ func siblingsAreStaged(children []db.Issue) bool {
 //     stage <= S is terminal (frontier closure). Later stages are normally
 //     parked in `backlog`, so they cannot fire out of order; the caller's
 //     idempotency guard collapses any duplicate wake.
-func stageBarrierClosed(children []db.Issue, completed db.Issue) bool {
+func stageBarrierClosed(children []db.Issue, completed db.Issue, isTerminal func(db.Issue) bool) bool {
 	if !siblingsAreStaged(children) {
 		for _, c := range children {
-			if !isTerminalChildStatus(c.Status) {
+			if !isTerminal(c) {
 				return false
 			}
 		}
@@ -392,7 +416,7 @@ func stageBarrierClosed(children []db.Issue, completed db.Issue) bool {
 		if !c.Stage.Valid {
 			continue // unstaged children are ignored by the frontier
 		}
-		if c.Stage.Int32 <= s && !isTerminalChildStatus(c.Status) {
+		if c.Stage.Int32 <= s && !isTerminal(c) {
 			return false
 		}
 	}
@@ -405,7 +429,7 @@ func stageBarrierClosed(children []db.Issue, completed db.Issue) bool {
 // children — the next group to promote — or 0 when none remain. Unstaged
 // children are skipped (they are not part of any stage), so the breakdown
 // never renders a "Stage 0".
-func stageProgressSummary(children []db.Issue, closedStage int32) (summary string, nextStage int32) {
+func stageProgressSummary(children []db.Issue, closedStage int32, isTerminal func(db.Issue) bool) (summary string, nextStage int32) {
 	type agg struct{ total, done int }
 	byStage := map[int32]*agg{}
 	order := []int32{}
@@ -421,7 +445,7 @@ func stageProgressSummary(children []db.Issue, closedStage int32) (summary strin
 			order = append(order, s)
 		}
 		a.total++
-		if isTerminalChildStatus(c.Status) {
+		if isTerminal(c) {
 			a.done++
 		}
 	}

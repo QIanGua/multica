@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
@@ -329,6 +330,7 @@ func TestArchiveRefusesWhileIssuesStillUseTheStatus(t *testing.T) {
 // TestCreateIssueStatusValidation covers the reserved-key and category rules.
 func TestCreateIssueStatusValidation(t *testing.T) {
 	seedTestCatalog(t)
+	withCustomIssueStatusesFlag(t, testHandler, true)
 
 	cases := []struct {
 		name string
@@ -351,4 +353,216 @@ func TestCreateIssueStatusValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCreateIssueStatusIsGatedOnRollout pins the rollout gate. Creating the
+// first custom status mints a value older pods cannot interpret, so it must be
+// impossible until the whole fleet is on this code. Reads stay open.
+func TestCreateIssueStatusIsGatedOnRollout(t *testing.T) {
+	seedTestCatalog(t)
+	withCustomIssueStatusesFlag(t, testHandler, false)
+
+	rec := httptest.NewRecorder()
+	testHandler.CreateIssueStatus(rec, newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
+		"name": "Human Review", "category": "in_review", "color": "#123456",
+	}))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 while the rollout gate is closed, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Reading the catalog is never gated — clients need it to render statuses.
+	listRec := httptest.NewRecorder()
+	testHandler.ListIssueStatuses(listRec, newRequest(http.MethodGet, "/api/issue-statuses", nil))
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("listing must stay open while the gate is closed, got %d: %s", listRec.Code, listRec.Body.String())
+	}
+}
+
+// TestIssueWriteStoresCanonicalStatusKey guards the 500 found in review:
+// resolution is case- and whitespace-insensitive, so writing the caller's raw
+// string back would store a value the column's format constraint rejects.
+func TestIssueWriteStoresCanonicalStatusKey(t *testing.T) {
+	createTestCustomStatus(t, "human_review_c", issuestatus.InReview)
+
+	for _, input := range []string{"HUMAN_REVIEW_C", "  human_review_c  ", "Human_Review_C"} {
+		t.Run(input, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+				"title": "canonical key " + input, "status": input,
+			}))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("expected 201 for %q, got %d: %s", input, rec.Code, rec.Body.String())
+			}
+			var created struct {
+				ID     string `json:"id"`
+				Status string `json:"status"`
+			}
+			json.Unmarshal(rec.Body.Bytes(), &created)
+			t.Cleanup(func() {
+				testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, parseUUID(created.ID))
+			})
+			if created.Status != "human_review_c" {
+				t.Errorf("stored status = %q, want the canonical key %q", created.Status, "human_review_c")
+			}
+			// The stored value must satisfy the column's format constraint; a
+			// non-canonical write would have failed as a 500 above, but assert
+			// the persisted row too so the guarantee is explicit.
+			var persisted string
+			if err := testPool.QueryRow(context.Background(),
+				`SELECT status FROM issue WHERE id = $1`, parseUUID(created.ID)).Scan(&persisted); err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if persisted != "human_review_c" {
+				t.Errorf("persisted status = %q, want %q", persisted, "human_review_c")
+			}
+		})
+	}
+}
+
+// TestArchiveIsSerializedAgainstIssueWrites is the counterexample for the
+// archive TOCTOU race: with the exclusive catalog lock held, an archive cannot
+// run its in-use census while an issue write targeting a custom status is in
+// flight, so it can never observe zero usage and strand that issue.
+func TestArchiveIsSerializedAgainstIssueWrites(t *testing.T) {
+	ctx := context.Background()
+	entry := createTestCustomStatus(t, "race_status", issuestatus.InProgress)
+
+	// Hold the SHARED lock exactly as an in-flight issue write would.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1::uuid::text || ':issue_status', 0))`,
+		parseUUID(testWorkspaceID)); err != nil {
+		t.Fatalf("take shared lock: %v", err)
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		testHandler.ArchiveIssueStatus(rec, withURLParam(
+			newRequest(http.MethodDelete, "/api/issue-statuses/"+uuidToString(entry.ID), nil),
+			"id", uuidToString(entry.ID)))
+		done <- rec.Code
+	}()
+
+	// The archive must be BLOCKED while the writer holds the shared lock.
+	select {
+	case code := <-done:
+		t.Fatalf("archive completed (%d) while a status write was in flight; the exclusive lock is not held", code)
+	case <-time.After(400 * time.Millisecond):
+		// Blocked as required.
+	}
+
+	// Releasing the writer lets the archive proceed.
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("release writer: %v", err)
+	}
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("archive after the writer released = %d, want 200", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive never completed after the writer released its lock")
+	}
+}
+
+// TestCustomTerminalStatusCountsAsTerminalInSQL covers the SQL-side consumers
+// the Go resolver cannot reach. Before issue_effective_status existed, each of
+// these read the status literal, so a custom status in the `done` category
+// still counted as open for the duplicate guard and was missed by sub-issue and
+// project completion counts.
+func TestCustomTerminalStatusCountsAsTerminalInSQL(t *testing.T) {
+	ctx := context.Background()
+	createTestCustomStatus(t, "gate_approved_s", issuestatus.Done)
+
+	mkIssue := func(title, status string) pgtype.UUID {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+			"title": title, "status": status,
+		}))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %q: %d %s", title, rec.Code, rec.Body.String())
+		}
+		var created struct {
+			ID string `json:"id"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &created)
+		id := parseUUID(created.ID)
+		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, id) })
+		return id
+	}
+
+	t.Run("duplicate guard treats it as closed", func(t *testing.T) {
+		title := "sql terminal duplicate probe"
+		mkIssue(title, "gate_approved_s")
+		if _, err := testHandler.Queries.FindActiveDuplicateIssue(ctx, db.FindActiveDuplicateIssueParams{
+			WorkspaceID:     parseUUID(testWorkspaceID),
+			NormalizedTitle: title,
+		}); err == nil {
+			t.Error("an issue on a custom done status must not count as an active duplicate")
+		}
+	})
+
+	t.Run("project completion counts it as done", func(t *testing.T) {
+		var projectID pgtype.UUID
+		if err := testPool.QueryRow(ctx,
+			`INSERT INTO project (workspace_id, title) VALUES ($1, 'Status SQL Probe') RETURNING id`,
+			parseUUID(testWorkspaceID)).Scan(&projectID); err != nil {
+			t.Fatalf("create project fixture: %v", err)
+		}
+		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM project WHERE id = $1`, projectID) })
+
+		for _, id := range []pgtype.UUID{
+			mkIssue("sql project custom done", "gate_approved_s"),
+			mkIssue("sql project open", "todo"),
+		} {
+			if _, err := testPool.Exec(ctx, `UPDATE issue SET project_id = $1 WHERE id = $2`, projectID, id); err != nil {
+				t.Fatalf("attach to project: %v", err)
+			}
+		}
+
+		stats, err := testHandler.Queries.GetProjectIssueStats(ctx, []pgtype.UUID{projectID})
+		if err != nil {
+			t.Fatalf("GetProjectIssueStats: %v", err)
+		}
+		if len(stats) != 1 {
+			t.Fatalf("expected stats for one project, got %d", len(stats))
+		}
+		if stats[0].TotalCount != 2 || stats[0].DoneCount != 1 {
+			t.Errorf("project stats = %d done / %d total, want 1/2 (the custom done status must count)",
+				stats[0].DoneCount, stats[0].TotalCount)
+		}
+	})
+
+	t.Run("sub-issue progress counts it as done", func(t *testing.T) {
+		parent := mkIssue("sql child progress parent", "in_progress")
+		for _, id := range []pgtype.UUID{
+			mkIssue("sql child custom done", "gate_approved_s"),
+			mkIssue("sql child open", "todo"),
+		} {
+			if _, err := testPool.Exec(ctx, `UPDATE issue SET parent_issue_id = $1 WHERE id = $2`, parent, id); err != nil {
+				t.Fatalf("attach child: %v", err)
+			}
+		}
+
+		rows, err := testHandler.Queries.ChildIssueProgress(ctx, parseUUID(testWorkspaceID))
+		if err != nil {
+			t.Fatalf("ChildIssueProgress: %v", err)
+		}
+		for _, row := range rows {
+			if row.ParentIssueID == parent {
+				if row.Total != 2 || row.Done != 1 {
+					t.Errorf("child progress = %d done / %d total, want 1/2 (the custom done status must count)",
+						row.Done, row.Total)
+				}
+				return
+			}
+		}
+		t.Error("no progress row for the parent issue")
+	})
 }

@@ -201,6 +201,17 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
 
+	// A create that lands on a CUSTOM status takes the shared catalog lock, so
+	// it cannot interleave with an archive's in-use census and leave the new
+	// issue stranded on a status archived a moment later. Built-in statuses skip
+	// it: they can never be archived, so the common path is unchanged.
+	// (MUL-6243)
+	if !issuestatus.IsBuiltIn(p.Status) {
+		if err := qtx.LockIssueStatusCatalogShared(ctx, p.WorkspaceID); err != nil {
+			return IssueCreateResult{}, err
+		}
+	}
+
 	// Resolve and validate parent / project before reading from the
 	// duplicate guard so a forged parent or project ID is rejected
 	// before we touch the issue counter. Both checks scope by

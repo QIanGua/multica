@@ -13,8 +13,15 @@
 --
 -- No foreign keys (workspace_id is an application-layer relation, per the
 -- project's database rules); cleanup is handled by the application.
+--
+-- id is NOT declared inline as PRIMARY KEY: the repo convention (see migrations
+-- 327-329) is to build the table without a primary key, create the backing
+-- unique index CONCURRENTLY in its own single-statement migration (333), then
+-- attach it with PRIMARY KEY USING INDEX (334). An inline PRIMARY KEY would
+-- build its index non-concurrently, which the project's migration rules forbid
+-- even on a new table.
 CREATE TABLE issue_status (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL,
 
     -- Stable machine handle. Immutable after create: it is what `issue.status`

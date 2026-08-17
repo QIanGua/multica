@@ -8,7 +8,7 @@
 -- A format constraint stays behind as defense in depth: it cannot know whether
 -- a key exists in the catalog, but it does keep an empty string or arbitrary
 -- text out of the column if a write path ever forgets to validate. Added
--- NOT VALID so it takes no table scan under lock; migration 336 validates it.
+-- NOT VALID so it takes no table scan under lock; migration 338 validates it.
 ALTER TABLE issue DROP CONSTRAINT issue_status_check;
 
 ALTER TABLE issue

@@ -2,7 +2,7 @@
 --
 -- New workspaces are seeded inside their create transaction; this covers the
 -- ones that already exist. Idempotent via the unique (workspace_id, key)
--- index from migration 333, so a re-run or a concurrent seed from a pod that
+-- index from migration 335, so a re-run or a concurrent seed from a pod that
 -- already booted the new code is a no-op rather than an error.
 --
 -- Not a hazard if it is slow: until a workspace has custom statuses, the
