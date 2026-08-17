@@ -52,7 +52,7 @@ export function WorkspaceRouteLayout() {
   // code and violated MUL-4741 invariant 1 (only the Coordinator navigates).
   // The `!user` early return below keeps the defense without navigating.
 
-  const { data: workspace, isFetched: listFetched } = useQuery({
+  const { data: workspace, isSuccess: listReady } = useQuery({
     ...workspaceBySlugOptions(workspaceSlug ?? ""),
     enabled: !!user && !!workspaceSlug,
   });
@@ -80,18 +80,18 @@ export function WorkspaceRouteLayout() {
   // inconsistent "tab in group X with path /" state.
   useEffect(() => {
     if (!user) return;
-    if (!listFetched) return;
+    if (!listReady) return;
     if (workspace) return;
     if (hasBeenSeen) return; // active eviction in flight — let the other path win
     if (!wsList) return;
     const validSlugs = new Set(wsList.map((w) => w.slug));
     useTabStore.getState().validateWorkspaceSlugs(validSlugs);
-  }, [user, listFetched, workspace, hasBeenSeen, wsList]);
+  }, [user, listReady, workspace, hasBeenSeen, wsList]);
 
   if (isAuthLoading) return null;
   if (!user) return null;
   if (!workspaceSlug) return null;
-  if (!listFetched) return null;
+  if (!listReady) return null;
   if (!workspace) return null; // auto-heal effect above handles the cleanup
 
   return (

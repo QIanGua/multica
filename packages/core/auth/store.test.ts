@@ -47,7 +47,8 @@ describe("authStore.initialize — token mode", () => {
     await store.getState().initialize();
 
     expect(store.getState().user).toBeNull();
-    expect(store.getState().isLoading).toBe(false);
+    expect(store.getState().isLoading).toBe(true);
+    expect(store.getState().status).toBe("recovering");
     expect(storage.snapshot().multica_token).toBe("t");
   });
 
@@ -59,6 +60,7 @@ describe("authStore.initialize — token mode", () => {
     await store.getState().initialize();
 
     expect(store.getState().user).toBeNull();
+    expect(store.getState().status).toBe("recovering");
     expect(storage.snapshot().multica_token).toBe("t");
   });
 
@@ -77,6 +79,7 @@ describe("authStore.initialize — token mode", () => {
     await store.getState().initialize();
 
     expect(store.getState().user).toBeNull();
+    expect(store.getState().status).toBe("unauthenticated");
     expect(storage.snapshot().multica_token).toBeUndefined();
   });
 
@@ -88,6 +91,23 @@ describe("authStore.initialize — token mode", () => {
     await store.getState().initialize();
 
     expect(store.getState().user).toEqual(fakeUser);
+    expect(store.getState().status).toBe("authenticated");
     expect(storage.snapshot().multica_token).toBe("t");
+  });
+
+  it("explicit logout still clears credentials and publishes unauthenticated state", () => {
+    const storage = makeStorage({ multica_token: "t" });
+    const api = makeApi(() => Promise.resolve(fakeUser));
+    const onLogout = vi.fn();
+    const store = createAuthStore({ api, storage, onLogout });
+
+    store.setState({ user: fakeUser, status: "authenticated", isLoading: false });
+    store.getState().logout();
+
+    expect(storage.snapshot().multica_token).toBeUndefined();
+    expect(api.setToken).toHaveBeenCalledWith(null);
+    expect(onLogout).toHaveBeenCalledOnce();
+    expect(store.getState().user).toBeNull();
+    expect(store.getState().status).toBe("unauthenticated");
   });
 });

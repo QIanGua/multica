@@ -13,11 +13,19 @@ export interface AuthStoreOptions {
   cookieAuth?: boolean;
 }
 
+export type AuthStatus =
+  | "authenticating"
+  | "authenticated"
+  | "unauthenticated"
+  | "recovering";
+
 export interface AuthState {
   user: User | null;
   isLoading: boolean;
+  status: AuthStatus;
 
   initialize: () => Promise<void>;
+  retryAuthentication: () => void;
   sendCode: (email: string) => Promise<void>;
   verifyCode: (email: string, code: string) => Promise<User>;
   loginWithGoogle: (code: string, redirectUri: string) => Promise<User>;
@@ -33,6 +41,7 @@ export function createAuthStore(options: AuthStoreOptions) {
   return create<AuthState>((set) => ({
     user: null,
     isLoading: true,
+    status: "authenticating",
 
     initialize: async () => {
       if (cookieAuth) {
@@ -40,9 +49,14 @@ export function createAuthStore(options: AuthStoreOptions) {
         // Try to fetch the current user — if the cookie exists the server will accept it.
         try {
           const user = await api.getMe();
-          set({ user, isLoading: false });
-        } catch {
-          set({ user: null, isLoading: false });
+          set({ user, isLoading: false, status: "authenticated" });
+        } catch (err) {
+          const unauthorized = err instanceof ApiError && err.status === 401;
+          set({
+            user: null,
+            isLoading: !unauthorized,
+            status: unauthorized ? "unauthenticated" : "recovering",
+          });
         }
         return;
       }
@@ -50,7 +64,7 @@ export function createAuthStore(options: AuthStoreOptions) {
       // Token mode: read from localStorage (Electron / legacy).
       const token = storage.getItem("multica_token");
       if (!token) {
-        set({ isLoading: false });
+        set({ isLoading: false, status: "unauthenticated" });
         return;
       }
 
@@ -58,7 +72,7 @@ export function createAuthStore(options: AuthStoreOptions) {
 
       try {
         const user = await api.getMe();
-        set({ user, isLoading: false });
+        set({ user, isLoading: false, status: "authenticated" });
       } catch (err) {
         // Only clear the stored token on a genuine auth failure (401). For
         // transient errors — network blips, backend rolling restarts, 5xx,
@@ -69,10 +83,17 @@ export function createAuthStore(options: AuthStoreOptions) {
         // user + workspace state here.
         if (err instanceof ApiError && err.status === 401) {
           setCurrentWorkspace(null, null);
+          set({ user: null, isLoading: false, status: "unauthenticated" });
+          return;
         }
-        set({ user: null, isLoading: false });
+        set({ user: null, isLoading: true, status: "recovering" });
       }
     },
+
+    // AuthInitializer installs the live retry callback while it is mounted.
+    // Keeping the action in the store lets platform UIs request recovery
+    // without importing browser-specific retry machinery into this module.
+    retryAuthentication: () => {},
 
     sendCode: async (email: string) => {
       await api.sendCode(email);
@@ -87,7 +108,7 @@ export function createAuthStore(options: AuthStoreOptions) {
       }
       onLogin?.();
       identifyAnalytics(user.id, { email: user.email, name: user.name });
-      set({ user });
+      set({ user, isLoading: false, status: "authenticated" });
       return user;
     },
 
@@ -99,7 +120,7 @@ export function createAuthStore(options: AuthStoreOptions) {
       }
       onLogin?.();
       identifyAnalytics(user.id, { email: user.email, name: user.name });
-      set({ user });
+      set({ user, isLoading: false, status: "authenticated" });
       return user;
     },
 
@@ -109,7 +130,7 @@ export function createAuthStore(options: AuthStoreOptions) {
       const user = await api.getMe();
       onLogin?.();
       identifyAnalytics(user.id, { email: user.email, name: user.name });
-      set({ user, isLoading: false });
+      set({ user, isLoading: false, status: "authenticated" });
       return user;
     },
 
@@ -123,16 +144,16 @@ export function createAuthStore(options: AuthStoreOptions) {
       setCurrentWorkspace(null, null);
       resetAnalytics();
       onLogout?.();
-      set({ user: null });
+      set({ user: null, isLoading: false, status: "unauthenticated" });
     },
 
     setUser: (user: User) => {
-      set({ user });
+      set({ user, isLoading: false, status: "authenticated" });
     },
 
     refreshMe: async () => {
       const user = await api.getMe();
-      set({ user });
+      set({ user, isLoading: false, status: "authenticated" });
     },
   }));
 }
