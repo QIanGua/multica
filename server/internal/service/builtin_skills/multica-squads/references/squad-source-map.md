@@ -232,9 +232,11 @@ Contracts:
   ungated path; any future invocation gate must be added to BOTH together.
 - parent status is not auto-advanced by the barrier: the system comment asks the
   leader to continue or — when the overall goal is met — run
-  `multica issue status <parent-id> in_review`. That explicit ask is what lets a
-  comment-triggered leader turn change status (the comment workflow otherwise
-  forbids status flips unless asked). `done` remains human / integration owned.
+  `multica issue status <parent-id> in_review`. The write is authorized by the
+  Squad Operating Protocol's standing "Own the parent issue status" grant
+  (present exactly when the issue is assigned to this squad); the system
+  comment marks the wrap-up moment, it is not the permission. `done` remains
+  human / integration owned.
 
 ## Private Leader Access
 
