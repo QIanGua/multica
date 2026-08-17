@@ -232,6 +232,34 @@ describe("GitHubTab", () => {
     expect(screen.getByRole("button", { name: /^Disconnect$/ })).toBeTruthy();
   });
 
+  it("can connect another account or organization without disconnecting the first", async () => {
+    installationsRef.current = {
+      configured: true,
+      can_manage: true,
+      installations: [{ id: "inst-1", account_login: "personal", installation_id: 1 }],
+    };
+    mockGetConnectURL.mockResolvedValue({
+      configured: true,
+      url: "https://github.com/apps/multica/installations/new",
+    });
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const user = userEvent.setup();
+    render(<GitHubTab />, { wrapper: I18nWrapper });
+
+    await user.click(
+      screen.getByRole("button", { name: "Add account or organization" }),
+    );
+
+    expect(mockGetConnectURL).toHaveBeenCalledWith("workspace-1");
+    expect(open).toHaveBeenCalledWith(
+      "https://github.com/apps/multica/installations/new",
+      "_blank",
+      "noopener",
+    );
+    expect(screen.getByRole("button", { name: /^Disconnect$/ })).toBeTruthy();
+    open.mockRestore();
+  });
+
   it("non-admin sees the existing connection but no Connect/Disconnect controls", () => {
     membersRef.current = [{ user_id: "user-1", role: "member" }];
     installationsRef.current = {

@@ -645,7 +645,12 @@ func (h *Handler) GitHubSetupCallback(w http.ResponseWriter, r *http.Request) {
 	h.publish(protocol.EventGitHubInstallationCreated, workspaceID, "system", "", map[string]any{
 		"installation": githubInstallationToBroadcast(inst),
 	})
-	http.Redirect(w, r, settingsURL+"&github_connected=1", http.StatusFound)
+	http.Redirect(
+		w,
+		r,
+		settingsURL+"&github_connected=1&github_installation="+url.QueryEscape(uuidToString(inst.ID)),
+		http.StatusFound,
+	)
 }
 
 // ── Install ownership proof ─────────────────────────────────────────────────

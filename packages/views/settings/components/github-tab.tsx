@@ -206,16 +206,27 @@ export function GitHubTab() {
               {canManage && (
                 <div className="flex items-center gap-2">
                   {connected && primaryInstallation ? (
-                    // Disconnect must stay reachable even when the master switch
-                    // is off — disconnect is a separate intent (revoke the App
-                    // grant) from hiding the feature.
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setDisconnectTarget(primaryInstallation.id)}
-                    >
-                      {t(($) => $.github.disconnect)}
-                    </Button>
+                    <>
+                      <Button
+                        size="sm"
+                        onClick={handleConnect}
+                        disabled={connecting || !configured}
+                      >
+                        {connecting
+                          ? t(($) => $.github.connect_opening)
+                          : t(($) => $.github.add_account_or_organization)}
+                      </Button>
+                      {/* Disconnect must stay reachable even when the master switch
+                          is off — disconnect is a separate intent (revoke the App
+                          grant) from hiding the feature. */}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setDisconnectTarget(primaryInstallation.id)}
+                      >
+                        {t(($) => $.github.disconnect)}
+                      </Button>
+                    </>
                   ) : (
                     <Button
                       size="sm"

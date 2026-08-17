@@ -210,12 +210,13 @@ func TestSetupCallback_RefreshesAnExistingBindingWithoutACode(t *testing.T) {
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
 	})
-	if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
+	seeded, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
 		WorkspaceID:    parseUUID(testWorkspaceID),
 		InstallationID: installationID,
 		AccountLogin:   "already-connected",
 		AccountType:    "Organization",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("seed installation: %v", err)
 	}
 
@@ -233,8 +234,15 @@ func TestSetupCallback_RefreshesAnExistingBindingWithoutACode(t *testing.T) {
 	if rec.Code != http.StatusFound {
 		t.Fatalf("setup callback: got %d, want 302", rec.Code)
 	}
-	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "github_connected=1") {
-		t.Fatalf("redirect = %q, want github_connected=1", loc)
+	redirect, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	if redirect.Query().Get("github_connected") != "1" {
+		t.Fatalf("redirect = %q, want github_connected=1", redirect.String())
+	}
+	if got := redirect.Query().Get("github_installation"); got != uuidToString(seeded.ID) {
+		t.Fatalf("redirect installation = %q, want %q", got, uuidToString(seeded.ID))
 	}
 }
 
