@@ -1,10 +1,11 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { CoreProvider } from "@multica/core/platform";
 import { pickLocale, type SupportedLocale } from "@multica/core/i18n";
 import { useAuthStore } from "@multica/core/auth";
 import { useWelcomeStore } from "@multica/core/onboarding";
-import { workspaceKeys, workspaceListOptions } from "@multica/core/workspace/queries";
+import { workspaceKeys } from "@multica/core/workspace/queries";
+import { useWorkspaceList } from "@multica/core/workspace";
 import { api } from "@multica/core/api";
 import { useHasOnboarded } from "@multica/core/paths";
 import { setCurrentWorkspace } from "@multica/core/platform";
@@ -28,10 +29,6 @@ import { DesktopClientUsageReporter } from "./platform/client-usage-reporter";
 import { DiagnosticRouteReporter } from "./platform/diagnostic-route-reporter";
 import { flushFreezeBreadcrumb } from "./freeze-flush";
 import { DesktopAuthSessionBridge } from "./platform/auth-session-bridge";
-import {
-  hasAuthoritativeWorkspaceList,
-  shouldShowWorkspaceListRecovery,
-} from "./workspace-list-gate";
 
 // BCP-47 region tags for the <html lang> attribute, mirroring
 // apps/web/app/layout.tsx HTML_LANG. index.html ships a static lang="en";
@@ -189,22 +186,13 @@ function AppContent() {
   // daemon restart here — daemon-manager already restarts on user change
   // via syncToken.
   const {
-    data: workspaceList,
-    isError: workspaceListFailed,
+    workspaces,
+    ready: workspaceListReady,
+    unavailable: workspaceListUnavailable,
     isFetching: workspaceListRetrying,
     refetch: retryWorkspaceList,
-  } = useQuery({
-    ...workspaceListOptions(),
+  } = useWorkspaceList({
     enabled: !!user,
-  });
-  const workspaces = useMemo(() => workspaceList ?? [], [workspaceList]);
-  // Cached data remains authoritative when a background refetch fails.
-  // Only the initial no-data state may block or drive destructive cleanup.
-  const workspaceListReady = hasAuthoritativeWorkspaceList(workspaceList);
-  const workspaceListUnavailable = shouldShowWorkspaceListRecovery({
-    authenticated: !!user,
-    workspaces: workspaceList,
-    failed: workspaceListFailed,
   });
   const wsCount = workspaces.length;
   const hasOnboarded = useHasOnboarded();
