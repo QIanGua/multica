@@ -2504,6 +2504,8 @@ type assigneeKinds struct {
 var (
 	issueAssigneeKinds = assigneeKinds{member: true, agent: true, squad: true}
 	memberOrAgentKinds = assigneeKinds{member: true, agent: true}
+	// Actor property values are members only (MUL-6286).
+	memberOnlyKinds = assigneeKinds{member: true}
 )
 
 var assigneeResolveRetrySleep = func(ctx context.Context, d time.Duration) bool {

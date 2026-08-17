@@ -153,7 +153,7 @@ string|number|bool` to force a type.
 Workspaces may define custom issue properties (Severity, Environment, QA
 Status, Reviewer, ...). Properties are the typed, user-visible sibling of
 metadata: values are validated against the definition (select options, date
-format, http(s) URL, member/agent reference), visible in the issue sidebar, and
+format, http(s) URL, member reference), visible in the issue sidebar, and
 addressed by name.
 
 - Read what exists before writing: `multica property list` shows the catalog;
@@ -169,13 +169,9 @@ multica issue property unset <issue-id> --name Environment
 
 - A validation error lists the legal options — fix the value and retry.
 - `actor` / `multi_actor` properties (Reviewer, Escalation contact, ...) hold
-  workspace members and agents — not squads. `--value` takes a name, email,
-  UUID, short id, or an explicit `member:<uuid>` / `agent:<uuid>`; `multi_actor`
-  takes a comma-separated list (duplicates dropped, order kept, max 20).
-- **Writing an agent into an actor property is a reference, not an
-  assignment.** It starts no run, routes nothing, and notifies no one. Only the
-  assignee (and an @mention) makes an agent work. Use an actor property to
-  record who is involved; use assignee to make something happen.
+  workspace members only. `--value` takes a member name, email, UUID, short id,
+  or an explicit `member:<uuid>`; `multi_actor` takes a comma-separated list
+  (duplicates dropped, order kept, max 20).
 - Definitions may include an optional catalog icon for visual identification;
   it does not change the property's type or value validation.
 - Agents cannot create or edit property definitions (owner/admin humans only).

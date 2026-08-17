@@ -613,10 +613,6 @@ func TestParseActorRefUnit(t *testing.T) {
 	if ref.String() != "member:"+memberID {
 		t.Fatalf("String() round-trip broken: %q", ref.String())
 	}
-	agentID := uuid.NewString()
-	if ref, err := parseActorRef("agent:" + agentID); err != nil || ref.Kind != "agent" || ref.ID != agentID {
-		t.Fatalf("agent reference rejected: %+v (%v)", ref, err)
-	}
 
 	cases := []struct {
 		name  string
@@ -625,7 +621,9 @@ func TestParseActorRefUnit(t *testing.T) {
 	}{
 		{"no colon", uuid.NewString(), `"<kind>:<uuid>"`},
 		{"empty string", "", `"<kind>:<uuid>"`},
-		// "squad" is an assignee kind on purpose left out of the V1 value range.
+		// "agent" and "squad" are assignee kinds deliberately left out of the
+		// V1 value range; both must read as unknown, not silently accepted.
+		{"agent kind", "agent:" + uuid.NewString(), "unknown actor kind"},
 		{"squad kind", "squad:" + uuid.NewString(), "unknown actor kind"},
 		{"user kind", "user:" + uuid.NewString(), "unknown actor kind"},
 		{"empty kind", ":" + uuid.NewString(), "unknown actor kind"},
@@ -649,7 +647,7 @@ func TestParseActorRefListUnit(t *testing.T) {
 	// Fixed ids so the insertion order below is neither ascending nor
 	// descending — any sort applied to the result would reorder it.
 	first := "member:11111111-1111-4111-8111-111111111111"
-	second := "agent:22222222-2222-4222-8222-222222222222"
+	second := "member:22222222-2222-4222-8222-222222222222"
 	third := "member:00000000-0000-4000-8000-000000000000"
 
 	if _, err := parseActorRefList(nil); err == nil {
@@ -701,8 +699,10 @@ func TestParseActorRefListUnit(t *testing.T) {
 func TestValidatePropertyValueActorUnit(t *testing.T) {
 	actorDef := makePropertyDef("actor", nil)
 	multiDef := makePropertyDef("multi_actor", nil)
-	memberRef := "member:" + uuid.NewString()
-	agentRef := "agent:" + uuid.NewString()
+	// Fixed ids: memberRef sorts AFTER secondRef, so the insertion order
+	// asserted below is proof that no canonicalizing sort ran.
+	memberRef := "member:99999999-9999-4999-8999-999999999999"
+	secondRef := "member:00000000-0000-4000-8000-000000000000"
 
 	stored, err := validatePropertyValue(actorDef, json.RawMessage(`"`+memberRef+`"`))
 	if err != nil {
@@ -720,6 +720,7 @@ func TestValidatePropertyValueActorUnit(t *testing.T) {
 		`{"kind":"member","id":"` + uuid.NewString() + `"}`,
 		`null`,
 		`"` + uuid.NewString() + `"`,
+		`"agent:` + uuid.NewString() + `"`,
 		`"squad:` + uuid.NewString() + `"`,
 	} {
 		if _, err := validatePropertyValue(actorDef, json.RawMessage(raw)); err == nil {
@@ -740,14 +741,13 @@ func TestValidatePropertyValueActorUnit(t *testing.T) {
 		}
 	}
 
-	// Duplicates collapse and the caller's order survives. "agent:" sorts
-	// before "member:", so the expected output is proof no sort ran.
+	// Duplicates collapse and the caller's order survives.
 	stored, err = validatePropertyValue(multiDef, json.RawMessage(
-		`["`+memberRef+`","`+agentRef+`","`+memberRef+`"]`))
+		`["`+memberRef+`","`+secondRef+`","`+memberRef+`"]`))
 	if err != nil {
 		t.Fatalf("multi_actor value rejected: %v", err)
 	}
-	if string(stored) != `["`+memberRef+`","`+agentRef+`"]` {
+	if string(stored) != `["`+memberRef+`","`+secondRef+`"]` {
 		t.Fatalf("multi_actor not deduped in insertion order: %s", stored)
 	}
 }
@@ -796,15 +796,8 @@ func TestIssueActorPropertyValues(t *testing.T) {
 		"name": "Reviewers" + uuid.NewString()[:8], "type": "multi_actor",
 	})
 
-	var agentID string
-	if err := testPool.QueryRow(context.Background(),
-		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
-		testWorkspaceID, "Handler Test Agent",
-	).Scan(&agentID); err != nil {
-		t.Fatalf("locate seeded test agent: %v", err)
-	}
 	memberRef := "member:" + testUserID
-	agentRef := "agent:" + agentID
+	secondRef := "member:" + createPropertyTestMember(t)
 
 	issueID := createPropertyTestIssue(t, "actor property values")
 
@@ -832,11 +825,6 @@ func TestIssueActorPropertyValues(t *testing.T) {
 		t.Fatalf("actor value missing from the issue bag: %v", fetched.Properties)
 	}
 
-	// An agent that exists in this workspace is a legal reference too.
-	if w := setIssuePropertyRaw(t, issueID, owner.ID, agentRef); w.Code != http.StatusOK {
-		t.Fatalf("actor set agent: expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-
 	// Shape is valid but the referent is not in this workspace → 400.
 	rejections := []struct {
 		name  string
@@ -844,8 +832,10 @@ func TestIssueActorPropertyValues(t *testing.T) {
 		want  string
 	}{
 		{"unknown member", "member:" + uuid.NewString(), "does not refer to a member"},
-		{"unknown agent", "agent:" + uuid.NewString(), "does not refer to an agent"},
-		{"unsupported kind", "squad:" + uuid.NewString(), "unknown actor kind"},
+		// Agents and squads are assignable but not referenceable in V1: both
+		// must be refused at the kind check, before any workspace lookup.
+		{"agent kind", "agent:" + uuid.NewString(), "unknown actor kind"},
+		{"squad kind", "squad:" + uuid.NewString(), "unknown actor kind"},
 		// writeJSON HTML-escapes the angle brackets, so match the prose part.
 		{"bare uuid", uuid.NewString(), "value must look like"},
 		{"array into actor", []string{memberRef}, "actor reference string"},
@@ -857,20 +847,8 @@ func TestIssueActorPropertyValues(t *testing.T) {
 			t.Fatalf("actor %s: expected 400 containing %q, got %d: %s", tc.name, tc.want, w.Code, w.Body.String())
 		}
 	}
-	// An archived agent still exists in the workspace but must not be referenced.
-	archivedAgentID := createHandlerTestAgent(t, "actor-archived-"+uuid.NewString()[:8], []byte(`{}`))
-	if _, err := testPool.Exec(context.Background(),
-		`UPDATE agent SET archived_at = now() WHERE id = $1`, archivedAgentID); err != nil {
-		t.Fatalf("archive agent: %v", err)
-	}
-	if w := setIssuePropertyRaw(t, issueID, owner.ID, "agent:"+archivedAgentID); w.Code != http.StatusBadRequest ||
-		!strings.Contains(w.Body.String(), "archived agent") {
-		t.Fatalf("archived agent reference: expected 400, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// multi_actor: duplicates dropped, insertion order kept. "agent:" sorts
-	// before "member:", so a member-first result proves nothing re-sorted it.
-	w = setIssuePropertyRaw(t, issueID, reviewers.ID, []string{memberRef, agentRef, memberRef})
+	// multi_actor: duplicates dropped, insertion order kept.
+	w = setIssuePropertyRaw(t, issueID, reviewers.ID, []string{memberRef, secondRef, memberRef})
 	if w.Code != http.StatusOK {
 		t.Fatalf("multi_actor set: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -878,7 +856,7 @@ func TestIssueActorPropertyValues(t *testing.T) {
 	if !ok || len(stored) != 2 {
 		t.Fatalf("multi_actor not stored as a 2-element array: %v", stored)
 	}
-	if stored[0] != memberRef || stored[1] != agentRef {
+	if stored[0] != memberRef || stored[1] != secondRef {
 		t.Fatalf("multi_actor lost insertion order: %v", stored)
 	}
 
@@ -908,37 +886,27 @@ func TestIssueActorPropertyValues(t *testing.T) {
 	}
 }
 
-// TestIssueActorPropertyPrivateAgentVisibility: referencing an agent discloses
-// its identity, so both the write path and the facet aggregation apply the same
-// visibility gate as every other workspace-wide agent surface.
-func TestIssueActorPropertyPrivateAgentVisibility(t *testing.T) {
-	privateAgentID, _, plainMemberID := privateAgentTestFixture(t)
+// TestIssueActorPropertyFacets: actor and multi_actor values aggregate into
+// table facets, which is what backs the "= me" filter in the header. Members
+// are the only referenceable kind, and workspace membership is visible to
+// every member, so there is no visibility gate to apply here — a plain member
+// sees the same keys the owner does.
+func TestIssueActorPropertyFacets(t *testing.T) {
+	_, _, plainMemberID := privateAgentTestFixture(t)
 	property := createTestProperty(t, map[string]any{
 		"name": "Facet Owner" + uuid.NewString()[:8], "type": "actor",
 	})
 	memberRef := "member:" + testUserID
-	privateAgentRef := "agent:" + privateAgentID
+	otherRef := "member:" + plainMemberID
 
-	memberIssueID := createPropertyTestIssue(t, "actor facet member")
-	agentIssueID := createPropertyTestIssue(t, "actor facet private agent")
+	firstIssueID := createPropertyTestIssue(t, "actor facet first")
+	secondIssueID := createPropertyTestIssue(t, "actor facet second")
 
-	// The workspace owner sees every agent, so both writes succeed for them.
-	if w := setIssuePropertyRaw(t, memberIssueID, property.ID, memberRef); w.Code != http.StatusOK {
-		t.Fatalf("owner set member: expected 200, got %d: %s", w.Code, w.Body.String())
+	if w := setIssuePropertyRaw(t, firstIssueID, property.ID, memberRef); w.Code != http.StatusOK {
+		t.Fatalf("set first actor value: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if w := setIssuePropertyRaw(t, agentIssueID, property.ID, privateAgentRef); w.Code != http.StatusOK {
-		t.Fatalf("owner set private agent: expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// A plain member cannot see that agent, so they cannot reference it either.
-	w := httptest.NewRecorder()
-	req := newRequestAs(plainMemberID, "PUT",
-		"/api/issues/"+memberIssueID+"/properties/"+property.ID,
-		map[string]any{"value": privateAgentRef})
-	req = withIssuePropertyParams(req, memberIssueID, property.ID)
-	testHandler.SetIssueProperty(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("plain member set private agent: expected 403, got %d: %s", w.Code, w.Body.String())
+	if w := setIssuePropertyRaw(t, secondIssueID, property.ID, otherRef); w.Code != http.StatusOK {
+		t.Fatalf("set second actor value: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
 	facetKeys := func(userID string) map[string]int64 {
@@ -973,14 +941,35 @@ func TestIssueActorPropertyPrivateAgentVisibility(t *testing.T) {
 	// Only these two issues carry this brand-new definition, so the counts are
 	// exact regardless of what else lives in the shared fixture workspace.
 	ownerCounts := facetKeys(testUserID)
-	if ownerCounts[memberRef] != 1 || ownerCounts[privateAgentRef] != 1 {
+	if ownerCounts[memberRef] != 1 || ownerCounts[otherRef] != 1 {
 		t.Fatalf("owner facet counts wrong: %v", ownerCounts)
 	}
 	memberCounts := facetKeys(plainMemberID)
-	if memberCounts[memberRef] != 1 {
-		t.Fatalf("member-typed facet value hidden from a plain member: %v", memberCounts)
+	if memberCounts[memberRef] != 1 || memberCounts[otherRef] != 1 {
+		t.Fatalf("plain member sees different facet keys than the owner: %v", memberCounts)
 	}
-	if _, present := memberCounts[privateAgentRef]; present {
-		t.Fatalf("private agent leaked through the actor facet: %v", memberCounts)
+}
+
+// createPropertyTestMember adds a second real member to the fixture workspace
+// so multi_actor ordering can be asserted with two resolvable references.
+func createPropertyTestMember(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	email := "actor-second-" + uuid.NewString()[:8] + "@multica.test"
+	var userID string
+	if err := testPool.QueryRow(ctx,
+		`INSERT INTO "user" (name, email) VALUES ('Actor Second Member', $1) RETURNING id`, email,
+	).Scan(&userID); err != nil {
+		t.Fatalf("create second member user: %v", err)
 	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM "user" WHERE email = $1`, email)
+	})
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO member (workspace_id, user_id, role) VALUES ($1, $2, 'member')`,
+		testWorkspaceID, userID,
+	); err != nil {
+		t.Fatalf("add second member: %v", err)
+	}
+	return userID
 }

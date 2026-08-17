@@ -617,7 +617,7 @@
       "value_placeholder": "값 입력…",
       "url_placeholder": "https://…",
       "number_placeholder": "0",
-      "actor_search_placeholder": "멤버 및 에이전트 검색…",
+      "actor_search_placeholder": "멤버 검색…",
       "open_link": "링크 열기",
       "archived_hint": "보관된 속성 — 값은 읽기 전용입니다"
     },

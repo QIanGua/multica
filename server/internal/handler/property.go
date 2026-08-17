@@ -305,11 +305,19 @@ func selectOptionsHint(cfg PropertyConfig) string {
 // Actor values (MUL-6286)
 // ---------------------------------------------------------------------------
 
-// actorPropertyKinds is the V1 value range for actor properties. The issue
-// assignee additionally accepts "squad", but a squad is a routing target
-// rather than a person, so it stays out until a concrete use case appears.
-// The stored form carries the kind, so widening this later needs no migration.
-var actorPropertyKinds = []string{"member", "agent"}
+// actorPropertyKinds is the V1 value range for actor properties: workspace
+// members only. The issue assignee also accepts "agent" and "squad", but
+// neither belongs in a passive reference yet — an agent reference drags in the
+// whole agent-visibility question (private / non-allow-listed agents must not
+// become discoverable by id) for no demonstrated use case, and a squad is a
+// routing target rather than a person.
+//
+// The stored form is "<kind>:<uuid>", so widening this list is a one-line
+// change: no migration, no new property type, and existing definitions gain
+// the new kind in place. Anything added here that is NOT universally visible
+// to every workspace member (an agent, for one) must also restore a visibility
+// gate on both the write path and the table-facet read path.
+var actorPropertyKinds = []string{"member"}
 
 // actorRef is a parsed "<kind>:<uuid>" property value.
 type actorRef struct {
@@ -413,59 +421,26 @@ func actorRefsInValue(propType string, stored []byte) ([]actorRef, error) {
 	return refs, nil
 }
 
-// resolveActorRefs checks that every reference points at something real in
-// this workspace, and that the caller is allowed to see it.
-//
-// Referencing an agent is NOT an assignment: it never enqueues a task, routes
-// a squad, or notifies. It does still disclose agent identity, so it reuses
-// the same visibility set as every other workspace-wide agent aggregation —
-// a private or non-allow-listed agent must not become referenceable by id.
+// resolveActorRefs checks that every reference points at a real member of this
+// workspace. No visibility gate is needed while members are the only kind:
+// workspace membership is already visible to every member. Adding a kind that
+// is not (an agent) means adding that gate back — see actorPropertyKinds.
 func (h *Handler) resolveActorRefs(r *http.Request, workspaceID string, refs []actorRef) (int, string) {
 	ctx := r.Context()
 	wsUUID, err := util.ParseUUID(workspaceID)
 	if err != nil {
 		return http.StatusBadRequest, "invalid workspace_id"
 	}
-	var allowedAgents map[string]struct{}
 	for _, ref := range refs {
 		refUUID, err := util.ParseUUID(ref.ID)
 		if err != nil {
 			return http.StatusBadRequest, fmt.Sprintf("actor id in %q must be a UUID", ref)
 		}
-		switch ref.Kind {
-		case "member":
-			if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
-				UserID:      refUUID,
-				WorkspaceID: wsUUID,
-			}); err != nil {
-				return http.StatusBadRequest, fmt.Sprintf("%q does not refer to a member of this workspace", ref)
-			}
-		case "agent":
-			agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
-				ID:          refUUID,
-				WorkspaceID: wsUUID,
-			})
-			if err != nil {
-				return http.StatusBadRequest, fmt.Sprintf("%q does not refer to an agent of this workspace", ref)
-			}
-			if agent.ArchivedAt.Valid {
-				return http.StatusBadRequest, fmt.Sprintf("%q refers to an archived agent", ref)
-			}
-			if allowedAgents == nil {
-				member, err := h.getWorkspaceMember(ctx, requestUserID(r), workspaceID)
-				if err != nil {
-					return http.StatusForbidden, "not a member of this workspace"
-				}
-				actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
-				allowed, ok := h.accessibleAgentIDs(ctx, workspaceID, actorType, actorID, member.Role)
-				if !ok {
-					return http.StatusInternalServerError, "failed to resolve agent access"
-				}
-				allowedAgents = allowed
-			}
-			if _, permitted := allowedAgents[ref.ID]; !permitted {
-				return http.StatusForbidden, fmt.Sprintf("%q refers to a private agent", ref)
-			}
+		if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+			UserID:      refUUID,
+			WorkspaceID: wsUUID,
+		}); err != nil {
+			return http.StatusBadRequest, fmt.Sprintf("%q does not refer to a member of this workspace", ref)
 		}
 	}
 	return 0, ""

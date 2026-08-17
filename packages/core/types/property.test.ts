@@ -8,6 +8,7 @@ import {
 } from "./property";
 
 const MEMBER = "11111111-2222-3333-4444-555555555555";
+const SECOND_MEMBER = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const AGENT = "66666666-7777-8888-9999-000000000000";
 
 describe("isKnownPropertyType", () => {
@@ -31,13 +32,13 @@ describe("isActorPropertyType", () => {
 });
 
 describe("parseActorRef", () => {
-  it("parses member and agent references", () => {
+  it("parses member references", () => {
     expect(parseActorRef(`member:${MEMBER}`)).toEqual({ kind: "member", id: MEMBER });
-    expect(parseActorRef(`agent:${AGENT}`)).toEqual({ kind: "agent", id: AGENT });
   });
 
   it("rejects kinds outside the V1 range", () => {
-    // Squads are assignable but deliberately not referenceable as a value.
+    // Agents and squads are assignable but deliberately not referenceable.
+    expect(parseActorRef(`agent:${AGENT}`)).toBeNull();
     expect(parseActorRef(`squad:${AGENT}`)).toBeNull();
     expect(parseActorRef(`user:${MEMBER}`)).toBeNull();
   });
@@ -53,9 +54,9 @@ describe("parseActorRef", () => {
 
 describe("formatActorRef", () => {
   it("round-trips through parseActorRef", () => {
-    const ref = formatActorRef("agent", AGENT);
-    expect(ref).toBe(`agent:${AGENT}`);
-    expect(parseActorRef(ref)).toEqual({ kind: "agent", id: AGENT });
+    const ref = formatActorRef("member", MEMBER);
+    expect(ref).toBe(`member:${MEMBER}`);
+    expect(parseActorRef(ref)).toEqual({ kind: "member", id: MEMBER });
   });
 });
 
@@ -65,14 +66,16 @@ describe("actorRefsFromValue", () => {
   });
 
   it("preserves multi_actor order rather than sorting", () => {
-    expect(actorRefsFromValue([`agent:${AGENT}`, `member:${MEMBER}`])).toEqual([
-      { kind: "agent", id: AGENT },
+    expect(actorRefsFromValue([`member:${SECOND_MEMBER}`, `member:${MEMBER}`])).toEqual([
+      { kind: "member", id: SECOND_MEMBER },
       { kind: "member", id: MEMBER },
     ]);
   });
 
   it("drops entries a newer backend may ship instead of throwing", () => {
-    expect(actorRefsFromValue([`member:${MEMBER}`, `squad:${AGENT}`, "garbage"])).toEqual([
+    // A backend that later widens the kind set must not blank the whole value
+    // on an older client — the unknown entries drop, the known ones render.
+    expect(actorRefsFromValue([`member:${MEMBER}`, `agent:${AGENT}`, "garbage"])).toEqual([
       { kind: "member", id: MEMBER },
     ]);
   });

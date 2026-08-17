@@ -197,9 +197,9 @@ comment-triggered runs otherwise must not change status unless asked.
 | Definition CRUD, admin gate, agent-actor rejection | `server/internal/handler/property.go` (`requirePropertyAdmin`) |
 | Optional catalog icon field and allowlist validation | `server/internal/handler/property.go` (`PropertyResponse`, `validatePropertyIcon`) |
 | Per-type value validation (self-correcting errors) | `server/internal/handler/property.go` (`validatePropertyValue`) |
-| `actor` / `multi_actor` reference parsing, member/agent kinds, 20-value cap | `server/internal/handler/property.go` (`parseActorRef`, `parseActorRefList`, `maxPropertyActorValues`) |
-| Actor references are existence/visibility checked only — no run enqueued, no routing, no notification | `server/internal/handler/property.go` (`resolveActorRefs`) |
-| `--value` name / email / id → `<kind>:<uuid>` resolution (same lookup as `--assignee`, minus squads) | `server/cmd/multica/cmd_property.go` (`resolveActorPropertyRef`) |
+| `actor` / `multi_actor` reference parsing, `member` as the only kind, 20-value cap | `server/internal/handler/property.go` (`actorPropertyKinds`, `parseActorRef`, `parseActorRefList`, `maxPropertyActorValues`) |
+| Actor references are checked for workspace membership only | `server/internal/handler/property.go` (`resolveActorRefs`) |
+| `--value` name / email / id → `member:<uuid>` resolution (same member lookup as `--assignee`) | `server/cmd/multica/cmd_property.go` (`resolveActorPropertyRef`, `memberOnlyKinds`) |
 | Shared actor-reference types and helpers | `packages/core/types/property.ts` (`parseActorRef`, `actorRefsFromValue`, `MAX_ISSUE_PROPERTY_ACTOR_VALUES`) |
 | API routes (`/api/properties`, PUT/DELETE `/api/issues/{id}/properties/{propertyId}`) | `server/cmd/server/router.go` |
 

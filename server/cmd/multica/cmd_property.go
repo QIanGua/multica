@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -77,10 +76,8 @@ flags:
       --option "Critical:#ef4444" --option "Major:#f59e0b" --option "Minor:#6b7280"
 The ":#rrggbb" color suffix is optional.
 
-The actor types hold workspace members and agents; they take no options:
-  multica property create --name Reviewer --type actor
-Setting an agent into an actor property is a reference only — it never starts
-a run.`,
+The actor types hold workspace members; they take no options:
+  multica property create --name Reviewer --type actor`,
 	Args: exactArgs(0),
 	RunE: runPropertyCreate,
 }
@@ -127,8 +124,8 @@ var issuePropertySetCmd = &cobra.Command{
 (case-insensitive) or UUID. Value forms by type:
   select        --value Staging            (option name or id)
   multi_select  --value "iOS,Android"      (comma-separated option names or ids)
-  actor         --value Bohan             (member/agent name, email, or id)
-  multi_actor   --value "Bohan,Elon"      (comma-separated members/agents)
+  actor         --value Bohan             (member name, email, or id)
+  multi_actor   --value "Bohan,Jiayuan"   (comma-separated members)
   checkbox      --value true|false
   number        --value 3.5
   date          --value 2026-07-13
@@ -443,22 +440,22 @@ func makePropertyArchiveRun(archive bool) func(*cobra.Command, []string) error {
 // issue property {list|set|unset}
 // ---------------------------------------------------------------------------
 
-// resolveActorPropertyRef turns one --value token into a "<kind>:<uuid>"
+// resolveActorPropertyRef turns one --value token into a "member:<uuid>"
 // actor reference. An already-prefixed token is taken as-is (after checking
-// the id parses); anything else goes through the same member/agent lookup
+// the id parses); anything else goes through the same member lookup
 // `--assignee` uses, so names, emails, UUIDs and short ids all work.
 func resolveActorPropertyRef(ctx context.Context, client *cli.APIClient, raw string) (string, error) {
 	token := strings.TrimSpace(raw)
 	if token == "" {
 		return "", fmt.Errorf("actor value cannot be empty")
 	}
-	if kind, id, found := strings.Cut(token, ":"); found && (kind == "member" || kind == "agent") {
+	if kind, id, found := strings.Cut(token, ":"); found && kind == "member" {
 		if _, err := uuid.Parse(strings.TrimSpace(id)); err != nil {
 			return "", fmt.Errorf("actor id in %q must be a UUID", token)
 		}
 		return kind + ":" + strings.TrimSpace(id), nil
 	}
-	actorType, actorID, err := resolveAssignee(ctx, client, token, memberOrAgentKinds)
+	actorType, actorID, err := resolveAssignee(ctx, client, token, memberOnlyKinds)
 	if err != nil {
 		return "", err
 	}
@@ -467,7 +464,7 @@ func resolveActorPropertyRef(ctx context.Context, client *cli.APIClient, raw str
 
 // encodeIssuePropertyValue converts the CLI --value string into the typed
 // JSON the API expects, translating option names to ids for select types and
-// member/agent names to actor references for actor types.
+// member names to actor references for actor types.
 func encodeIssuePropertyValue(ctx context.Context, client *cli.APIClient, property propertyDTO, raw string) (json.RawMessage, error) {
 	optionNames := make([]string, len(property.Config.Options))
 	for i, opt := range property.Config.Options {
@@ -527,7 +524,7 @@ func encodeIssuePropertyValue(ctx context.Context, client *cli.APIClient, proper
 			refs = append(refs, ref)
 		}
 		if len(refs) == 0 {
-			return nil, fmt.Errorf("--value must list at least one member or agent")
+			return nil, fmt.Errorf("--value must list at least one member")
 		}
 		return json.Marshal(refs)
 	case "number":
@@ -546,7 +543,7 @@ func encodeIssuePropertyValue(ctx context.Context, client *cli.APIClient, proper
 }
 
 // formatIssuePropertyValue renders a stored value for humans: option ids
-// become option names, actor references become member/agent names, everything
+// become option names, actor references become member names, everything
 // else prints via formatMetadataValue. actorNames may be nil — references then
 // print in their raw "<kind>:<uuid>" form rather than failing.
 func formatIssuePropertyValue(property propertyDTO, value any, actorNames map[string]string) string {
@@ -632,10 +629,10 @@ func buildIssuePropertyRows(properties []propertyDTO, bag map[string]any, actorN
 	return rows
 }
 
-// fetchActorPropertyNames builds a "<kind>:<uuid>" → display name map, but
+// fetchActorPropertyNames builds a "member:<uuid>" → display name map, but
 // only when the bag actually holds an actor value: every other property type
 // renders without a second round trip, and `issue property list` shouldn't pay
-// for two extra requests it doesn't need.
+// for a request it doesn't need.
 func fetchActorPropertyNames(ctx context.Context, client *cli.APIClient, properties []propertyDTO, bag map[string]any) map[string]string {
 	needed := false
 	for _, p := range properties {
@@ -653,15 +650,6 @@ func fetchActorPropertyNames(ctx context.Context, client *cli.APIClient, propert
 		for _, m := range members {
 			if id := strVal(m, "user_id"); id != "" {
 				names["member:"+id] = strVal(m, "name")
-			}
-		}
-	}
-	var agents []map[string]any
-	agentPath := "/api/agents?" + url.Values{"workspace_id": {client.WorkspaceID}}.Encode()
-	if err := getAssigneeJSON(ctx, client, agentPath, &agents); err == nil {
-		for _, a := range agents {
-			if id := strVal(a, "id"); id != "" {
-				names["agent:"+id] = strVal(a, "name")
 			}
 		}
 	}

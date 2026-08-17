@@ -365,8 +365,8 @@
       "date": "날짜",
       "checkbox": "체크박스",
       "url": "URL",
-      "actor": "멤버 또는 에이전트",
-      "multi_actor": "멤버 또는 에이전트(다중 선택)"
+      "actor": "멤버",
+      "multi_actor": "멤버(다중 선택)"
     },
     "actions": {
       "open": "{{name}} 작업",

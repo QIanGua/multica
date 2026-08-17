@@ -8,7 +8,7 @@ import {
   formatActorRef,
   MAX_ISSUE_PROPERTY_ACTOR_VALUES,
 } from "@multica/core/types";
-import { memberListOptions, agentListOptions } from "@multica/core/workspace/queries";
+import { memberListOptions } from "@multica/core/workspace/queries";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { ActorAvatar } from "../../../common/actor-avatar";
@@ -19,15 +19,11 @@ import { PropertyPicker, PickerItem, PickerSection, PickerEmpty } from "./proper
 /**
  * Value editor for `actor` / `multi_actor` custom properties (MUL-6286).
  *
- * Shaped like AssigneePicker — same member/agent sections, same avatars — with
- * two deliberate differences:
- *
- *   1. No squad section. A squad is a routing target, not a person; the actor
- *      property's value range stops at member/agent.
- *   2. Agents are never disabled for runtime binding or invoke permission.
- *      Writing an agent here is a REFERENCE, not an assignment: nothing is
- *      enqueued, so "can this agent run" is the wrong question. The server
- *      gates the same way — on visibility, not invocability.
+ * Shaped like AssigneePicker's members section — same rows, same avatars — but
+ * members are the only kind an actor property accepts. Agents and squads are
+ * assignable but not referenceable: an agent would need the picker to answer
+ * visibility and invoke-permission questions that a passive reference has no
+ * business asking, and a squad is a routing target rather than a person.
  *
  * `multi_actor` toggles in place and keeps the popover open (mirroring
  * multi_select); `actor` commits and closes.
@@ -55,7 +51,6 @@ export function ActorPropertyPicker({
   const [filter, setFilter] = useState("");
   const wsId = useWorkspaceId();
   const { data: members = [] } = useQuery(memberListOptions(wsId));
-  const { data: agents = [] } = useQuery(agentListOptions(wsId));
 
   const multiple = property.type === "multi_actor";
   const selected = actorRefsFromValue(value);
@@ -65,9 +60,8 @@ export function ActorPropertyPicker({
   const query = filter.trim().toLowerCase();
   const matches = (name: string) => name.toLowerCase().includes(query) || matchesPinyin(name, query);
   const filteredMembers = members.filter((m) => matches(m.name));
-  const filteredAgents = agents.filter((a) => !a.archived_at && matches(a.name));
 
-  const commit = (kind: "member" | "agent", id: string) => {
+  const commit = (kind: "member", id: string) => {
     const key = formatActorRef(kind, id);
     if (!multiple) {
       onChange(key);
@@ -88,7 +82,7 @@ export function ActorPropertyPicker({
     onChange([...selected.map((ref) => formatActorRef(ref.kind, ref.id)), key]);
   };
 
-  const rowsEmpty = filteredMembers.length === 0 && filteredAgents.length === 0;
+  const rowsEmpty = filteredMembers.length === 0;
 
   return (
     <PropertyPicker
@@ -121,26 +115,6 @@ export function ActorPropertyPicker({
               >
                 <ActorAvatar actorType="member" actorId={m.user_id} size="sm" />
                 <span className="truncate">{m.name}</span>
-              </PickerItem>
-            );
-          })}
-        </PickerSection>
-      )}
-
-      {filteredAgents.length > 0 && (
-        <PickerSection label={t(($) => $.pickers.assignee.agents_group)}>
-          {filteredAgents.map((a) => {
-            const key = formatActorRef("agent", a.id);
-            const isSelected = selectedKeys.has(key);
-            return (
-              <PickerItem
-                key={a.id}
-                selected={isSelected}
-                disabled={atCapacity && !isSelected}
-                onClick={() => commit("agent", a.id)}
-              >
-                <ActorAvatar actorType="agent" actorId={a.id} size="sm" />
-                <span className="truncate">{a.name}</span>
               </PickerItem>
             );
           })}

@@ -366,8 +366,8 @@
       "date": "Date",
       "checkbox": "Checkbox",
       "url": "URL",
-      "actor": "Member or agent",
-      "multi_actor": "Members or agents"
+      "actor": "Member",
+      "multi_actor": "Members"
     },
     "actions": {
       "open": "Actions for {{name}}",

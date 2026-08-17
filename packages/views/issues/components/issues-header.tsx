@@ -660,7 +660,7 @@ function LabelSubContent({
  * Select/multi_select list the definition's options (dot + name); checkbox
  * definitions expose the "true"/"false" pseudo-options with Yes/No labels;
  * actor definitions have no config options at all, so their candidates come
- * from the workspace directories instead, with the signed-in member first so
+ * from the member directory instead, with the signed-in member first so
  * "this property is me" stays one click away.
  */
 function PropertyFilterOptions({
@@ -686,14 +686,10 @@ function PropertyFilterOptions({
     ...memberListOptions(wsId),
     enabled: actorProperty,
   });
-  const { data: actorAgents = [] } = useQuery({
-    ...agentListOptions(wsId),
-    enabled: actorProperty,
-  });
 
   const actorOptions = useMemo(() => {
     if (!actorProperty) return [];
-    const memberOptions = actorMembers
+    return actorMembers
       .slice()
       .sort((a, b) => {
         if (a.user_id === currentUserId) return -1;
@@ -706,16 +702,7 @@ function PropertyFilterOptions({
         actorType: "member" as const,
         actorId: m.user_id,
       }));
-    const agentOptions = actorAgents
-      .filter((a) => !a.archived_at)
-      .map((a) => ({
-        id: formatActorRef("agent", a.id),
-        name: a.name,
-        actorType: "agent" as const,
-        actorId: a.id,
-      }));
-    return [...memberOptions, ...agentOptions];
-  }, [actorProperty, actorMembers, actorAgents, currentUserId]);
+  }, [actorProperty, actorMembers, currentUserId]);
 
   const options = actorProperty
     ? actorOptions.map((option) => ({

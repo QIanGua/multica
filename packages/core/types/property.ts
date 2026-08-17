@@ -6,7 +6,7 @@
  *
  * Values are typed per definition: select stores an option id, multi_select
  * an array of option ids (config order), date a "YYYY-MM-DD" string, checkbox
- * a boolean, number a number, text/url strings, actor a "<kind>:<uuid>"
+ * a boolean, number a number, text/url strings, actor a "member:<user_id>"
  * reference string, multi_actor an array of them (insertion order).
  */
 export type IssuePropertyType =
@@ -37,15 +37,17 @@ export function isKnownPropertyType(type: string): type is IssuePropertyType {
 }
 
 /**
- * Actor properties (MUL-6286) reference a workspace member or agent. The
- * assignee field additionally accepts a squad; actor properties deliberately
- * do not, because a squad is a routing target rather than a person.
+ * Actor properties (MUL-6286) reference a workspace member. The assignee field
+ * also accepts agents and squads; actor properties deliberately do not — an
+ * agent reference would drag in agent-visibility rules, and a squad is a
+ * routing target rather than a person.
  *
- * Referencing an agent here is NOT an assignment: it never starts a run.
+ * The stored form is "<kind>:<uuid>", so widening this union later needs no
+ * migration and no new property type.
  */
-export type IssuePropertyActorKind = "member" | "agent";
+export type IssuePropertyActorKind = "member";
 
-export const ISSUE_PROPERTY_ACTOR_KINDS: IssuePropertyActorKind[] = ["member", "agent"];
+export const ISSUE_PROPERTY_ACTOR_KINDS: IssuePropertyActorKind[] = ["member"];
 
 /** Upper bound on a single multi_actor value; mirrors the server cap. */
 export const MAX_ISSUE_PROPERTY_ACTOR_VALUES = 20;
