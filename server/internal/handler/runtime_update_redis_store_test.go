@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func TestRedisUpdateStore_EnvelopePersistsRunStartedAt(t *testing.T) {
@@ -77,6 +79,54 @@ func TestRedisUpdateStore_CreateGetComplete(t *testing.T) {
 
 	if _, err := store.Create(ctx, "runtime-1", "v1.2.4", "user-1"); err != nil {
 		t.Fatalf("create after complete should be allowed: %v", err)
+	}
+}
+
+func TestRedisUpdateStore_CreateWithoutMultiPermission(t *testing.T) {
+	rdb := newRedisTestClient(t)
+	ctx := context.Background()
+
+	const (
+		username = "runtime-update-no-multi"
+		password = "runtime-update-test-password"
+	)
+	if err := rdb.Do(
+		ctx,
+		"ACL", "SETUSER", username,
+		"reset", "on", ">"+password, "~*", "+@all", "-multi", "-exec",
+	).Err(); err != nil {
+		t.Fatalf("create restricted Redis user: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := rdb.Do(context.Background(), "ACL", "DELUSER", username).Err(); err != nil {
+			t.Errorf("delete restricted Redis user: %v", err)
+		}
+	})
+
+	opts := *rdb.Options()
+	opts.Username = username
+	opts.Password = password
+	restricted := redis.NewClient(&opts)
+	t.Cleanup(func() { _ = restricted.Close() })
+	if err := restricted.Ping(ctx).Err(); err != nil {
+		t.Fatalf("connect as restricted Redis user: %v", err)
+	}
+
+	store := NewRedisUpdateStore(restricted)
+	req, err := store.Create(ctx, "runtime-no-multi", "v1.2.3", "user-1")
+	if err != nil {
+		t.Fatalf("create without MULTI permission: %v", err)
+	}
+	if req.Status != UpdatePending {
+		t.Fatalf("initial status = %s, want %s", req.Status, UpdatePending)
+	}
+
+	got, err := store.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatalf("get created request: %v", err)
+	}
+	if got == nil || got.ID != req.ID {
+		t.Fatalf("created request was not persisted: %+v", got)
 	}
 }
 
