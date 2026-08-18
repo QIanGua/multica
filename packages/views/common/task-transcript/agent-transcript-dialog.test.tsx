@@ -333,6 +333,33 @@ describe("AgentTranscriptDialog", () => {
     expect(screen.getAllByTestId("actor-avatar")).toHaveLength(1);
   });
 
+  // A facet is only readable if you can see what it selects. Tool facets always
+  // could — their rows print the tool name — but prose rows carried no kind
+  // mark at all, so "Agent" in the menu pointed at nothing.
+  it("anchors each filter facet to the glyph its rows carry", () => {
+    renderDialog([
+      { seq: 1, type: "text", content: "Committing now:" },
+      { seq: 2, type: "tool_use", tool: "Bash", input: { command: "git commit" } },
+    ]);
+
+    const agentFacet = screen.getByRole("menuitemcheckbox", { name: "Agent" });
+    expect(agentFacet.querySelector(".lucide-bot")).not.toBeNull();
+
+    const proseRow = screen.getByTestId("rich-content").closest(".group");
+    expect(proseRow?.querySelector(".lucide-bot")).not.toBeNull();
+  });
+
+  it("names a tool facet the way its rows do, keeping the prefix in the key", () => {
+    renderDialog([{ seq: 1, type: "tool_use", tool: "Bash", input: { command: "ls" } }]);
+
+    expect(screen.getByRole("menuitemcheckbox", { name: "Bash" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitemcheckbox", { name: "tool:Bash" })).toBeNull();
+
+    // The label changed; the persisted facet key did not.
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Bash" }));
+    expect(useTranscriptViewStore.getState().selectedFilterKeys).toEqual(["tool:Bash"]);
+  });
+
   it("folds a call and its result into one step instead of two rows", () => {
     renderDialog([
       { seq: 1, type: "tool_use", tool: "Bash", input: { command: "ls" } },
