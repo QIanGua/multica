@@ -539,9 +539,10 @@ WHERE id = $1 AND issue_id IS NULL
 -- fire_at arms a backoff before the retry: when non-NULL the child is inserted
 -- as 'deferred' with that fire_at and stays inert until the existing
 -- PromoteDueDeferredTasksForRuntime sweeper (run promote-first on every claim
--- poll) flips it to 'queued'. Used for provider_network's final attempt so it
--- waits ~5s instead of firing back-to-back with the immediate retry (MUL-4910).
--- NULL keeps the historical behaviour: an immediately-claimable 'queued' child.
+-- poll) flips it to 'queued'. Used for runtime_offline so the child waits for a
+-- healthy runtime, and for provider_network's final attempt so it waits ~5s
+-- instead of firing back-to-back with the immediate retry (MUL-4910). NULL
+-- keeps the historical behaviour: an immediately-claimable 'queued' child.
 --
 -- max_attempts overrides the inherited budget when non-NULL (NULL inherits
 -- p.max_attempts unchanged). Callers persist the reason-aware effective ceiling
@@ -669,7 +670,8 @@ JOIN agent a ON a.id = atq.agent_id
 WHERE atq.id = $1 AND a.workspace_id = $2;
 
 -- name: ClaimAgentTask :one
--- Claims the next queued task for an agent, enforcing per-(issue, agent) serialization:
+-- Claims the next queued task for an agent on one healthy runtime, enforcing
+-- per-(issue, agent) serialization:
 -- a task is only claimable when no other task for the same issue AND same agent is
 -- already dispatched or running. This allows different agents to work on the same
 -- issue in parallel while preventing a single agent from running duplicate tasks.
@@ -684,7 +686,16 @@ SET status = 'dispatched',
     prepare_lease_expires_at = now() + make_interval(secs => @prepare_lease_secs::double precision)
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
-    WHERE atq.agent_id = $1 AND atq.status = 'queued'
+    WHERE atq.agent_id = @agent_id
+      AND atq.runtime_id = @runtime_id
+      AND atq.status = 'queued'
+      AND EXISTS (
+          SELECT 1 FROM agent_runtime r
+          WHERE r.id = atq.runtime_id
+            AND r.status = 'online'
+            AND COALESCE(r.last_seen_at, r.updated_at) >=
+                now() - make_interval(secs => @runtime_stale_secs::double precision)
+      )
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
           WHERE active.agent_id = atq.agent_id
@@ -767,6 +778,13 @@ WHERE id = (
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
+      AND EXISTS (
+          SELECT 1 FROM agent_runtime r
+          WHERE r.id = atq.runtime_id
+            AND r.status = 'online'
+            AND COALESCE(r.last_seen_at, r.updated_at) >=
+                now() - make_interval(secs => @runtime_stale_secs::double precision)
+      )
     ORDER BY atq.priority DESC, atq.dispatched_at ASC
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -791,6 +809,13 @@ WHERE id IN (
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
+      AND EXISTS (
+          SELECT 1 FROM agent_runtime r
+          WHERE r.id = atq.runtime_id
+            AND r.status = 'online'
+            AND COALESCE(r.last_seen_at, r.updated_at) >=
+                now() - make_interval(secs => @runtime_stale_secs::double precision)
+      )
     ORDER BY atq.priority DESC, atq.dispatched_at ASC
     LIMIT @max_tasks::int
     FOR UPDATE SKIP LOCKED
@@ -1147,25 +1172,20 @@ RETURNING *;
 --
 --   * Dispatched: `prepare_lease_expires_at` is refreshed every 15s by the
 --     daemon between claim and StartTask (see startTaskPrepareLeaseExtender).
---     A live lease excludes the row.
+--     A live lease excludes the row. An expired lease may fail immediately on
+--     a healthy runtime, but a disconnected runtime gets the same reconnect
+--     grace as a running task.
 --
 --   * Running: no per-task lease is renewed once StartTask fires, so we key
 --     off the daemon-wide heartbeat instead — `agent_runtime.last_seen_at`,
---     which the daemon bumps every ~15s while it is up. A running task whose
---     runtime is `online` AND whose `last_seen_at` is within
---     @runtime_stale_secs is treated as alive and is NOT killed by this
---     wall-clock backstop, even after `started_at` exceeds the running
---     timeout. This is what lets healthy multi-hour research / training runs
---     survive on self-hosted deployments (MUL-4107): the daemon side is
---     bounded only by inactivity watchdogs (idle / per-tool), so the
---     server-side wall clock must not shadow that with a coarser cap.
+--     which the daemon bumps every ~15s while it is up. A running task is not
+--     killed until that heartbeat has been absent for the full reconnect
+--     grace, even when its own wall-clock timeout elapsed earlier. This keeps
+--     healthy multi-hour work alive through a network partition.
 --
--- The daemon-dead case is the primary responsibility of `sweepStaleRuntimes`
--- (which mixes DB `last_seen_at` with the Redis LivenessStore and calls
--- `FailTasksForOfflineRuntimes` in the same tick). The wall-clock branch
--- here is a defensive backstop for pathological cases where a runtime row
--- somehow retains status='online' with a stale DB heartbeat for longer than
--- the wall clock allows.
+-- The daemon-dead case is recovered immediately when that daemon restarts via
+-- RecoverOrphanedTasksForRuntime. Until then, this query and
+-- FailTasksForOfflineRuntimes share the same bounded reconnect grace.
 --
 -- runtime_id IS NULL: a running row with no runtime is by definition not
 -- proving liveness, so the wall clock is allowed to fire — same shape as
@@ -1184,15 +1204,38 @@ WHERE (
     status = 'dispatched'
     AND dispatched_at < now() - make_interval(secs => @dispatch_timeout_secs::double precision)
     AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
+    AND (
+      runtime_id IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+          AND (
+            (
+              r.status = 'online'
+              AND COALESCE(r.last_seen_at, r.updated_at) >=
+                  now() - make_interval(secs => @runtime_stale_secs::double precision)
+            )
+            OR COALESCE(r.last_seen_at, r.updated_at) <
+               now() - make_interval(secs => @runtime_reconnect_grace_secs::double precision)
+          )
+      )
+    )
   )
    OR (
     status = 'running'
     AND started_at < now() - make_interval(secs => @running_timeout_secs::double precision)
-    AND NOT EXISTS (
-      SELECT 1 FROM agent_runtime r
-      WHERE r.id = agent_task_queue.runtime_id
-        AND r.status = 'online'
-        AND r.last_seen_at >= now() - make_interval(secs => @runtime_stale_secs::double precision)
+    AND (
+      runtime_id IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_runtime r
+        WHERE r.id = agent_task_queue.runtime_id
+          AND COALESCE(r.last_seen_at, r.updated_at) >=
+              now() - make_interval(secs => @runtime_reconnect_grace_secs::double precision)
+      )
     )
   )
 RETURNING *;
@@ -1204,7 +1247,9 @@ RETURNING *;
 -- is offline, we still need to drain the historical 87k+ doomed rows and
 -- handle edge cases where a runtime goes offline AFTER a task is already
 -- queued (the admission check protects new enqueues, not in-flight queue
--- depth).
+-- depth). A retry created by runtime_offline is exempt: it deliberately waits
+-- for that runtime to reconnect, so time spent in this recovery state must not
+-- consume the generic queue TTL.
 --
 -- Concurrency safety: the daemon's claim path may race with this sweeper to
 -- transition the same row out of 'queued'. We protect against that two
@@ -1224,6 +1269,11 @@ WITH victims AS (
     SELECT id FROM agent_task_queue
     WHERE status = 'queued'
       AND created_at < now() - make_interval(secs => @ttl_secs::double precision)
+      AND NOT EXISTS (
+          SELECT 1 FROM agent_task_queue retry_parent
+          WHERE retry_parent.id = agent_task_queue.parent_task_id
+            AND retry_parent.failure_reason = 'runtime_offline'
+      )
     ORDER BY created_at ASC
     LIMIT @max_per_tick::int
     FOR UPDATE SKIP LOCKED
@@ -1238,7 +1288,63 @@ FROM victims v
 WHERE t.id = v.id
   AND t.status = 'queued'
   AND t.created_at < now() - make_interval(secs => @ttl_secs::double precision)
+  AND NOT EXISTS (
+      SELECT 1 FROM agent_task_queue retry_parent
+      WHERE retry_parent.id = t.parent_task_id
+        AND retry_parent.failure_reason = 'runtime_offline'
+  )
 RETURNING t.*;
+
+-- name: FailExpiredRuntimeReconnectRetries :many
+-- A runtime_offline retry waits in deferred until its runtime returns healthy.
+-- Give that recovery state a bounded exit: after one full reconnect grace,
+-- fail it with a non-retryable reason so issues, agents, and runtime GC can
+-- converge. A runtime that is healthy when this query runs wins the race and
+-- remains deferred for the next daemon poll to promote. The parent join is the
+-- lineage discriminator; provider backoff and other deferred task types are
+-- intentionally excluded.
+WITH victims AS (
+    SELECT retry.id
+    FROM agent_task_queue retry
+    JOIN agent_task_queue parent ON parent.id = retry.parent_task_id
+    WHERE retry.status = 'deferred'
+      AND retry.fire_at < now() - make_interval(secs => @reconnect_grace_secs::double precision)
+      AND parent.failure_reason = 'runtime_offline'
+      AND NOT EXISTS (
+          SELECT 1 FROM agent_runtime runtime
+          WHERE runtime.id = retry.runtime_id
+            AND runtime.status = 'online'
+            AND COALESCE(runtime.last_seen_at, runtime.updated_at) >=
+                now() - make_interval(secs => @runtime_stale_secs::double precision)
+      )
+    ORDER BY retry.fire_at, retry.created_at
+    LIMIT @max_per_tick::int
+    FOR UPDATE OF retry SKIP LOCKED
+)
+UPDATE agent_task_queue AS retry
+SET status = 'failed',
+    completed_at = now(),
+    error = 'runtime did not reconnect within the configured grace period',
+    failure_reason = 'runtime_reconnect_timeout',
+    wait_reason = NULL,
+    prepare_lease_expires_at = NULL
+FROM victims
+WHERE retry.id = victims.id
+  AND retry.status = 'deferred'
+  AND retry.fire_at < now() - make_interval(secs => @reconnect_grace_secs::double precision)
+  AND EXISTS (
+      SELECT 1 FROM agent_task_queue parent
+      WHERE parent.id = retry.parent_task_id
+        AND parent.failure_reason = 'runtime_offline'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM agent_runtime runtime
+      WHERE runtime.id = retry.runtime_id
+        AND runtime.status = 'online'
+        AND COALESCE(runtime.last_seen_at, runtime.updated_at) >=
+            now() - make_interval(secs => @runtime_stale_secs::double precision)
+  )
+RETURNING retry.*;
 
 -- name: CancelAgentTask :one
 -- Automatic cancellation without an explicit persisted failure reason. Unlike
@@ -1822,6 +1928,13 @@ SET status = 'queued'
 WHERE runtime_id = @runtime_id
   AND status = 'deferred'
   AND fire_at <= now()
+  AND EXISTS (
+    SELECT 1 FROM agent_runtime r
+    WHERE r.id = agent_task_queue.runtime_id
+      AND r.status = 'online'
+      AND COALESCE(r.last_seen_at, r.updated_at) >=
+          now() - make_interval(secs => @runtime_stale_secs::double precision)
+  )
 RETURNING *;
 
 -- name: ListQueuedClaimCandidatesByRuntimes :many
@@ -1847,6 +1960,13 @@ SET status = 'queued'
 WHERE runtime_id = ANY(@runtime_ids::uuid[])
   AND status = 'deferred'
   AND fire_at <= now()
+  AND EXISTS (
+    SELECT 1 FROM agent_runtime r
+    WHERE r.id = agent_task_queue.runtime_id
+      AND r.status = 'online'
+      AND COALESCE(r.last_seen_at, r.updated_at) >=
+          now() - make_interval(secs => @runtime_stale_secs::double precision)
+  )
 RETURNING *;
 
 -- name: CancelDeferredEscalationsForTask :many
