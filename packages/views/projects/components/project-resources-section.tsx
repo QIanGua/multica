@@ -566,6 +566,7 @@ function worktreeUnavailableReason(
   if (isGitRepo === false) return "not_git";
   if (support === "server_capability_blind") return "server_outdated";
   if (support === "runtime_registration_stale") return "runtime_stale";
+  if (support === "capability_source_unknown") return "capability_unknown";
   if (support === "daemon_unsupported") return "daemon_outdated";
   return undefined;
 }

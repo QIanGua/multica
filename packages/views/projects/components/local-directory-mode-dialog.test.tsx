@@ -100,7 +100,12 @@ describe("LocalDirectoryModeDialog", () => {
   // floor told a user on v0.4.28 they needed v0.4.24 or newer. Any version
   // number in this copy is a regression, whichever blocker fired.
   it("never quotes a daemon version at the user", () => {
-    for (const reason of ["daemon_outdated", "server_outdated", "runtime_stale"] as const) {
+    for (const reason of [
+      "daemon_outdated",
+      "server_outdated",
+      "runtime_stale",
+      "capability_unknown",
+    ] as const) {
       const { unmount } = renderDialog({ unavailableReason: reason });
       expect(screen.queryByText(/0\.4\.24/)).toBeNull();
       expect(screen.queryByText(/an older version/i)).toBeNull();
@@ -116,6 +121,18 @@ describe("LocalDirectoryModeDialog", () => {
     expect(worktreeOption().hasAttribute("disabled")).toBe(true);
     expect(screen.getByText(/Restart Multica there/i)).toBeTruthy();
     expect(screen.queryByText(/Multica server is older/i)).toBeNull();
+  });
+
+  // A pre-v0.4.2 self-hosted server reports no version and records no
+  // capabilities, so "restart that machine" would loop forever. When we cannot
+  // tell which half is behind, the copy has to carry both remedies.
+  it("names both remedies when the backend cannot be identified", () => {
+    renderDialog({ unavailableReason: "capability_unknown" });
+
+    expect(worktreeOption().hasAttribute("disabled")).toBe(true);
+    const notice = screen.getByText(/can't confirm whether that machine/i);
+    expect(notice.textContent).toMatch(/self-hosted Multica server, upgrade it/i);
+    expect(notice.textContent).toMatch(/restart Multica on that machine/i);
   });
 
   // The remedy is on the backend, and no amount of updating the machine can

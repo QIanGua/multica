@@ -23,13 +23,18 @@ import { useT } from "../../i18n/use-t";
  * updating that machine will fix — and `runtime_stale` by getting that machine
  * to register again with a backend that has since been upgraded.
  *
+ * `capability_unknown` is the honest fallback: the backend does not name a
+ * version and nothing else proves which of those two it is, so the copy names
+ * both remedies rather than sending the user down one that cannot work.
+ *
  * `undefined` means available.
  */
 export type WorktreeUnavailableReason =
   | "not_git"
   | "daemon_outdated"
   | "server_outdated"
-  | "runtime_stale";
+  | "runtime_stale"
+  | "capability_unknown";
 
 interface LocalDirectoryModeDialogProps {
   open: boolean;
@@ -174,9 +179,11 @@ export function LocalDirectoryModeOptions({
                 })
               : unavailableReason === "runtime_stale"
                 ? t(($) => $.resources.mode_worktree_needs_reregister)
-                : unavailableReason === "daemon_outdated"
-                  ? t(($) => $.resources.mode_worktree_needs_upgrade)
-                  : undefined
+                : unavailableReason === "capability_unknown"
+                  ? t(($) => $.resources.mode_worktree_capability_unknown)
+                  : unavailableReason === "daemon_outdated"
+                    ? t(($) => $.resources.mode_worktree_needs_upgrade)
+                    : undefined
         }
         onSelect={() => onChange("worktree")}
       />

@@ -305,6 +305,23 @@ describe("CreateProjectModal — local directory execution mode", () => {
     expect(screen.queryByText(/Update Multica there/i)).not.toBeInTheDocument();
   });
 
+  // A pre-v0.4.2 self-hosted backend names no version and records no
+  // capabilities: the machine is the only runtime here, so nothing else
+  // identifies the server either. Sending this operator to restart the machine
+  // would loop against the same blind backend forever.
+  it("names both remedies when nothing identifies the backend", async () => {
+    runtimeWorktreeMetadata = "server_recorded_nothing";
+    runtimeCliVersion = "v0.4.28";
+    serverVersion = "";
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+
+    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).toBeDisabled();
+    expect(screen.getByText(/can't confirm whether that machine/i)).toBeInTheDocument();
+  });
+
   // Same stored row, backend since upgraded. Upgrading it again fixes nothing —
   // the row simply predates the upgrade, so the machine has to register again.
   it("asks for a re-register when the backend is current but the row is old", async () => {

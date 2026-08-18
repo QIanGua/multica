@@ -222,9 +222,11 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
         ? ("server_outdated" as const)
         : localWorktree === "runtime_registration_stale"
           ? ("runtime_stale" as const)
-          : localWorktree === "daemon_unsupported"
-            ? ("daemon_outdated" as const)
-            : undefined;
+          : localWorktree === "capability_source_unknown"
+            ? ("capability_unknown" as const)
+            : localWorktree === "daemon_unsupported"
+              ? ("daemon_outdated" as const)
+              : undefined;
   // Preselection, not a default behavior change: when the folder is a git repo
   // and the runtime can actually run worktree mode, parallel is the better fit,
   // so it starts selected — visibly, in a control the user can flip in one

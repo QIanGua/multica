@@ -178,23 +178,51 @@ export const MIN_CAPABILITY_AWARE_SERVER_VERSION = "0.4.25";
  * heartbeats touch only `last_seen_at`, so an upgraded deployment would go on
  * being called stale, and re-upgrading it would fix nothing.
  *
- * An ABSENT version reads as capability-aware, which is the load-bearing part.
- * `/api/config` omits the field on the managed cloud on purpose (MUL-4108) and
- * leaves it empty for unstamped dev builds — both record capabilities — while
- * the field itself shipped in v0.4.2, 23 patches before the handshake. So every
- * self-hosted release that could actually be blind still names itself, and
- * guessing "old" here would tell cloud users to upgrade a backend they do not
- * run.
+ * Deliberately three-valued. An absent version has three real sources and they
+ * do not share a remedy:
+ *
+ * - the managed cloud, which omits the field on purpose (MUL-4108),
+ * - an unstamped dev build,
+ * - a self-hosted server older than v0.4.2, which is where the field shipped.
+ *
+ * The first two record capabilities; the third predates the handshake and does
+ * not. Collapsing them to "aware" tells that operator to restart the machine,
+ * which re-registers against the same blind server and produces the same row —
+ * a loop with no exit. Collapsing them to "blind" tells cloud users to upgrade
+ * a backend they do not run. So `unknown` stays its own answer and the caller
+ * resolves it from evidence.
  */
-export function serverRecordsDaemonCapabilities(
+export type ServerCapabilityAwareness = "aware" | "blind" | "unknown";
+
+export function serverCapabilityAwareness(
   detected: string | undefined | null,
-): boolean {
+): ServerCapabilityAwareness {
   const current = (detected ?? "").trim();
-  if (!current) return true;
-  if (DEV_DESCRIBE_RE.test(current)) return true;
+  if (!current) return "unknown";
+  if (DEV_DESCRIBE_RE.test(current)) return "aware";
   const parsed = parseSemver(current);
-  if (!parsed) return true;
-  return !lessThan(parsed, parseSemver(MIN_CAPABILITY_AWARE_SERVER_VERSION)!);
+  if (!parsed) return "unknown";
+  return lessThan(parsed, parseSemver(MIN_CAPABILITY_AWARE_SERVER_VERSION)!) ? "blind" : "aware";
+}
+
+/**
+ * Second opinion for an unnamed server: does ANY runtime row in this workspace
+ * carry a `capabilities` key?
+ *
+ * One does not appear unless a capability-aware server wrote it, and servers
+ * move forward — so a single such row anywhere proves the deployment learned
+ * the handshake, whoever the row belongs to. That resolves the common shape of
+ * `unknown` (managed cloud, several machines, one of them registered before the
+ * handshake shipped) into the precise answer without a version to read.
+ *
+ * The converse is not proof: every row missing the key is what an old
+ * self-hosted server looks like, and also what a brand-new workspace with one
+ * stale machine looks like. That case stays `unknown` and says so.
+ */
+function anyRuntimeRecordsCapabilities(runtimes: RuntimeCapabilityRow[]): boolean {
+  return runtimes.some(
+    (rt) => !!rt.metadata && typeof rt.metadata === "object" && "capabilities" in rt.metadata,
+  );
 }
 
 /**
@@ -213,12 +241,16 @@ export function serverRecordsDaemonCapabilities(
  * - `runtime_registration_stale`: the backend records capabilities, but this
  *   row was written before it learned to. Nothing is wrong with either half —
  *   the machine just has to register again.
+ * - `capability_source_unknown`: the backend does not name a version and no row
+ *   anywhere proves it records capabilities. Either remedy might apply, so the
+ *   copy names both rather than sending the user down one that cannot work.
  */
 export type LocalWorktreeSupport =
   | "supported"
   | "daemon_unsupported"
   | "server_capability_blind"
-  | "runtime_registration_stale";
+  | "runtime_registration_stale"
+  | "capability_source_unknown";
 
 /**
  * Read one runtime row's answer.
@@ -231,10 +263,12 @@ export type LocalWorktreeSupport =
  */
 function runtimeWorktreeSupport(
   metadata: unknown,
-  serverRecordsCapabilities: boolean,
+  awareness: ServerCapabilityAwareness,
 ): LocalWorktreeSupport {
   if (!metadata || typeof metadata !== "object" || !("capabilities" in metadata)) {
-    return serverRecordsCapabilities ? "runtime_registration_stale" : "server_capability_blind";
+    if (awareness === "aware") return "runtime_registration_stale";
+    if (awareness === "blind") return "server_capability_blind";
+    return "capability_source_unknown";
   }
   const caps = (metadata as { capabilities?: unknown }).capabilities;
   return Array.isArray(caps) && caps.includes(LOCAL_WORKTREE_CAPABILITY)
@@ -264,8 +298,9 @@ type RuntimeCapabilityRow = {
  * there can run the task, and "update Multica on that machine" is the remedy.
  *
  * `serverVersion` is `/api/config`'s `server_version` for the backend this
- * client is connected to — see `serverRecordsDaemonCapabilities` for why the
- * question has to be asked of the live server rather than inferred from the row.
+ * client is connected to — see `serverCapabilityAwareness` for why the question
+ * has to be asked of the live server rather than inferred from the row, and why
+ * an unnamed server is not assumed to be either kind.
  */
 export function localWorktreeSupport(
   runtimes: RuntimeCapabilityRow[],
@@ -286,5 +321,11 @@ export function localWorktreeSupport(
     if (candidateSeen > currentSeen) newest = rt;
   }
   if (!newest) return "daemon_unsupported";
-  return runtimeWorktreeSupport(newest.metadata, serverRecordsDaemonCapabilities(serverVersion));
+  let awareness = serverCapabilityAwareness(serverVersion);
+  // An unnamed server can still be pinned down by what it has written for other
+  // machines; nothing can promote it the other way, so only "aware" is derived.
+  if (awareness === "unknown" && anyRuntimeRecordsCapabilities(runtimes)) {
+    awareness = "aware";
+  }
+  return runtimeWorktreeSupport(newest.metadata, awareness);
 }

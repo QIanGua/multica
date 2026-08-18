@@ -7,7 +7,7 @@ import {
   MIN_CHAT_PROJECT_CONTEXT_CLI_VERSION,
   MIN_HANDOFF_CLI_VERSION,
   localWorktreeSupport,
-  serverRecordsDaemonCapabilities,
+  serverCapabilityAwareness,
 } from "./cli-version";
 
 describe("checkQuickCreateCliVersion", () => {
@@ -94,22 +94,22 @@ describe("chatProjectContextSupported", () => {
   });
 });
 
-describe("serverRecordsDaemonCapabilities", () => {
+describe("serverCapabilityAwareness", () => {
   it("reads the running backend's version", () => {
-    expect(serverRecordsDaemonCapabilities("0.4.25")).toBe(true);
-    expect(serverRecordsDaemonCapabilities("v0.4.28")).toBe(true);
-    expect(serverRecordsDaemonCapabilities("0.4.24")).toBe(false);
-    expect(serverRecordsDaemonCapabilities("0.3.0")).toBe(false);
+    expect(serverCapabilityAwareness("0.4.25")).toBe("aware");
+    expect(serverCapabilityAwareness("v0.4.28")).toBe("aware");
+    expect(serverCapabilityAwareness("v0.4.21-24-gcd3c0bb89")).toBe("aware");
+    expect(serverCapabilityAwareness("0.4.24")).toBe("blind");
+    expect(serverCapabilityAwareness("0.3.0")).toBe("blind");
   });
 
-  // Absent is not "old". /api/config omits server_version on the managed cloud
-  // by design (MUL-4108) and leaves it empty for unstamped dev builds — both
-  // record capabilities — while the field itself shipped in v0.4.2, long before
-  // the handshake. Guessing "old" here would tell cloud users to upgrade a
-  // backend they do not run.
-  it("treats an absent or unreadable version as capability-aware", () => {
-    for (const v of ["", "   ", undefined, null, "unknown", "v0.4.21-24-gcd3c0bb89"]) {
-      expect(serverRecordsDaemonCapabilities(v)).toBe(true);
+  // An absent version has three sources that do not share a remedy: the managed
+  // cloud (omits it on purpose, MUL-4108), an unstamped dev build, and a
+  // self-hosted server older than v0.4.2 where the field shipped. The first two
+  // record capabilities, the third does not — so this must not answer.
+  it("refuses to guess when the server does not name itself", () => {
+    for (const v of ["", "   ", undefined, null, "unknown"]) {
+      expect(serverCapabilityAwareness(v)).toBe("unknown");
     }
   });
 });
@@ -179,10 +179,31 @@ describe("localWorktreeSupport", () => {
     expect(localWorktreeSupport([row({ cli_version: "v0.4.28" })], "d1", BLIND)).toBe(
       "server_capability_blind",
     );
-    // Managed cloud omits server_version entirely; it must never read as old.
+    });
+
+  // A v0.4.1-era self-hosted server names no version AND records no
+  // capabilities. Reading its silence as "aware" tells the operator to restart
+  // the machine, which re-registers against the same blind server and writes
+  // the same key-less row — a loop whose only real exit (upgrade the backend)
+  // the copy never mentions.
+  it("does not guess a remedy when nothing identifies the backend", () => {
     expect(localWorktreeSupport([row({ cli_version: "v0.4.28" })], "d1", "")).toBe(
-      "runtime_registration_stale",
+      "capability_source_unknown",
     );
+    expect(localWorktreeSupport([row({})], "d1", undefined)).toBe("capability_source_unknown");
+  });
+
+  // ...but an unnamed server that has written capabilities for ANY machine has
+  // identified itself: the key does not appear unless a capability-aware server
+  // wrote it, and servers move forward. This is the managed-cloud shape — no
+  // version reported, several machines, one of them registered long ago.
+  it("resolves an unnamed backend from what it has written elsewhere", () => {
+    const stale = { daemon_id: "d1", last_seen_at: "2026-08-13T00:00:00Z", metadata: {} };
+    const other = { daemon_id: "d2", last_seen_at: "2026-08-13T00:00:00Z", metadata: capable };
+    expect(localWorktreeSupport([stale, other], "d1", "")).toBe("runtime_registration_stale");
+    // Evidence only ever promotes to "aware"; a named-blind server is not
+    // overridden by a row some earlier deployment wrote.
+    expect(localWorktreeSupport([stale, other], "d1", BLIND)).toBe("server_capability_blind");
   });
 
   // Deregistering only marks a runtime offline; its metadata survives and the
