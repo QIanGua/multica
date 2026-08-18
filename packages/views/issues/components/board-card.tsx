@@ -141,6 +141,7 @@ export const BoardCardContent = memo(function BoardCardContent({
         actorId={issue.assignee_id!}
         size="sm"
         enableHoverCard
+        profileLink={false}
         className="shrink-0"
       />
       {assigneeName && (
@@ -346,6 +347,7 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({
       <div
         ref={setNodeRef}
         style={style}
+        data-board-card=""
         {...attributes}
         {...listeners}
         className={`group/card ${isDragging ? "opacity-30" : ""}`}
