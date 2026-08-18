@@ -790,5 +790,10 @@
     "manage_hint": "Order and visibility only affect you",
     "visible_toggle": "Show in view bar",
     "more_label": "More views"
+  },
+  "plugins": {
+    "panels": "Plugins",
+    "surface_failed": "{{name}} could not load its interface.",
+    "surface_local_only": "{{name}} was installed from a local source, so its interface cannot be loaded in the browser."
   }
 }

@@ -2471,6 +2471,28 @@ export class ApiClient {
     });
   }
 
+  /**
+   * Performs one Action API call on behalf of a plugin surface.
+   *
+   * The surface has no credential — it asked the host over postMessage, and
+   * this re-issues the call on the signed-in user's session. The installation
+   * travels in a header the iframe cannot set for itself; the server derives
+   * the workspace from it rather than trusting anything the client sends.
+   */
+  async callPluginAction(
+    installationId: string,
+    request: { method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE"; path: string; body?: unknown; issueId?: string },
+  ): Promise<unknown> {
+    const query = request.path === "/context" && request.issueId
+      ? `?issue_id=${encodeURIComponent(request.issueId)}`
+      : "";
+    return this.fetch<unknown>(`/api/v1/plugin${request.path}${query}`, {
+      method: request.method,
+      headers: { "X-Multica-Plugin-Installation": installationId },
+      body: request.body === undefined ? undefined : JSON.stringify(request.body),
+    });
+  }
+
   async uninstallPlugin(workspaceId: string, installationId: string): Promise<void> {
     await this.fetch(`/api/workspaces/${workspaceId}/plugins/${installationId}`, {
       method: "DELETE",
