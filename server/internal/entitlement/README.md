@@ -16,8 +16,10 @@ The client reads:
 
 - `schema_version`: only version 1 is accepted.
 - `policy_revision` and `subscription_version`: independently monotonic. A
-  response that moves either revision backwards never replaces the cached
-  policy.
+  response that moves either revision backwards cannot replace a cached policy
+  while it is still usable for fresh or stale decisions. After the bounded
+  stale window ends, the cache accepts the current Cloud response so an
+  accidental operator rollback cannot create a permanent retry loop.
 - `valid_for_seconds`: the enforcement TTL, measured from local receipt time
   with Go's monotonic clock. It is capped at five minutes. This is authoritative
   for enforcement expiry.
@@ -32,9 +34,11 @@ failures, and timeouts fail open.
 ## Cache and degradation
 
 The cache is workspace-keyed, LRU-bounded, and collapses concurrent refreshes
-for one workspace through `singleflight`. A fresh entry is returned without an
-HTTP call. After its local TTL expires, refresh is attempted with an independent
-three-second maximum timeout. If refresh fails during the bounded stale grace,
+for one workspace through `singleflight`. Shared refreshes retain request values
+but are detached from the first caller's cancellation; an independent
+three-second maximum timeout bounds their lifetime. A fresh entry is returned
+without an HTTP call. After its local TTL expires, refresh is attempted. If
+refresh fails during the bounded stale grace,
 cached `enforce` is downgraded to `observe`; after the grace, the result is
 `off`. Stale policy never blocks. A five-second per-workspace retry suppression
 also bounds Cloud request rate when an outage returns errors immediately; cold

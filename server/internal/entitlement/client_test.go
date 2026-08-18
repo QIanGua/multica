@@ -168,6 +168,55 @@ func TestConcurrentWorkspaceMissesUseSingleflight(t *testing.T) {
 	}
 }
 
+func TestCancelledLeaderDoesNotCancelSharedRefresh(t *testing.T) {
+	requestStarted := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	policyBody, err := json.Marshal(samplePolicy(1, 0, 60, ActionObserve))
+	if err != nil {
+		t.Fatalf("marshal policy: %v", err)
+	}
+	client := newTestClient(t, "https://cloud.internal", func(cfg *Config) {
+		cfg.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				close(requestStarted)
+			}
+			<-release
+			if err := req.Context().Err(); err != nil {
+				return nil, err
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(string(policyBody))),
+				Request:    req,
+			}, nil
+		})}
+	})
+	workspaceID := uuid.New()
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderResult := make(chan Decision, 1)
+	go func() {
+		leaderResult <- client.Gate(leaderCtx, workspaceID, GateIssueWindow)
+	}()
+	<-requestStarted
+
+	cancelLeader()
+	followerResult := make(chan Decision, 1)
+	go func() {
+		followerResult <- client.Gate(context.Background(), workspaceID, GateIssueWindow)
+	}()
+	close(release)
+
+	leader, follower := <-leaderResult, <-followerResult
+	if leader.Gate.Action != ActionObserve || follower.Gate.Action != ActionObserve {
+		t.Fatalf("leader = %+v, follower = %+v", leader, follower)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("HTTP calls = %d, want 1", calls.Load())
+	}
+}
+
 func TestWorkspaceIsolationAndBoundedLRUEviction(t *testing.T) {
 	workspaceA, workspaceB := uuid.New(), uuid.New()
 	limits := map[string]int{workspaceA.String(): 11, workspaceB.String(): 22}
@@ -219,9 +268,9 @@ func TestColdFailuresFailOpen(t *testing.T) {
 			limit := testAutopilotLimit
 			p.Gates[string(GateAutopilotRuns)] = wireGate{Action: string(ActionEnforce), Limit: &limit}
 		}), ReasonInvalidPolicy},
-		{"autopilot reset differs from period end", policyHandler(func(p *wirePolicy) {
+		{"autopilot reset is not after period start", policyHandler(func(p *wirePolicy) {
 			gate := p.Gates[string(GateAutopilotRuns)]
-			resetAt := gate.PeriodEnd.Add(time.Second)
+			resetAt := *gate.PeriodStart
 			gate.ResetAt = &resetAt
 			p.Gates[string(GateAutopilotRuns)] = gate
 		}), ReasonInvalidPolicy},
@@ -236,6 +285,18 @@ func TestColdFailuresFailOpen(t *testing.T) {
 				t.Fatalf("decision = %+v", decision)
 			}
 		})
+	}
+}
+
+func TestAutopilotResetMayFollowPeriodEnd(t *testing.T) {
+	policy := samplePolicy(1, 0, 60, ActionObserve)
+	gate := policy.Gates[string(GateAutopilotRuns)]
+	resetAt := gate.PeriodEnd.Add(time.Hour)
+	gate.ResetAt = &resetAt
+	policy.Gates[string(GateAutopilotRuns)] = gate
+
+	if _, err := normalizePolicy(policy); err != nil {
+		t.Fatalf("normalizePolicy: %v", err)
 	}
 }
 
@@ -476,6 +537,38 @@ func TestRevisionRegressionCannotOverwriteWorkspaceCache(t *testing.T) {
 	}
 	if got := observer.regressions(); len(got) != 2 || got[1] != "subscription" {
 		t.Fatalf("regressions = %v", got)
+	}
+}
+
+func TestRevisionRegressionIsAcceptedAfterStaleGrace(t *testing.T) {
+	clock := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC)
+	var calls atomic.Int64
+	var policyRevision atomic.Int64
+	policyRevision.Store(2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writePolicy(t, w, samplePolicy(policyRevision.Load(), 0, 60, ActionOff))
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, func(cfg *Config) { cfg.StaleGrace = 10 * time.Second })
+	client.now = func() time.Time { return clock }
+	workspaceID := uuid.New()
+
+	initial := client.Gate(context.Background(), workspaceID, GateIssueWindow)
+	if initial.PolicyRevision != 2 || initial.Reason != ReasonRefreshed {
+		t.Fatalf("initial = %+v", initial)
+	}
+	policyRevision.Store(1)
+	clock = clock.Add(71 * time.Second)
+	recovered := client.Gate(context.Background(), workspaceID, GateIssueWindow)
+	if recovered.PolicyRevision != 1 || recovered.Reason != ReasonRefreshed {
+		t.Fatalf("recovered = %+v", recovered)
+	}
+
+	clock = clock.Add(defaultFailureRetry + time.Millisecond)
+	cached := client.Gate(context.Background(), workspaceID, GateIssueWindow)
+	if cached.PolicyRevision != 1 || cached.Reason != ReasonCacheFresh || calls.Load() != 2 {
+		t.Fatalf("cached = %+v, HTTP calls = %d", cached, calls.Load())
 	}
 }
 

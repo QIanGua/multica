@@ -60,15 +60,20 @@ func (c *policyCache) get(workspaceID uuid.UUID) (cacheEntry, bool) {
 	return elem.Value.(*cacheItem).entry, true
 }
 
-func (c *policyCache) put(workspaceID uuid.UUID, entry cacheEntry) (cacheEntry, error) {
+func (c *policyCache) put(workspaceID uuid.UUID, entry cacheEntry, receivedAt time.Time) (cacheEntry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if elem, ok := c.entries[workspaceID]; ok {
 		current := elem.Value.(*cacheItem).entry
-		if current.hasPolicy && entry.policy.policyRevision < current.policy.policyRevision {
+		// The version guard prevents an out-of-order response from replacing a
+		// snapshot that is still usable for bounded stale observation. Once that
+		// window ends, accepting the current Cloud response lets an operator
+		// recover from an accidental revision rollback without a retry storm.
+		guardVersions := current.hasPolicy && receivedAt.Before(current.staleUntil)
+		if guardVersions && entry.policy.policyRevision < current.policy.policyRevision {
 			return current, &revisionError{source: "policy"}
 		}
-		if current.hasPolicy && entry.policy.subscriptionVersion < current.policy.subscriptionVersion {
+		if guardVersions && entry.policy.subscriptionVersion < current.policy.subscriptionVersion {
 			return current, &revisionError{source: "subscription"}
 		}
 		elem.Value.(*cacheItem).entry = entry

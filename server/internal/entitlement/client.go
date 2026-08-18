@@ -211,6 +211,10 @@ type refreshResult struct {
 }
 
 func (c *Client) refresh(ctx context.Context, workspaceID uuid.UUID) (cacheEntry, bool, error) {
+	// A refresh is shared by all callers for this workspace, so its lifetime
+	// cannot belong to whichever request happens to enter singleflight first.
+	// Keep request-scoped values, but let the independent fetch timeout bound it.
+	refreshCtx := context.WithoutCancel(ctx)
 	value, err, _ := c.refreshes.Do(workspaceID.String(), func() (any, error) {
 		now := c.now()
 		if cached, ok := c.cache.get(workspaceID); ok {
@@ -223,11 +227,11 @@ func (c *Client) refresh(ctx context.Context, workspaceID uuid.UUID) (cacheEntry
 		}
 
 		started := time.Now()
-		policy, err := c.fetch(ctx, workspaceID)
+		policy, err := c.fetch(refreshCtx, workspaceID)
 		if err != nil {
 			c.cache.markFailure(workspaceID, c.now().Add(defaultFailureRetry))
 			c.recordRefresh(refreshOutcome(err), time.Since(started))
-			c.logger.DebugContext(ctx, "entitlement policy refresh failed",
+			c.logger.DebugContext(refreshCtx, "entitlement policy refresh failed",
 				"workspace_id", workspaceID.String(), "outcome", refreshOutcome(err))
 			return nil, err
 		}
@@ -239,7 +243,7 @@ func (c *Client) refresh(ctx context.Context, workspaceID uuid.UUID) (cacheEntry
 			freshUntil: receivedAt.Add(ttl),
 			staleUntil: receivedAt.Add(ttl).Add(c.staleGrace),
 		}
-		stored, err := c.cache.put(workspaceID, entry)
+		stored, err := c.cache.put(workspaceID, entry, receivedAt)
 		if err != nil {
 			c.cache.markFailure(workspaceID, c.now().Add(defaultFailureRetry))
 			var regression *revisionError
@@ -251,7 +255,7 @@ func (c *Client) refresh(ctx context.Context, workspaceID uuid.UUID) (cacheEntry
 				}
 			}
 			c.recordRefresh("version_regression", time.Since(started))
-			c.logger.WarnContext(ctx, "entitlement policy revision regressed",
+			c.logger.WarnContext(refreshCtx, "entitlement policy revision regressed",
 				"workspace_id", workspaceID.String(), "source", source)
 			return nil, err
 		}
@@ -379,7 +383,7 @@ func normalizeGate(name GateName, wire wireGate) (Gate, error) {
 	if name == GateAutopilotRuns && periodFields != 3 {
 		return Gate{}, ErrInvalidPolicy
 	}
-	if periodFields == 3 && (!wire.PeriodStart.Before(*wire.PeriodEnd) || !wire.ResetAt.Equal(*wire.PeriodEnd)) {
+	if periodFields == 3 && (!wire.PeriodStart.Before(*wire.PeriodEnd) || !wire.PeriodStart.Before(*wire.ResetAt)) {
 		return Gate{}, ErrInvalidPolicy
 	}
 	limit := *wire.Limit
