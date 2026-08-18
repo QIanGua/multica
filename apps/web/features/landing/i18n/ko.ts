@@ -271,7 +271,7 @@ export function createKoDict(allowSignup: boolean): LandingDict {
         {
           version: "0.4.29",
           date: "2026-08-18",
-          title: "MiniMax Code, 에이전트 실행 기록, 설정 단축키",
+          title: "MiniMax Code, 실행 기록 개선, Hermes 에이전트 동작 수정",
           changes: [],
           features: [
             "MiniMax Code로 에이전트를 실행할 수 있어요.",

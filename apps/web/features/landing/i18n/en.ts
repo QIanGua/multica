@@ -296,7 +296,7 @@ export function createEnDict(allowSignup: boolean): LandingDict {
       {
         version: "0.4.29",
         date: "2026-08-18",
-        title: "MiniMax Code, clearer agent activity, and a Settings shortcut",
+        title: "MiniMax Code, cleaner run transcripts, and Hermes agent fixes",
         changes: [],
         features: [
           "You can now run agents with MiniMax Code.",

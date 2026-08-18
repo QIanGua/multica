@@ -296,7 +296,7 @@ export function createZhDict(allowSignup: boolean): LandingDict {
       {
         version: "0.4.29",
         date: "2026-08-18",
-        title: "MiniMax Code、智能体运行记录、设置快捷键",
+        title: "MiniMax Code、运行记录优化、Hermes 智能体行为修复",
         changes: [],
         features: [
           "现在可以用 MiniMax Code 运行智能体。",

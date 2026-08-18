@@ -272,7 +272,7 @@ export function createJaDict(allowSignup: boolean): LandingDict {
         {
           version: "0.4.29",
           date: "2026-08-18",
-          title: "MiniMax Code、エージェントの実行記録、設定のショートカット",
+          title: "MiniMax Code、実行記録の改善、Hermes エージェントの動作修正",
           changes: [],
           features: [
             "MiniMax Code でエージェントを実行できます。",
