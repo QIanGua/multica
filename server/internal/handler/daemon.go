@@ -4530,7 +4530,7 @@ func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, err := h.TaskService.CancelTask(r.Context(), existing.ID)
+	task, err := h.TaskService.CancelTaskByUser(r.Context(), existing.ID)
 	if err != nil {
 		slog.Warn("cancel task failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())

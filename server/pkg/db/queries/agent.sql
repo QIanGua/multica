@@ -1241,10 +1241,52 @@ WHERE t.id = v.id
 RETURNING t.*;
 
 -- name: CancelAgentTask :one
+-- Automatic cancellation without an explicit persisted failure reason. Unlike
+-- CancelAgentTaskByUser, this deliberately leaves recovery inputs replayable.
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
 WHERE id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
+
+-- name: CancelAgentTaskByUser :one
+-- An explicit user cancellation is a terminal acknowledgement for any
+-- delegated-failure recovery signal planned into this task. Server-initiated
+-- cancellations keep using CancelAgentTask / CancelAgentTaskWithReason so a
+-- stale plan, claim failure, or other automatic repair can still be replayed.
+UPDATE agent_task_queue AS task
+SET status = 'cancelled',
+    completed_at = now(),
+    prepare_lease_expires_at = NULL,
+    delivered_comment_ids = (
+        SELECT COALESCE(array_agg(DISTINCT receipt.id), '{}')::uuid[]
+        FROM unnest(array_cat(
+            task.delivered_comment_ids,
+            ARRAY(
+                SELECT recovery.id
+                FROM comment recovery
+                JOIN agent_task_queue failed ON failed.id = recovery.source_task_id
+                JOIN agent_task_queue source ON source.id = failed.delegated_from_task_id
+                WHERE (
+                    recovery.id = task.trigger_comment_id
+                    OR recovery.id = ANY(task.coalesced_comment_ids)
+                )
+                  AND recovery.author_type = 'system'
+                  AND recovery.type = 'progress_update'
+                  AND recovery.source_task_id IS NOT NULL
+                  AND failed.status = 'failed'
+                  AND failed.delegated_from_task_id IS NOT NULL
+                  AND failed.autopilot_run_id IS NULL
+                  AND failed.trigger_evidence_kind IS DISTINCT FROM 'delegated_failure'
+                  AND source.autopilot_run_id IS NULL
+                  AND source.issue_id = task.issue_id
+                  AND source.agent_id = task.agent_id
+                  AND recovery.issue_id = source.issue_id
+            )
+        )) AS receipt(id)
+    )
+WHERE task.id = $1
+  AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING task.*;
 
 -- name: SetAgentTaskBranchName :exec
 -- Records the delivered branch on a CANCELLED task. Needed because the daemon
@@ -1280,12 +1322,11 @@ WHERE id = sqlc.arg('id') AND (error IS NULL OR error = '') AND status = 'cancel
 -- name: CancelAgentTaskWithReason :one
 -- Cancels a task AND records why, for cancellations the user did not ask for.
 --
--- Plain CancelAgentTask leaves error/failure_reason NULL, which is right for a
--- user-initiated cancel — the user knows why. A server-initiated one is the
--- opposite: without a persisted reason the run surfaces as an unexplained
--- "cancelled", and the only trace is a 4xx in a daemon log the user never sees.
--- Retrying cannot help either (the task is refused for a durable reason), so
--- this is a terminal state that has to carry its own explanation.
+-- CancelAgentTaskByUser leaves error/failure_reason NULL because the user knows
+-- why. A server-initiated refusal is the opposite: without a persisted reason
+-- the run surfaces as an unexplained "cancelled", and the only trace is a 4xx
+-- in a daemon log the user never sees. Retrying cannot help either (the task is
+-- refused for a durable reason), so this terminal state carries its explanation.
 UPDATE agent_task_queue
 SET status = 'cancelled',
     completed_at = now(),
@@ -1613,6 +1654,42 @@ WHERE issue_id = @issue_id
           AND (trigger_comment_id = @comment_id::uuid OR @comment_id::uuid = ANY(coalesced_comment_ids))
       )
   );
+
+-- name: CountDelegatedFailureRecoveryTasks :one
+-- Counts dedicated coordinator wakeups for one failed delegated task. Merged
+-- recovery signals do not create a new row and therefore do not consume an
+-- automatic attempt until they need a standalone successor.
+SELECT count(*)
+FROM agent_task_queue
+WHERE trigger_evidence_kind = 'delegated_failure'
+  AND trigger_evidence_ref_id = @failed_task_id;
+
+-- name: AcknowledgeExhaustedDelegatedFailureRecovery :one
+-- Once the bounded automatic attempts are exhausted, record a terminal
+-- acknowledgement on the newest recovery task. The outbox treats this receipt
+-- as settled, while the service writes a separate visible system comment that
+-- tells the user why no further task will be generated.
+UPDATE agent_task_queue AS acknowledged
+SET delivered_comment_ids = (
+    SELECT COALESCE(array_agg(DISTINCT receipt.id), '{}')::uuid[]
+    FROM unnest(array_append(acknowledged.delivered_comment_ids, @comment_id::uuid)) AS receipt(id)
+)
+WHERE acknowledged.id = (
+    SELECT attempt.id
+    FROM agent_task_queue attempt
+    WHERE attempt.trigger_evidence_kind = 'delegated_failure'
+      AND attempt.trigger_evidence_ref_id = @failed_task_id
+    ORDER BY attempt.created_at DESC, attempt.id DESC
+    LIMIT 1
+    FOR UPDATE
+)
+  AND (
+      SELECT count(*)
+      FROM agent_task_queue attempt_count
+      WHERE attempt_count.trigger_evidence_kind = 'delegated_failure'
+        AND attempt_count.trigger_evidence_ref_id = @failed_task_id
+  ) >= @max_attempts::int
+RETURNING acknowledged.*;
 
 -- name: ListPendingDelegatedFailureRecoveries :many
 -- Durable outbox scan for platform recovery comments that are not yet owned by

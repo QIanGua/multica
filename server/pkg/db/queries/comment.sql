@@ -461,6 +461,20 @@ WHERE issue_id = @issue_id
 ORDER BY created_at ASC, id ASC
 LIMIT 1;
 
+-- name: GetDelegatedFailureRecoveryExhaustionComment :one
+-- The failed task and newest recovery-attempt row are locked by the caller
+-- before this lookup/insert pair. Keeping exhaustion as a separate system
+-- comment preserves the original recovery signal while making the automatic
+-- stop visible in the issue timeline.
+SELECT * FROM comment
+WHERE issue_id = @issue_id
+  AND workspace_id = @workspace_id
+  AND author_type = 'system'
+  AND type = 'system'
+  AND source_task_id = @source_task_id
+ORDER BY created_at ASC, id ASC
+LIMIT 1;
+
 -- name: UpdateComment :one
 UPDATE comment SET
     content = $2,

@@ -2312,18 +2312,39 @@ type CancelTaskOptions struct {
 	// daemon log the user never sees.
 	ErrorMessage  string
 	FailureReason string
+	// UserInitiated distinguishes the issue UI/API cancel action from automatic
+	// server repairs. An explicit user cancellation terminally acknowledges any
+	// delegated-failure recovery signal planned into the task; automatic
+	// cancellations must leave that signal replayable.
+	UserInitiated bool
 }
 
-// CancelTask cancels a single task by ID. It broadcasts a task:cancelled event
-// so frontends can update immediately.
+// CancelTask cancels a single task by ID for an automatic server path. It does
+// not acknowledge delegated-failure recovery inputs; use CancelTaskByUser for
+// an explicit issue-task cancellation. It broadcasts a task:cancelled event so
+// frontends can update immediately.
 func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	// Every caller of this wrapper cancels a non-chat task — issue/autopilot
-	// tasks through the issue-scoped endpoint, plus the daemon and sweeper paths
-	// — so finalizeCancelledChatMessage returns before the gate is even read.
+	// Callers of this wrapper are automatic non-chat repair/daemon paths, so
+	// finalizeCancelledChatMessage returns before the gate is even read.
 	// Should a chat task ever reach here, there is no client waiting on a
 	// synchronous restore anyway, and the durable path is the only one that can
 	// hand the prompt back at all.
 	result, err := s.CancelTaskWithResult(ctx, taskID, CancelTaskOptions{ClientSupportsDraftRestore: true})
+	if err != nil {
+		return nil, err
+	}
+	return &result.Task, nil
+}
+
+// CancelTaskByUser is the explicit issue-task cancellation path. Unlike an
+// automatic server cancellation, it terminally acknowledges any delegated-
+// failure recovery signal carried by the task so the sweeper respects the
+// user's decision instead of recreating the task.
+func (s *TaskService) CancelTaskByUser(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	result, err := s.CancelTaskWithResult(ctx, taskID, CancelTaskOptions{
+		ClientSupportsDraftRestore: true,
+		UserInitiated:              true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2351,6 +2372,9 @@ func (s *TaskService) CancelTaskWithReason(ctx context.Context, taskID pgtype.UU
 // CancelTaskWithResult cancels a single task and returns any chat-specific
 // cleanup result needed by user-facing callers.
 func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UUID, opts CancelTaskOptions) (*CancelTaskResult, error) {
+	if opts.UserInitiated && (opts.ErrorMessage != "" || opts.FailureReason != "") {
+		return nil, errors.New("user-initiated cancellation cannot carry a server failure reason")
+	}
 	var (
 		task                 db.AgentTaskQueue
 		cancelledChatMessage *CancelledChatMessageResult
@@ -2390,7 +2414,9 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 				cancelled db.AgentTaskQueue
 				err       error
 			)
-			if opts.ErrorMessage != "" || opts.FailureReason != "" {
+			if opts.UserInitiated {
+				cancelled, err = qtx.CancelAgentTaskByUser(ctx, taskID)
+			} else if opts.ErrorMessage != "" || opts.FailureReason != "" {
 				cancelled, err = qtx.CancelAgentTaskWithReason(ctx, db.CancelAgentTaskWithReasonParams{
 					ID:            taskID,
 					Error:         pgtype.Text{String: opts.ErrorMessage, Valid: opts.ErrorMessage != ""},
@@ -4851,7 +4877,11 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 	return retried
 }
 
-const delegatedFailureErrorSummaryRunes = 800
+const (
+	delegatedFailureErrorSummaryRunes       = 800
+	delegatedFailureRecoveryMaxTaskAttempts = 3
+	delegatedFailureRecoveryCommentType     = "progress_update"
+)
 
 type delegatedFailureRecoveryTarget struct {
 	failed  db.AgentTaskQueue
@@ -4868,7 +4898,7 @@ type delegatedFailureRecoveryTarget struct {
 // completion-reconcile branch.
 func IsDelegatedFailureRecoveryComment(comment db.Comment) bool {
 	return comment.AuthorType == "system" &&
-		comment.Type == "progress_update" &&
+		comment.Type == delegatedFailureRecoveryCommentType &&
 		comment.SourceTaskID.Valid
 }
 
@@ -4976,7 +5006,7 @@ func (s *TaskService) ensureDelegatedFailureRecoveryComment(ctx context.Context,
 			AuthorType:   "system",
 			AuthorID:     pgtype.UUID{Valid: true},
 			Content:      delegatedFailureRecoveryContent(target.failed, target.source),
-			Type:         "progress_update",
+			Type:         delegatedFailureRecoveryCommentType,
 			SourceTaskID: failed.ID,
 		})
 		if err != nil {
@@ -5017,6 +5047,89 @@ func (s *TaskService) ensureDelegatedFailureRecoveryComment(ctx context.Context,
 	return target, created, nil
 }
 
+func delegatedFailureRecoveryExhaustionContent(target *delegatedFailureRecoveryTarget) string {
+	return fmt.Sprintf(
+		"Automatic recovery for delegated task `%s` stopped after %d coordinator tasks ended before receiving the recovery signal. No more recovery tasks will be created automatically; resume or dismiss the work manually. Source coordinator task: `%s`.",
+		util.UUIDToString(target.failed.ID),
+		delegatedFailureRecoveryMaxTaskAttempts,
+		util.UUIDToString(target.source.ID),
+	)
+}
+
+// exhaustDelegatedFailureRecovery atomically settles the recovery outbox after
+// its bounded automatic attempts and creates one visible system explanation.
+// Updating the newest attempt first serializes concurrent sweepers; the second
+// caller then observes the explanation written by the first.
+func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, target *delegatedFailureRecoveryTarget) error {
+	var exhaustedComment db.Comment
+	created := false
+	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		if _, err := qtx.AcknowledgeExhaustedDelegatedFailureRecovery(ctx, db.AcknowledgeExhaustedDelegatedFailureRecoveryParams{
+			CommentID:    target.comment.ID,
+			FailedTaskID: target.failed.ID,
+			MaxAttempts:  delegatedFailureRecoveryMaxTaskAttempts,
+		}); err != nil {
+			return fmt.Errorf("acknowledge exhausted delegated failure recovery: %w", err)
+		}
+
+		comment, err := qtx.GetDelegatedFailureRecoveryExhaustionComment(ctx, db.GetDelegatedFailureRecoveryExhaustionCommentParams{
+			IssueID:      target.issue.ID,
+			WorkspaceID:  target.issue.WorkspaceID,
+			SourceTaskID: target.failed.ID,
+		})
+		if err == nil {
+			exhaustedComment = comment
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("find delegated failure exhaustion comment: %w", err)
+		}
+
+		comment, err = qtx.CreateComment(ctx, db.CreateCommentParams{
+			IssueID:      target.issue.ID,
+			WorkspaceID:  target.issue.WorkspaceID,
+			AuthorType:   "system",
+			AuthorID:     pgtype.UUID{Valid: true},
+			Content:      delegatedFailureRecoveryExhaustionContent(target),
+			Type:         "system",
+			SourceTaskID: target.failed.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("create delegated failure exhaustion comment: %w", err)
+		}
+		exhaustedComment = comment
+		created = true
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if created && s.Bus != nil {
+		s.Bus.Publish(events.Event{
+			Type:        protocol.EventCommentCreated,
+			WorkspaceID: util.UUIDToString(target.issue.WorkspaceID),
+			ActorType:   "system",
+			ActorID:     "",
+			Payload: map[string]any{
+				"comment": map[string]any{
+					"id":             util.UUIDToString(exhaustedComment.ID),
+					"issue_id":       util.UUIDToString(exhaustedComment.IssueID),
+					"author_type":    exhaustedComment.AuthorType,
+					"author_id":      util.UUIDToString(exhaustedComment.AuthorID),
+					"content":        exhaustedComment.Content,
+					"type":           exhaustedComment.Type,
+					"parent_id":      util.UUIDToPtr(exhaustedComment.ParentID),
+					"source_task_id": util.UUIDToPtr(exhaustedComment.SourceTaskID),
+					"created_at":     exhaustedComment.CreatedAt.Time.Format("2006-01-02T15:04:05Z"),
+				},
+				"issue_title":  target.issue.Title,
+				"issue_status": target.issue.Status,
+			},
+		})
+	}
+	return nil
+}
+
 // dispatchDelegatedFailureRecovery routes a recovery comment to the source
 // coordinator without relying on generic mention parsing. A pre-claim task
 // absorbs it; otherwise a dedicated queued successor is created. The only
@@ -5039,6 +5152,14 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 		}
 		if covered {
 			return nil
+		}
+
+		recoveryTasks, err := s.Queries.CountDelegatedFailureRecoveryTasks(ctx, target.failed.ID)
+		if err != nil {
+			return fmt.Errorf("count delegated failure recovery tasks: %w", err)
+		}
+		if recoveryTasks >= delegatedFailureRecoveryMaxTaskAttempts {
+			return s.exhaustDelegatedFailureRecovery(ctx, target)
 		}
 
 		if merged, err := s.Queries.MergeDelegatedFailureCommentIntoPendingTask(ctx, db.MergeDelegatedFailureCommentIntoPendingTaskParams{
@@ -5134,9 +5255,9 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 }
 
 // recoverDelegatedTaskFailure is the shared post-terminal hook for FailTask and
-// HandleFailedTasks. handled reports that the failure was an eligible delegated
-// terminal and therefore already has a richer recovery comment; callers use it
-// to suppress the legacy duplicate raw-error comment.
+// HandleFailedTasks. handled reports whether the failure was an eligible
+// delegated terminal; the production terminal paths deliberately retain their
+// legacy raw-error notice alongside the richer coordinator recovery signal.
 func (s *TaskService) recoverDelegatedTaskFailure(ctx context.Context, failed db.AgentTaskQueue) (handled bool, err error) {
 	target, _, err := s.ensureDelegatedFailureRecoveryComment(ctx, failed.ID)
 	if err != nil || target == nil {

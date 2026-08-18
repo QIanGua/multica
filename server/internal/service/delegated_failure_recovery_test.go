@@ -275,7 +275,11 @@ func TestPendingDelegatedFailureSweepRequeuesTerminalUndeliveredTask(t *testing.
 				WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&firstRecoveryID); err != nil {
 				t.Fatalf("load first recovery task: %v", err)
 			}
-			if _, err := f.pool.Exec(ctx, `
+			if terminalStatus == "cancelled" {
+				if _, err := svc.CancelTask(ctx, firstRecoveryID); err != nil {
+					t.Fatalf("server-cancel recovery before delivery: %v", err)
+				}
+			} else if _, err := f.pool.Exec(ctx, `
 				UPDATE agent_task_queue
 				SET status = $2, completed_at = now(), delivered_comment_ids = '{}'
 				WHERE id = $1`, firstRecoveryID, terminalStatus); err != nil {
@@ -301,6 +305,150 @@ func TestPendingDelegatedFailureSweepRequeuesTerminalUndeliveredTask(t *testing.
 				t.Fatalf("second recovery sweep = %d, %v; want 0, nil", recovered, err)
 			}
 		})
+	}
+}
+
+func TestUserCancelledDelegatedFailureRecoveryStaysCancelled(t *testing.T) {
+	f, svc := seedDelegatedFailureFixture(t)
+	ctx := context.Background()
+	failedID := f.insertWorkerTask(t, "failed", "comment", 1, 2)
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET failure_reason = 'agent_error.process_failure', error = 'worker exited', completed_at = now()
+		WHERE id = $1`, failedID); err != nil {
+		t.Fatalf("stamp failed task: %v", err)
+	}
+	failed, err := svc.Queries.GetAgentTask(ctx, failedID)
+	if err != nil {
+		t.Fatalf("load failed task: %v", err)
+	}
+	if handled, err := svc.recoverDelegatedTaskFailure(ctx, failed); err != nil || !handled {
+		t.Fatalf("initial recovery = handled %v err %v", handled, err)
+	}
+
+	var recoveryTaskID, recoveryCommentID pgtype.UUID
+	if err := f.pool.QueryRow(ctx, `
+		SELECT task.id, recovery.id
+		FROM agent_task_queue task
+		JOIN comment recovery ON recovery.id = task.trigger_comment_id
+		WHERE task.trigger_evidence_kind = 'delegated_failure'
+		  AND task.trigger_evidence_ref_id = $1`, failedID).Scan(&recoveryTaskID, &recoveryCommentID); err != nil {
+		t.Fatalf("load recovery task/comment: %v", err)
+	}
+	cancelled, err := svc.CancelTaskByUser(ctx, recoveryTaskID)
+	if err != nil {
+		t.Fatalf("CancelTaskByUser: %v", err)
+	}
+	if cancelled.Status != "cancelled" {
+		t.Fatalf("cancelled status = %q, want cancelled", cancelled.Status)
+	}
+
+	var acknowledged bool
+	if err := f.pool.QueryRow(ctx, `
+		SELECT $2::uuid = ANY(delivered_comment_ids)
+		FROM agent_task_queue WHERE id = $1`, recoveryTaskID, recoveryCommentID).Scan(&acknowledged); err != nil {
+		t.Fatalf("read user-cancel acknowledgement: %v", err)
+	}
+	if !acknowledged {
+		t.Fatal("user cancellation did not terminally acknowledge the recovery signal")
+	}
+	if recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || recovered != 0 {
+		t.Fatalf("recovery sweep after user cancel = %d, %v; want 0, nil", recovered, err)
+	}
+	var taskCount int
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_task_queue
+		WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&taskCount); err != nil {
+		t.Fatalf("count recovery tasks: %v", err)
+	}
+	if taskCount != 1 {
+		t.Fatalf("recovery tasks after user cancel = %d, want 1", taskCount)
+	}
+}
+
+func TestDelegatedFailureRecoveryStopsAfterBoundedUndeliveredAttempts(t *testing.T) {
+	f, svc := seedDelegatedFailureFixture(t)
+	ctx := context.Background()
+	failedID := f.insertWorkerTask(t, "failed", "comment", 1, 2)
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET failure_reason = 'agent_error.process_failure', error = 'worker exited', completed_at = now()
+		WHERE id = $1`, failedID); err != nil {
+		t.Fatalf("stamp failed task: %v", err)
+	}
+	failed, err := svc.Queries.GetAgentTask(ctx, failedID)
+	if err != nil {
+		t.Fatalf("load failed task: %v", err)
+	}
+	if handled, err := svc.recoverDelegatedTaskFailure(ctx, failed); err != nil || !handled {
+		t.Fatalf("initial recovery = handled %v err %v", handled, err)
+	}
+
+	for attempt := 1; attempt <= delegatedFailureRecoveryMaxTaskAttempts; attempt++ {
+		var currentTaskID pgtype.UUID
+		if err := f.pool.QueryRow(ctx, `
+			SELECT id FROM agent_task_queue
+			WHERE trigger_evidence_kind = 'delegated_failure'
+			  AND trigger_evidence_ref_id = $1
+			  AND status = 'queued'
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1`, failedID).Scan(&currentTaskID); err != nil {
+			t.Fatalf("load recovery attempt %d: %v", attempt, err)
+		}
+		if _, err := f.pool.Exec(ctx, `
+			UPDATE agent_task_queue
+			SET status = 'failed', completed_at = now(), failure_reason = 'queued_expired',
+			    error = 'task expired in queue', delivered_comment_ids = '{}'
+			WHERE id = $1`, currentTaskID); err != nil {
+			t.Fatalf("fail recovery attempt %d: %v", attempt, err)
+		}
+
+		processed, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
+		if err != nil || processed != 1 {
+			t.Fatalf("recovery sweep after attempt %d = %d, %v; want 1, nil", attempt, processed, err)
+		}
+		var active, total int
+		if err := f.pool.QueryRow(ctx, `
+			SELECT count(*) FILTER (WHERE status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')),
+			       count(*)
+			FROM agent_task_queue
+			WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&active, &total); err != nil {
+			t.Fatalf("count attempt %d tasks: %v", attempt, err)
+		}
+		wantActive := 1
+		wantTotal := attempt + 1
+		if attempt == delegatedFailureRecoveryMaxTaskAttempts {
+			wantActive = 0
+			wantTotal = delegatedFailureRecoveryMaxTaskAttempts
+		}
+		if active != wantActive || total != wantTotal {
+			t.Fatalf("attempt %d active/total = %d/%d, want %d/%d", attempt, active, total, wantActive, wantTotal)
+		}
+	}
+
+	var exhaustionComments int
+	var exhaustionContent string
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*), COALESCE(max(content), '')
+		FROM comment
+		WHERE issue_id = $1 AND author_type = 'system' AND type = 'system' AND source_task_id = $2`, f.issueID, failedID).
+		Scan(&exhaustionComments, &exhaustionContent); err != nil {
+		t.Fatalf("read exhaustion comment: %v", err)
+	}
+	if exhaustionComments != 1 || !strings.Contains(exhaustionContent, "stopped after 3") {
+		t.Fatalf("exhaustion comment = count %d content %q, want one visible bounded-stop explanation", exhaustionComments, exhaustionContent)
+	}
+	if processed, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || processed != 0 {
+		t.Fatalf("post-exhaustion recovery sweep = %d, %v; want 0, nil", processed, err)
+	}
+	var finalTasks int
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_task_queue
+		WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&finalTasks); err != nil {
+		t.Fatalf("count final recovery tasks: %v", err)
+	}
+	if finalTasks != delegatedFailureRecoveryMaxTaskAttempts {
+		t.Fatalf("final recovery task count = %d, want %d", finalTasks, delegatedFailureRecoveryMaxTaskAttempts)
 	}
 }
 

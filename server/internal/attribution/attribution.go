@@ -131,7 +131,6 @@ const (
 	KindRetry             TriggerKind = "retry"
 	KindRerun             TriggerKind = "rerun"
 	KindDeferredFallback  TriggerKind = "deferred_fallback"
-	KindDelegatedFailure  TriggerKind = "delegated_failure"
 )
 
 // Result is the attribution stamped onto a queued run.

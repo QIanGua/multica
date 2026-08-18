@@ -11,6 +11,101 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acknowledgeExhaustedDelegatedFailureRecovery = `-- name: AcknowledgeExhaustedDelegatedFailureRecovery :one
+UPDATE agent_task_queue AS acknowledged
+SET delivered_comment_ids = (
+    SELECT COALESCE(array_agg(DISTINCT receipt.id), '{}')::uuid[]
+    FROM unnest(array_append(acknowledged.delivered_comment_ids, $1::uuid)) AS receipt(id)
+)
+WHERE acknowledged.id = (
+    SELECT attempt.id
+    FROM agent_task_queue attempt
+    WHERE attempt.trigger_evidence_kind = 'delegated_failure'
+      AND attempt.trigger_evidence_ref_id = $2
+    ORDER BY attempt.created_at DESC, attempt.id DESC
+    LIMIT 1
+    FOR UPDATE
+)
+  AND (
+      SELECT count(*)
+      FROM agent_task_queue attempt_count
+      WHERE attempt_count.trigger_evidence_kind = 'delegated_failure'
+        AND attempt_count.trigger_evidence_ref_id = $2
+  ) >= $3::int
+RETURNING acknowledged.id, acknowledged.agent_id, acknowledged.issue_id, acknowledged.status, acknowledged.priority, acknowledged.dispatched_at, acknowledged.started_at, acknowledged.completed_at, acknowledged.result, acknowledged.error, acknowledged.created_at, acknowledged.context, acknowledged.runtime_id, acknowledged.session_id, acknowledged.work_dir, acknowledged.trigger_comment_id, acknowledged.chat_session_id, acknowledged.autopilot_run_id, acknowledged.attempt, acknowledged.max_attempts, acknowledged.parent_task_id, acknowledged.failure_reason, acknowledged.trigger_summary, acknowledged.force_fresh_session, acknowledged.is_leader_task, acknowledged.wait_reason, acknowledged.initiator_user_id, acknowledged.handoff_note, acknowledged.prepare_lease_expires_at, acknowledged.squad_id, acknowledged.runtime_mcp_overlay, acknowledged.escalation_for_task_id, acknowledged.fire_at, acknowledged.originator_user_id, acknowledged.runtime_connected_apps, acknowledged.coalesced_comment_ids, acknowledged.delivered_comment_ids, acknowledged.chat_input_task_id, acknowledged.chat_finalize_deferred_at, acknowledged.originator_source, acknowledged.delegated_from_task_id, acknowledged.retry_of_task_id, acknowledged.rerun_of_task_id, acknowledged.rule_version_id, acknowledged.trigger_evidence_kind, acknowledged.trigger_evidence_ref_id, acknowledged.accountable_user_id, acknowledged.session_rollout_missing, acknowledged.retired_session_id, acknowledged.quick_actions_disabled, acknowledged.regenerate_quick_actions_for, acknowledged.plugin_execution_manifest_id, acknowledged.branch_name
+`
+
+type AcknowledgeExhaustedDelegatedFailureRecoveryParams struct {
+	CommentID    pgtype.UUID `json:"comment_id"`
+	FailedTaskID pgtype.UUID `json:"failed_task_id"`
+	MaxAttempts  int32       `json:"max_attempts"`
+}
+
+// Once the bounded automatic attempts are exhausted, record a terminal
+// acknowledgement on the newest recovery task. The outbox treats this receipt
+// as settled, while the service writes a separate visible system comment that
+// tells the user why no further task will be generated.
+func (q *Queries) AcknowledgeExhaustedDelegatedFailureRecovery(ctx context.Context, arg AcknowledgeExhaustedDelegatedFailureRecoveryParams) (AgentTaskQueue, error) {
+	row := q.db.QueryRow(ctx, acknowledgeExhaustedDelegatedFailureRecovery, arg.CommentID, arg.FailedTaskID, arg.MaxAttempts)
+	var i AgentTaskQueue
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+		&i.ChatSessionID,
+		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
+		&i.IsLeaderTask,
+		&i.WaitReason,
+		&i.InitiatorUserID,
+		&i.HandoffNote,
+		&i.PrepareLeaseExpiresAt,
+		&i.SquadID,
+		&i.RuntimeMcpOverlay,
+		&i.EscalationForTaskID,
+		&i.FireAt,
+		&i.OriginatorUserID,
+		&i.RuntimeConnectedApps,
+		&i.CoalescedCommentIds,
+		&i.DeliveredCommentIds,
+		&i.ChatInputTaskID,
+		&i.ChatFinalizeDeferredAt,
+		&i.OriginatorSource,
+		&i.DelegatedFromTaskID,
+		&i.RetryOfTaskID,
+		&i.RerunOfTaskID,
+		&i.RuleVersionID,
+		&i.TriggerEvidenceKind,
+		&i.TriggerEvidenceRefID,
+		&i.AccountableUserID,
+		&i.SessionRolloutMissing,
+		&i.RetiredSessionID,
+		&i.QuickActionsDisabled,
+		&i.RegenerateQuickActionsFor,
+		&i.PluginExecutionManifestID,
+		&i.BranchName,
+	)
+	return i, err
+}
+
 const archiveAgent = `-- name: ArchiveAgent :one
 UPDATE agent SET archived_at = now(), archived_by = $2, updated_at = now()
 WHERE id = $1
@@ -207,8 +302,112 @@ WHERE id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_d
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, plugin_execution_manifest_id, branch_name
 `
 
+// Automatic cancellation without an explicit persisted failure reason. Unlike
+// CancelAgentTaskByUser, this deliberately leaves recovery inputs replayable.
 func (q *Queries) CancelAgentTask(ctx context.Context, id pgtype.UUID) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, cancelAgentTask, id)
+	var i AgentTaskQueue
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+		&i.ChatSessionID,
+		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
+		&i.IsLeaderTask,
+		&i.WaitReason,
+		&i.InitiatorUserID,
+		&i.HandoffNote,
+		&i.PrepareLeaseExpiresAt,
+		&i.SquadID,
+		&i.RuntimeMcpOverlay,
+		&i.EscalationForTaskID,
+		&i.FireAt,
+		&i.OriginatorUserID,
+		&i.RuntimeConnectedApps,
+		&i.CoalescedCommentIds,
+		&i.DeliveredCommentIds,
+		&i.ChatInputTaskID,
+		&i.ChatFinalizeDeferredAt,
+		&i.OriginatorSource,
+		&i.DelegatedFromTaskID,
+		&i.RetryOfTaskID,
+		&i.RerunOfTaskID,
+		&i.RuleVersionID,
+		&i.TriggerEvidenceKind,
+		&i.TriggerEvidenceRefID,
+		&i.AccountableUserID,
+		&i.SessionRolloutMissing,
+		&i.RetiredSessionID,
+		&i.QuickActionsDisabled,
+		&i.RegenerateQuickActionsFor,
+		&i.PluginExecutionManifestID,
+		&i.BranchName,
+	)
+	return i, err
+}
+
+const cancelAgentTaskByUser = `-- name: CancelAgentTaskByUser :one
+UPDATE agent_task_queue AS task
+SET status = 'cancelled',
+    completed_at = now(),
+    prepare_lease_expires_at = NULL,
+    delivered_comment_ids = (
+        SELECT COALESCE(array_agg(DISTINCT receipt.id), '{}')::uuid[]
+        FROM unnest(array_cat(
+            task.delivered_comment_ids,
+            ARRAY(
+                SELECT recovery.id
+                FROM comment recovery
+                JOIN agent_task_queue failed ON failed.id = recovery.source_task_id
+                JOIN agent_task_queue source ON source.id = failed.delegated_from_task_id
+                WHERE (
+                    recovery.id = task.trigger_comment_id
+                    OR recovery.id = ANY(task.coalesced_comment_ids)
+                )
+                  AND recovery.author_type = 'system'
+                  AND recovery.type = 'progress_update'
+                  AND recovery.source_task_id IS NOT NULL
+                  AND failed.status = 'failed'
+                  AND failed.delegated_from_task_id IS NOT NULL
+                  AND failed.autopilot_run_id IS NULL
+                  AND failed.trigger_evidence_kind IS DISTINCT FROM 'delegated_failure'
+                  AND source.autopilot_run_id IS NULL
+                  AND source.issue_id = task.issue_id
+                  AND source.agent_id = task.agent_id
+                  AND recovery.issue_id = source.issue_id
+            )
+        )) AS receipt(id)
+    )
+WHERE task.id = $1
+  AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING task.id, task.agent_id, task.issue_id, task.status, task.priority, task.dispatched_at, task.started_at, task.completed_at, task.result, task.error, task.created_at, task.context, task.runtime_id, task.session_id, task.work_dir, task.trigger_comment_id, task.chat_session_id, task.autopilot_run_id, task.attempt, task.max_attempts, task.parent_task_id, task.failure_reason, task.trigger_summary, task.force_fresh_session, task.is_leader_task, task.wait_reason, task.initiator_user_id, task.handoff_note, task.prepare_lease_expires_at, task.squad_id, task.runtime_mcp_overlay, task.escalation_for_task_id, task.fire_at, task.originator_user_id, task.runtime_connected_apps, task.coalesced_comment_ids, task.delivered_comment_ids, task.chat_input_task_id, task.chat_finalize_deferred_at, task.originator_source, task.delegated_from_task_id, task.retry_of_task_id, task.rerun_of_task_id, task.rule_version_id, task.trigger_evidence_kind, task.trigger_evidence_ref_id, task.accountable_user_id, task.session_rollout_missing, task.retired_session_id, task.quick_actions_disabled, task.regenerate_quick_actions_for, task.plugin_execution_manifest_id, task.branch_name
+`
+
+// An explicit user cancellation is a terminal acknowledgement for any
+// delegated-failure recovery signal planned into this task. Server-initiated
+// cancellations keep using CancelAgentTask / CancelAgentTaskWithReason so a
+// stale plan, claim failure, or other automatic repair can still be replayed.
+func (q *Queries) CancelAgentTaskByUser(ctx context.Context, id pgtype.UUID) (AgentTaskQueue, error) {
+	row := q.db.QueryRow(ctx, cancelAgentTaskByUser, id)
 	var i AgentTaskQueue
 	err := row.Scan(
 		&i.ID,
@@ -287,12 +486,11 @@ type CancelAgentTaskWithReasonParams struct {
 
 // Cancels a task AND records why, for cancellations the user did not ask for.
 //
-// Plain CancelAgentTask leaves error/failure_reason NULL, which is right for a
-// user-initiated cancel — the user knows why. A server-initiated one is the
-// opposite: without a persisted reason the run surfaces as an unexplained
-// "cancelled", and the only trace is a 4xx in a daemon log the user never sees.
-// Retrying cannot help either (the task is refused for a durable reason), so
-// this is a terminal state that has to carry its own explanation.
+// CancelAgentTaskByUser leaves error/failure_reason NULL because the user knows
+// why. A server-initiated refusal is the opposite: without a persisted reason
+// the run surfaces as an unexplained "cancelled", and the only trace is a 4xx
+// in a daemon log the user never sees. Retrying cannot help either (the task is
+// refused for a durable reason), so this terminal state carries its explanation.
 func (q *Queries) CancelAgentTaskWithReason(ctx context.Context, arg CancelAgentTaskWithReasonParams) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, cancelAgentTaskWithReason, arg.Error, arg.FailureReason, arg.ID)
 	var i AgentTaskQueue
@@ -1657,6 +1855,23 @@ func (q *Queries) CompleteAgentTask(ctx context.Context, arg CompleteAgentTaskPa
 		&i.BranchName,
 	)
 	return i, err
+}
+
+const countDelegatedFailureRecoveryTasks = `-- name: CountDelegatedFailureRecoveryTasks :one
+SELECT count(*)
+FROM agent_task_queue
+WHERE trigger_evidence_kind = 'delegated_failure'
+  AND trigger_evidence_ref_id = $1
+`
+
+// Counts dedicated coordinator wakeups for one failed delegated task. Merged
+// recovery signals do not create a new row and therefore do not consume an
+// automatic attempt until they need a standalone successor.
+func (q *Queries) CountDelegatedFailureRecoveryTasks(ctx context.Context, failedTaskID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countDelegatedFailureRecoveryTasks, failedTaskID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const countRunningTasks = `-- name: CountRunningTasks :one
