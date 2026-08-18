@@ -39,19 +39,20 @@ func TestPrepareInPlaceKeepsRepositoryCleanForGitAddAll(t *testing.T) {
 		t.Fatal("Prepare wrote sidecars into the user's repo but reported none to hide from git")
 	}
 	if dirty := gitRun(t, repo, "status", "--porcelain"); dirty == "" {
-		t.Fatalf("precondition: expected Prepare to dirty the repo before excluding, got a clean tree")
+		t.Fatalf("precondition: expected Prepare to dirty the repo, got a clean tree")
 	}
 
 	// What the daemon does with SidecarPaths once Prepare hands them over.
-	if err := ExcludeSidecarsFromGit(repo, env.SidecarPaths); err != nil {
-		t.Fatalf("ExcludeSidecarsFromGit: %v", err)
+	gitEnvVars, err := PrepareGitExcludes(env.RootDir, repo, env.SidecarPaths)
+	if err != nil {
+		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
 
-	if status := gitRun(t, repo, "status", "--porcelain"); status != "" {
-		t.Errorf("runtime files still visible to git during the task:\n%s", status)
+	if status := gitEnv(t, repo, gitEnvVars, "status", "--porcelain"); status != "" {
+		t.Errorf("runtime files still visible to the agent's git:\n%s", status)
 	}
-	gitRun(t, repo, "add", "-A")
-	if staged := gitRun(t, repo, "diff", "--cached", "--name-only"); staged != "" {
+	gitEnv(t, repo, gitEnvVars, "add", "-A")
+	if staged := gitEnv(t, repo, gitEnvVars, "diff", "--cached", "--name-only"); staged != "" {
 		t.Errorf("the agent's `git add -A` staged Multica runtime files:\n%s", staged)
 	}
 
@@ -60,11 +61,67 @@ func TestPrepareInPlaceKeepsRepositoryCleanForGitAddAll(t *testing.T) {
 	if err := CleanupSidecars(env.RootDir); err != nil {
 		t.Fatalf("CleanupSidecars: %v", err)
 	}
-	if err := CleanupGitExclude(repo); err != nil {
-		t.Fatalf("CleanupGitExclude: %v", err)
-	}
 	if status := gitRun(t, repo, "status", "--porcelain"); status != "" {
 		t.Errorf("repository not restored to its pre-task state:\n%s", status)
+	}
+}
+
+// Elon review, must-fix 2, end to end. This is the state a repository already
+// hit by #7114 is in: sidecars were committed by an earlier run and then
+// deleted by its cleanup, so the paths are gone from disk but still tracked.
+// Prepare must not write there again — no ignore rule can hide a modification
+// to a tracked file, so doing so would re-arm the exact loop reported.
+func TestPrepareInPlaceDoesNotRewriteCommittedThenDeletedSidecars(t *testing.T) {
+	repo := newTestRepo(t)
+
+	// Reproduce the damage the old behaviour left behind.
+	firstEnv, err := Prepare(PrepareParams{
+		WorkspacesRoot: t.TempDir(),
+		WorkspaceID:    "ws-gh7114-004",
+		TaskID:         "dddddddd-1111-2222-3333-444444444444",
+		AgentName:      "Test Agent",
+		Provider:       "grok",
+		LocalWorkDir:   repo,
+		Task: TaskContextForEnv{
+			IssueID: "11111111-2222-3333-4444-555555555555",
+			AgentID: "99999999-8888-7777-6666-555555555555",
+		},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("first Prepare: %v", err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-m", "the bug: runtime files committed")
+	if err := CleanupSidecars(firstEnv.RootDir); err != nil {
+		t.Fatalf("CleanupSidecars: %v", err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-m", "the bug: runtime files deleted again")
+
+	// A later task on the same repository.
+	secondEnv, err := Prepare(PrepareParams{
+		WorkspacesRoot: t.TempDir(),
+		WorkspaceID:    "ws-gh7114-004",
+		TaskID:         "eeeeeeee-1111-2222-3333-444444444444",
+		AgentName:      "Test Agent",
+		Provider:       "grok",
+		LocalWorkDir:   repo,
+		Task: TaskContextForEnv{
+			IssueID: "11111111-2222-3333-4444-555555555555",
+			AgentID: "99999999-8888-7777-6666-555555555555",
+		},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("second Prepare: %v", err)
+	}
+	gitEnvVars, err := PrepareGitExcludes(secondEnv.RootDir, repo, secondEnv.SidecarPaths)
+	if err != nil {
+		t.Fatalf("PrepareGitExcludes: %v", err)
+	}
+
+	gitEnv(t, repo, gitEnvVars, "add", "-A")
+	if staged := gitEnv(t, repo, gitEnvVars, "diff", "--cached", "--name-only"); staged != "" {
+		t.Errorf("the injection loop is still armed on an already-polluted repo; staged:\n%s", staged)
 	}
 }
 
@@ -89,7 +146,7 @@ func TestPrepareInPlaceOnNonGitFolder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	if err := ExcludeSidecarsFromGit(userDir, env.SidecarPaths); err != nil {
+	if _, err := PrepareGitExcludes(t.TempDir(), userDir, env.SidecarPaths); err != nil {
 		t.Errorf("excluding in a non-git folder must be a no-op, got: %v", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(userDir, ".git")); !os.IsNotExist(statErr) {

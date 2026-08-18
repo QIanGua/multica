@@ -6698,19 +6698,6 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				}
 				d.logger.Warn("execenv: cleanup sidecars failed", "error", cerr)
 			}
-			// Drop the patterns ExcludeSidecarsFromGit added to the user's
-			// .git/info/exclude. In place only, matching where they are
-			// written: leaving them behind would keep hiding those paths from
-			// `git status` after the task is over, in the user's own
-			// repository, which is theirs to see.
-			if env.LocalDirectory {
-				if cerr := execenv.CleanupGitExclude(env.WorkDir); cerr != nil {
-					if cleanupErr == nil {
-						cleanupErr = cerr
-					}
-					d.logger.Warn("execenv: cleanup git exclude failed", "error", cerr)
-				}
-			}
 			// In worktree mode a failed cleanup is NOT survivable: Finalize is
 			// about to `git add -A`, so whatever the cleanup could not remove
 			// gets committed and delivered as the task's branch — a diff whose
@@ -6798,14 +6785,25 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 
-	// Keep the runtime's own files out of the user's `git status` for the
-	// length of the run, so the agent cannot sweep them into a commit. In
-	// place only — worktree mode shares the user's common git dir and removes
-	// the sidecars before Finalize commits instead.
+	// Keep the runtime's own files out of the git view the AGENT sees for the
+	// length of the run, so it cannot sweep them into a commit in the user's
+	// repository. Scoped to the agent process's environment: the user's own
+	// git keeps telling them the truth, sibling worktrees are unaffected, and
+	// nothing is left behind if this daemon is killed.
+	//
+	// In place only. Worktree mode has no such exposure — the worktree is
+	// disposable and the sidecars are removed before Finalize commits.
+	//
+	// Fail closed. A repository we could not protect is the exact condition
+	// GitHub #7114 reported, so launching the agent anyway would make the
+	// guarantee advisory. A plain (non-git) folder returns no env and no
+	// error, and keeps running: there is nothing there to protect.
+	var gitExcludeEnv map[string]string
 	if env.LocalDirectory {
-		if err := execenv.ExcludeSidecarsFromGit(env.WorkDir, gitExcludePaths); err != nil {
-			taskLog.Warn("execenv: could not hide runtime files from git; they may show up as untracked changes in your repository",
-				"work_dir", env.WorkDir, "error", err)
+		var excErr error
+		gitExcludeEnv, excErr = execenv.PrepareGitExcludes(env.RootDir, env.WorkDir, gitExcludePaths)
+		if excErr != nil {
+			return TaskResult{}, fmt.Errorf("prepare git excludes: %w", excErr)
 		}
 	}
 	prompt := BuildPrompt(task, provider)
@@ -6857,6 +6855,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	// Point Codex to the per-task CODEX_HOME so it discovers skills natively
 	// without polluting the system ~/.codex/skills/.
+	// Task-scoped core.excludesFile pointing at daemon scratch, so the agent's
+	// own git ignores the runtime's sidecars (see PrepareGitExcludes).
+	for k, v := range gitExcludeEnv {
+		agentEnv[k] = v
+	}
 	if env.CodexHome != "" {
 		agentEnv["CODEX_HOME"] = env.CodexHome
 	}

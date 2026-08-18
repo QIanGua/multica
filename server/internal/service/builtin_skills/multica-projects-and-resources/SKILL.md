@@ -67,10 +67,14 @@ it back to the default.
 
 Under `in_place` the runtime writes its own files (`.multica/`, `.agent_context/`, the runtime's skills tree) into the
 user's directory for the length of the task, then removes them. When that directory is a git repository, the daemon
-adds those paths to `.git/info/exclude` while the task runs — never to `.gitignore`, which is tracked — so they stay
-out of `git status` and cannot be swept into a commit by `git add -A`; the entries are removed on cleanup. Runtimes
-that can take the runtime brief inline receive it that way in this mode, so the repository's own `AGENTS.md` /
-`CLAUDE.md` is left untouched instead of carrying a Multica-managed block (GitHub #7114).
+points the agent's git at a task-scoped ignore file (`core.excludesFile`, passed in the agent process's environment
+and stored in daemon scratch) so those paths cannot be swept into a commit by `git add -A`. Nothing is written into
+the repository or its git metadata: the user's own `git status` is unchanged, sibling worktrees are unaffected, and
+a killed daemon leaves nothing behind. If the directory is a git repository and this protection cannot be
+established, the task fails instead of running unprotected. Paths git already tracks are treated as the user's and
+never rewritten — a repository previously polluted this way keeps its committed copies untouched. Runtimes that can
+take the runtime brief inline receive it that way in this mode, so the repository's own `AGENTS.md` / `CLAUDE.md` is
+left untouched instead of carrying a Multica-managed block (GitHub #7114).
 
 For `github_repo`, non-JSON `--ref` sets `resource_ref.ref`, the default checkout branch/tag/SHA for future tasks in that project. JSON `--ref '<json>'` remains the escape hatch for full payloads or resource types not covered by shortcuts.
 

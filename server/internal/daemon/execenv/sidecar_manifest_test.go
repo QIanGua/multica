@@ -829,7 +829,7 @@ func TestAllocateCollisionFreeSkillDir(t *testing.T) {
 	parent := t.TempDir()
 
 	// 1) No collision → use the base slug as-is.
-	slug, dir, err := allocateCollisionFreeSkillDir(parent, "issue-review")
+	slug, dir, err := allocateCollisionFreeSkillDir(parent, "issue-review", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -844,7 +844,7 @@ func TestAllocateCollisionFreeSkillDir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(parent, "issue-review"), 0o755); err != nil {
 		t.Fatalf("seed user dir: %v", err)
 	}
-	slug, dir, err = allocateCollisionFreeSkillDir(parent, "issue-review")
+	slug, dir, err = allocateCollisionFreeSkillDir(parent, "issue-review", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -859,7 +859,7 @@ func TestAllocateCollisionFreeSkillDir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(parent, "issue-review-multica"), 0o755); err != nil {
 		t.Fatalf("seed bumped dir: %v", err)
 	}
-	slug, dir, err = allocateCollisionFreeSkillDir(parent, "issue-review")
+	slug, dir, err = allocateCollisionFreeSkillDir(parent, "issue-review", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

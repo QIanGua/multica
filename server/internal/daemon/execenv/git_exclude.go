@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,137 +9,173 @@ import (
 	"strings"
 )
 
-// gitExcludeBlock is the managed region Multica owns inside the repository's
-// .git/info/exclude. `#` is gitignore's comment syntax, so the markers are
-// inert to git and to anything else reading the file.
-//
-// info/exclude rather than .gitignore, deliberately: .gitignore is a TRACKED
-// file in virtually every repository, so writing our patterns there would
-// commit a Multica-authored change to the user's project — the very class of
-// pollution this file exists to prevent, and it would land in the diff of the
-// next `git add -A` exactly like the sidecars do. info/exclude lives inside
-// .git/, is never tracked, never appears in a diff, and never reaches a remote.
-var gitExcludeBlock = managedBlock{
-	begin:     "# BEGIN MULTICA-RUNTIME (auto-managed; do not edit)",
-	end:       "# END MULTICA-RUNTIME",
-	separator: "\n\n",
-}
+// gitExcludesFileName is the task-scoped ignore file, written into envRoot —
+// daemon scratch — never into the user's repository.
+const gitExcludesFileName = ".multica_git_excludes"
 
-// ExcludeSidecarsFromGit hides the daemon's own sidecar files from git inside
-// the repository that contains workDir, by writing them as patterns into the
-// repo's .git/info/exclude.
+// ErrGitExcludesUnprotected is returned when workDir IS inside a git
+// repository but the task-scoped excludes could not be established. The caller
+// must treat it as fatal and refuse to launch the agent: the whole point of
+// this mechanism is that the runtime's own files cannot reach the user's
+// history, and an agent running unprotected in a real repository is exactly
+// the failure GitHub #7114 reported. Degrading to a warning here would make
+// the data-integrity guarantee advisory.
+var ErrGitExcludesUnprotected = errors.New("execenv: could not protect the user's repository from the runtime's own files")
+
+// PrepareGitExcludes arranges for the daemon's own sidecars to be invisible to
+// the git commands the AGENT runs, for the length of the task, without
+// touching a single byte of the user's repository or its git metadata.
 //
-// This exists for the in_place local_directory flow, where WorkDir IS the
-// user's repository and the sidecars Prepare writes (.multica/,
-// .agent_context/, the runtime's skills tree) are therefore untracked files
-// sitting in the user's own working tree for the length of the run. Cleanup
-// removes them afterwards, but "afterwards" is too late: the agent itself
-// routinely runs `git add -A` mid-task and commits them into the user's
-// project. Excluding them closes that window at its only reliable point —
-// git's own view of the tree — instead of hoping no commit happens first.
-// See GitHub #7114.
+// It writes a task-scoped ignore file into envRoot and returns the environment
+// variables that point the agent's git at it via `core.excludesFile`. Because
+// the setting rides in the agent process's environment, it applies to that
+// process and its children and to nothing else:
 //
-// Scope and safety:
+//   - The user's own `git status` in the same directory keeps telling them the
+//     truth. Their repository is theirs to see.
+//   - Sibling worktrees of the same repository are unaffected. An earlier
+//     revision of this wrote `.git/info/exclude`, which git resolves to the
+//     repository's COMMON git dir — so a pattern written for one in_place task
+//     would have hidden identically-named untracked files in every other
+//     worktree, including a parallel task's real output, and silently dropped
+//     them from that task's `git add -A`.
+//   - Nothing survives a crash. There is no on-disk state in the user's repo
+//     to roll back, so a killed daemon cannot leave a broad pattern behind
+//     quietly hiding files that appear later.
 //
-//   - Only paths this task actually created are excluded. The caller passes
-//     them from the sidecar manifest, which records a path only after
-//     verifying it did NOT pre-exist, so a pattern can never hide a file that
-//     is the user's.
-//   - Patterns are anchored to the repository root with a leading slash, so
-//     `/.multica/` cannot also swallow a `docs/.multica/` the user owns.
-//   - A workDir that is not inside a git repository is a no-op, as is an empty
-//     path list. Both are ordinary: local_directory resources may point at a
-//     plain folder.
+// The user's own global excludes are preserved: whatever `core.excludesFile`
+// resolved to before is concatenated ahead of our patterns, so overriding the
+// setting does not make the agent start seeing files the user globally
+// ignores.
 //
-// Not used for worktree mode. A linked worktree resolves info/exclude to the
-// repository's COMMON git dir — the user's own — so writing there would change
-// what `git status` hides in the user's checkout for a file we did not put in
-// their checkout. Worktree mode keeps its existing guarantee instead: the
-// sidecars are removed before Finalize commits anything.
-func ExcludeSidecarsFromGit(workDir string, paths []string) error {
-	if len(paths) == 0 {
-		return nil
-	}
-	root, excludePath, ok := gitExcludeTarget(workDir)
+// Returns nil env with a nil error when workDir is not inside a git repository
+// — a local_directory resource may point at a plain folder, and there is
+// nothing to protect. Any failure while a git repository IS present is
+// returned wrapped in ErrGitExcludesUnprotected.
+func PrepareGitExcludes(envRoot, workDir string, paths []string) (map[string]string, error) {
+	root, ok := gitRepoRoot(workDir)
 	if !ok {
-		return nil
+		return nil, nil
+	}
+	if envRoot == "" {
+		return nil, fmt.Errorf("%w: no daemon scratch directory to hold the excludes file", ErrGitExcludesUnprotected)
 	}
 
-	patterns := gitExcludePatterns(root, paths)
-	if len(patterns) == 0 {
-		return nil
+	patterns, dropped := gitExcludePatterns(root, paths)
+	if dropped > 0 {
+		// Silently writing a shorter list is how a protection mechanism turns
+		// into a no-op nobody notices: the report in #7114 is precisely what
+		// an unprotected run looks like.
+		return nil, fmt.Errorf("%w: %d of %d sidecar paths could not be expressed relative to %s",
+			ErrGitExcludesUnprotected, dropped, len(paths), root)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(excludePath), 0o755); err != nil {
-		return fmt.Errorf("create git info dir: %w", err)
-	}
 	body := "# Multica runtime files for the task running in this directory.\n" +
-		"# Removed automatically when the task finishes.\n" +
-		strings.Join(patterns, "\n")
-	if _, err := gitExcludeBlock.write(excludePath, body); err != nil {
-		return fmt.Errorf("write git exclude %s: %w", excludePath, err)
+		"# Task-scoped: this file is read only by the agent process, via\n" +
+		"# core.excludesFile, and is never written into your repository.\n"
+	if inherited, err := inheritedGlobalExcludes(workDir); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrGitExcludesUnprotected, err)
+	} else if inherited != "" {
+		body += "\n# --- your own global excludes, preserved verbatim ---\n" + inherited + "\n"
 	}
-	return nil
+	if len(patterns) > 0 {
+		body += "\n" + strings.Join(patterns, "\n") + "\n"
+	}
+
+	path := filepath.Join(envRoot, gitExcludesFileName)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		return nil, fmt.Errorf("%w: write %s: %v", ErrGitExcludesUnprotected, path, err)
+	}
+
+	// GIT_CONFIG_COUNT/KEY/VALUE is git's supported way to set config for one
+	// invocation tree without a config file (git >= 2.31).
+	return map[string]string{
+		"GIT_CONFIG_COUNT":   "1",
+		"GIT_CONFIG_KEY_0":   "core.excludesFile",
+		"GIT_CONFIG_VALUE_0": path,
+	}, nil
 }
 
-// CleanupGitExclude removes the managed block from the repository's
-// .git/info/exclude, restoring the file to its exact pre-task bytes (and
-// removing it outright when Multica created it).
-//
-// Safe to call defensively: a workDir outside any git repository, a missing
-// exclude file, and a file without the managed block are all no-ops.
-func CleanupGitExclude(workDir string) error {
-	_, excludePath, ok := gitExcludeTarget(workDir)
-	if !ok {
-		return nil
+// inheritedGlobalExcludes returns the contents of whatever core.excludesFile
+// resolved to before we override it, so the agent keeps ignoring what the user
+// globally ignores. A missing or unset file is not an error — most users have
+// neither.
+func inheritedGlobalExcludes(workDir string) (string, error) {
+	current, err := runGitTrimmed(workDir, "config", "--get", "core.excludesFile")
+	if err != nil || current == "" {
+		// `--get` exits non-zero when the key is unset; fall back to git's
+		// documented default location.
+		current = defaultGlobalExcludesPath()
+		if current == "" {
+			return "", nil
+		}
 	}
-	if err := gitExcludeBlock.cleanup(excludePath); err != nil {
-		return fmt.Errorf("clean git exclude %s: %w", excludePath, err)
+	if strings.HasPrefix(current, "~") {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			return "", nil
+		}
+		current = filepath.Join(home, strings.TrimPrefix(current, "~"))
 	}
-	return nil
-}
-
-// gitExcludeTarget resolves the repository root containing workDir and the
-// path of its info/exclude file. ok is false when workDir is not inside a git
-// repository, which callers treat as "nothing to do" rather than an error.
-//
-// --git-common-dir rather than --git-dir: the two differ inside a linked
-// worktree, and only the common dir holds the info/exclude git actually reads.
-func gitExcludeTarget(workDir string) (root, excludePath string, ok bool) {
-	out, err := runGitTrimmed(workDir, "rev-parse", "--show-toplevel", "--git-common-dir")
+	data, err := os.ReadFile(current)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
 	if err != nil {
-		return "", "", false
+		return "", fmt.Errorf("read the global excludes file %s: %w", current, err)
 	}
-	lines := strings.Split(out, "\n")
-	if len(lines) < 2 {
-		return "", "", false
-	}
-	root = strings.TrimSpace(lines[0])
-	gitDir := strings.TrimSpace(lines[1])
-	if root == "" || gitDir == "" {
-		return "", "", false
-	}
-	if !filepath.IsAbs(gitDir) {
-		// git resolves a relative --git-common-dir against the directory it
-		// ran in, which -C pinned to workDir.
-		gitDir = filepath.Join(workDir, gitDir)
-	}
-	return root, filepath.Join(gitDir, "info", "exclude"), true
+	return strings.TrimRight(string(data), "\n"), nil
 }
 
-// gitExcludePatterns turns absolute sidecar paths into gitignore patterns
-// anchored at the repository root, sorted for deterministic file contents so
-// repeated runs on an unchanged sidecar set rewrite identical bytes.
-//
-// A path that resolves outside root is dropped rather than emitted: it cannot
-// be expressed as a repo-relative pattern, and guessing would risk excluding
-// the wrong thing.
-func gitExcludePatterns(root string, paths []string) []string {
+// defaultGlobalExcludesPath is git's fallback when core.excludesFile is unset:
+// $XDG_CONFIG_HOME/git/ignore, or ~/.config/git/ignore.
+func defaultGlobalExcludesPath() string {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "git", "ignore")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "git", "ignore")
+}
+
+// gitRepoRoot returns the repository root containing workDir, canonicalised.
+// ok is false when workDir is not inside a git repository, which callers treat
+// as "nothing to protect" rather than an error.
+func gitRepoRoot(workDir string) (string, bool) {
+	out, err := runGitTrimmed(workDir, "rev-parse", "--show-toplevel")
+	if err != nil || out == "" {
+		return "", false
+	}
+	return canonicalPath(out), true
+}
+
+// canonicalPath resolves symlinks so two spellings of one directory compare
+// equal. A local_directory resource keeps the path the user typed, while git
+// reports the resolved one — on macOS a /var/... resource against a
+// /private/var/... repo root — and comparing them raw made every pattern look
+// like it pointed outside the repository (they were then all dropped, leaving
+// the run silently unprotected).
+func canonicalPath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return filepath.Clean(p)
+}
+
+// gitExcludePatterns turns absolute sidecar paths into ignore patterns
+// anchored at the repository root, sorted so repeated runs on an unchanged
+// sidecar set produce identical bytes. dropped counts paths that could not be
+// expressed relative to root; the caller treats a non-zero count as a failure
+// to protect rather than as a shorter list.
+func gitExcludePatterns(root string, paths []string) (patterns []string, dropped int) {
 	seen := make(map[string]struct{}, len(paths))
-	patterns := make([]string, 0, len(paths))
+	patterns = make([]string, 0, len(paths))
 	for _, p := range paths {
-		rel, err := filepath.Rel(root, p)
+		rel, err := filepath.Rel(root, canonicalPath(p))
 		if err != nil || rel == "." || !filepath.IsLocal(rel) {
+			dropped++
 			continue
 		}
 		pattern := "/" + filepath.ToSlash(rel)
@@ -156,19 +193,77 @@ func gitExcludePatterns(root string, paths []string) []string {
 		patterns = append(patterns, pattern)
 	}
 	sort.Strings(patterns)
-	return patterns
+	return patterns, dropped
+}
+
+// GitTrackedFilesUnder returns the absolute paths of files git already tracks
+// beneath the given directories, in the repository containing workDir.
+//
+// This is the state no ignore rule can help with. A repository already
+// polluted by GitHub #7114 typically carries committed sidecars: they were
+// committed by an earlier run, then deleted by its cleanup, leaving paths that
+// are gone from the working tree but still in the index. `os.Lstat` says
+// "absent, safe to create", so Prepare writes there again — and because the
+// path is tracked, no excludes file can hide it and the next `git add -A`
+// stages Multica content once more. That is the reported loop, reproducing on
+// exactly the repositories that already suffered it.
+//
+// Prepare therefore treats these paths as belonging to the user and refuses to
+// write them, the same as any other pre-existing path: skills get a
+// collision-free alternative directory, and the Multica-only markers degrade
+// to absent, which their callers already tolerate.
+//
+// No candidates, a non-git workDir, or a git failure all yield nothing: this
+// hardens a write path that is already conservative, and must never be the
+// reason a task cannot start.
+func GitTrackedFilesUnder(workDir string, roots []string) map[string]struct{} {
+	if len(roots) == 0 {
+		return nil
+	}
+	repoRoot, ok := gitRepoRoot(workDir)
+	if !ok {
+		return nil
+	}
+	args := []string{"ls-files", "-z", "--"}
+	for _, r := range roots {
+		rel, err := filepath.Rel(repoRoot, canonicalPath(r))
+		if err != nil || !filepath.IsLocal(rel) {
+			continue
+		}
+		args = append(args, filepath.ToSlash(rel))
+	}
+	if len(args) == 3 {
+		return nil
+	}
+	// Pathspec-limited so this stays cheap even on a very large repository.
+	out, err := runGitStdout(workDir, args...)
+	if err != nil {
+		return nil
+	}
+
+	tracked := make(map[string]struct{})
+	for _, entry := range strings.Split(out, "\x00") {
+		if entry == "" {
+			continue
+		}
+		tracked[filepath.Join(repoRoot, filepath.FromSlash(entry))] = struct{}{}
+	}
+	if len(tracked) == 0 {
+		return nil
+	}
+	return tracked
 }
 
 // excludablePaths returns the minimal set of paths covering everything the
 // manifest records: every created directory that has no created ancestor, plus
 // every created file that sits outside all of them.
 //
-// Minimal matters because each pattern is a line in the user's info/exclude.
-// Recording `.grok/skills/multica-a`, `.grok/skills/multica-b`, … when we also
-// created `.grok/` itself would write a dozen redundant lines describing one
-// subtree. Emitting the shallowest created path is both smaller and more
-// accurate: it excludes exactly the tree we brought into existence and stops
-// at the boundary where the user's own content begins.
+// Minimal matters because each pattern is a line in the ignore file. Recording
+// `.grok/skills/multica-a`, `.grok/skills/multica-b`, … when we also created
+// `.grok/` itself would write a dozen redundant lines describing one subtree.
+// Emitting the shallowest created path is both smaller and more accurate: it
+// covers exactly the tree we brought into existence and stops at the boundary
+// where the user's own content begins.
 func (m sidecarManifest) excludablePaths() []string {
 	roots := make([]string, 0, len(m.Dirs))
 	for _, d := range m.Dirs {

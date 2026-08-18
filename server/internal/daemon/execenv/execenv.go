@@ -471,15 +471,29 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		}()
 	}
 
+	// In place the workdir is the user's own repository, so "this path does
+	// not exist" is not enough to prove it is ours to write: git may still
+	// track it from a run that committed a sidecar before cleanup deleted it
+	// (GitHub #7114). Load those paths first so writeContextFiles treats them
+	// as the user's — skills route around them, Multica-only markers degrade
+	// to absent — rather than modifying a tracked file no ignore rule can hide.
+	if params.LocalWorkDir != "" {
+		manifest.reserved = GitTrackedFilesUnder(workDir, []string{
+			filepath.Join(workDir, ".multica"),
+			filepath.Join(workDir, ".agent_context"),
+			skillsDirPath(workDir, params.Provider),
+		})
+	}
+
 	if err := writeContextFiles(workDir, params.Provider, params.Task, manifest); err != nil {
 		return nil, fmt.Errorf("execenv: write context files: %w", err)
 	}
 
 	// In place only: hand the caller the set of paths we just created inside
-	// the user's repository so it can keep them out of git for the duration of
-	// the run (GitHub #7114). Derived from the manifest rather than from a
-	// hardcoded list of sidecar names, so it stays exact as runtimes are added
-	// and can never name a path we did not create.
+	// the user's repository so it can keep them out of the agent's git view
+	// for the duration of the run. Derived from the manifest rather than from
+	// a hardcoded list of sidecar names, so it stays exact as runtimes are
+	// added and can never name a path we did not create.
 	if params.LocalWorkDir != "" {
 		env.SidecarPaths = manifest.excludablePaths()
 	}

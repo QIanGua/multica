@@ -949,7 +949,7 @@ func writeSkillFiles(skillsDir string, skills []SkillContextForEnv, manifest *si
 	batchSlugs := resolveSkillSlugs(skills)
 
 	for i, skill := range skills {
-		slug, dir, err := allocateCollisionFreeSkillDir(skillsDir, batchSlugs[i])
+		slug, dir, err := allocateCollisionFreeSkillDir(skillsDir, batchSlugs[i], manifest)
 		if err != nil {
 			return fmt.Errorf("allocate skill dir for %q: %w", skill.Name, err)
 		}
