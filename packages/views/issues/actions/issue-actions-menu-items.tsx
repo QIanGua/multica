@@ -48,7 +48,7 @@ import {
 } from "@multica/ui/components/ui/context-menu";
 import { copyText } from "@multica/ui/lib/clipboard";
 import type { UseIssueActionsResult } from "./use-issue-actions";
-import { PluginHookMenuItems } from "../../plugins";
+import { PluginHookMenuItems, PluginModalMenuItems } from "../../plugins";
 import { useT } from "../../i18n";
 
 // Both Dropdown and Context menu wrappers expose an API-compatible surface
@@ -342,6 +342,10 @@ export function IssueActionsMenuItems({
           person who picked it, so the entry has to live where the host can
           prove somebody did. Renders nothing when no plugin declares one. */}
       <PluginHookMenuItems issueId={issue.id} Item={P.Item} Separator={P.Separator} />
+      {/* Modal surfaces open from here for the same reason: a modal is a third
+          party's UI taking over the screen, so it opens because a person chose
+          it, never on the plugin's own initiative. */}
+      <PluginModalMenuItems issueId={issue.id} Item={P.Item} />
 
       <P.Separator />
 

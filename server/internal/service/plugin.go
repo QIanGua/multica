@@ -709,6 +709,12 @@ func (s *PluginService) Uninstall(ctx context.Context, installation db.PluginIns
 	if err := queries.DeletePluginSecretsByInstallation(ctx, installation.ID); err != nil {
 		return &PluginError{Kind: PluginErrorUnavailable, Message: "delete plugin secrets", Err: err}
 	}
+	// Hook records go too. They name an installation that is about to stop
+	// existing, and keeping them would leave rows nothing can attribute — the
+	// same reason storage and secrets are cleared here rather than swept later.
+	if err := queries.DeletePluginInvocationsByInstallation(ctx, installation.ID); err != nil {
+		return &PluginError{Kind: PluginErrorUnavailable, Message: "delete plugin invocations", Err: err}
+	}
 	if err := queries.DeletePluginInstallation(ctx, installation.ID); err != nil {
 		return &PluginError{Kind: PluginErrorUnavailable, Message: "delete plugin installation", Err: err}
 	}
