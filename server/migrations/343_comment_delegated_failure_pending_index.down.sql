@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_comment_delegated_failure_pending;

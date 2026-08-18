@@ -4925,7 +4925,8 @@ func loadDelegatedFailureRecoveryTarget(ctx context.Context, q *db.Queries, fail
 		}
 		return nil, fmt.Errorf("load source issue: %w", err)
 	}
-	if issue.Status == "done" || issue.Status == "cancelled" || issue.Status == "backlog" {
+	effectiveStatus := issuestatus.Effective(ctx, q, issue.WorkspaceID, issue.Status)
+	if effectiveStatus == issuestatus.Done || effectiveStatus == issuestatus.Cancelled || effectiveStatus == issuestatus.Backlog {
 		return nil, nil
 	}
 	agent, err := q.GetAgent(ctx, source.AgentID)
@@ -5142,6 +5143,34 @@ func (s *TaskService) recoverDelegatedTaskFailure(ctx context.Context, failed db
 		return false, err
 	}
 	return true, s.dispatchDelegatedFailureRecovery(ctx, target, pgtype.UUID{})
+}
+
+// RecoverPendingDelegatedFailures replays the durable recovery outbox. The
+// platform recovery comment is the obligation; it is complete only while a task
+// that carries it can still execute, or after a task records it in
+// delivered_comment_ids. This lets a later sweeper repair a process crash or
+// transient database error between comment creation and coordinator dispatch
+// without producing duplicate runnable tasks.
+func (s *TaskService) RecoverPendingDelegatedFailures(ctx context.Context, maxPerTick int32) (int, error) {
+	if maxPerTick <= 0 {
+		return 0, nil
+	}
+	pending, err := s.Queries.ListPendingDelegatedFailureRecoveries(ctx, maxPerTick)
+	if err != nil {
+		return 0, fmt.Errorf("list pending delegated failure recoveries: %w", err)
+	}
+
+	recovered := 0
+	errs := make([]error, 0)
+	for _, comment := range pending {
+		recoveryErr := s.DispatchDelegatedFailureRecoveryComment(ctx, comment, pgtype.UUID{})
+		if recoveryErr != nil {
+			errs = append(errs, fmt.Errorf("dispatch recovery comment %s: %w", util.UUIDToString(comment.ID), recoveryErr))
+			continue
+		}
+		recovered++
+	}
+	return recovered, errors.Join(errs...)
 }
 
 // DispatchDelegatedFailureRecoveryComment is used by completion reconciliation

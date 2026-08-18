@@ -1594,18 +1594,84 @@ RETURNING *;
 -- name: HasTaskCoveringDelegatedFailureComment :one
 -- Durable idempotency check for a recovery comment. The completion reconciler
 -- excludes its own just-completed task when replaying a planned-but-undelivered
--- signal; every other task that already carries the comment is a durable
--- coverage record, including cancelled/failed tasks. A terminal recovery task
--- must not be silently recreated and turn one source failure into a loop.
+-- signal. A planned comment is covered only while its task can still execute;
+-- after a task becomes terminal, delivered_comment_ids is the sole durable
+-- receipt. This prevents cancelled/failed pre-delivery tasks from swallowing
+-- the recovery obligation while still avoiding a loop after real delivery.
 SELECT count(*) > 0 AS covered
 FROM agent_task_queue
 WHERE issue_id = @issue_id
   AND agent_id = @agent_id
-  AND (trigger_comment_id = @comment_id::uuid OR @comment_id::uuid = ANY(coalesced_comment_ids))
   AND (
-      id IS DISTINCT FROM sqlc.narg('exclude_task_id')::uuid
-      OR @comment_id::uuid = ANY(delivered_comment_ids)
+      @comment_id::uuid = ANY(delivered_comment_ids)
+      OR (
+          id IS DISTINCT FROM sqlc.narg('exclude_task_id')::uuid
+          AND (
+              status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+              OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
+          )
+          AND (trigger_comment_id = @comment_id::uuid OR @comment_id::uuid = ANY(coalesced_comment_ids))
+      )
   );
+
+-- name: ListPendingDelegatedFailureRecoveries :many
+-- Durable outbox scan for platform recovery comments that are not yet owned by
+-- an executable task and have no terminal delivery receipt. Starting from the
+-- explicit recovery signal avoids retroactively waking unrelated historical
+-- delegated failures. A bounded runtime sweeper replays these comments after a
+-- transient dispatch error or process restart.
+SELECT recovery.*
+FROM comment recovery
+JOIN agent_task_queue failed ON failed.id = recovery.source_task_id
+JOIN agent_task_queue source ON source.id = failed.delegated_from_task_id
+JOIN issue source_issue ON source_issue.id = source.issue_id
+JOIN agent source_agent ON source_agent.id = source.agent_id
+WHERE recovery.author_type = 'system'
+  AND recovery.type = 'progress_update'
+  AND recovery.source_task_id IS NOT NULL
+  AND recovery.issue_id = source_issue.id
+  AND recovery.workspace_id = source_issue.workspace_id
+  AND failed.status = 'failed'
+  AND failed.delegated_from_task_id IS NOT NULL
+  AND failed.autopilot_run_id IS NULL
+  AND failed.trigger_evidence_kind IS DISTINCT FROM 'delegated_failure'
+  AND source.autopilot_run_id IS NULL
+  AND source.issue_id IS NOT NULL
+  AND source.agent_id <> failed.agent_id
+  AND issue_effective_status(source_issue.workspace_id, source_issue.status) NOT IN ('done', 'cancelled', 'backlog')
+  AND source_agent.archived_at IS NULL
+  AND source_agent.runtime_id IS NOT NULL
+  AND source_agent.workspace_id = source_issue.workspace_id
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue retry
+      WHERE retry.parent_task_id = failed.id
+        AND retry.status <> 'cancelled'
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue covering
+      WHERE covering.issue_id = source_issue.id
+        AND covering.agent_id = source.agent_id
+        AND (
+            recovery.id = ANY(covering.delivered_comment_ids)
+            OR (
+                (
+                    covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+                    OR (
+                        covering.status = 'deferred'
+                        AND covering.context->>'channel_issue_media_pending' = 'true'
+                    )
+                )
+                AND (
+                    covering.trigger_comment_id = recovery.id
+                    OR recovery.id = ANY(covering.coalesced_comment_ids)
+                )
+            )
+        )
+  )
+ORDER BY recovery.created_at ASC, recovery.id ASC
+LIMIT @max_per_tick;
 
 -- name: HasActiveTaskForIssueAndAgent :one
 -- MUL-4195: true when the (issue, agent) pair has any non-terminal task in a

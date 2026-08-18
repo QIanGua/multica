@@ -106,7 +106,7 @@ func TestFailTaskFinalDelegatedFailureWakesCoordinatorOnce(t *testing.T) {
 	failedID := f.insertWorkerTask(t, "running", "comment", 1, 2)
 	secret := "sk-" + strings.Repeat("a", 24)
 
-	failed, err := svc.FailTask(ctx, failedID, "upstream capacity exhausted "+secret, "", "", "agent_error.process_failure", false, "")
+	failed, err := svc.FailTask(ctx, failedID, "upstream capacity exhausted "+secret, "", "", "", "agent_error.process_failure", false, "")
 	if err != nil {
 		t.Fatalf("FailTask: %v", err)
 	}
@@ -175,7 +175,12 @@ func TestFailTaskFinalDelegatedFailureWakesCoordinatorOnce(t *testing.T) {
 	}
 	if _, err := f.pool.Exec(ctx, `
 		UPDATE agent_task_queue
-		SET status = 'failed', completed_at = now(), failure_reason = 'agent_error.process_failure'
+		SET status = 'failed', completed_at = now(), failure_reason = 'agent_error.process_failure',
+		    delivered_comment_ids = ARRAY[(
+		        SELECT id FROM comment
+		        WHERE type = 'progress_update' AND source_task_id = $1
+		        LIMIT 1
+		    )]::uuid[]
 		WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID); err != nil {
 		t.Fatalf("fail recovery task: %v", err)
 	}
@@ -186,7 +191,116 @@ func TestFailTaskFinalDelegatedFailureWakesCoordinatorOnce(t *testing.T) {
 		t.Fatalf("recount recovery tasks: %v", err)
 	}
 	if recoveryCount != 1 {
-		t.Fatalf("terminal recovery was recreated: task count = %d, want 1", recoveryCount)
+		t.Fatalf("delivered terminal recovery was recreated: task count = %d, want 1", recoveryCount)
+	}
+}
+
+func TestPendingDelegatedFailureSweepRepairsCommittedCommentWithoutTask(t *testing.T) {
+	f, svc := seedDelegatedFailureFixture(t)
+	ctx := context.Background()
+	failedID := f.insertWorkerTask(t, "failed", "comment", 1, 2)
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET failure_reason = 'agent_error.process_failure', error = 'worker exited', completed_at = now()
+		WHERE id = $1`, failedID); err != nil {
+		t.Fatalf("stamp failed task: %v", err)
+	}
+	// The durable outbox starts at the explicit platform comment. Do not
+	// retroactively wake arbitrary historical delegated failures that predate
+	// this recovery mechanism.
+	if recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || recovered != 0 {
+		t.Fatalf("pre-comment recovery sweep = %d, %v; want 0, nil", recovered, err)
+	}
+
+	// This is the durable intermediate state left when comment creation commits
+	// but the first coordinator dispatch fails or the server exits immediately.
+	target, created, err := svc.ensureDelegatedFailureRecoveryComment(ctx, failedID)
+	if err != nil || target == nil || !created {
+		t.Fatalf("ensure recovery comment = target %v created %v err %v", target != nil, created, err)
+	}
+	var tasksBefore int
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_task_queue
+		WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&tasksBefore); err != nil {
+		t.Fatalf("count recovery tasks before sweep: %v", err)
+	}
+	if tasksBefore != 0 {
+		t.Fatalf("recovery tasks before sweep = %d, want 0", tasksBefore)
+	}
+
+	recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
+	if err != nil || recovered != 1 {
+		t.Fatalf("RecoverPendingDelegatedFailures = %d, %v; want 1, nil", recovered, err)
+	}
+	var comments, tasks int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM comment WHERE type = 'progress_update' AND source_task_id = $1`, failedID).Scan(&comments); err != nil {
+		t.Fatalf("count recovery comments: %v", err)
+	}
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_task_queue
+		WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&tasks); err != nil {
+		t.Fatalf("count recovery tasks after sweep: %v", err)
+	}
+	if comments != 1 || tasks != 1 {
+		t.Fatalf("comments/tasks after sweep = %d/%d, want 1/1", comments, tasks)
+	}
+	if recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || recovered != 0 {
+		t.Fatalf("second recovery sweep = %d, %v; want 0, nil", recovered, err)
+	}
+}
+
+func TestPendingDelegatedFailureSweepRequeuesTerminalUndeliveredTask(t *testing.T) {
+	for _, terminalStatus := range []string{"failed", "cancelled"} {
+		t.Run(terminalStatus, func(t *testing.T) {
+			f, svc := seedDelegatedFailureFixture(t)
+			ctx := context.Background()
+			failedID := f.insertWorkerTask(t, "failed", "comment", 1, 2)
+			if _, err := f.pool.Exec(ctx, `
+				UPDATE agent_task_queue
+				SET failure_reason = 'agent_error.process_failure', error = 'worker exited', completed_at = now()
+				WHERE id = $1`, failedID); err != nil {
+				t.Fatalf("stamp failed task: %v", err)
+			}
+			failed, err := svc.Queries.GetAgentTask(ctx, failedID)
+			if err != nil {
+				t.Fatalf("load failed task: %v", err)
+			}
+			if handled, err := svc.recoverDelegatedTaskFailure(ctx, failed); err != nil || !handled {
+				t.Fatalf("initial recovery = handled %v err %v", handled, err)
+			}
+
+			var firstRecoveryID pgtype.UUID
+			if err := f.pool.QueryRow(ctx, `
+				SELECT id FROM agent_task_queue
+				WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&firstRecoveryID); err != nil {
+				t.Fatalf("load first recovery task: %v", err)
+			}
+			if _, err := f.pool.Exec(ctx, `
+				UPDATE agent_task_queue
+				SET status = $2, completed_at = now(), delivered_comment_ids = '{}'
+				WHERE id = $1`, firstRecoveryID, terminalStatus); err != nil {
+				t.Fatalf("terminalize recovery before delivery: %v", err)
+			}
+
+			recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
+			if err != nil || recovered != 1 {
+				t.Fatalf("RecoverPendingDelegatedFailures = %d, %v; want 1, nil", recovered, err)
+			}
+			var active, total int
+			if err := f.pool.QueryRow(ctx, `
+				SELECT count(*) FILTER (WHERE status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')),
+				       count(*)
+				FROM agent_task_queue
+				WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&active, &total); err != nil {
+				t.Fatalf("count recovery tasks: %v", err)
+			}
+			if active != 1 || total != 2 {
+				t.Fatalf("active/total recovery tasks = %d/%d, want 1/2", active, total)
+			}
+			if recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || recovered != 0 {
+				t.Fatalf("second recovery sweep = %d, %v; want 0, nil", recovered, err)
+			}
+		})
 	}
 }
 
@@ -226,7 +340,7 @@ func TestFailTaskRetryPendingDoesNotWakeCoordinator(t *testing.T) {
 	ctx := context.Background()
 	failedID := f.insertWorkerTask(t, "running", "comment", 1, 2)
 
-	if _, err := svc.FailTask(ctx, failedID, "task timed out", "", "", "timeout", false, ""); err != nil {
+	if _, err := svc.FailTask(ctx, failedID, "task timed out", "", "", "", "timeout", false, ""); err != nil {
 		t.Fatalf("FailTask: %v", err)
 	}
 
@@ -262,7 +376,7 @@ func TestFinalDelegatedFailureMergesIntoPendingCoordinatorTask(t *testing.T) {
 		t.Fatalf("seed pending coordinator task: %v", err)
 	}
 
-	if _, err := svc.FailTask(ctx, failedID, "worker exited", "", "", "agent_error.process_failure", false, ""); err != nil {
+	if _, err := svc.FailTask(ctx, failedID, "worker exited", "", "", "", "agent_error.process_failure", false, ""); err != nil {
 		t.Fatalf("FailTask: %v", err)
 	}
 
@@ -289,7 +403,7 @@ func TestFinalDelegatedFailureMergesIntoPendingCoordinatorTask(t *testing.T) {
 	// A second delegated failure while the same coordinator task is still
 	// queued must coalesce into that task instead of creating a parallel run.
 	secondFailedID := f.insertWorkerTask(t, "running", "comment", 1, 2)
-	if _, err := svc.FailTask(ctx, secondFailedID, "second worker exited", "", "", "agent_error.process_failure", false, ""); err != nil {
+	if _, err := svc.FailTask(ctx, secondFailedID, "second worker exited", "", "", "", "agent_error.process_failure", false, ""); err != nil {
 		t.Fatalf("FailTask(second): %v", err)
 	}
 	var secondCommentID pgtype.UUID
@@ -323,7 +437,7 @@ func TestDelegatedFailurePlannedBehindDispatchedCoordinatorGetsFollowUp(t *testi
 		t.Fatalf("seed active coordinator task: %v", err)
 	}
 
-	if _, err := svc.FailTask(ctx, failedID, "worker exited", "", "", "agent_error.process_failure", false, ""); err != nil {
+	if _, err := svc.FailTask(ctx, failedID, "worker exited", "", "", "", "agent_error.process_failure", false, ""); err != nil {
 		t.Fatalf("FailTask: %v", err)
 	}
 	comment, err := svc.Queries.GetDelegatedFailureRecoveryComment(ctx, db.GetDelegatedFailureRecoveryCommentParams{
@@ -376,7 +490,7 @@ func TestDelegatedFailureRecoveryTaskDoesNotRecursivelyWake(t *testing.T) {
 	ctx := context.Background()
 	recoveryID := f.insertWorkerTask(t, "running", string(attribution.EvidenceDelegatedFailure), 1, 2)
 
-	if _, err := svc.FailTask(ctx, recoveryID, "recovery failed", "", "", "agent_error.process_failure", false, ""); err != nil {
+	if _, err := svc.FailTask(ctx, recoveryID, "recovery failed", "", "", "", "agent_error.process_failure", false, ""); err != nil {
 		t.Fatalf("FailTask: %v", err)
 	}
 

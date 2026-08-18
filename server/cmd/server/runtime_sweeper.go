@@ -94,6 +94,9 @@ const (
 	chatFinalizeGraceSeconds = 60.0
 	// chatFinalizeBatchSize caps deferred finalizations per tick.
 	chatFinalizeBatchSize = 100
+	// delegatedFailureRecoveryBatchSize bounds the durable recovery-outbox
+	// replay so a historical backlog cannot monopolise the runtime sweep tick.
+	delegatedFailureRecoveryBatchSize = 100
 )
 
 type runtimeGCTxStarter interface {
@@ -123,9 +126,25 @@ func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, querie
 			sweepStaleRuntimes(ctx, queries, liveness, taskSvc, bus)
 			sweepStaleTasks(ctx, queries, taskSvc, bus)
 			sweepExpiredQueuedTasks(ctx, queries, taskSvc)
+			sweepPendingDelegatedFailureRecoveries(ctx, taskSvc)
 			sweepDeferredChatFinalizations(ctx, queries, taskSvc)
 			gcRuntimes(ctx, txStarter, queries, taskSvc.Metrics, bus)
 		}
+	}
+}
+
+// sweepPendingDelegatedFailureRecoveries retries durable coordinator handoffs
+// that were not acquired by an executable task. It runs even when no stale
+// task was found in this tick, which is what repairs a recovery dispatch lost
+// before a server restart.
+func sweepPendingDelegatedFailureRecoveries(ctx context.Context, taskSvc *service.TaskService) {
+	recovered, err := taskSvc.RecoverPendingDelegatedFailures(ctx, delegatedFailureRecoveryBatchSize)
+	if err != nil {
+		slog.Warn("delegated failure recovery sweeper: replay failed", "recovered", recovered, "error", err)
+		return
+	}
+	if recovered > 0 {
+		slog.Info("delegated failure recovery sweeper: replayed pending recoveries", "count", recovered)
 	}
 }
 
