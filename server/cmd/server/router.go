@@ -1003,10 +1003,28 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			slog.Error("plugins: secretbox.New failed; Plugin secrets disabled", "error", err)
 		} else if h.PluginService != nil {
 			h.PluginService.Secrets = box
+			// The same deployment key, kept raw as well. Sealing and signing
+			// need different things from it: a secret config value is sealed
+			// and later opened, while a hook signature must be REPRODUCED on
+			// demand, which a box cannot do. Each installation's signing secret
+			// is derived from this rather than stored, so no row holds a usable
+			// one.
+			h.PluginService.DeploymentKey = pluginKey
 			slog.Info("Plugin secret encryption enabled")
 		}
 	} else {
 		slog.Info("Plugin secrets disabled (MULTICA_PLUGIN_SECRET_KEY not set)")
+	}
+
+	// Hook engine. Event-triggered hooks are dispatched off the bus onto a
+	// worker pool: Bus.Publish runs listeners inline on the publishing request's
+	// goroutine, so anything that dials a third-party endpoint from there would
+	// put an outside server on the critical path of creating an issue.
+	if h.PluginService != nil {
+		h.PluginService.Callbacks = service.NewCallbackTokens()
+		h.PluginService.CallbackBaseURL = strings.TrimSuffix(os.Getenv("MULTICA_PUBLIC_URL"), "/") + "/api/v1/plugin"
+		pluginEvents := service.NewPluginEventDispatcher(h.PluginService)
+		service.SubscribePluginEvents(bus, pluginEvents)
 	}
 
 	if opts.HeartbeatScheduler != nil {
@@ -1240,6 +1258,38 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	})
 
 	// Protected API routes
+	// Plugin Action API. Two kinds of caller reach these, and the difference is
+	// only in WHO the call acts as.
+	//
+	// A SURFACE has no credential: the iframe asks the host page over the
+	// postMessage bridge, and the host re-issues the call on the signed-in
+	// user's own session, naming the installation in a header the iframe cannot
+	// set for itself. That path goes through the ordinary Auth chain.
+	//
+	// A HOOK HANDLER — the plugin author's own server — has no session and
+	// never will, so it presents a plugin bearer token instead. PluginAuth
+	// routes that request past the session chain to the handler, which resolves
+	// the token itself; a request with neither credential is refused there.
+	//
+	// The workspace always comes from the installation, never from the client.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.PluginAuth(middleware.Auth(queries, patCache, cloudPATVerifier)))
+		r.Route("/api/v1/plugin", func(r chi.Router) {
+			r.Get("/context", h.GetPluginContext)
+			r.Get("/issues/{id}", h.GetPluginIssue)
+			r.Patch("/issues/{id}", h.PatchPluginIssue)
+			r.Get("/issues/{id}/comments", h.ListPluginComments)
+			r.Post("/issues/{id}/comments", h.CreatePluginComment)
+			r.Get("/storage/{scope}", h.ListPluginStorage)
+			r.Get("/storage/{scope}/{key}", h.GetPluginStorage)
+			r.Put("/storage/{scope}/{key}", h.PutPluginStorage)
+			r.Delete("/storage/{scope}/{key}", h.DeletePluginStorage)
+			// ui / manual only. `event` is dispatched by the host off the event
+			// bus and never requested; `agent` arrives over MCP in PR 4.
+			r.Post("/hooks/{key}", h.InvokePluginHook)
+		})
+	})
+
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
 		r.Use(middleware.RefreshCloudFrontCookies(cfSigner))
@@ -1252,18 +1302,6 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		// than trusted from the client, and membership is then checked
 		// against it. Sits in the user-scoped group for that reason: there is
 		// no workspace in the path to gate on.
-		r.Route("/api/v1/plugin", func(r chi.Router) {
-			r.Get("/context", h.GetPluginContext)
-			r.Get("/issues/{id}", h.GetPluginIssue)
-			r.Patch("/issues/{id}", h.PatchPluginIssue)
-			r.Get("/issues/{id}/comments", h.ListPluginComments)
-			r.Post("/issues/{id}/comments", h.CreatePluginComment)
-			r.Get("/storage/{scope}", h.ListPluginStorage)
-			r.Get("/storage/{scope}/{key}", h.GetPluginStorage)
-			r.Put("/storage/{scope}/{key}", h.PutPluginStorage)
-			r.Delete("/storage/{scope}/{key}", h.DeletePluginStorage)
-		})
-
 		// --- User-scoped routes (no workspace context required) ---
 		r.Get("/api/me", h.GetMe)
 		r.Patch("/api/me", h.UpdateMe)
@@ -1369,6 +1407,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// show before an installation exists.
 					r.Post("/plugins/preview", h.PreviewPlugin)
 					r.Post("/plugins", h.InstallPlugin)
+					r.Get("/plugins/{installationId}/invocations", h.ListPluginInvocations)
+					r.Post("/plugins/{installationId}/token", h.RotatePluginToken)
+					r.Delete("/plugins/{installationId}/token", h.RevokePluginToken)
 					r.Put("/plugins/{installationId}/config", h.ConfigurePlugin)
 					r.Post("/plugins/{installationId}/enable", h.EnablePlugin)
 					r.Post("/plugins/{installationId}/disable", h.DisablePlugin)

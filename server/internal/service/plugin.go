@@ -46,6 +46,21 @@ type PluginService struct {
 	DevOrigins []string
 	// Host gates which declared contributions this build can actually run.
 	Host plugincontract.Capabilities
+	// DeploymentKey is the raw MULTICA_PLUGIN_SECRET_KEY, used to derive each
+	// installation's hook signing secret. Held separately from Secrets because
+	// signing needs a key it can reproduce, not a sealed box.
+	DeploymentKey []byte
+	// Callbacks issues the short-lived tokens a hook handler uses to call back.
+	// Nil means hooks go out without one.
+	Callbacks *CallbackTokens
+	// CallbackBaseURL is the Action API root a hook handler should call, sent
+	// alongside the callback token so a plugin does not hardcode our hostname.
+	CallbackBaseURL string
+	// HookClient overrides the outbound client, and ONLY for an endpoint whose
+	// origin the operator already named in DevOrigins. Nil everywhere else, so
+	// a public endpoint always goes through the SSRF-guarded client and this
+	// field cannot widen what a deployment can reach.
+	HookClient *http.Client
 }
 
 func NewPluginService(queries *db.Queries, txStarter TxStarter) *PluginService {
