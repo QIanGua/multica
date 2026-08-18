@@ -653,7 +653,10 @@ func TestOfflineRuntimeTasksRespectReconnectGrace(t *testing.T) {
 	setAgentRuntimeOffline(t, agentID, 10*time.Minute)
 	queries := db.New(testPool)
 
-	failed, err := queries.FailTasksForOfflineRuntimes(ctx, defaultRuntimeReconnectGrace.Seconds())
+	failed, err := queries.FailTasksForOfflineRuntimes(ctx, db.FailTasksForOfflineRuntimesParams{
+		ReconnectGraceSecs: defaultRuntimeReconnectGrace.Seconds(),
+		MaxPerTick:         offlineTaskFailBatchSize,
+	})
 	if err != nil {
 		t.Fatalf("FailTasksForOfflineRuntimes inside grace: %v", err)
 	}
@@ -671,7 +674,10 @@ func TestOfflineRuntimeTasksRespectReconnectGrace(t *testing.T) {
 		t.Fatalf("age runtime beyond grace: %v", err)
 	}
 
-	failed, err = queries.FailTasksForOfflineRuntimes(ctx, defaultRuntimeReconnectGrace.Seconds())
+	failed, err = queries.FailTasksForOfflineRuntimes(ctx, db.FailTasksForOfflineRuntimesParams{
+		ReconnectGraceSecs: defaultRuntimeReconnectGrace.Seconds(),
+		MaxPerTick:         offlineTaskFailBatchSize,
+	})
 	if err != nil {
 		t.Fatalf("FailTasksForOfflineRuntimes beyond grace: %v", err)
 	}
@@ -686,6 +692,114 @@ func TestOfflineRuntimeTasksRespectReconnectGrace(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("task was not failed after reconnect grace elapsed")
+	}
+}
+
+func TestRuntimeReconnectRetryHasBoundedTerminalPath(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database connection")
+	}
+
+	ctx := context.Background()
+	issueID, agentID, parentID := setupSweeperTestFixture(t, "running")
+	t.Cleanup(func() { cleanupSweeperFixture(t, issueID, agentID) })
+	setAgentRuntimeOffline(t, agentID, defaultRuntimeReconnectGrace+time.Hour)
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET status = 'failed', completed_at = now(), failure_reason = 'runtime_offline'
+		WHERE id = $1
+	`, parentID); err != nil {
+		t.Fatalf("fail runtime_offline parent: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'in_progress' WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("mark issue in progress: %v", err)
+	}
+
+	var retryID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, fire_at,
+			parent_task_id, retry_of_task_id, attempt, max_attempts
+		)
+		SELECT agent_id, runtime_id, issue_id, 'deferred', priority,
+		       now() - interval '10 minutes', id, id, attempt + 1, max_attempts
+		FROM agent_task_queue WHERE id = $1
+		RETURNING id
+	`, parentID).Scan(&retryID); err != nil {
+		t.Fatalf("insert deferred retry: %v", err)
+	}
+
+	queries := db.New(testPool)
+	params := db.FailExpiredRuntimeReconnectRetriesParams{
+		ReconnectGraceSecs: defaultRuntimeReconnectGrace.Seconds(),
+		RuntimeStaleSecs:   staleThresholdSeconds,
+		MaxPerTick:         reconnectRetryExpireBatchSize,
+	}
+
+	failed, err := queries.FailExpiredRuntimeReconnectRetries(ctx, params)
+	if err != nil {
+		t.Fatalf("expire retry inside grace: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("retry failed inside reconnect grace: got %d rows", len(failed))
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET fire_at = now() - make_interval(secs => $1)
+		WHERE id = $2
+	`, (defaultRuntimeReconnectGrace + time.Hour).Seconds(), retryID); err != nil {
+		t.Fatalf("age retry beyond reconnect grace: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_runtime SET status = 'online', last_seen_at = now()
+		WHERE id = (SELECT runtime_id FROM agent WHERE id = $1)
+	`, agentID); err != nil {
+		t.Fatalf("restore healthy runtime: %v", err)
+	}
+
+	failed, err = queries.FailExpiredRuntimeReconnectRetries(ctx, params)
+	if err != nil {
+		t.Fatalf("expire retry after healthy reconnect: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("healthy runtime lost reconnect race: got %d rows", len(failed))
+	}
+
+	setAgentRuntimeOffline(t, agentID, defaultRuntimeReconnectGrace+time.Hour)
+	failed, err = queries.FailExpiredRuntimeReconnectRetries(ctx, params)
+	if err != nil {
+		t.Fatalf("expire retry beyond grace: %v", err)
+	}
+	if len(failed) != 1 || failed[0].ID.Bytes != parseUUIDBytes(retryID) {
+		t.Fatalf("expired retries = %d, want retry %s", len(failed), retryID)
+	}
+	if !failed[0].FailureReason.Valid || failed[0].FailureReason.String != "runtime_reconnect_timeout" {
+		t.Fatalf("failure reason = %q, want runtime_reconnect_timeout", failed[0].FailureReason.String)
+	}
+
+	taskSvc := service.NewTaskService(queries, testPool, nil, events.New())
+	taskSvc.HandleFailedTasks(ctx, failed)
+
+	var issueStatus string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, issueID).Scan(&issueStatus); err != nil {
+		t.Fatalf("read issue status: %v", err)
+	}
+	if issueStatus != "todo" {
+		t.Fatalf("issue status = %q, want todo after terminal reconnect timeout", issueStatus)
+	}
+
+	var undrained, retryChildren int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE completed_at IS NULL),
+		       count(*) FILTER (WHERE parent_task_id = $1)
+		FROM agent_task_queue WHERE issue_id = $2
+	`, retryID, issueID).Scan(&undrained, &retryChildren); err != nil {
+		t.Fatalf("read terminal retry state: %v", err)
+	}
+	if undrained != 0 || retryChildren != 0 {
+		t.Fatalf("terminal retry leaked work: undrained=%d child_retries=%d", undrained, retryChildren)
 	}
 }
 

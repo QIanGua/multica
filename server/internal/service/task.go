@@ -165,9 +165,11 @@ const (
 	taskAnalyticsContextCacheMax = 4096
 	// RuntimeClaimFreshnessSeconds is the maximum DB heartbeat age accepted by
 	// every task release path (deferred promotion, stale-dispatch reclaim, and
-	// fresh claim). Keep the runtime sweeper threshold aligned with this value:
-	// a runtime must not be able to start more work after it is stale enough to
-	// be marked offline.
+	// fresh claim). It must exceed the 60s DB heartbeat flush interval, one ~15s
+	// daemon heartbeat, and the ~30s batch scheduler tick. 150s leaves a 45s
+	// buffer above that 105s worst-case age. Keep the runtime sweeper threshold
+	// aligned: a runtime must not start work after it is stale enough to be
+	// marked offline.
 	RuntimeClaimFreshnessSeconds = 150.0
 	// claimResponseRecoveryWindow must exceed daemon client.Timeout for
 	// /tasks/claim (30s) plus /tasks/{id}/start (30s) plus scheduling slack.
@@ -2928,10 +2930,10 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 }
 
 // claimTask is the runtime-scoped claim primitive used by daemon poll paths.
-// When runtimeID is invalid, the agent's current runtime is used for legacy
-// internal callers. Scoping the SQL claim itself prevents an offline candidate
-// on runtime A from causing the same agent's task on runtime B to be dispatched
-// and then dropped by the caller's runtime guard.
+// The exported ClaimTask wrapper omits runtimeID and therefore resolves the
+// agent's currently bound runtime. Scoping the SQL claim itself prevents an
+// offline candidate on runtime A from causing the same agent's task on runtime
+// B to be dispatched and then dropped by the caller's runtime guard.
 func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
 	start := time.Now()
 	outcome := "unknown"
@@ -4294,10 +4296,10 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 // that did download is already cached on disk — a retry resumes from there
 // instead of re-fetching the whole set (MUL-5370).
 var retryableReasons = map[string]bool{
-	"runtime_offline":           true,
-	"runtime_recovery":          true,
-	"timeout":                   true,
-	"codex_semantic_inactivity": true,
+	string(taskfailure.ReasonRuntimeOffline):         true,
+	string(taskfailure.ReasonRuntimeRecovery):        true,
+	string(taskfailure.ReasonTimeout):                true,
+	"codex_semantic_inactivity":                      true,
 	string(taskfailure.ReasonAgentProviderNetwork):   true,
 	string(taskfailure.ReasonSkillBundleUnavailable): true,
 }
@@ -4348,7 +4350,7 @@ func retryAttemptCeiling(reason string, taskMaxAttempts int32) int32 {
 // the child is created 'queued', claimable at once). Callers pass the returned
 // delay to CreateRetryTask via fire_at.
 func retryDelayForAttempt(reason string, failedAttempt int32) time.Duration {
-	if reason == "runtime_offline" {
+	if reason == string(taskfailure.ReasonRuntimeOffline) {
 		return runtimeOfflineRetryDeferral
 	}
 	if reason == string(taskfailure.ReasonAgentProviderNetwork) &&

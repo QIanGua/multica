@@ -1279,6 +1279,57 @@ WHERE t.id = v.id
   )
 RETURNING t.*;
 
+-- name: FailExpiredRuntimeReconnectRetries :many
+-- A runtime_offline retry waits in deferred until its runtime returns healthy.
+-- Give that recovery state a bounded exit: after one full reconnect grace,
+-- fail it with a non-retryable reason so issues, agents, and runtime GC can
+-- converge. A runtime that is healthy when this query runs wins the race and
+-- remains deferred for the next daemon poll to promote. The parent join is the
+-- lineage discriminator; provider backoff and other deferred task types are
+-- intentionally excluded.
+WITH victims AS (
+    SELECT retry.id
+    FROM agent_task_queue retry
+    JOIN agent_task_queue parent ON parent.id = retry.parent_task_id
+    WHERE retry.status = 'deferred'
+      AND retry.fire_at < now() - make_interval(secs => @reconnect_grace_secs::double precision)
+      AND parent.failure_reason = 'runtime_offline'
+      AND NOT EXISTS (
+          SELECT 1 FROM agent_runtime runtime
+          WHERE runtime.id = retry.runtime_id
+            AND runtime.status = 'online'
+            AND COALESCE(runtime.last_seen_at, runtime.updated_at) >=
+                now() - make_interval(secs => @runtime_stale_secs::double precision)
+      )
+    ORDER BY retry.fire_at, retry.created_at
+    LIMIT @max_per_tick::int
+    FOR UPDATE OF retry SKIP LOCKED
+)
+UPDATE agent_task_queue AS retry
+SET status = 'failed',
+    completed_at = now(),
+    error = 'runtime did not reconnect within the configured grace period',
+    failure_reason = 'runtime_reconnect_timeout',
+    wait_reason = NULL,
+    prepare_lease_expires_at = NULL
+FROM victims
+WHERE retry.id = victims.id
+  AND retry.status = 'deferred'
+  AND retry.fire_at < now() - make_interval(secs => @reconnect_grace_secs::double precision)
+  AND EXISTS (
+      SELECT 1 FROM agent_task_queue parent
+      WHERE parent.id = retry.parent_task_id
+        AND parent.failure_reason = 'runtime_offline'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM agent_runtime runtime
+      WHERE runtime.id = retry.runtime_id
+        AND runtime.status = 'online'
+        AND COALESCE(runtime.last_seen_at, runtime.updated_at) >=
+            now() - make_interval(secs => @runtime_stale_secs::double precision)
+  )
+RETURNING retry.*;
+
 -- name: CancelAgentTask :one
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
