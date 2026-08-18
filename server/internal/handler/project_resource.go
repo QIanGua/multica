@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -308,8 +309,42 @@ func localDirectoryRefLabel(ref json.RawMessage) string {
 	return strings.TrimSpace(payload.Label)
 }
 
+// localDirectoryRefDiffersOnlyByLabel reports whether two refs are identical
+// once their labels are set aside.
+//
+// This is what separates "a ≤ v0.4.28 client renamed the folder" from "a client
+// sent a ref it had been holding since before someone else renamed it". Both
+// arrive as a full ref whose label differs from the stored one; only the first
+// is a rename. The mode dialog snapshots the whole ref when it opens, so a
+// second device renaming in between turns an execution-mode save into a name
+// rollback unless the two are told apart.
+//
+// Compared as decoded values rather than bytes: the stored ref may have been
+// written by a different build, so key order and spacing prove nothing. Unknown
+// keys count — a difference this binary cannot interpret is still a difference,
+// and calling such a request a pure rename would be a guess.
+func localDirectoryRefDiffersOnlyByLabel(a, b json.RawMessage) bool {
+	strip := func(raw json.RawMessage) (map[string]any, bool) {
+		var fields map[string]any
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return nil, false
+		}
+		delete(fields, "label")
+		return fields, true
+	}
+	left, ok := strip(a)
+	if !ok {
+		return false
+	}
+	right, ok := strip(b)
+	if !ok {
+		return false
+	}
+	return reflect.DeepEqual(left, right)
+}
+
 // withLocalDirectoryRefLabel returns ref with only its "label" key set (or
-// removed, when label is NULL) and every other key preserved byte-for-byte.
+// removed, when label is NULL) and every other key preserved.
 //
 // A local_directory's display name has two homes: desktop builds up to v0.4.28
 // rename by rewriting resource_ref.label, newer clients rename the top-level
@@ -323,7 +358,8 @@ func localDirectoryRefLabel(ref json.RawMessage) string {
 // Patch the raw map rather than round-tripping localDirectoryRef: the stored
 // ref may carry fields written by a NEWER server, and re-marshaling through
 // this binary's struct would drop them — the exact failure mode this PR exists
-// to close.
+// to close. Key order and whitespace are not preserved (nor promised by JSONB);
+// every key and value is.
 func withLocalDirectoryRefLabel(ref json.RawMessage, label pgtype.Text) (json.RawMessage, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(ref, &fields); err != nil {
@@ -589,10 +625,19 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Gate only when the caller is changing the ref: a label/position-only
-	// update must not start failing because the daemon's version drifted
-	// after the mode was legitimately saved.
-	if refProvided {
+	// A ≤ v0.4.28 client renames by resending the ref, so "the ref was sent"
+	// does not mean "the execution mode was touched". Anything else about the
+	// ref changing does mean it might have been.
+	refRenameOnly := refProvided &&
+		existing.ResourceType == "local_directory" &&
+		localDirectoryRefDiffersOnlyByLabel(nextRef, existing.ResourceRef)
+
+	// Gate only when the caller is actually changing what would run: a label or
+	// position update — including an old client's rename, which carries the ref
+	// along — must not start failing because the daemon's registration drifted
+	// after the mode was legitimately saved. The row already says worktree; the
+	// claim gate is what stops it from running somewhere that cannot.
+	if refProvided && !refRenameOnly {
 		if !h.requireWorktreeCapableDaemon(w, r, project.WorkspaceID, existing.ResourceType, nextRef) {
 			return
 		}
@@ -616,17 +661,17 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 		} else {
 			nextLabel = pgtype.Text{String: strings.TrimSpace(*labelStr), Valid: true}
 		}
-	} else if refProvided && existing.ResourceType == "local_directory" {
-		// No label field, but the ref's embedded label changed: that is how
-		// desktop builds up to v0.4.28 rename — they rewrite ref.label and
-		// never send the column. Follow the rename into the column, or the
+	} else if refRenameOnly {
+		// No label field, and the ref differs ONLY by its embedded label: that
+		// is how desktop builds up to v0.4.28 rename — they rewrite ref.label
+		// and never send the column. Follow the rename into the column, or the
 		// newer clients (which read the column first) keep showing the old
 		// name this rename just replaced.
 		//
-		// Only a CHANGED ref label counts as a rename. Ref-resending edits
-		// (the execution-mode dialog spreads the stored ref back) carry the
-		// embedded label along unchanged, and must not overwrite a column
-		// rename done since the row was last written.
+		// A ref that also changes something else is not a rename however
+		// different its label looks: the mode dialog snapshots the ref when it
+		// opens, so a rename on another device in the meantime would otherwise
+		// be undone by whoever saves an execution mode next.
 		if refLabel := localDirectoryRefLabel(nextRef); refLabel != localDirectoryRefLabel(existing.ResourceRef) {
 			if refLabel == "" {
 				nextLabel = pgtype.Text{}
@@ -655,13 +700,29 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 	// deleted. Rows the two-copy era left disagreeing converge on their first
 	// write here. A NULL column that was never set stays out of the ref: for
 	// rows created by older clients the ref copy IS the name.
-	if existing.ResourceType == "local_directory" && (nextLabel.Valid || labelCleared) {
-		synced, err := withLocalDirectoryRefLabel(nextRef, nextLabel)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to update project resource")
-			return
+	if existing.ResourceType == "local_directory" {
+		// The name this request is entitled to write. Only a rename or an
+		// explicit label field may change it; anything else keeps whatever the
+		// row is called today, wherever that name currently lives — so a stale
+		// ref snapshot cannot carry an old name back in behind an unrelated
+		// edit.
+		name := nextLabel
+		if !nextLabel.Valid && !labelCleared {
+			if stored := localDirectoryRefLabel(existing.ResourceRef); stored != "" {
+				name = pgtype.Text{String: stored, Valid: true}
+			}
 		}
-		nextRef = synced
+		// Rows that have never had a name at all are left alone, and so is the
+		// ref on updates that do not touch it: an unrelated position change
+		// must not rewrite a ref, and for old rows the ref copy IS the name.
+		if refProvided || nextLabel.Valid || labelCleared {
+			synced, err := withLocalDirectoryRefLabel(nextRef, name)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to update project resource")
+				return
+			}
+			nextRef = synced
+		}
 	}
 
 	updated, err := h.Queries.UpdateProjectResource(r.Context(), db.UpdateProjectResourceParams{

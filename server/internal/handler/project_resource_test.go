@@ -797,17 +797,25 @@ func TestProjectResourceUpdateLifecycle(t *testing.T) {
 	if err := json.Unmarshal(updated.ResourceRef, &ref); err != nil {
 		t.Fatalf("decode resource_ref: %v", err)
 	}
-	if ref.LocalPath != "/Users/foo/work/b" || ref.DaemonID != "d2" || ref.Label != "B" {
+	if ref.LocalPath != "/Users/foo/work/b" || ref.DaemonID != "d2" {
 		t.Errorf("ref-update mismatch: %+v", ref)
 	}
 	if updated.Position != 5 {
 		t.Errorf("position = %d, want 5", updated.Position)
 	}
-	// The ref's label changed ("renamed" → "B") with no label field in the
-	// request: that is the pre-v0.4.29 desktop rename shape, so the column
-	// follows it. TestProjectResourceLabelConvergence pins the full matrix.
-	if updated.Label == nil || *updated.Label != "B" {
-		t.Errorf("column should follow a legacy ref rename, got %v", updated.Label)
+	// This request changes the ref's label ("renamed" → "B") AND its path and
+	// daemon, so it is not a rename — a client's ref is a snapshot, and only a
+	// request whose sole difference is the label can be read as "the user
+	// renamed this". The name therefore stays put in both homes, and callers
+	// that mean to rename say so with the top-level label field.
+	// TestProjectResourceStaleRefSnapshotDoesNotRollBackARename pins why:
+	// otherwise an execution-mode dialog opened before someone else's rename
+	// undoes it on save. TestProjectResourceLabelConvergence pins the matrix.
+	if updated.Label == nil || *updated.Label != "renamed" {
+		t.Errorf("an edit that is not a rename must not change the name, got %v", updated.Label)
+	}
+	if ref.Label != "renamed" {
+		t.Errorf("ref copy should hold the row's current name, got %q", ref.Label)
 	}
 
 	// Explicit null clears the outer label — and the ref's copy with it, or
@@ -986,7 +994,7 @@ func TestProjectResourceLabelConvergence(t *testing.T) {
 		t.Errorf("rename must not touch execution_mode, got %q", got)
 	}
 	if string(fields["future_field"]) != `{"keep":"me"}` {
-		t.Errorf("rename must preserve unknown ref fields byte-for-byte, got %s", fields["future_field"])
+		t.Errorf("rename must preserve unknown ref fields and their values, got %s", fields["future_field"])
 	}
 
 	// A ref resent with its embedded label UNCHANGED — the execution-mode
@@ -1498,5 +1506,194 @@ func TestCreateProjectGatesWorktreeLocalDirectory(t *testing.T) {
 	testHandler.ListProjects(lw, lreq)
 	if strings.Contains(lw.Body.String(), "Bundled worktree resource") {
 		t.Fatal("rejected create left a project behind")
+	}
+}
+
+// createTestProjectForResources / createLocalDirectoryResourceFor build the
+// fixtures the label-classification tests share, through the real handlers so
+// the rows look exactly like a client's would.
+func createTestProjectForResources(t *testing.T, title string) ProjectResponse {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/projects?workspace_id="+testWorkspaceID, map[string]any{"title": title})
+	testHandler.CreateProject(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateProject: %d %s", w.Code, w.Body.String())
+	}
+	var project ProjectResponse
+	if err := json.NewDecoder(w.Body).Decode(&project); err != nil {
+		t.Fatalf("decode CreateProject: %v", err)
+	}
+	t.Cleanup(func() {
+		r := newRequest("DELETE", "/api/projects/"+project.ID, nil)
+		r = withURLParam(r, "id", project.ID)
+		testHandler.DeleteProject(httptest.NewRecorder(), r)
+	})
+	return project
+}
+
+func createLocalDirectoryResourceFor(t *testing.T, projectID string, ref map[string]any) ProjectResourceResponse {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/projects/"+projectID+"/resources", map[string]any{
+		"resource_type": "local_directory",
+		"resource_ref":  ref,
+	})
+	req = withURLParam(req, "id", projectID)
+	testHandler.CreateProjectResource(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateProjectResource: %d %s", w.Code, w.Body.String())
+	}
+	var created ProjectResourceResponse
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+		t.Fatalf("decode CreateProjectResource: %v", err)
+	}
+	return created
+}
+
+// A resource's execution-mode dialog snapshots the whole ref when it OPENS, and
+// sends it back on save. If someone renames the folder from another device in
+// between, that snapshot arrives carrying a label the row no longer has — and
+// reading "the ref label differs" as "an old client renamed it" would undo the
+// rename, from a dialog that has nothing to do with the name.
+//
+// Also pins the other half of the same classification: an old client's rename
+// resends the ref but changes no execution semantics, so it must not be refused
+// by the worktree capability gate for a machine whose registration has drifted.
+func TestProjectResourceStaleRefSnapshotDoesNotRollBackARename(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	project := createTestProjectForResources(t, "Stale mode snapshot")
+	const daemonID = "daemon-stale-snapshot"
+
+	// The row as both devices last saw it: named "Game Client", in_place.
+	created := createLocalDirectoryResourceFor(t, project.ID, map[string]any{
+		"local_path": "/Users/dev/work/game-client",
+		"daemon_id":  daemonID,
+		"label":      "Game Client",
+	})
+
+	update := func(body map[string]any) ProjectResourceResponse {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := newRequest("PUT", "/api/projects/"+project.ID+"/resources/"+created.ID, body)
+		req = withURLParams(req, "id", project.ID, "resourceId", created.ID)
+		testHandler.UpdateProjectResource(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("UpdateProjectResource(%v): %d %s", body, w.Code, w.Body.String())
+		}
+		var resp ProjectResourceResponse
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp
+	}
+	refLabelOf := func(resp ProjectResourceResponse) string {
+		t.Helper()
+		var fields map[string]any
+		if err := json.Unmarshal(resp.ResourceRef, &fields); err != nil {
+			t.Fatalf("decode ref: %v", err)
+		}
+		label, _ := fields["label"].(string)
+		return label
+	}
+
+	// Device B renames it. Both homes of the name now say "Renamed Client".
+	renamed := update(map[string]any{"label": "Renamed Client"})
+	if refLabelOf(renamed) != "Renamed Client" {
+		t.Fatalf("setup: ref copy did not follow the rename: %s", renamed.ResourceRef)
+	}
+
+	// Device A, whose dialog opened before that, saves in_place → in_place with
+	// its stale snapshot. The mode is what it came to change; the name is not.
+	after := update(map[string]any{
+		"resource_ref": map[string]any{
+			"local_path":     "/Users/dev/work/game-client",
+			"daemon_id":      daemonID,
+			"label":          "Game Client",
+			"execution_mode": "in_place",
+		},
+	})
+	if after.Label == nil || *after.Label != "Renamed Client" {
+		t.Fatalf("a stale mode snapshot rolled back the rename: column = %v", after.Label)
+	}
+	if got := refLabelOf(after); got != "Renamed Client" {
+		t.Errorf("stale ref label should be healed to the current name, got %q", got)
+	}
+
+	// A genuine ≤ v0.4.28 rename — ref resent, ONLY the label different — still
+	// counts, and still reaches the column.
+	legacy := update(map[string]any{
+		"resource_ref": map[string]any{
+			"local_path":     "/Users/dev/work/game-client",
+			"daemon_id":      daemonID,
+			"label":          "Renamed On Old Desktop",
+			"execution_mode": "in_place",
+		},
+	})
+	if legacy.Label == nil || *legacy.Label != "Renamed On Old Desktop" {
+		t.Fatalf("legacy rename should still reach the column, got %v", legacy.Label)
+	}
+}
+
+// An old client renames by resending the ref, so the worktree capability gate
+// would see "the ref was provided" and refuse the rename on a machine whose
+// runtime registration no longer advertises the capability — failing an edit
+// that changes nothing about what runs. The row already says worktree; the
+// claim gate is what keeps it from running somewhere that cannot.
+func TestProjectResourceLegacyRenameSkipsWorktreeGate(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	project := createTestProjectForResources(t, "Legacy rename on a worktree row")
+	const daemonID = "daemon-no-runtime-row-for-rename"
+
+	created := createLocalDirectoryResourceFor(t, project.ID, map[string]any{
+		"local_path": "/Users/dev/work/game-client",
+		"daemon_id":  daemonID,
+		"label":      "Game Client",
+	})
+	// Plant the worktree mode directly: saving it through the API would (
+	// correctly) be refused for a daemon with no capable runtime row.
+	if _, err := testHandler.Queries.UpdateProjectResource(context.Background(), db.UpdateProjectResourceParams{
+		ID:          parseUUID(created.ID),
+		ResourceRef: json.RawMessage(`{"local_path":"/Users/dev/work/game-client","daemon_id":"` + daemonID + `","label":"Game Client","execution_mode":"worktree"}`),
+		Label:       pgtype.Text{String: "Game Client", Valid: true},
+		Position:    0,
+	}); err != nil {
+		t.Fatalf("plant worktree row: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("PUT", "/api/projects/"+project.ID+"/resources/"+created.ID, map[string]any{
+		"resource_ref": map[string]any{
+			"local_path":     "/Users/dev/work/game-client",
+			"daemon_id":      daemonID,
+			"label":          "Renamed On Old Desktop",
+			"execution_mode": "worktree",
+		},
+	})
+	req = withURLParams(req, "id", project.ID, "resourceId", created.ID)
+	testHandler.UpdateProjectResource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("a rename that changes no execution semantics must not hit the capability gate: %d %s",
+			w.Code, w.Body.String())
+	}
+
+	// And the gate still fires when the same client actually changes the mode.
+	w = httptest.NewRecorder()
+	req = newRequest("PUT", "/api/projects/"+project.ID+"/resources/"+created.ID, map[string]any{
+		"resource_ref": map[string]any{
+			"local_path":     "/Users/dev/work/game-client",
+			"daemon_id":      daemonID,
+			"label":          "Renamed On Old Desktop",
+			"execution_mode": "in_place",
+		},
+	})
+	req = withURLParams(req, "id", project.ID, "resourceId", created.ID)
+	testHandler.UpdateProjectResource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("switching to in_place needs no capability: %d %s", w.Code, w.Body.String())
 	}
 }
