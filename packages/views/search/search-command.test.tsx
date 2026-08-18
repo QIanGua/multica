@@ -1161,4 +1161,93 @@ describe("SearchCommand", () => {
       expect(renderedHeadings()).not.toContain("Cancelled");
     });
   });
+
+  // Rows from the previous query stay on screen while the next request is in
+  // flight (that is what keeps the list from strobing on every keystroke), so
+  // they have to stop being *reachable*. cmdk re-selects the first valid item
+  // on every input change, so a live stale row means Enter opens a result the
+  // user is no longer searching for.
+  describe("stale results while the next query is in flight", () => {
+    const alphaIssue = {
+      id: "issue-alpha",
+      workspace_id: "ws-test",
+      number: 100,
+      identifier: "MUL-100",
+      title: "Alpha result",
+      description: null,
+      status: "todo",
+      priority: "none",
+      assignee_type: null,
+      assignee_id: null,
+      creator_type: "member",
+      creator_id: "user-1",
+      parent_issue_id: null,
+      project_id: null,
+      position: 0,
+      start_date: null,
+      due_date: null,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      match_source: "title",
+    };
+
+    /** HighlightText splits the title into <mark> + text, so match the span. */
+    const alphaRowTitle = () =>
+      screen.getByText(
+        (_, el) => el?.textContent === "Alpha result" && el?.tagName === "SPAN",
+      );
+
+    /** Resolve the first query; hang on everything after it. */
+    const answerOnlyAlpha = () => {
+      mockSearchIssues.mockImplementation(({ q }: { q: string }) =>
+        q === "alpha"
+          ? Promise.resolve({ issues: [alphaIssue], total: 1 })
+          : new Promise(() => {}),
+      );
+      mockSearchProjects.mockImplementation(({ q }: { q: string }) =>
+        q === "alpha"
+          ? Promise.resolve({ projects: [], total: 0 })
+          : new Promise(() => {}),
+      );
+    };
+
+    const typeAlphaThenChange = async (
+      user: ReturnType<typeof userEvent.setup>,
+    ) => {
+      answerOnlyAlpha();
+      renderSearch();
+      const input = screen.getByPlaceholderText("Type a command or search...");
+      await user.type(input, "alpha");
+      await waitFor(
+        () => {
+          expect(alphaRowTitle()).toBeInTheDocument();
+        },
+        { timeout: 2000 },
+      );
+      // Query changes; the response for it never arrives.
+      await user.type(input, "zzz");
+      return input;
+    };
+
+    it("does not open the previous query's result on Enter", async () => {
+      const user = userEvent.setup();
+      const input = await typeAlphaThenChange(user);
+
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      expect(mockPush).not.toHaveBeenCalled();
+      expect(useSearchStore.getState().open).toBe(true);
+    });
+
+    it("does not open the previous query's result on click", async () => {
+      const user = userEvent.setup();
+      await typeAlphaThenChange(user);
+
+      // Still painted (that is the point), but inert.
+      fireEvent.click(alphaRowTitle());
+
+      expect(mockPush).not.toHaveBeenCalled();
+      expect(useSearchStore.getState().open).toBe(true);
+    });
+  });
 });

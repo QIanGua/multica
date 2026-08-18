@@ -175,16 +175,19 @@ function IssueAssigneeAvatar({
 function ProjectResultRow({
   project,
   query,
+  disabled,
   onSelect,
 }: {
   project: SearchProjectResult;
   query: string;
+  disabled?: boolean;
   onSelect: (value: string) => void;
 }) {
   return (
     <CommandPrimitive.Item
       key={`project:${project.id}`}
       value={`project:${project.id}`}
+      disabled={disabled}
       onSelect={onSelect}
       className="flex cursor-default select-none flex-col gap-1 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
     >
@@ -213,16 +216,19 @@ function ProjectResultRow({
 function IssueResultRow({
   issue,
   query,
+  disabled,
   onSelect,
 }: {
   issue: SearchIssueResult;
   query: string;
+  disabled?: boolean;
   onSelect: (value: string) => void;
 }) {
   return (
     <CommandPrimitive.Item
       key={issue.id}
       value={issue.id}
+      disabled={disabled}
       onSelect={onSelect}
       className="flex cursor-default select-none flex-col gap-1 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
     >
@@ -272,9 +278,18 @@ interface CommandItem {
 }
 
 interface SearchResults {
+  /**
+   * The trimmed query these rows answer. Rows outlive the query that fetched
+   * them — they stay painted while the next request is in flight — so every
+   * result set carries the question it is the answer to, and anything that can
+   * act on a row checks that it still matches what the user typed.
+   */
+  query: string;
   issues: SearchIssueResult[];
   projects: SearchProjectResult[];
 }
+
+const NO_RESULTS: SearchResults = { query: "", issues: [], projects: [] };
 
 // One heading treatment for every group. Headings go through cmdk's `heading`
 // prop rather than a hand-rolled div: cmdk renders it into a
@@ -344,7 +359,7 @@ export function SearchCommand() {
   );
 
   const [query, setQuery] = useState("");
-  const [results, setResults] = useState<SearchResults>({ issues: [], projects: [] });
+  const [results, setResults] = useState<SearchResults>(NO_RESULTS);
   const [isLoading, setIsLoading] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -537,6 +552,13 @@ export function SearchCommand() {
     results.projects.length > 0 ||
     filteredMembers.length > 0;
 
+  // Rows answering an earlier query are still painted while the next request
+  // is in flight — that is what keeps the list from strobing on every
+  // keystroke — but they must not be actionable: cmdk re-selects the first
+  // valid item whenever the input changes, so a live stale row turns the next
+  // Enter into a jump to a result the user has already typed past.
+  const resultsAreStale = results.query !== query.trim();
+
   // Cross-type cancelled demotion (MUL-5824). The two searches are ranked
   // independently server-side, so the partition has to happen here, where they
   // are aggregated for display. See the render note on the results list.
@@ -545,9 +567,11 @@ export function SearchCommand() {
       partitionAggregatedSearchResults({
         issues: results.issues,
         projects: results.projects,
-        query,
+        // The partition describes these rows, so it keys off the query they
+        // answer — not what the user has typed since.
+        query: results.query,
       }),
-    [results, query],
+    [results],
   );
 
   // Close on single ESC — capture phase fires before base-ui Dialog's handlers
@@ -576,7 +600,7 @@ export function SearchCommand() {
   useEffect(() => {
     if (!open) {
       setQuery("");
-      setResults({ issues: [], projects: [] });
+      setResults(NO_RESULTS);
       setIsLoading(false);
     }
   }, [open]);
@@ -586,7 +610,7 @@ export function SearchCommand() {
     if (abortRef.current) abortRef.current.abort();
 
     if (!q.trim()) {
-      setResults({ issues: [], projects: [] });
+      setResults(NO_RESULTS);
       setIsLoading(false);
       return;
     }
@@ -612,6 +636,7 @@ export function SearchCommand() {
         ]);
         if (!controller.signal.aborted) {
           setResults({
+            query: q.trim(),
             issues: issueRes.issues,
             projects: projectRes.projects,
           });
@@ -619,6 +644,10 @@ export function SearchCommand() {
         }
       } catch {
         if (!controller.signal.aborted) {
+          // Drop the previous query's rows rather than leaving them on screen
+          // permanently greyed out: the request that would have replaced them
+          // is never coming. The list falls through to the empty state.
+          setResults({ query: q.trim(), issues: [], projects: [] });
           setIsLoading(false);
         }
       }
@@ -838,7 +867,8 @@ export function SearchCommand() {
                   <ProjectResultRow
                     key={`project:${project.id}`}
                     project={project}
-                    query={query}
+                    query={results.query}
+                    disabled={resultsAreStale}
                     onSelect={handleSelect}
                   />
                 ))}
@@ -854,7 +884,8 @@ export function SearchCommand() {
                   <IssueResultRow
                     key={issue.id}
                     issue={issue}
-                    query={query}
+                    query={results.query}
+                    disabled={resultsAreStale}
                     onSelect={handleSelect}
                   />
                 ))}
@@ -870,7 +901,8 @@ export function SearchCommand() {
                   <ProjectResultRow
                     key={`project:${project.id}`}
                     project={project}
-                    query={query}
+                    query={results.query}
+                    disabled={resultsAreStale}
                     onSelect={handleSelect}
                   />
                 ))}
@@ -878,7 +910,8 @@ export function SearchCommand() {
                   <IssueResultRow
                     key={issue.id}
                     issue={issue}
-                    query={query}
+                    query={results.query}
+                    disabled={resultsAreStale}
                     onSelect={handleSelect}
                   />
                 ))}
