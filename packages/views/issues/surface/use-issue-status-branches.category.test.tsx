@@ -43,6 +43,21 @@ function makeIssue(id: string, status: string, category: IssueStatusCategory): I
   } as Issue;
 }
 
+const QA_ENTRY = {
+  id: "s-qa",
+  workspace_id: "ws-1",
+  key: "qa",
+  name: "QA",
+  description: "",
+  category: "in_review" as const,
+  color: "#ff0000",
+  is_system: false,
+  position: 1,
+  archived_at: null,
+  created_at: "",
+  updated_at: "",
+};
+
 const QUERY = {
   scope: { kind: "workspace" as const },
   filters: {},
@@ -84,7 +99,9 @@ describe("useIssueStatusBranches — category columns", () => {
     });
     setApiInstance({
       listIssueTableRows,
-      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
+      // The category contract only switches on for a workspace that HAS a
+      // custom status — see IssueStatusCatalog.hasCustomStatuses.
+      listIssueStatuses: async () => ({ statuses: [QA_ENTRY], categories: [], total: 1 }),
     } as unknown as ApiClient);
 
     const qc = new QueryClient({
@@ -106,9 +123,15 @@ describe("useIssueStatusBranches — category columns", () => {
 
     await waitFor(() => expect(result.current.issues.length).toBe(2));
 
-    // The request names the CATEGORY contract, not a concrete status key.
-    expect(requests[0]?.group).toEqual({ kind: "status_category" });
-    expect(requests[0]?.group_key).toBe("status_category:in_review");
+    // The FIRST request is the pre-feature contract: the catalog has not landed
+    // yet, so the hook cannot know this workspace has custom statuses and must
+    // not send a group kind an un-upgraded backend would reject. (MUL-6243)
+    expect(requests[0]?.group).toEqual({ kind: "status" });
+    expect(requests[0]?.group_key).toBe("status:in_review");
+    // Once the catalog confirms a custom status, it switches to the CATEGORY
+    // contract — which is what actually returns the QA card.
+    expect(requests.at(-1)?.group).toEqual({ kind: "status_category" });
+    expect(requests.at(-1)?.group_key).toBe("status_category:in_review");
     // Both rows land in the column: the custom one is not dropped for failing
     // to equal the column key.
     expect(result.current.issues.map((i) => i.id).sort()).toEqual(["qa-1", "std-1"]);
@@ -125,26 +148,7 @@ describe("useIssueStatusBranches — category columns", () => {
         branch_total: 0,
         next_cursor: null,
       }),
-      listIssueStatuses: async () => ({
-        statuses: [
-          {
-            id: "s-qa",
-            workspace_id: "ws-1",
-            key: "qa",
-            name: "QA",
-            description: "",
-            category: "in_review",
-            color: "#ff0000",
-            is_system: false,
-            position: 1,
-            archived_at: null,
-            created_at: "",
-            updated_at: "",
-          },
-        ],
-        categories: [],
-        total: 1,
-      }),
+      listIssueStatuses: async () => ({ statuses: [QA_ENTRY], categories: [], total: 1 }),
     } as unknown as ApiClient);
 
     const qc = new QueryClient({
@@ -183,3 +187,68 @@ describe("useIssueStatusBranches — category columns", () => {
     );
   });
 });
+
+/**
+ * Rolling-deploy safety (MUL-6243).
+ *
+ * `group.kind=status_category` is a server contract this feature introduced.
+ * A new Web build hitting a backend pod that has not been updated yet gets a
+ * 400 — and unlike the creation flag, which is deployment-wide and default off,
+ * nothing else guards this request path. So the contract may only be sent once
+ * the catalog has confirmed the workspace HAS a custom status, which can only
+ * be true if the fleet was already serving this version.
+ */
+describe("useIssueStatusBranches — mixed-version safety", () => {
+  it("never sends the new group kind for a workspace with no custom statuses", async () => {
+    const requests: IssueTableRowsRequest[] = [];
+    const listIssueStatuses = vi.fn(async () => ({
+      // Built-ins only — the state of every workspace until an admin creates
+      // a custom status, which the rollout flag gates.
+      statuses: [
+        { ...QA_ENTRY, id: "s-in-review", key: "in_review", name: "In Review", is_system: true, position: 0 },
+      ],
+      categories: [],
+      total: 1,
+    }));
+    setApiInstance({
+      listIssueTableRows: async (request: IssueTableRowsRequest) => {
+        requests.push(request);
+        return {
+          query_fingerprint: "test",
+          group_key: request.group_key ?? null,
+          parent_id: null,
+          total: 0,
+          rows: [],
+          branch_total: 0,
+          next_cursor: null,
+        };
+      },
+      listIssueStatuses,
+    } as unknown as ApiClient);
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    renderHook(
+      () =>
+        useIssueStatusBranches({
+          wsId: "ws-1",
+          query: QUERY,
+          statuses: ["in_review"],
+          facets: undefined,
+          facetsPending: false,
+          facetsFetching: false,
+          enabled: true,
+        }),
+      { wrapper: wrapper(qc) },
+    );
+
+    await waitFor(() => expect(listIssueStatuses).toHaveBeenCalled());
+    await waitFor(() => expect(requests.length).toBeGreaterThan(0));
+
+    for (const request of requests) {
+      expect(request.group).toEqual({ kind: "status" });
+      expect(request.group_key).toBe("status:in_review");
+    }
+  });
+})

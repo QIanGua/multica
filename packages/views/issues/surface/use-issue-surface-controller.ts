@@ -17,6 +17,7 @@ import { workspaceWorkingAgentsOptions } from "@multica/core/agents";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { ALL_STATUSES } from "@multica/core/issues/config";
 import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
+import { statusFilterColumns } from "@multica/core/issues";
 import { dateOnlyToLocalDate } from "@multica/core/issues/date";
 import type { IssueSortParam } from "@multica/core/issues/queries";
 import { issueTableFacetsOptions } from "@multica/core/issues/queries";
@@ -226,7 +227,7 @@ export function useIssueSurfaceController({
   const tableColumns = useViewStore((s) => s.tableColumns);
   const listCollapsedStatuses = useViewStore((s) => s.listCollapsedStatuses);
   const hiddenStatusCategories = useViewStore((s) => s.hiddenStatusCategories);
-  const { categoryOf } = useIssueStatuses(wsId);
+  const catalog = useIssueStatuses(wsId);
   const [tableSearch, setTableSearch] = useState("");
 
   const allowedModes = useMemo(() => new Set<IssueSurfaceMode>(modes), [modes]);
@@ -322,6 +323,12 @@ export function useIssueSurfaceController({
     effectiveViewMode === "swimlane";
   const usesServerFacets =
     usesTable || usesServerStatusSurface || usesServerGroupSurface;
+  const statusColumnsForFilters = useMemo(
+    () => statusFilterColumns(statusFilters, catalog),
+    [catalog, statusFilters],
+  );
+
+
   // Columns are CATEGORIES. Two independent things narrow them, and conflating
   // them is what let "hide the Backlog column" also drop every custom status in
   // other categories: `hiddenStatusCategories` is display state, `statusFilters`
@@ -329,8 +336,7 @@ export function useIssueSurfaceController({
   // keys land in. (MUL-6243)
   const serverStatuses = useMemo<IssueStatusCategory[]>(
     () => {
-      const selected =
-        statusFilters.length > 0 ? new Set(statusFilters.map(categoryOf)) : null;
+      const selected = statusFilters.length > 0 ? statusColumnsForFilters : null;
       const visible = ALL_STATUSES.filter(
         (category) =>
           !hiddenStatusCategories.includes(category) &&
@@ -341,10 +347,10 @@ export function useIssueSurfaceController({
         : visible;
     },
     [
-      categoryOf,
       effectiveViewMode,
       hiddenStatusCategories,
       listCollapsedStatuses,
+      statusColumnsForFilters,
       statusFilters,
     ],
   );

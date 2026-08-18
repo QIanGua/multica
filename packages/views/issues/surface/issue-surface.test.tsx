@@ -661,7 +661,7 @@ describe("IssueSurface — table pagination ownership", () => {
           total: 1,
           groups: [
             {
-              key: "status_category:todo",
+              key: "status:todo",
               value: { kind: "status", status: "todo" },
               count: 1,
             },
@@ -672,7 +672,7 @@ describe("IssueSurface — table pagination ownership", () => {
       listIssueTableRows: vi.fn(() =>
         Promise.resolve({
           query_fingerprint: "sha256:collapsed-rows",
-          group_key: "status_category:todo",
+          group_key: "status:todo",
           parent_id: null,
           total: 1,
           rows: [{ issue, direct_child_count: 0 }],

@@ -203,6 +203,56 @@ func (q *Queries) GetIssueStatusEntryByKey(ctx context.Context, arg GetIssueStat
 	return i, err
 }
 
+const listActiveCustomIssueStatusEntries = `-- name: ListActiveCustomIssueStatusEntries :many
+SELECT id, workspace_id, key, name, description, category, color, is_system, position, archived_at, created_at, updated_at FROM issue_status
+WHERE workspace_id = $1::uuid
+  AND category = $2::text
+  AND is_system = FALSE
+  AND archived_at IS NULL
+ORDER BY position, key
+`
+
+type ListActiveCustomIssueStatusEntriesParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Category    string      `json:"category"`
+}
+
+// One category's ACTIVE custom statuses — the exact set a reorder must cover.
+// Read inside the reorder transaction, under the catalog lock, so a status
+// archived concurrently cannot slip in or out between validation and write.
+func (q *Queries) ListActiveCustomIssueStatusEntries(ctx context.Context, arg ListActiveCustomIssueStatusEntriesParams) ([]IssueStatus, error) {
+	rows, err := q.db.Query(ctx, listActiveCustomIssueStatusEntries, arg.WorkspaceID, arg.Category)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []IssueStatus{}
+	for rows.Next() {
+		var i IssueStatus
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.Key,
+			&i.Name,
+			&i.Description,
+			&i.Category,
+			&i.Color,
+			&i.IsSystem,
+			&i.Position,
+			&i.ArchivedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listIssueStatusEntries = `-- name: ListIssueStatusEntries :many
 SELECT id, workspace_id, key, name, description, category, color, is_system, position, archived_at, created_at, updated_at FROM issue_status
 WHERE workspace_id = $1::uuid
@@ -331,7 +381,7 @@ func (q *Queries) LockIssueStatusCatalogShared(ctx context.Context, workspaceID 
 	return err
 }
 
-const reorderIssueStatusEntries = `-- name: ReorderIssueStatusEntries :exec
+const reorderIssueStatusEntries = `-- name: ReorderIssueStatusEntries :execrows
 UPDATE issue_status s
 SET position = v.ordinality::int,
     updated_at = now()
@@ -355,9 +405,12 @@ type ReorderIssueStatusEntriesParams struct {
 // never move (is_system rows are excluded here, as they are in every write).
 // Archived rows are excluded too: they are frozen, and letting one into the
 // write sequence is exactly what made a drag past an archived row half-commit.
-func (q *Queries) ReorderIssueStatusEntries(ctx context.Context, arg ReorderIssueStatusEntriesParams) error {
-	_, err := q.db.Exec(ctx, reorderIssueStatusEntries, arg.WorkspaceID, arg.Ids)
-	return err
+func (q *Queries) ReorderIssueStatusEntries(ctx context.Context, arg ReorderIssueStatusEntriesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, reorderIssueStatusEntries, arg.WorkspaceID, arg.Ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const seedIssueStatusEntries = `-- name: SeedIssueStatusEntries :exec

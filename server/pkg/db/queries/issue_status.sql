@@ -144,7 +144,18 @@ SELECT key FROM issue_status
 WHERE workspace_id = sqlc.arg('workspace_id')::uuid
   AND category = ANY(sqlc.arg('categories')::text[]);
 
--- name: ReorderIssueStatusEntries :exec
+-- name: ListActiveCustomIssueStatusEntries :many
+-- One category's ACTIVE custom statuses — the exact set a reorder must cover.
+-- Read inside the reorder transaction, under the catalog lock, so a status
+-- archived concurrently cannot slip in or out between validation and write.
+SELECT * FROM issue_status
+WHERE workspace_id = sqlc.arg('workspace_id')::uuid
+  AND category = sqlc.arg('category')::text
+  AND is_system = FALSE
+  AND archived_at IS NULL
+ORDER BY position, key;
+
+-- name: ReorderIssueStatusEntries :execrows
 -- Atomic intra-category reorder. One statement, so a failure leaves the whole
 -- order untouched instead of the partially-applied prefix a per-row PATCH loop
 -- produces.

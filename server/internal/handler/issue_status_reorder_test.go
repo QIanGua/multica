@@ -148,3 +148,77 @@ func TestReorderIssueStatusesRejectsForeignInputs(t *testing.T) {
 		})
 	}
 }
+
+// TestReorderIssueStatusesSerializesAgainstConcurrentArchive is the one that
+// makes "atomic" mean something.
+//
+// The old shape validated every id, THEN ran the UPDATE — with no lock and no
+// transaction spanning the two. An archive committing in that window left the
+// UPDATE silently skipping the archived row (it is excluded by the statement)
+// while the earlier rows were rewritten, and the caller still got a 200 over a
+// half-applied order.
+//
+// Holding the EXCLUSIVE archive-side lock pins that exact interleaving: the
+// reorder cannot even read the catalog until the archive commits, so it sees
+// the archived row and refuses the whole request.
+func TestReorderIssueStatusesSerializesAgainstConcurrentArchive(t *testing.T) {
+	suffix := time.Now().UnixNano()
+	first := insertCustomStatus(t, fmt.Sprintf("qa_h_%d", suffix), "in_review", 1, false)
+	second := insertCustomStatus(t, fmt.Sprintf("qa_i_%d", suffix), "in_review", 2, false)
+
+	before := positionsByID(t, first, second)
+
+	release := holdExclusiveCatalogLock(t)
+	archived := make(chan struct{})
+	go func() {
+		// Archive `second` while the reorder is blocked on the lock, then let
+		// the reorder proceed into a catalog that no longer matches its payload.
+		_, _ = testPool.Exec(context.Background(),
+			`UPDATE issue_status SET archived_at = now() WHERE id = $1`, second)
+		close(archived)
+		release()
+	}()
+	<-archived
+
+	rec := reorderVia(t, "in_review", []string{second, first})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("reorder status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+
+	after := positionsByID(t, first, second)
+	for id, position := range before {
+		if after[id] != position {
+			t.Fatalf("position of %s moved from %d to %d despite the conflict: %#v",
+				id, position, after[id], after)
+		}
+	}
+}
+
+// A payload that names only SOME of a category's active custom statuses cannot
+// be applied: positions come from the array index, so reordering a subset
+// writes positions that collide with the rows left out of it.
+func TestReorderIssueStatusesRejectsAPartialSet(t *testing.T) {
+	suffix := time.Now().UnixNano()
+	first := insertCustomStatus(t, fmt.Sprintf("qa_j_%d", suffix), "in_review", 1, false)
+	second := insertCustomStatus(t, fmt.Sprintf("qa_k_%d", suffix), "in_review", 2, false)
+
+	before := positionsByID(t, first, second)
+
+	rec := reorderVia(t, "in_review", []string{second})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("reorder status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+
+	after := positionsByID(t, first, second)
+	for id, position := range before {
+		if after[id] != position {
+			t.Fatalf("position of %s moved from %d to %d on a partial payload: %#v",
+				id, position, after[id], after)
+		}
+	}
+	// Specifically: `second` must NOT have been written to position 1, which is
+	// what would have collided with `first`.
+	if after[second] != before[second] {
+		t.Fatalf("partial payload still rewrote a position: %#v", after)
+	}
+}

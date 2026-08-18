@@ -376,7 +376,11 @@ function ScheduledRow({
           className="sticky left-0 z-[1] flex shrink-0 items-center gap-2 border-r bg-background px-3 text-body min-w-0"
           style={{ width: LEFT_COL_WIDTH }}
         >
-          <StatusIcon status={issue.status} className="h-3.5 w-3.5" />
+          <StatusIcon
+            status={issue.status}
+            category={issueStatusCategory(issue) ?? undefined}
+            className="h-3.5 w-3.5"
+          />
           <PriorityIcon priority={issue.priority} />
           <span className="w-14 shrink-0 text-caption text-muted-foreground tabular-nums truncate">
             {issue.identifier}

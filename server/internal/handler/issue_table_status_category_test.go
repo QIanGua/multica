@@ -280,3 +280,149 @@ func TestIssueTableStatusCategoryMatchesStatusWithoutCustomStatuses(t *testing.T
 		}
 	}
 }
+
+// countCatalogSelects reads pg_stat_statements-free: it uses the table's own
+// sequential/index scan counters from pg_stat_user_tables, which advance once
+// per scan of `issue_status`.
+func catalogScans(t *testing.T) int64 {
+	t.Helper()
+	// The stats collector is asynchronous; force this backend's view forward so
+	// two readings around one request are comparable.
+	if _, err := testPool.Exec(context.Background(), `SELECT pg_stat_clear_snapshot()`); err != nil {
+		t.Fatalf("clear stat snapshot: %v", err)
+	}
+	var scans int64
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT COALESCE(seq_scan, 0) + COALESCE(idx_scan, 0)
+		FROM pg_stat_user_tables WHERE relname = 'issue_status'
+	`).Scan(&scans); err != nil {
+		t.Fatalf("read issue_status scan count: %v", err)
+	}
+	return scans
+}
+
+// A board loads seven column branches as seven separate HTTP requests, so a
+// catalog read that looks cheap per request is multiplied by seven. The first
+// cut ran ExpandCategories AND CustomKeyCategories per resolve — two reads
+// where one suffices, i.e. 14 catalog scans behind one board load instead of 7.
+//
+// This asserts the observable count, not that the derived SQL matches: the
+// point Elon made is that identical SQL says nothing about how many times it
+// ran.
+func TestIssueTableStatusCategoryReadsCatalogOncePerRequest(t *testing.T) {
+	projectID, _ := seedStatusCategoryFixture(t)
+
+	// Warm any lazily-built state (issue prefix, seeding) so it is not counted.
+	warm := httptest.NewRecorder()
+	testHandler.ListIssueTableGroups(warm, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
+		Query: statusCategoryQuery(projectID),
+		Group: issueTableGroupSpec{Kind: "status_category"},
+		Page:  issueTablePageRequest{Limit: 100},
+	}))
+	if warm.Code != http.StatusOK {
+		t.Fatalf("warm-up status = %d: %s", warm.Code, warm.Body.String())
+	}
+
+	before := catalogScans(t)
+	w := httptest.NewRecorder()
+	testHandler.ListIssueTableGroups(w, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
+		Query: statusCategoryQuery(projectID),
+		Group: issueTableGroupSpec{Kind: "status_category"},
+		Page:  issueTablePageRequest{Limit: 100},
+	}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("groups status = %d: %s", w.Code, w.Body.String())
+	}
+	after := catalogScans(t)
+
+	if delta := after - before; delta > 1 {
+		t.Fatalf("one category-grouped request scanned issue_status %d times, want at most 1", delta)
+	}
+}
+
+// The common case: no custom statuses means the client never asks for the
+// category contract at all, so a default board pays nothing for this feature.
+// This pins the SERVER half — that `status` grouping still reads no catalog.
+func TestIssueTableStatusGroupingReadsNoCatalog(t *testing.T) {
+	projectID, _ := seedStatusCategoryFixture(t)
+
+	warm := httptest.NewRecorder()
+	testHandler.ListIssueTableGroups(warm, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
+		Query: statusCategoryQuery(projectID),
+		Group: issueTableGroupSpec{Kind: "status"},
+		Page:  issueTablePageRequest{Limit: 100},
+	}))
+	if warm.Code != http.StatusOK {
+		t.Fatalf("warm-up status = %d: %s", warm.Code, warm.Body.String())
+	}
+
+	before := catalogScans(t)
+	w := httptest.NewRecorder()
+	testHandler.ListIssueTableGroups(w, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
+		Query: statusCategoryQuery(projectID),
+		Group: issueTableGroupSpec{Kind: "status"},
+		Page:  issueTablePageRequest{Limit: 100},
+	}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("groups status = %d: %s", w.Code, w.Body.String())
+	}
+	after := catalogScans(t)
+
+	if delta := after - before; delta != 0 {
+		t.Fatalf("plain status grouping scanned issue_status %d times, want 0", delta)
+	}
+}
+
+// Plain `status` grouping — what the Table view uses, and what every client
+// falls back to before its catalog lands — must survive a workspace that has
+// custom statuses. The descriptor used to reject any non-built-in raw value,
+// which failed the WHOLE grouped response: one custom status made "group by
+// status" 500 for the entire workspace.
+func TestIssueTableStatusGroupingCarriesCustomStatusGroups(t *testing.T) {
+	projectID, customKey := seedStatusCategoryFixture(t)
+
+	w := httptest.NewRecorder()
+	testHandler.ListIssueTableGroups(w, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
+		Query: statusCategoryQuery(projectID),
+		Group: issueTableGroupSpec{Kind: "status"},
+		Page:  issueTablePageRequest{Limit: 100},
+	}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("groups status = %d: %s", w.Code, w.Body.String())
+	}
+	var groups issueTableGroupsResponse
+	if err := json.NewDecoder(w.Body).Decode(&groups); err != nil {
+		t.Fatalf("decode groups: %v", err)
+	}
+
+	counts := map[string]int64{}
+	for _, group := range groups.Groups {
+		counts[group.Value.Status] = group.Count
+	}
+	if counts[customKey] != 2 {
+		t.Fatalf("custom status group = %d, want 2: %#v", counts[customKey], counts)
+	}
+	if counts["in_review"] != 1 {
+		t.Fatalf("built-in group = %d, want 1: %#v", counts["in_review"], counts)
+	}
+
+	// And its group_key has to page back its own rows.
+	groupKey := "status:" + customKey
+	rowsRecorder := httptest.NewRecorder()
+	testHandler.ListIssueTableRows(rowsRecorder, newRequest(http.MethodPost, "/api/issues/table/rows", issueTableRowsRequest{
+		Query:    statusCategoryQuery(projectID),
+		Group:    issueTableGroupSpec{Kind: "status"},
+		GroupKey: &groupKey,
+		Page:     issueTablePageRequest{Limit: 50},
+	}))
+	if rowsRecorder.Code != http.StatusOK {
+		t.Fatalf("rows status = %d: %s", rowsRecorder.Code, rowsRecorder.Body.String())
+	}
+	var rows issueTableRowsResponse
+	if err := json.NewDecoder(rowsRecorder.Body).Decode(&rows); err != nil {
+		t.Fatalf("decode rows: %v", err)
+	}
+	if len(rows.Rows) != 2 {
+		t.Fatalf("custom status rows = %d, want 2", len(rows.Rows))
+	}
+}

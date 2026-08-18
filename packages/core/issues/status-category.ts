@@ -1,5 +1,7 @@
 import type { Issue, IssueStatusCategory } from "../types";
 import { isIssueStatusCategory } from "../issue-statuses";
+import type { IssueStatusCatalog } from "../issue-statuses";
+import { ALL_STATUSES } from "./config";
 
 /**
  * The category an issue's status belongs to — the bucket it occupies on the
@@ -61,4 +63,64 @@ export function normalizeStatusPatch(patch: Partial<Issue>): Partial<Issue> {
   // Undefined rather than the inherited value: an unresolvable status must not
   // silently keep the previous category.
   return { ...patch, status_category: category ?? undefined };
+}
+
+/**
+ * The board/list COLUMNS an exact status-key filter narrows to (MUL-6243).
+ *
+ * Built-in keys resolve with no catalog at all, because a built-in key IS its
+ * own category. A custom key does not — and `categoryOf` answers `todo` for
+ * anything it has not loaded, which is indistinguishable from a real `todo`
+ * status. Routing on that guess would page the todo column for a saved `qa`
+ * filter while the query still restricts `status=qa`: a board that is briefly
+ * empty on every cold load, and permanently empty if the catalog request fails.
+ *
+ * So an unresolved custom key contributes NO column until the catalog is
+ * authoritative. The column appears the moment it lands.
+ */
+export function statusFilterColumns(
+  statusFilters: readonly string[],
+  catalog: Pick<IssueStatusCatalog, "entryOf" | "isLoaded">,
+): Set<IssueStatusCategory> {
+  const columns = new Set<IssueStatusCategory>();
+  for (const key of statusFilters) {
+    if (isIssueStatusCategory(key)) {
+      columns.add(key);
+      continue;
+    }
+    if (!catalog.isLoaded) continue;
+    const category = catalog.entryOf(key)?.category;
+    if (category && ALL_STATUSES.includes(category)) columns.add(category);
+  }
+  return columns;
+}
+
+/**
+ * Whether an issue BEHAVES as a given category (MUL-6243).
+ *
+ * The one question every status-coupled product rule actually asks. Comparing
+ * `issue.status` to a built-in key answers it only for a workspace with no
+ * custom statuses: a custom status in the `done` category is done, and code
+ * that checks `status === "done"` silently disagrees.
+ *
+ * An unresolved custom key answers `false`, and that direction is deliberate —
+ * every caller of this fails safe that way. "Is it done/cancelled?" false keeps
+ * a row VISIBLE rather than hiding it; "is it backlog?" false keeps the
+ * agent-run confirmation rather than skipping it. Guessing the other way would
+ * hide work or start an agent without asking.
+ */
+export function issueBehavesAs(
+  issue: Pick<Issue, "status" | "status_category">,
+  category: IssueStatusCategory,
+): boolean {
+  return issueStatusCategory(issue) === category;
+}
+
+/** True when the issue behaves as any of the given categories. */
+export function issueBehavesAsAny(
+  issue: Pick<Issue, "status" | "status_category">,
+  categories: readonly IssueStatusCategory[],
+): boolean {
+  const resolved = issueStatusCategory(issue);
+  return resolved !== null && categories.includes(resolved);
 }

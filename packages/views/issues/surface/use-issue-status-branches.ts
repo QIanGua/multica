@@ -14,6 +14,7 @@ import {
 } from "@tanstack/react-query";
 import { ALL_STATUSES } from "@multica/core/issues/config";
 import { statusCategoryOfKey } from "@multica/core/issues";
+import type { IssueStatusCatalog } from "@multica/core/issue-statuses";
 import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
 import {
   issueKeys,
@@ -70,12 +71,21 @@ interface StatusBranchData {
 // Every "status" in this hook is a board COLUMN, and columns are categories:
 // a workspace's custom statuses live inside their category's column rather than
 // adding one of their own. (MUL-6243)
-function statusGroupKey(status: IssueStatusCategory) {
-  return `status_category:${status}`;
+function statusGroupKey(status: IssueStatusCategory, byCategory: boolean) {
+  return byCategory ? `status_category:${status}` : `status:${status}`;
 }
 
-/** The group spec every branch in this hook pages with. */
+/**
+ * The grouping contract this hook pages with.
+ *
+ * `status_category` is a server contract this feature introduced, so it is only
+ * sent once the workspace is KNOWN to have custom statuses — see
+ * `IssueStatusCatalog.hasCustomStatuses` for why that is both the
+ * rolling-deploy guard and the cold-load guard. Everyone else keeps the exact
+ * request they made before. (MUL-6243)
+ */
 const CATEGORY_GROUP = { kind: "status_category" } as const;
+const STATUS_GROUP = { kind: "status" } as const;
 
 function initialCursorState(
   identity: string,
@@ -125,17 +135,24 @@ function rowCategory(issue: Issue): IssueStatusCategory {
  * The facet is keyed by concrete status KEY, while columns are categories, so
  * custom keys are folded into their category instead of being discarded —
  * dropping them made a column's total disagree with the cards it rendered.
- * (MUL-6243)
+ *
+ * A key the LOADED catalog does not know is dropped rather than guessed into
+ * `todo`: `categoryOf` cannot distinguish "custom status created seconds ago
+ * elsewhere" from "not a status at all", and inflating an arbitrary column's
+ * header is worse than a total that is briefly one card short. Before the
+ * catalog loads there is nothing to fold, so only built-ins are counted — which
+ * is exactly the pre-feature behavior. (MUL-6243)
  */
 function statusCountsFromFacets(
   facets: IssueTableFacetsResponse | undefined,
-  categoryOf: (statusKey: string) => IssueStatusCategory,
+  catalog: Pick<IssueStatusCatalog, "entryOf" | "isLoaded">,
 ) {
   const counts = new Map<IssueStatusCategory, number>();
   const statusFacet = facets?.facets.find((facet) => facet.kind === "status");
   for (const value of statusFacet?.values ?? []) {
-    const category = categoryOf(value.key);
-    if (!ALL_STATUSES.includes(category)) continue;
+    const builtIn = ALL_STATUSES.find((category) => category === value.key);
+    const category = builtIn ?? (catalog.isLoaded ? catalog.entryOf(value.key)?.category : undefined);
+    if (!category || !ALL_STATUSES.includes(category)) continue;
     counts.set(category, (counts.get(category) ?? 0) + value.count);
   }
   return counts;
@@ -175,7 +192,9 @@ export function useIssueStatusBranches({
   enabled: boolean;
 }): IssueStatusBranches {
   const queryClient = useQueryClient();
-  const { categoryOf } = useIssueStatuses(wsId);
+  const catalog = useIssueStatuses(wsId);
+  const { hasCustomStatuses } = catalog;
+  const group = hasCustomStatuses ? CATEGORY_GROUP : STATUS_GROUP;
   const identity = useMemo(() => JSON.stringify(query), [query]);
   const [cursorState, setCursorState] = useState<StatusCursorState>(() =>
     initialCursorState(identity, statuses),
@@ -215,8 +234,8 @@ export function useIssueStatusBranches({
         return {
           ...issueTableRowPageOptions(wsId, {
             query,
-            group: CATEGORY_GROUP,
-            group_key: statusGroupKey(status),
+            group,
+            group_key: statusGroupKey(status, hasCustomStatuses),
             hierarchy: { enabled: false },
             parent_id: null,
             page: { limit: 50, cursor },
@@ -229,7 +248,7 @@ export function useIssueStatusBranches({
           enabled,
         };
       }),
-    [enabled, pageTargets, query, wsId],
+    [enabled, group, hasCustomStatuses, pageTargets, query, wsId],
   );
   const pageResults = useQueries({ queries: pageQueries }) as Array<
     UseQueryResult<IssueTableRowsResponse, Error>
@@ -368,8 +387,8 @@ export function useIssueStatusBranches({
   ]);
 
   const counts = useMemo(
-    () => statusCountsFromFacets(facets, categoryOf),
-    [facets, categoryOf],
+    () => statusCountsFromFacets(facets, catalog),
+    [facets, catalog],
   );
   const loadMore = useCallback(
     (status: IssueStatusCategory) => {
@@ -396,8 +415,8 @@ export function useIssueStatusBranches({
         queryKey: issueKeys.tableRows(
           wsId,
           query,
-          CATEGORY_GROUP,
-          statusGroupKey(status),
+          group,
+          statusGroupKey(status, hasCustomStatuses),
           false,
           null,
         ),
@@ -405,7 +424,7 @@ export function useIssueStatusBranches({
         type: "active",
       });
     },
-    [query, queryClient, wsId],
+    [group, hasCustomStatuses, query, queryClient, wsId],
   );
 
   const pagination = useMemo<IssueStatusPagination>(() => {

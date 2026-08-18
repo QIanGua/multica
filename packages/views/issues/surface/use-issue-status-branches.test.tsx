@@ -138,7 +138,10 @@ describe("useIssueStatusBranches", () => {
     expect(listIssueTableRows).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({
-        group_key: "status_category:todo",
+        // No custom statuses in this fixture, so the hook keeps the
+        // pre-feature contract. See use-issue-status-branches.category.test.tsx
+        // for the category contract. (MUL-6243)
+        group_key: "status:todo",
         page: { limit: 50, cursor: "cursor-2" },
       }),
     );

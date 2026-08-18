@@ -10,6 +10,7 @@ import { issueSurfaceGanttOptions } from "@multica/core/issues/surface/repositor
 import type { IssueSurfaceQueryPlan } from "@multica/core/issues/surface/query-plan";
 import type { IssueStatus, IssueStatusCategory } from "@multica/core/types";
 import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
+import { issueBehavesAsAny, statusFilterColumns } from "@multica/core/issues";
 import {
   applyIssueFilters,
   type IssueFilterState,
@@ -45,7 +46,9 @@ const EMPTY_PROJECTS: Project[] = [];
 function ganttCanvasRows(issues: Issue[], showCompleted: boolean): Issue[] {
   const dated = issues.filter((i) => i.start_date || i.due_date);
   if (showCompleted) return dated;
-  return dated.filter((i) => i.status !== "done" && i.status !== "cancelled");
+  // By CATEGORY: a custom status in done/cancelled is completed work, and
+  // "show completed" has to hide it too. (MUL-6243)
+  return dated.filter((i) => !issueBehavesAsAny(i, ["done", "cancelled"]));
 }
 
 export interface IssueSurfaceData {
@@ -319,7 +322,7 @@ export function useIssueSurfaceData({
     ],
   );
 
-  const { categoryOf } = useIssueStatuses(wsId);
+  const catalog = useIssueStatuses(wsId);
 
   const visibleStatuses = useMemo<IssueStatusCategory[]>(() => {
     // Board columns are CATEGORIES, not status keys — adding a custom status
@@ -329,13 +332,13 @@ export function useIssueSurfaceData({
     // in. Default view shows every category, `cancelled` last (its canonical
     // position in ALL_STATUSES). (MUL-6243)
     const selected =
-      statusFilters.length > 0 ? new Set(statusFilters.map(categoryOf)) : null;
+      statusFilters.length > 0 ? statusFilterColumns(statusFilters, catalog) : null;
     return ALL_STATUSES.filter(
       (s) =>
         !hiddenStatusCategories.includes(s) &&
         (selected === null || selected.has(s)),
     );
-  }, [statusFilters, hiddenStatusCategories, categoryOf]);
+  }, [statusFilters, hiddenStatusCategories, catalog]);
 
   // Hidden columns are the lifecycle statuses not currently visible, so
   // `cancelled` participates in the board show/hide controls exactly like the

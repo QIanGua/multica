@@ -238,8 +238,9 @@ describe("useIssueSurfaceController", () => {
         query: expect.objectContaining({
           scope: { kind: "project", project_id: "p1" },
         }),
-        // Board columns are CATEGORIES since MUL-6243.
-        group: { kind: "status_category" },
+        // A workspace with no custom statuses keeps the original contract —
+        // that is what makes this safe across a rolling deploy. (MUL-6243)
+        group: { kind: "status" },
       }),
     );
   });
@@ -316,7 +317,7 @@ describe("useIssueSurfaceController", () => {
     });
     expect(listIssueTableRows).toHaveBeenCalledWith(
       expect.objectContaining({
-        group_key: "status_category:backlog",
+        group_key: "status:backlog",
         page: { limit: 50, cursor: null },
       }),
     );

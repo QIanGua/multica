@@ -1,6 +1,6 @@
 "use client";
 
-import { statusCategoryOfKey } from "@multica/core/issues";
+import { issueStatusCategory, statusCategoryOfKey } from "@multica/core/issues";
 import { memo, useState, useCallback, useMemo, useEffect, useRef } from "react";
 import {
   DndContext,
@@ -1619,7 +1619,11 @@ function DraggableSwimLane({
             className={`!size-3 shrink-0 stroke-[2.5] text-muted-foreground transition-transform ${isCollapsed ? "" : "rotate-90"}`}
           />
           {lane.parentIssue && (
-            <StatusIcon status={lane.parentIssue.status} className="size-3.5" />
+            <StatusIcon
+              status={lane.parentIssue.status}
+              category={issueStatusCategory(lane.parentIssue) ?? undefined}
+              className="size-3.5"
+            />
           )}
           {lane.project && <ProjectIcon project={lane.project} size="sm" />}
           {lane.actor && (

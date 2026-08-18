@@ -60,6 +60,26 @@ export interface IssueStatusCatalog {
   inCategory: (category: IssueStatusCategory) => IssueStatusEntry[];
   /** True once the catalog has loaded; false while it is still in flight. */
   isLoaded: boolean;
+  /**
+   * True when the catalog is LOADED and holds at least one custom status.
+   *
+   * This is the switch for the category-grouped surface contract. Two reasons
+   * it has to be both conditions:
+   *
+   * - Rolling deploy. `group.kind=status_category` is a server contract this
+   *   feature introduced, so a client that sends it unconditionally 400s
+   *   against any pod that has not been updated yet. A workspace only HAS a
+   *   custom status once the creation flag was on, which means the fleet was
+   *   already serving this version.
+   * - Cold load. Until the catalog lands, `categoryOf` cannot tell a custom key
+   *   from an unknown one and falls back to `todo`. Routing on that guess sends
+   *   a saved `qa` filter to the todo column and renders an empty board.
+   *
+   * A workspace with no custom statuses therefore keeps the exact request it
+   * made before this feature — which is also what keeps its board off the extra
+   * catalog reads the category contract needs. (MUL-6243)
+   */
+  hasCustomStatuses: boolean;
 }
 
 const BUILT_IN = new Set<string>(STATUS_ORDER);
@@ -120,5 +140,7 @@ export function buildIssueStatusCatalog(
     },
     inCategory: (category) => list.filter((e) => e.category === category && !e.archived_at),
     isLoaded: entries !== undefined,
+    hasCustomStatuses:
+      entries !== undefined && list.some((e) => e.is_system !== true),
   };
 }

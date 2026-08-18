@@ -104,32 +104,40 @@ func statusCategoryExpr(customKeys map[string]string, addArg func(any) string) s
 	return b.String()
 }
 
-// resolveStatusCategoryKeys expands every category to its concrete status keys
-// up front, so predicate() — which has no context or Querier — can look the
-// expansion up instead of querying mid-request.
-func (h *Handler) resolveStatusCategoryKeys(ctx context.Context, workspaceID pgtype.UUID) (map[string][]string, error) {
-	out := make(map[string][]string, len(validIssueStatuses))
-	keys, err := issuestatus.ExpandCategories(ctx, h.Queries, workspaceID, validIssueStatuses)
+// resolveStatusCategoryMaps derives BOTH shapes a category grouping needs from
+// ONE catalog read: the custom key -> category map behind the GROUP BY rewrite,
+// and the category -> concrete keys expansion that predicate() looks up (it has
+// no context or Querier of its own).
+//
+// One read, not three. A board loads seven column branches as seven separate
+// HTTP requests, so a per-call `ExpandCategories` + `CustomKeyCategories` pair
+// meant 21 extra catalog SELECTs behind one surface load.
+func (h *Handler) resolveStatusCategoryMaps(
+	ctx context.Context,
+	workspaceID pgtype.UUID,
+) (customKeys map[string]string, categoryKeys map[string][]string, err error) {
+	customKeys, err = issuestatus.CustomKeyCategories(ctx, h.Queries, workspaceID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	customKeys, err := issuestatus.CustomKeyCategories(ctx, h.Queries, workspaceID)
-	if err != nil {
-		return nil, err
-	}
+	categoryKeys = make(map[string][]string, len(validIssueStatuses))
 	for _, category := range validIssueStatuses {
 		// A category always contains at least its own canonical key, even on an
-		// unseeded workspace.
-		out[category] = []string{category}
+		// unseeded workspace — a built-in key IS its own category.
+		categoryKeys[category] = []string{category}
 	}
+	// Sorted so the expansion — and therefore the query's argument list — is
+	// deterministic for the same catalog.
+	keys := make([]string, 0, len(customKeys))
+	for key := range customKeys {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	for _, key := range keys {
-		category, isCustom := customKeys[key]
-		if !isCustom {
-			continue
-		}
-		out[category] = append(out[category], key)
+		category := customKeys[key]
+		categoryKeys[category] = append(categoryKeys[category], key)
 	}
-	return out, nil
+	return customKeys, categoryKeys, nil
 }
 
 func issueTableGroupIdentity(group issueTableGroupSpec) string {
@@ -164,15 +172,9 @@ func (h *Handler) resolveIssueTableGroup(w http.ResponseWriter, r *http.Request,
 		// Board / list / swimlane columns are CATEGORIES, so a custom status
 		// groups into the column it behaves as instead of getting a column of
 		// its own — that is what keeps the fan-out pinned at 7. (MUL-6243)
-		customKeys, err := issuestatus.CustomKeyCategories(r.Context(), h.Queries, workspaceID)
+		customKeys, categoryKeys, err := h.resolveStatusCategoryMaps(r.Context(), workspaceID)
 		if err != nil {
 			slog.Warn("resolve status category group failed", append(logger.RequestAttrs(r), "error", err)...)
-			writeIssueTableQueryFailure(w, r, "failed to resolve table group")
-			return resolvedIssueTableGroup{}, false
-		}
-		categoryKeys, err := h.resolveStatusCategoryKeys(r.Context(), workspaceID)
-		if err != nil {
-			slog.Warn("resolve status category keys failed", append(logger.RequestAttrs(r), "error", err)...)
 			writeIssueTableQueryFailure(w, r, "failed to resolve table group")
 			return resolvedIssueTableGroup{}, false
 		}
@@ -246,15 +248,9 @@ END, ''))`,
 			secondaryCategory: secondaryCategory,
 		}
 		if secondaryCategory {
-			customKeys, err := issuestatus.CustomKeyCategories(r.Context(), h.Queries, workspaceID)
+			customKeys, categoryKeys, err := h.resolveStatusCategoryMaps(r.Context(), workspaceID)
 			if err != nil {
 				slog.Warn("resolve compound status category group failed", append(logger.RequestAttrs(r), "error", err)...)
-				writeIssueTableQueryFailure(w, r, "failed to resolve table group")
-				return resolvedIssueTableGroup{}, false
-			}
-			categoryKeys, err := h.resolveStatusCategoryKeys(r.Context(), workspaceID)
-			if err != nil {
-				slog.Warn("resolve compound status category keys failed", append(logger.RequestAttrs(r), "error", err)...)
 				writeIssueTableQueryFailure(w, r, "failed to resolve table group")
 				return resolvedIssueTableGroup{}, false
 			}
@@ -463,7 +459,11 @@ func (group resolvedIssueTableGroup) descriptor(raw string, count int64, context
 	descriptor := issueTableGroupDescriptorResponse{Count: count}
 	switch group.kind {
 	case "status":
-		if !issueTableContainsString(validIssueStatuses, raw) {
+		// Any non-empty status KEY, not just the 7 built-ins. Since MUL-6243 a
+		// workspace can hold custom statuses, and rejecting one here failed the
+		// WHOLE grouped response with a 500 — one custom status made "group by
+		// status" unusable for the entire workspace.
+		if raw == "" {
 			return descriptor, fmt.Errorf("unexpected status group value %q", raw)
 		}
 		descriptor.Key = "status:" + raw
@@ -601,11 +601,15 @@ func (group resolvedIssueTableGroup) predicate(w http.ResponseWriter, key string
 		return "TRUE", true
 	case "status":
 		const prefix = "status:"
-		if !strings.HasPrefix(key, prefix) || !issueTableContainsString(validIssueStatuses, strings.TrimPrefix(key, prefix)) {
+		status, found := strings.CutPrefix(key, prefix)
+		// A custom status is a valid group here too; the predicate is an exact
+		// key match either way. Length-bounded so an arbitrary blob cannot ride
+		// in as a status key.
+		if !found || status == "" || len(status) > 64 {
 			writeError(w, http.StatusBadRequest, "invalid group_key")
 			return "", false
 		}
-		return fmt.Sprintf("i.status = %s::text", addArg(strings.TrimPrefix(key, prefix))), true
+		return fmt.Sprintf("i.status = %s::text", addArg(status)), true
 	case "status_category":
 		category, ok := parseStatusCategoryGroupKey(key)
 		if !ok {
