@@ -13,7 +13,6 @@ _features
 .kilo
 .idea
 .DS_Store
-.husky
 .vscode
 
 /.dockerignore
@@ -25,10 +24,9 @@ _features
 /CONTRIBUTING.md
 /Dockerfile
 /Dockerfile.web
-/HANDOFF_ARCHITECTURE_AUDIT.md
 /Makefile
 /README.md
-/README.zh-CN.md
+/README.zh.md
 /SELF_HOSTING.md
 /SELF_HOSTING_ADVANCED.md
 /SELF_HOSTING_AI.md
@@ -42,6 +40,7 @@ _features
 /e2e/
 /server/
 /apps/desktop/
+/apps/mobile/
 /scripts/
 
 *.log

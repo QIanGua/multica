@@ -32,7 +32,15 @@ e2e/test-results
 coverage
 
 # Docs
-docs/
+/docs/
+*.md
 
-# Desktop app (not needed for web self-hosting)
-apps/desktop
+# Non-target workspaces
+/apps/desktop/
+/apps/docs/
+/apps/mobile/
+
+# Repository-only tooling
+/.github/
+/deploy/
+/scripts/
