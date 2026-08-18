@@ -4064,29 +4064,98 @@ func TestHermesClientDefersToolUseForPartialStreamedArgs(t *testing.T) {
 	}
 }
 
-func TestACPToolCallArgsSettled(t *testing.T) {
+func TestACPToolCallStartCarriesInvocation(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name     string
+		toolName string
 		argsText string
 		want     bool
 	}{
-		{"empty", "", false},
-		{"whitespace only", "   \n ", false},
-		{"partial json object", `{"comm`, false},
-		{"partial json array", `[{"a":1}`, false},
-		{"complete json object", `{"command":"echo hi"}`, true},
-		{"complete json array", `[1,2]`, true},
-		{"hermes shell text", "$ ls -la", true},
-		{"plain text", "not-json", true},
+		{"hermes terminal command", "terminal", "$ ls -la", true},
+		{"hermes terminal with leading space", "terminal", "  $ go build ./...", true},
+		{"terminal but not a command line", "terminal", "Running the command...", false},
+		{"write_file prose", "write_file", "Preparing write to /tmp/a.txt. Approval prompt shows the diff.", false},
+		{"patch prose", "patch", "Preparing replace edit for /tmp/a.txt. Approval prompt shows the diff.", false},
+		{"web_search summary", "web_search", "Searching the web for golang acp", false},
+		{"kimi streamed json", "Shell", `{"command":"echo hi"}`, false},
+		{"kimi partial json", "Shell", `{"comm`, false},
+		{"empty", "terminal", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := acpToolCallArgsSettled(tt.argsText); got != tt.want {
-				t.Errorf("acpToolCallArgsSettled(%q) = %v, want %v", tt.argsText, got, tt.want)
+			if got := acpToolCallStartCarriesInvocation(tt.toolName, tt.argsText); got != tt.want {
+				t.Errorf("acpToolCallStartCarriesInvocation(%q, %q) = %v, want %v",
+					tt.toolName, tt.argsText, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestHermesClientDoesNotFreezeDisplayTextAsInput is the protocol-level guard.
+//
+// ACP defines `content` as display output produced by the tool call and
+// `rawInput` as the input, and a later update may still supply the real
+// rawInput. Hermes itself does this: write_file's start frame renders
+// "Preparing write to <path>..." with no rawInput. That text must never be
+// recorded as the invocation, and a rawInput arriving later must win.
+func TestHermesClientDoesNotFreezeDisplayTextAsInput(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	// Start frame: display prose only, no rawInput (verbatim Hermes shape).
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"Preparing write to /tmp/hello.txt. Approval prompt shows the diff.","type":"text"},"type":"content"}],"kind":"edit","locations":[{"path":"/tmp/hello.txt"}],"title":"write: /tmp/hello.txt","toolCallId":"tc-w1","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 0 {
+		t.Fatalf("display-only start frame must not emit a tool use, got %+v", got)
+	}
+
+	// Completion carries the real input.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-w1","status":"completed","title":"write: /tmp/hello.txt","kind":"edit","rawInput":{"path":"/tmp/hello.txt","content":"hi"},"content":[{"type":"content","content":{"type":"text","text":"wrote 2 bytes"}}]}}}`)
+
+	if len(got) != 2 || got[0].Type != MessageToolUse || got[1].Type != MessageToolResult {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if path, _ := got[0].Input["path"].(string); path != "/tmp/hello.txt" {
+		t.Errorf("real rawInput must win over display text; Input = %v", got[0].Input)
+	}
+	if text, ok := got[0].Input["text"].(string); ok && strings.Contains(text, "Preparing write") {
+		t.Errorf("display text was frozen as the invocation: %q", text)
+	}
+}
+
+// TestHermesClientDefersNonCommandStartContent: a start frame whose content is
+// not a `$ <command>` line stays deferred even when the text is complete and
+// non-JSON, so a backend that renders a status line cannot have it mistaken for
+// the invocation.
+func TestHermesClientDefersNonCommandStartContent(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"tc","title":"Shell","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"not-json"}}]}}}`)
+
+	if len(got) != 0 {
+		t.Fatalf("non-command start content must stay deferred, got %+v", got)
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc","status":"completed","content":[{"type":"content","content":{"type":"text","text":"output"}}]}}}`)
+
+	if len(got) != 2 || got[0].Type != MessageToolUse {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if text, _ := got[0].Input["text"].(string); text != "not-json" {
+		t.Errorf("deferred fallback Input.text: got %v", got[0].Input)
 	}
 }

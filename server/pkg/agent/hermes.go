@@ -1562,20 +1562,20 @@ func (c *hermesClient) handleToolCallStart(data json.RawMessage) {
 		return
 	}
 
-	// No rawInput: the args, if any, live in the content blocks. Whether we
-	// can emit now depends on whether those args are already complete.
+	// No rawInput: whatever the start frame carries is in the content blocks.
 	argsText := extractACPToolCallText(msg.Content)
 
-	// Hermes puts the whole invocation in the start frame's content (its
-	// terminal tool sends `$ <command>` and never streams more), so deferring
-	// buys nothing and costs the run its only evidence that a tool is running:
-	// nothing at all is emitted until tool_call_update completes. A tool that
-	// stalls then renders as a blank run with no visible tool call — the
+	// Emitting at the start frame is what makes an in-flight tool visible at
+	// all: nothing is otherwise emitted until tool_call_update completes, so a
+	// tool that stalls renders as a blank run with no visible tool call — the
 	// symptom in GH#6583 — and, because the daemon's in-flight tool counter
 	// only advances on MessageToolUse, such a call never gets charged to
 	// AgentToolWatchdog and is judged by the much shorter AgentIdleWatchdog
 	// instead, so a legitimately long tool call is force-stopped early.
-	if acpToolCallArgsSettled(argsText) {
+	//
+	// It is only safe where the content demonstrably IS the invocation, which
+	// ACP does not promise in general — see acpToolCallStartCarriesInvocation.
+	if acpToolCallStartCarriesInvocation(toolName, argsText) {
 		c.trackTool(msg.ToolCallID, &pendingToolCall{
 			toolName: toolName,
 			argsText: argsText,
@@ -1603,31 +1603,29 @@ func (c *hermesClient) handleToolCallStart(data json.RawMessage) {
 	})
 }
 
-// acpToolCallArgsSettled reports whether a tool_call start frame's content
-// already carries the complete tool arguments, so MessageToolUse can be emitted
-// immediately instead of being held until the call completes.
+// acpToolCallStartCarriesInvocation reports whether a tool_call start frame's
+// content can be treated as the call's input, which is the only case where
+// MessageToolUse may be emitted before the call completes.
 //
-// The discriminator is the shape of the text, not the backend, because all nine
-// ACP backends share this client and each may change independently. Kimi streams
-// its args as a JSON object built up token by token, so a mid-stream fragment is
-// always an *unterminated* JSON object or array (`{"comm`). Everything else is
-// as complete as it will ever be: a whole JSON object, or plain text like
-// Hermes' `$ ls -la`. Empty content carries nothing to show and stays deferred.
+// It deliberately recognises exactly one shape: a `terminal` call whose content
+// is the `$ <command>` line. In ACP, `content` is display output produced by the
+// tool call and `rawInput` is the input, and a later update may still supply the
+// real rawInput — so treating arbitrary content as input would both mis-record
+// the invocation and freeze the wrong value before the real one arrives. Hermes
+// suppresses rawInput for its whole "polished" tool set and renders each one
+// differently: `terminal` renders `$ <command>` (the invocation), but
+// `write_file` and `patch` render prose like "Preparing write to <path>", and
+// the browser/web/media tools render their own summaries. Only the terminal
+// rendering is the command itself.
 //
-// Emitting early does not change what the UI renders — parseToolArgsJSON turns
-// the same text into the same Input map the deferred path would have produced at
-// completion time — it only changes when it appears.
-func acpToolCallArgsSettled(argsText string) bool {
-	trimmed := strings.TrimSpace(argsText)
-	if trimmed == "" {
+// Nine ACP backends share this client, so everything else — including Kimi's
+// token-streamed args and any backend whose start frame carries a status line —
+// keeps deferring exactly as before.
+func acpToolCallStartCarriesInvocation(toolName, argsText string) bool {
+	if toolName != "terminal" {
 		return false
 	}
-	// Only a JSON object/array can be a partially-streamed fragment; treat it
-	// as settled once it parses as a complete value.
-	if trimmed[0] == '{' || trimmed[0] == '[' {
-		return json.Valid([]byte(trimmed))
-	}
-	return true
+	return strings.HasPrefix(strings.TrimSpace(argsText), "$ ")
 }
 
 func (c *hermesClient) handleToolCallUpdate(data json.RawMessage) {
@@ -1757,7 +1755,16 @@ func (c *hermesClient) emitDeferredToolUse(
 		input = p.input
 	case p != nil:
 		toolName = p.toolName
-		input = parseToolArgsJSON(p.argsText)
+		// A rawInput on the update is the call's actual input, so it wins over
+		// whatever the start frame rendered into content. ACP lets a start
+		// frame carry only display text ("Preparing write to <path>") and
+		// supply rawInput later; without this the display text would be
+		// recorded as the invocation and the real input silently dropped.
+		if updateRawInput != nil {
+			input = updateRawInput
+		} else {
+			input = parseToolArgsJSON(p.argsText)
+		}
 	default:
 		// No record of the start frame — fall back to the update's own
 		// title/kind/rawInput so the UI at least sees the tool name.
