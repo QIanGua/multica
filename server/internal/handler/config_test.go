@@ -463,9 +463,10 @@ func TestGetConfigExposesEnabledPluginsV1Flag(t *testing.T) {
 	}
 }
 
-// Clients fail closed on this flag: absent means a server that would accept a
-// worktree resource, silently drop execution_mode and run the task in the
-// user's working copy (#7113). So a build that HAS the save gate has to say so,
+// Clients fail closed on this flag: absent covers every server that predates
+// the signal, including the ones that accept a worktree resource, silently drop
+// execution_mode and run the task in the user's working copy (#7113). A build
+// that HAS the save gate therefore has to say so,
 // unconditionally — not behind a deployment check, an env var or a feature
 // flag, all of which would disable worktree mode for the users who can run it.
 func TestGetConfigDeclaresLocalWorktreeSupport(t *testing.T) {

@@ -58,7 +58,7 @@ export function LocalDirectoryHint({
     <div className="mt-3 space-y-1 rounded-md border border-dashed bg-muted/40 px-3 py-2 text-caption text-muted-foreground">
       {matches.map((resource) => {
         const ref = resource.resource_ref;
-        const label = (ref.label || resource.label || ref.local_path).trim() ||
+        const label = (resource.label || ref.label || ref.local_path).trim() ||
           ref.local_path;
         // Anything other than an explicit "worktree" is in_place: the mode is
         // absent on resources created before it existed, and an unknown value

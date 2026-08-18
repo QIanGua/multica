@@ -846,7 +846,7 @@ describe("dashboard + runtime usage schema drift", () => {
 // leaving the task to run in the user's working copy (#7113). So the absent
 // case has to parse as false, not as "unknown, probably fine".
 describe("AppConfigSchema local_worktree_supported drift", () => {
-  it("defaults to false when the server omits it (pre-v0.4.25 servers)", () => {
+  it("defaults to false when the server predates the signal", () => {
     const parsed = AppConfigSchema.parse({ cdn_domain: "cdn.example.com" });
     expect(parsed.local_worktree_supported).toBe(false);
   });

@@ -68,8 +68,11 @@ type AppConfig struct {
 	// it, so `execution_mode: "worktree"` was silently DROPPED and answered
 	// 201 — the resource then ran in_place, editing the working copy the user
 	// asked to isolate, with no gate anywhere to catch it. A new client cannot
-	// tell that from success, so it has to ask first, and absent must read as
-	// "old server": every release that drops the field also omits this one.
+	// tell that from success, so it has to ask first, and absent has to read as
+	// "cannot honour it": every release that drops the field also omits this
+	// one. Releases between that fix and this signal do gate the save but say
+	// nothing, so they are treated the same way — the client cannot distinguish
+	// them, and only one of the two guesses is safe.
 	LocalWorktreeSupported bool `json:"local_worktree_supported"`
 
 	// ServerVersion is the running API build version, so self-hosted

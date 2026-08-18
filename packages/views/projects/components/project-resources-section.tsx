@@ -328,17 +328,22 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
     nextLabel: string,
   ) => {
     const trimmed = nextLabel.trim();
-    const previous = resource.resource_ref.label ?? resource.label ?? "";
+    const previous = localDirectoryLabel(resource);
     if (trimmed === previous.trim()) return;
     try {
+      // Top-level label ONLY — renaming must not resend resource_ref.
+      //
+      // The server replaces the ref wholesale with whatever it can parse, so a
+      // server that predates a ref field drops it and answers 200. On a backend
+      // rolled back below v0.4.25 (documented as supported while the runtimes
+      // stay current) that turned "rename this folder" into "silently forget
+      // this folder was isolated", and the next task edited the working copy
+      // (#7113). Omitting the ref keeps the stored one untouched on every
+      // server version — the same reason it must not be resent for any other
+      // unrelated edit either.
       await updateResource.mutateAsync({
         resourceId: resource.id,
-        data: {
-          resource_ref: {
-            ...resource.resource_ref,
-            label: trimmed,
-          },
-        },
+        data: { label: trimmed },
       });
       toast.success(t(($) => $.resources.toast_local_renamed));
     } catch (err) {
@@ -570,6 +575,22 @@ function worktreeUnavailableReason(
   return undefined;
 }
 
+/**
+ * Display name for a local_directory row.
+ *
+ * Top-level `label` wins over the one inside the ref. Renames write the
+ * top-level column precisely so they never resend the ref (see
+ * handleRenameLocalDirectory), which leaves the ref's older `label` behind on
+ * anything created before that change; reading it second keeps those rows
+ * showing their original name until they are renamed.
+ */
+export function localDirectoryLabel(
+  resource: ProjectResource & { resource_ref: LocalDirectoryResourceRef },
+): string {
+  const ref = resource.resource_ref;
+  return (resource.label || ref.label || ref.local_path).trim();
+}
+
 interface ResourceRowProps {
   resource: ProjectResource;
   localDaemonId: string | null;
@@ -682,8 +703,7 @@ function LocalDirectoryRow({
   const { t } = useT("projects");
   const ref = resource.resource_ref;
   const mode = executionModeOf(ref);
-  const display = (ref.label || resource.label || ref.local_path).trim() ||
-    ref.local_path;
+  const display = localDirectoryLabel(resource) || ref.local_path;
   const isForeignDaemon =
     localDaemonId !== null && ref.daemon_id !== localDaemonId;
   const isLocalUnknown = localDaemonId === null;
