@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { PluginInstallation, PluginSurface } from "@multica/core/types";
 import { cn } from "@multica/ui/lib/utils";
 import { useT } from "../i18n";
@@ -33,24 +33,32 @@ export function PluginSurfaceFrame({ installation, surface, issueId, className }
 
   const entryUrl = useMemo(() => resolveSurfaceEntry(installation, surface), [installation, surface]);
 
-  // Read the tokens off a real element so the frame inherits whatever theme the
-  // app is currently in, rather than a hardcoded copy that drifts.
-  const theme = useMemo(() => readThemeTokens(anchorRef.current), []);
+  // Tokens are read off a mounted element, so the frame inherits whatever theme
+  // the app is actually in rather than a hardcoded copy that drifts. It has to
+  // happen after mount: on first render the ref is still null and the surface
+  // would be built with no theme at all.
+  const [theme, setTheme] = useState<Record<string, string>>({});
+  useEffect(() => setTheme(readThemeTokens(anchorRef.current)), []);
 
-  const document = useMemo(() => {
+  const surfaceDocument = useMemo(() => {
     if (!entryUrl) return null;
     return buildSurfaceDocument({ entryUrl, grantedScopes: installation.granted_scopes, theme });
   }, [entryUrl, installation.granted_scopes, theme]);
 
+  // One bridge per rendered document. srcDoc changing reloads the frame — and
+  // therefore restarts the guest's handshake — so the old bridge is finished:
+  // close() is terminal, and reusing a closed one across a document change is
+  // exactly how the panel ends up permanently blank.
   const bridge = useMemo(
     () => createSurfaceBridge({ installationId: installation.id, issueId, onResize: setHeight }),
-    [installation.id, issueId],
+    [installation.id, issueId, surfaceDocument],
   );
 
-  useEffect(() => () => bridge.close(), [bridge]);
-
-  const onLoad = useCallback(() => {
+  // Arm as soon as the frame element exists. The surface announces itself once
+  // its listener is attached, so there is no load event to race.
+  useEffect(() => {
     if (frameRef.current) bridge.connect(frameRef.current, readThemeTokens(anchorRef.current));
+    return () => bridge.close();
   }, [bridge]);
 
   useEffect(() => {
@@ -63,7 +71,7 @@ export function PluginSurfaceFrame({ installation, surface, issueId, className }
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  if (!document) {
+  if (!surfaceDocument) {
     return (
       <div ref={anchorRef} className={cn("rounded-lg border border-surface-border px-4 py-3 text-caption text-muted-foreground", className)}>
         {/* A local: install has no URL to load a script from — say so instead of
@@ -83,9 +91,8 @@ export function PluginSurfaceFrame({ installation, surface, issueId, className }
       <iframe
         ref={frameRef}
         title={`${installation.name} — ${surface.name}`}
-        srcDoc={document}
+        srcDoc={surfaceDocument}
         sandbox="allow-scripts"
-        onLoad={onLoad}
         className="w-full border-0 bg-transparent"
         style={{ height }}
       />

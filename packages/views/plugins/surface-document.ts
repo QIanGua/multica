@@ -52,12 +52,25 @@ export function readThemeTokens(element: Element | null): Record<string, string>
  */
 export function resolveSurfaceEntry(installation: PluginInstallation, surface: PluginSurface): string | null {
   const source = installation.source_url ?? "";
-  if (!source.startsWith("https://")) return null;
+  let resolved: URL;
   try {
-    return new URL(surface.entry, source).toString();
+    resolved = new URL(surface.entry, source);
   } catch {
+    // A `local:` source is not a URL at all — there is nothing a browser could
+    // fetch, and guessing one would be worse than saying so.
     return null;
   }
+  if (resolved.protocol === "https:") return resolved.toString();
+  // Plain HTTP is allowed only from loopback, matching what browsers already
+  // treat as a secure context. That is what makes developing a surface possible
+  // — serve it from a local static server and install by URL like any other —
+  // without opening plaintext delivery on a real deployment.
+  if (resolved.protocol === "http:" && isLoopbackHost(resolved.hostname)) return resolved.toString();
+  return null;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
 function escapeAttribute(value: string): string {
@@ -90,7 +103,9 @@ export function buildSurfaceCSP(grantedScopes: string[], scriptOrigin: string): 
     // the policy honest if the sandbox attribute is ever loosened.
     "form-action 'none'",
     "base-uri 'none'",
-    "frame-ancestors 'none'",
+    // frame-ancestors is deliberately absent: it is ignored when delivered via
+    // <meta>, and the browser logs a warning for it. Nothing is lost — the
+    // sandbox already denies this document the ability to frame anything.
   ].join("; ");
 }
 

@@ -62,7 +62,9 @@ describe("surface connect-src", () => {
   it("denies everything by default and allows no plugin-controlled framing", () => {
     const csp = buildSurfaceCSP([], "https://example.com");
     expect(csp).toContain("default-src 'none'");
-    expect(csp).toContain("frame-ancestors 'none'");
+    // frame-ancestors is intentionally absent — <meta> ignores it, and the
+    // sandbox already denies this document the ability to frame anything.
+    expect(csp).not.toContain("frame-ancestors");
     expect(csp).toContain("base-uri 'none'");
     expect(csp).toContain("form-action 'none'");
   });
@@ -79,8 +81,23 @@ describe("surface entry resolution", () => {
     expect(resolveSurfaceEntry(installation({ source_url: "local:hello" }), SURFACE)).toBeNull();
   });
 
-  it("refuses a plaintext source", () => {
+  it("refuses a plaintext source on a real host", () => {
     expect(resolveSurfaceEntry(installation({ source_url: "http://example.com/multica.plugin.json" }), SURFACE)).toBeNull();
+  });
+
+  it("allows plain HTTP from loopback so a surface can be developed locally", () => {
+    // Browsers already treat loopback as a secure context. Without this a
+    // plugin author cannot iterate on a surface at all: there is no way to
+    // serve one over HTTPS from a laptop.
+    expect(resolveSurfaceEntry(installation({ source_url: "http://localhost:8787/multica.plugin.json" }), SURFACE))
+      .toBe("http://localhost:8787/ui/main.js");
+    expect(resolveSurfaceEntry(installation({ source_url: "http://127.0.0.1:8787/multica.plugin.json" }), SURFACE))
+      .toBe("http://127.0.0.1:8787/ui/main.js");
+  });
+
+  it("does not treat a hostname that merely contains localhost as loopback", () => {
+    expect(resolveSurfaceEntry(installation({ source_url: "http://localhost.evil.test/multica.plugin.json" }), SURFACE)).toBeNull();
+    expect(resolveSurfaceEntry(installation({ source_url: "http://notlocalhost/multica.plugin.json" }), SURFACE)).toBeNull();
   });
 });
 

@@ -19,7 +19,6 @@ type ActivityLog struct {
 	Action      string             `json:"action"`
 	Details     []byte             `json:"details"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	ViaPluginID pgtype.UUID        `json:"via_plugin_id"`
 }
 
 type Agent struct {

@@ -31,6 +31,17 @@ window.addEventListener("message", (event) => {
   start();
 });
 
+// Announce until the host answers with a port. One announcement is not enough
+// in either direction: this frame can finish executing before the embedder's
+// effect attaches its listener, and a host waiting on the iframe load event can
+// miss that event entirely. Repeating makes the handshake independent of who is
+// ready first — the one ordering neither side controls.
+(function announce(attempts) {
+  if (port || attempts > 50) return;
+  window.parent.postMessage({ type: "multica:plugin-surface-ready" }, "*");
+  setTimeout(() => announce(attempts + 1), 120);
+})(0);
+
 function applyTheme(theme) {
   for (const [name, value] of Object.entries(theme ?? {})) {
     document.documentElement.style.setProperty(name, value);

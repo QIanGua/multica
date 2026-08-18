@@ -15,6 +15,7 @@
 import {
   BRIDGE_INIT_MESSAGE,
   BRIDGE_PROTOCOL_VERSION,
+  BRIDGE_READY_MESSAGE,
   isBridgeEvent,
   isBridgeResponse,
   type BridgeMethod,
@@ -71,6 +72,8 @@ export class MulticaPluginError extends Error {
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+const ANNOUNCE_INTERVAL_MS = 120;
+const ANNOUNCE_ATTEMPTS = 50;
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -94,7 +97,30 @@ class Bridge {
     });
     if (typeof window !== "undefined") {
       window.addEventListener("message", this.onWindowMessage);
+      this.announce();
     }
+  }
+
+  /**
+   * Announces until the host answers with a port.
+   *
+   * One announcement is not enough in either direction: a srcdoc frame can
+   * finish executing before the embedder's effect attaches its listener, and a
+   * host that waits on the iframe load event can miss it entirely. Repeating
+   * until the port arrives makes the handshake independent of who is ready
+   * first, which is the only ordering nobody controls.
+   */
+  private announce() {
+    if (typeof window === "undefined" || !window.parent) return;
+    let attempts = 0;
+    const beat = () => {
+      if (this.port || attempts++ > ANNOUNCE_ATTEMPTS) return;
+      // targetOrigin "*" because this frame has an opaque origin and cannot
+      // know the embedder's. The message carries nothing but the signal.
+      window.parent.postMessage({ type: BRIDGE_READY_MESSAGE }, "*");
+      setTimeout(beat, ANNOUNCE_INTERVAL_MS);
+    };
+    beat();
   }
 
   private onWindowMessage = (event: MessageEvent) => {

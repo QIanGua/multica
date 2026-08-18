@@ -88,6 +88,7 @@ export const PluginConfigFieldSchema = z.object({
   required: z.boolean().default(false),
   options: z.array(z.string()).default([]),
   placeholder: z.string().optional(),
+  multiline: z.boolean().default(false),
 }).loose();
 
 export const PluginSurfaceSchema = z.object({

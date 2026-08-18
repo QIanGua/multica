@@ -17,6 +17,7 @@ import { api } from "@multica/core/api";
 
 const BRIDGE_PROTOCOL_VERSION = 1;
 const BRIDGE_INIT_MESSAGE = "multica:plugin-bridge-init";
+const BRIDGE_READY_MESSAGE = "multica:plugin-surface-ready";
 
 type BridgeMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
@@ -59,7 +60,14 @@ export interface SurfaceBridgeOptions {
 }
 
 export interface SurfaceBridge {
-  /** Hands the frame its port. Call once, after the iframe reports load. */
+  /**
+   * Waits for the surface to announce itself, then hands it a port.
+   *
+   * Driven by the guest rather than by the iframe's load event: a srcdoc frame
+   * can finish loading before React attaches `onLoad`, so a load-driven host
+   * either never fires or sends the port before the guest is listening. Both
+   * failures look the same from outside — a blank panel.
+   */
   connect(frame: HTMLIFrameElement, theme: Record<string, string>): void;
   /** Pushes a theme change to an already-connected frame. */
   pushTheme(theme: Record<string, string>): void;
@@ -69,6 +77,7 @@ export interface SurfaceBridge {
 export function createSurfaceBridge(options: SurfaceBridgeOptions): SurfaceBridge {
   let channel: MessageChannel | null = null;
   let closed = false;
+  const readyListeners: Array<(event: MessageEvent) => void> = [];
 
   const handle = async (request: BridgeRequest, port: MessagePort) => {
     if (request.kind === "ui.resize") {
@@ -102,28 +111,42 @@ export function createSurfaceBridge(options: SurfaceBridgeOptions): SurfaceBridg
 
   return {
     connect(frame, theme) {
-      if (closed || !frame.contentWindow) return;
-      channel?.port1.close();
-      channel = new MessageChannel();
-      channel.port1.onmessage = (event) => {
-        if (!isBridgeRequest(event.data)) return;
-        void handle(event.data, channel!.port1);
+      if (closed) return;
+      const onReady = (event: MessageEvent) => {
+        if ((event.data as { type?: string } | null)?.type !== BRIDGE_READY_MESSAGE) return;
+        // The only check that matters: the signal came from the window this
+        // bridge owns. Origin cannot be used — every sandboxed frame reports
+        // "null" — so identity is the window reference plus, from here on, the
+        // private port.
+        if (!frame.contentWindow || event.source !== frame.contentWindow) return;
+        window.removeEventListener("message", onReady);
+        if (closed) return;
+
+        channel?.port1.close();
+        channel = new MessageChannel();
+        channel.port1.onmessage = (portEvent) => {
+          if (!isBridgeRequest(portEvent.data)) return;
+          void handle(portEvent.data, channel!.port1);
+        };
+        channel.port1.start();
+        // targetOrigin "*" is required, not lax: an opaque origin can never
+        // match a string. The message carries no secret, and the port is
+        // transferred into this specific contentWindow.
+        frame.contentWindow.postMessage(
+          { type: BRIDGE_INIT_MESSAGE, version: BRIDGE_PROTOCOL_VERSION, theme },
+          "*",
+          [channel.port2],
+        );
       };
-      channel.port1.start();
-      // targetOrigin "*" is required, not lax: the frame's origin is opaque, so
-      // there is no origin string that could ever match. The message carries no
-      // secret, and the port is transferred to this specific contentWindow.
-      frame.contentWindow.postMessage(
-        { type: BRIDGE_INIT_MESSAGE, version: BRIDGE_PROTOCOL_VERSION, theme },
-        "*",
-        [channel.port2],
-      );
+      readyListeners.push(onReady);
+      window.addEventListener("message", onReady);
     },
     pushTheme(theme) {
       channel?.port1.postMessage({ kind: "theme", theme });
     },
     close() {
       closed = true;
+      for (const listener of readyListeners.splice(0)) window.removeEventListener("message", listener);
       channel?.port1.close();
       channel = null;
     },

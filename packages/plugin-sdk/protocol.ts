@@ -21,6 +21,18 @@ export const BRIDGE_PROTOCOL_VERSION = 1;
 /** Marks the single window message that carries the port. */
 export const BRIDGE_INIT_MESSAGE = "multica:plugin-bridge-init";
 
+/**
+ * Posted by the surface to its embedder once its message listener is attached.
+ *
+ * The handshake has to start from the guest. A srcdoc frame can finish loading
+ * before the embedder's React `onLoad` handler is even attached, so a host that
+ * connects on load either misses the event entirely or sends the port before
+ * anything is listening for it — both look identical from outside: a blank
+ * panel. The host answers this signal instead, and matches `event.source`
+ * against the iframe it created so another frame cannot claim the port.
+ */
+export const BRIDGE_READY_MESSAGE = "multica:plugin-surface-ready";
+
 export type BridgeInitMessage = {
   type: typeof BRIDGE_INIT_MESSAGE;
   version: number;

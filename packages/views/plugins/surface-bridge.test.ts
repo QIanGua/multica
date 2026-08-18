@@ -12,7 +12,6 @@ import { createSurfaceBridge } from "./surface-bridge";
 function connectedBridge(options: Parameters<typeof createSurfaceBridge>[0] = { installationId: "installation-1" }) {
   const bridge = createSurfaceBridge(options);
   const posted: unknown[] = [];
-  // Stand in for the iframe: capture the transferred port and speak through it.
   const frame = {
     contentWindow: {
       postMessage: (_message: unknown, _origin: string, transfer: MessagePort[]) => {
@@ -24,8 +23,24 @@ function connectedBridge(options: Parameters<typeof createSurfaceBridge>[0] = { 
       },
     },
   } as unknown as HTMLIFrameElement & { port: MessagePort };
+
   bridge.connect(frame, {});
+  // The guest announces itself; the host answers that, not the iframe's load
+  // event. `source` has to be the frame's own window or the host must ignore it.
+  announce(frame.contentWindow as unknown as Window);
   return { bridge, frame, posted };
+}
+
+/**
+ * Fires the surface's readiness signal as if it came from `source`.
+ *
+ * `MessageEvent.source` is getter-only, so it is redefined on the instance. The
+ * host reads it by identity, which is exactly the check being exercised.
+ */
+function announce(source: Window | null) {
+  const event = new MessageEvent("message", { data: { type: "multica:plugin-surface-ready" } });
+  Object.defineProperty(event, "source", { value: source, configurable: true });
+  window.dispatchEvent(event);
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -95,6 +110,23 @@ describe("surface bridge", () => {
     await settle();
 
     expect(heights).toEqual([4000, 0, 320]);
+  });
+
+  it("ignores a readiness signal from a window it does not own", async () => {
+    // Every sandboxed frame reports the opaque origin "null", so the window
+    // reference is the only thing that distinguishes this surface from any
+    // other frame on the page — including a hostile one shouting the signal.
+    const bridge = createSurfaceBridge({ installationId: "installation-1" });
+    let transferred = false;
+    const frame = {
+      contentWindow: { postMessage: () => { transferred = true; } },
+    } as unknown as HTMLIFrameElement;
+    bridge.connect(frame, {});
+    announce({} as Window);
+    await settle();
+
+    expect(transferred).toBe(false);
+    bridge.close();
   });
 
   it("stops answering once closed", async () => {
