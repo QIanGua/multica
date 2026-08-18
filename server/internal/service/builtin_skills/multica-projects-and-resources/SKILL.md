@@ -67,11 +67,13 @@ it back to the default.
 
 Under `in_place` the runtime writes its own files (`.multica/`, `.agent_context/`, the runtime's skills tree) into the
 user's directory for the length of the task, then removes them. When that directory is a git repository, the daemon
-points the agent's git at a task-scoped ignore file (`core.excludesFile`, passed in the agent process's environment
-and stored in daemon scratch) so those paths cannot be swept into a commit by `git add -A`. Nothing is written into
+points the agent's git at a task-scoped ignore file so those paths cannot be swept into a commit by `git add -A`.
+It is delivered through the agent process's environment and stored in daemon scratch, scoped by a conditional
+include to this repository only, so it never applies to another repository the agent visits. Nothing is written into
 the repository or its git metadata: the user's own `git status` is unchanged, sibling worktrees are unaffected, and
-a killed daemon leaves nothing behind. If the directory is a git repository and this protection cannot be
-established, the task fails instead of running unprotected. Paths git already tracks are treated as the user's and
+a killed daemon leaves nothing behind. The protection is applied after the agent's `custom_env` and then verified
+against the final environment; if the directory is a git repository and the protection cannot be established or
+proven, the task fails instead of running unprotected. Paths git already tracks are treated as the user's and
 never rewritten — a repository previously polluted this way keeps its committed copies untouched. Runtimes that can
 take the runtime brief inline receive it that way in this mode, so the repository's own `AGENTS.md` / `CLAUDE.md` is
 left untouched instead of carrying a Multica-managed block (GitHub #7114).

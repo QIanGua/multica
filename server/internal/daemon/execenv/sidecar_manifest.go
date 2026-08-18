@@ -84,14 +84,21 @@ type sidecarManifest struct {
 
 // isReserved reports whether path is one git still tracks, or a directory
 // holding one. Callers treat a reserved path exactly like a pre-existing one.
+//
+// The comparison runs in canonical path space. The reserved set is built from
+// git's output, which is always resolved, while the paths Prepare writes carry
+// whatever spelling the local_directory resource used — a symlinked resource
+// makes those two differ for every entry, and comparing them raw matched
+// nothing at all.
 func (m *sidecarManifest) isReserved(path string) bool {
 	if m == nil || len(m.reserved) == 0 {
 		return false
 	}
-	if _, ok := m.reserved[path]; ok {
+	canonical := canonicalPath(path)
+	if _, ok := m.reserved[canonical]; ok {
 		return true
 	}
-	prefix := path + string(filepath.Separator)
+	prefix := canonical + string(filepath.Separator)
 	for tracked := range m.reserved {
 		if strings.HasPrefix(tracked, prefix) {
 			return true

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -223,6 +224,16 @@ func writeTaskContextMarker(workDir string, ctx TaskContextForEnv, manifest *sid
 		if errors.Is(err, errPathPreExists) {
 			path := filepath.Join(workDir, TaskContextMarkerRelPath)
 			existing, readErr := os.ReadFile(path)
+			if errors.Is(readErr, fs.ErrNotExist) {
+				// Reserved rather than present: git still tracks this path
+				// even though the working tree no longer has it, which is
+				// what a repository polluted by GitHub #7114 looks like.
+				// Writing here would modify a TRACKED file that no ignore
+				// rule can hide, so the marker degrades to absent — the same
+				// outcome the other Multica-only namespaces take when their
+				// path is not ours to write.
+				return nil
+			}
 			if readErr != nil {
 				return fmt.Errorf("read existing task context marker: %w", readErr)
 			}

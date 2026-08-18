@@ -51,13 +51,17 @@ func TestGitExcludesHideSidecarsFromTheAgent(t *testing.T) {
 	agentCtx := mkSidecarDir(t, repo, ".agent_context")
 	multicaDir := mkSidecarDir(t, repo, ".multica")
 
-	gitEnvVars, err := PrepareGitExcludes(envRoot, repo, []string{skills, agentCtx, multicaDir})
+	prot, err := PrepareGitExcludes(envRoot, repo, []string{skills, agentCtx, multicaDir})
 	if err != nil {
 		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
-	if len(gitEnvVars) == 0 {
-		t.Fatal("a git repository must produce excludes env")
+	if prot == nil || len(prot.Env) == 0 {
+		t.Fatal("a git repository must produce protection env")
 	}
+	if err := prot.Verify(prot.Env); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	gitEnvVars := prot.Env
 
 	if status := gitEnv(t, repo, gitEnvVars, "status", "--porcelain"); status != "" {
 		t.Errorf("sidecars still visible to the agent's git:\n%s", status)
@@ -114,7 +118,7 @@ func TestGitExcludesDoNotLeakIntoSiblingWorktrees(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(otherWork, "real-output.md"), "the other task's work\n")
 
-	gitEnvVars, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
+	prot, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
 	if err != nil {
 		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
@@ -126,7 +130,7 @@ func TestGitExcludesDoNotLeakIntoSiblingWorktrees(t *testing.T) {
 	if staged := gitRun(t, sibling, "diff", "--cached", "--name-only"); !strings.Contains(staged, "real-output.md") {
 		t.Errorf("the sibling worktree could not stage its own output; staged:\n%s", staged)
 	}
-	_ = gitEnvVars
+	_ = prot
 }
 
 // Elon review, must-fix 3. A local_directory resource keeps the path the user
@@ -146,10 +150,11 @@ func TestGitExcludesThroughASymlinkedResourcePath(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(sidecar, "marker.json"), "{}\n")
 
-	gitEnvVars, err := PrepareGitExcludes(envRoot, link, []string{sidecar})
+	prot, err := PrepareGitExcludes(envRoot, link, []string{sidecar})
 	if err != nil {
 		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
+	gitEnvVars := prot.Env
 	if status := gitEnv(t, link, gitEnvVars, "status", "--porcelain"); status != "" {
 		t.Errorf("sidecar reached through a symlinked resource path is unprotected:\n%s", status)
 	}
@@ -189,12 +194,12 @@ func TestGitExcludesNoOpOutsideGitRepo(t *testing.T) {
 	envRoot := t.TempDir()
 	sidecar := mkSidecarDir(t, dir, ".multica")
 
-	gitEnvVars, err := PrepareGitExcludes(envRoot, dir, []string{sidecar})
+	prot, err := PrepareGitExcludes(envRoot, dir, []string{sidecar})
 	if err != nil {
 		t.Fatalf("a plain folder must be a no-op, got: %v", err)
 	}
-	if gitEnvVars != nil {
-		t.Errorf("a plain folder must produce no env, got %v", gitEnvVars)
+	if prot != nil {
+		t.Errorf("a plain folder must produce no protection, got %v", prot.Env)
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".git")); !os.IsNotExist(err) {
 		t.Errorf("must not create a git repository in the user's plain folder")
@@ -206,17 +211,27 @@ func TestGitExcludesNoOpOutsideGitRepo(t *testing.T) {
 func TestGitExcludesPreserveTheUsersGlobalIgnores(t *testing.T) {
 	repo := newTestRepo(t)
 	envRoot := t.TempDir()
-	globalIgnore := filepath.Join(t.TempDir(), "global_ignore")
+	// Set it where a user actually would — their GLOBAL config — not in the
+	// repository. A repo-local core.excludesFile outranks anything a global
+	// config can say, including ours; Verify is what turns that into a failed
+	// task rather than a silently unprotected run.
+	xdg := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(xdg, "git"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	globalIgnore := filepath.Join(xdg, "git", "ignore")
 	writeFile(t, globalIgnore, "*.scratch\n")
-	gitRun(t, repo, "config", "core.excludesFile", globalIgnore)
+	writeFile(t, filepath.Join(xdg, "git", "config"), "[core]\n\texcludesFile = "+globalIgnore+"\n")
+	t.Setenv("XDG_CONFIG_HOME", xdg)
 
 	sidecar := mkSidecarDir(t, repo, ".multica")
 	writeFile(t, filepath.Join(repo, "notes.scratch"), "personal\n")
 
-	gitEnvVars, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
+	prot, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
 	if err != nil {
 		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
+	gitEnvVars := prot.Env
 	if status := gitEnv(t, repo, gitEnvVars, "status", "--porcelain"); status != "" {
 		t.Errorf("the user's own global ignores stopped applying for the agent:\n%s", status)
 	}
@@ -230,10 +245,11 @@ func TestGitExcludePatternsAnchorAtRepoRoot(t *testing.T) {
 	sidecar := mkSidecarDir(t, repo, ".multica")
 	mkSidecarDir(t, repo, "docs/.multica")
 
-	gitEnvVars, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
+	prot, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
 	if err != nil {
 		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
+	gitEnvVars := prot.Env
 	// -uall so git lists files individually; the default collapses a wholly
 	// untracked directory to "docs/" and would hide what is being asserted.
 	status := gitEnv(t, repo, gitEnvVars, "status", "--porcelain", "-uall")
@@ -253,10 +269,11 @@ func TestGitExcludesFromRepoSubdirectory(t *testing.T) {
 	}
 	sidecar := mkSidecarDir(t, repo, "packages/api/.multica")
 
-	gitEnvVars, err := PrepareGitExcludes(envRoot, sub, []string{sidecar})
+	prot, err := PrepareGitExcludes(envRoot, sub, []string{sidecar})
 	if err != nil {
 		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
+	gitEnvVars := prot.Env
 	if status := gitEnv(t, repo, gitEnvVars, "status", "--porcelain"); status != "" {
 		t.Errorf("sidecar in a subdirectory still visible to the agent:\n%s", status)
 	}
@@ -300,7 +317,10 @@ func TestGitTrackedFilesUnderFindsCommittedThenDeletedSidecars(t *testing.T) {
 		t.Fatalf("precondition: the directory should be gone from disk")
 	}
 
-	tracked := GitTrackedFilesUnder(repo, []string{filepath.Join(repo, ".grok", "skills")})
+	tracked, err := GitTrackedFilesUnder(repo, []string{filepath.Join(repo, ".grok", "skills")})
+	if err != nil {
+		t.Fatalf("GitTrackedFilesUnder: %v", err)
+	}
 	if len(tracked) == 0 {
 		t.Fatal("a committed-then-deleted sidecar must still be reported as tracked")
 	}
@@ -316,11 +336,13 @@ func TestGitTrackedFilesUnderFindsCommittedThenDeletedSidecars(t *testing.T) {
 
 func TestGitTrackedFilesUnderIsEmptyForACleanRepo(t *testing.T) {
 	repo := newTestRepo(t)
-	if tracked := GitTrackedFilesUnder(repo, []string{filepath.Join(repo, ".multica")}); len(tracked) != 0 {
-		t.Errorf("a repo that never carried sidecars must report none, got %v", tracked)
+	tracked, err := GitTrackedFilesUnder(repo, []string{filepath.Join(repo, ".multica")})
+	if err != nil || len(tracked) != 0 {
+		t.Errorf("a repo that never carried sidecars must report none, got %v (err %v)", tracked, err)
 	}
-	if tracked := GitTrackedFilesUnder(t.TempDir(), []string{"anything"}); len(tracked) != 0 {
-		t.Errorf("a non-git folder must report none, got %v", tracked)
+	tracked, err = GitTrackedFilesUnder(t.TempDir(), []string{"anything"})
+	if err != nil || len(tracked) != 0 {
+		t.Errorf("a non-git folder must report none, got %v (err %v)", tracked, err)
 	}
 }
 
@@ -381,5 +403,172 @@ func TestExcludablePathsKeepsUserOwnedParentsVisible(t *testing.T) {
 		if filepath.Base(filepath.Dir(p)) != "skills" {
 			t.Errorf("path %q escaped up into a directory the user owns", p)
 		}
+	}
+}
+
+// Elon review round 2, must-fix 1. The protection rides in the agent's
+// environment, which is assembled from several layers — an operator's
+// custom_env among them. Reasoning about precedence is not enough, so Verify
+// asks git directly, with the exact environment the child will get.
+func TestVerifyRejectsAnEnvironmentThatDisarmsTheProtection(t *testing.T) {
+	repo := newTestRepo(t)
+	envRoot := t.TempDir()
+	sidecar := mkSidecarDir(t, repo, ".multica")
+
+	prot, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
+	if err != nil {
+		t.Fatalf("PrepareGitExcludes: %v", err)
+	}
+	if err := prot.Verify(prot.Env); err != nil {
+		t.Fatalf("the untampered environment must verify: %v", err)
+	}
+
+	// git's own GIT_CONFIG_* entries outrank config files, so this wins over
+	// our includeIf no matter which layer applied last.
+	for _, tampered := range []map[string]string{
+		{"GIT_CONFIG_GLOBAL": filepath.Join(t.TempDir(), "empty")},
+		{"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.excludesFile", "GIT_CONFIG_VALUE_0": filepath.Join(t.TempDir(), "nothing")},
+	} {
+		env := map[string]string{}
+		for k, v := range prot.Env {
+			env[k] = v
+		}
+		for k, v := range tampered {
+			env[k] = v
+		}
+		if err := prot.Verify(env); !errors.Is(err, ErrGitExcludesUnprotected) {
+			t.Errorf("Verify accepted a disarmed environment %v, got err=%v", tampered, err)
+		}
+	}
+}
+
+// Pre-existing GIT_CONFIG_* tuples set by the daemon or the user must survive:
+// the protection no longer claims index 0, so nothing it does can displace them.
+func TestGitExcludesPreserveExistingGitConfigTuples(t *testing.T) {
+	repo := newTestRepo(t)
+	envRoot := t.TempDir()
+	sidecar := mkSidecarDir(t, repo, ".multica")
+
+	prot, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
+	if err != nil {
+		t.Fatalf("PrepareGitExcludes: %v", err)
+	}
+	for k := range prot.Env {
+		if strings.HasPrefix(k, "GIT_CONFIG_COUNT") || strings.HasPrefix(k, "GIT_CONFIG_KEY_") || strings.HasPrefix(k, "GIT_CONFIG_VALUE_") {
+			t.Fatalf("the protection must not claim GIT_CONFIG_* tuple slots, got %q", k)
+		}
+	}
+
+	env := map[string]string{
+		"GIT_CONFIG_COUNT":   "1",
+		"GIT_CONFIG_KEY_0":   "user.name",
+		"GIT_CONFIG_VALUE_0": "Pre Existing",
+	}
+	for k, v := range prot.Env {
+		env[k] = v
+	}
+	if err := prot.Verify(env); err != nil {
+		t.Errorf("an unrelated pre-existing tuple must not break the protection: %v", err)
+	}
+	if got := gitEnv(t, repo, env, "config", "--get", "user.name"); got != "Pre Existing" {
+		t.Errorf("pre-existing tuple lost: user.name = %q", got)
+	}
+}
+
+// Elon review round 2, must-fix 2. core.excludesFile is process-global, so an
+// agent that steps into a DIFFERENT repository mid-task would have had the
+// same patterns applied there — hiding that repository's genuine files from
+// its own `git add -A`. The conditional include confines them to this repo.
+func TestGitExcludesDoNotReachAnotherRepositoryTheAgentVisits(t *testing.T) {
+	repo := newTestRepo(t)
+	envRoot := t.TempDir()
+	sidecar := mkSidecarDir(t, repo, ".multica")
+
+	other := newTestRepo(t)
+	otherWork := mkSidecarDir(t, other, ".multica")
+	writeFile(t, filepath.Join(otherWork, "genuine.json"), "the agent's real work\n")
+
+	prot, err := PrepareGitExcludes(envRoot, repo, []string{sidecar})
+	if err != nil {
+		t.Fatalf("PrepareGitExcludes: %v", err)
+	}
+
+	// Same agent environment, second repository.
+	if status := gitEnv(t, other, prot.Env, "status", "--porcelain", "-uall"); !strings.Contains(status, "genuine.json") {
+		t.Errorf("the other repository's real files were hidden by this task's patterns; status:\n%s", status)
+	}
+	gitEnv(t, other, prot.Env, "add", "-A")
+	if staged := gitEnv(t, other, prot.Env, "diff", "--cached", "--name-only"); !strings.Contains(staged, "genuine.json") {
+		t.Errorf("the other repository could not stage its own files; staged:\n%s", staged)
+	}
+	// And the target repository is still protected.
+	if status := gitEnv(t, repo, prot.Env, "status", "--porcelain"); status != "" {
+		t.Errorf("target repository unprotected:\n%s", status)
+	}
+}
+
+// Elon review round 2, must-fix 3. The tracked-path scan runs BEFORE any
+// sidecar exists, so its inputs are paths EvalSymlinks cannot resolve. Falling
+// back to the raw path there skipped the scan entirely for a symlinked
+// resource, and isReserved then compared unresolved paths against git's
+// resolved output.
+func TestTrackedSidecarsAreFoundThroughASymlinkedResourcePath(t *testing.T) {
+	repo := newTestRepo(t)
+	mkSidecarDir(t, repo, ".grok/skills/multica-squads")
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-m", "the bug: sidecars committed")
+	if err := os.RemoveAll(filepath.Join(repo, ".grok")); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+
+	link := filepath.Join(t.TempDir(), "repo-link")
+	if err := os.Symlink(repo, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	// Roots as Prepare builds them: through the link, and not yet on disk.
+	tracked, err := GitTrackedFilesUnder(link, SidecarScanRoots(link, "grok"))
+	if err != nil {
+		t.Fatalf("GitTrackedFilesUnder: %v", err)
+	}
+	if len(tracked) == 0 {
+		t.Fatal("the scan missed committed sidecars reached through a symlinked resource path")
+	}
+
+	// And the reservation must match the unresolved path Prepare would write.
+	m := &sidecarManifest{reserved: tracked}
+	if !m.isReserved(filepath.Join(link, ".grok", "skills", "multica-squads")) {
+		t.Errorf("isReserved failed to match the unresolved write path against git's resolved output")
+	}
+}
+
+// SidecarScanRoots is the scan's coverage: a sidecar target missing from it is
+// a path the scan cannot protect.
+func TestSidecarScanRootsCoverEverySidecarTarget(t *testing.T) {
+	workDir := t.TempDir()
+	roots := SidecarScanRoots(workDir, "cursor")
+
+	for _, want := range []string{".agent_context", ".multica", ".cursor", reasonixProjectConfigFile} {
+		found := false
+		for _, r := range roots {
+			if filepath.Base(r) == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("scan roots miss %q; a sidecar written there could not be protected", want)
+		}
+	}
+	// The provider's own skills tree has to be in there too.
+	skills := canonicalPath(skillsDirPath(workDir, "cursor"))
+	found := false
+	for _, r := range roots {
+		if r == skills {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("scan roots miss the runtime skills dir %q", skills)
 	}
 }

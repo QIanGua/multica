@@ -43,10 +43,14 @@ func TestPrepareInPlaceKeepsRepositoryCleanForGitAddAll(t *testing.T) {
 	}
 
 	// What the daemon does with SidecarPaths once Prepare hands them over.
-	gitEnvVars, err := PrepareGitExcludes(env.RootDir, repo, env.SidecarPaths)
+	prot, err := PrepareGitExcludes(env.RootDir, repo, env.SidecarPaths)
 	if err != nil {
 		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
+	if err := prot.Verify(prot.Env); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	gitEnvVars := prot.Env
 
 	if status := gitEnv(t, repo, gitEnvVars, "status", "--porcelain"); status != "" {
 		t.Errorf("runtime files still visible to the agent's git:\n%s", status)
@@ -95,8 +99,20 @@ func TestPrepareInPlaceDoesNotRewriteCommittedThenDeletedSidecars(t *testing.T) 
 	if err := CleanupSidecars(firstEnv.RootDir); err != nil {
 		t.Fatalf("CleanupSidecars: %v", err)
 	}
-	gitRun(t, repo, "add", "-A")
-	gitRun(t, repo, "commit", "-m", "the bug: runtime files deleted again")
+	// Deliberately NOT committing the deletion. That is the state the bug
+	// leaves behind and the one that matters: the paths are gone from the
+	// working tree but still in the index, so os.Lstat calls them free while
+	// git calls them tracked. Committing the removal here would drop them from
+	// the index and quietly stop testing anything.
+	stillTracked := gitRun(t, repo, "ls-files", "--", ".multica", ".agent_context")
+	if stillTracked == "" {
+		t.Fatal("precondition: the sidecars should still be tracked after cleanup")
+	}
+	for _, rel := range strings.Split(stillTracked, "\n") {
+		if _, err := os.Stat(filepath.Join(repo, filepath.FromSlash(rel))); !os.IsNotExist(err) {
+			t.Fatalf("precondition: %s should be gone from the working tree but still tracked", rel)
+		}
+	}
 
 	// A later task on the same repository.
 	secondEnv, err := Prepare(PrepareParams{
@@ -114,14 +130,29 @@ func TestPrepareInPlaceDoesNotRewriteCommittedThenDeletedSidecars(t *testing.T) 
 	if err != nil {
 		t.Fatalf("second Prepare: %v", err)
 	}
-	gitEnvVars, err := PrepareGitExcludes(secondEnv.RootDir, repo, secondEnv.SidecarPaths)
+	prot, err := PrepareGitExcludes(secondEnv.RootDir, repo, secondEnv.SidecarPaths)
 	if err != nil {
 		t.Fatalf("PrepareGitExcludes: %v", err)
 	}
+	gitEnvVars := prot.Env
 
 	gitEnv(t, repo, gitEnvVars, "add", "-A")
-	if staged := gitEnv(t, repo, gitEnvVars, "diff", "--cached", "--name-only"); staged != "" {
-		t.Errorf("the injection loop is still armed on an already-polluted repo; staged:\n%s", staged)
+	// Deletions of the previously-committed copies are the damage this test
+	// set up; what must not appear is Multica content being added or modified
+	// again, because that is the loop re-arming.
+	for _, line := range strings.Split(gitEnv(t, repo, gitEnvVars, "diff", "--cached", "--name-status"), "\n") {
+		if line == "" || strings.HasPrefix(line, "D\t") {
+			continue
+		}
+		t.Errorf("the injection loop is still armed on an already-polluted repo; staged: %s", line)
+	}
+
+	// And Prepare must have refused the tracked paths outright rather than
+	// recreating them on disk.
+	for _, rel := range []string{".multica/daemon_task_context.json", ".agent_context/issue_context.md"} {
+		if _, err := os.Stat(filepath.Join(repo, filepath.FromSlash(rel))); !os.IsNotExist(err) {
+			t.Errorf("%s was rewritten at a path git still tracks (stat err: %v)", rel, err)
+		}
 	}
 }
 

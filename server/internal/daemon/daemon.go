@@ -6798,10 +6798,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// GitHub #7114 reported, so launching the agent anyway would make the
 	// guarantee advisory. A plain (non-git) folder returns no env and no
 	// error, and keeps running: there is nothing there to protect.
-	var gitExcludeEnv map[string]string
+	var gitProtection *execenv.GitProtection
 	if env.LocalDirectory {
 		var excErr error
-		gitExcludeEnv, excErr = execenv.PrepareGitExcludes(env.RootDir, env.WorkDir, gitExcludePaths)
+		gitProtection, excErr = execenv.PrepareGitExcludes(env.RootDir, env.WorkDir, gitExcludePaths)
 		if excErr != nil {
 			return TaskResult{}, fmt.Errorf("prepare git excludes: %w", excErr)
 		}
@@ -6855,11 +6855,6 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	// Point Codex to the per-task CODEX_HOME so it discovers skills natively
 	// without polluting the system ~/.codex/skills/.
-	// Task-scoped core.excludesFile pointing at daemon scratch, so the agent's
-	// own git ignores the runtime's sidecars (see PrepareGitExcludes).
-	for k, v := range gitExcludeEnv {
-		agentEnv[k] = v
-	}
 	if env.CodexHome != "" {
 		agentEnv["CODEX_HOME"] = env.CodexHome
 	}
@@ -6904,6 +6899,22 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		agentCustomEnv = task.Agent.CustomEnv
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
+
+	// Applied AFTER custom_env, and then proven. This protects the user's
+	// repository from the runtime's own files (GitHub #7114), so an operator
+	// env entry must not be able to switch it off — and "applied last" is not
+	// sufficient on its own, because git's own GIT_CONFIG_* entries outrank
+	// config files and a single GIT_CONFIG_COUNT=0 would still win. Verify
+	// asks git, with this exact environment, whether a sidecar is actually
+	// ignored; anything else fails the task before the agent starts.
+	if gitProtection != nil {
+		for k, v := range gitProtection.Env {
+			agentEnv[k] = v
+		}
+		if err := gitProtection.Verify(agentEnv); err != nil {
+			return TaskResult{}, fmt.Errorf("verify git excludes: %w", err)
+		}
+	}
 	if provider == "reasonix" {
 		reasonixStateHome, err := prepareReasonixTaskStateHome(d.cfg.Profile, task.RuntimeID, task.AgentID)
 		if err != nil {

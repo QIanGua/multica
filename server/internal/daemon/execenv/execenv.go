@@ -478,11 +478,15 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// as the user's — skills route around them, Multica-only markers degrade
 	// to absent — rather than modifying a tracked file no ignore rule can hide.
 	if params.LocalWorkDir != "" {
-		manifest.reserved = GitTrackedFilesUnder(workDir, []string{
-			filepath.Join(workDir, ".multica"),
-			filepath.Join(workDir, ".agent_context"),
-			skillsDirPath(workDir, params.Provider),
-		})
+		reserved, trackedErr := GitTrackedFilesUnder(workDir, SidecarScanRoots(workDir, params.Provider))
+		if trackedErr != nil {
+			// Fail closed. An empty result is indistinguishable from "this
+			// repository is clean", and assuming clean is what re-arms the
+			// injection loop on a repository that already carries committed
+			// sidecars.
+			return nil, fmt.Errorf("execenv: %w", trackedErr)
+		}
+		manifest.reserved = reserved
 	}
 
 	if err := writeContextFiles(workDir, params.Provider, params.Task, manifest); err != nil {
