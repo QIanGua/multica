@@ -128,6 +128,7 @@
     "mode_worktree_needs_git": "这个文件夹不是 git 仓库，分支无处可放。请选择一个仓库，或者继续直接修改这个文件夹。",
     "mode_worktree_needs_upgrade": "这个文件夹所在机器上的 Multica 不支持并行运行。在那台机器上升级 Multica 后即可开启。",
     "mode_worktree_needs_server_upgrade": "当前工作区的 Multica 服务端版本低于 v{{min}}，无法识别那台机器是否支持并行运行。升级服务端后即可开启。",
+    "mode_worktree_needs_reregister": "那台机器上的 Multica 是在服务端能够记录能力之前登记的。在那台机器上重启 Multica 让它重新登记后即可开启。",
     "mode_cancel": "取消",
     "mode_save": "保存",
     "mode_add": "添加文件夹",

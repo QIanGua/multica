@@ -18,16 +18,18 @@ import { useT } from "../../i18n/use-t";
 /**
  * Why the worktree option may be unavailable. Each case needs different copy
  * because each is fixed somewhere else: `not_git` by choosing a different
- * folder, `daemon_outdated` by updating the app on that machine, and
+ * folder, `daemon_outdated` by updating the app on that machine,
  * `server_outdated` by upgrading the (self-hosted) backend — which no amount of
- * updating that machine will fix.
+ * updating that machine will fix — and `runtime_stale` by getting that machine
+ * to register again with a backend that has since been upgraded.
  *
  * `undefined` means available.
  */
 export type WorktreeUnavailableReason =
   | "not_git"
   | "daemon_outdated"
-  | "server_outdated";
+  | "server_outdated"
+  | "runtime_stale";
 
 interface LocalDirectoryModeDialogProps {
   open: boolean;
@@ -157,10 +159,12 @@ export function LocalDirectoryModeOptions({
         identifier="worktree"
         selected={value === "worktree"}
         disabled={worktreeDisabled}
-        // No version numbers in any of this copy. Nothing gates on a version
+        // No DAEMON version numbers in any of this copy. Nothing gates on one
         // any more (MUL-5707), so quoting the floor told a user running the
         // newest release that they needed an older one (#7113); the server's
-        // own 422 was rewritten the same way.
+        // own 422 was rewritten the same way. The backend floor below is a
+        // different thing: it is the number the operator upgrades past, and it
+        // is checked against the live server, not guessed from a runtime row.
         disabledReason={
           unavailableReason === "not_git"
             ? t(($) => $.resources.mode_worktree_needs_git)
@@ -168,9 +172,11 @@ export function LocalDirectoryModeOptions({
               ? t(($) => $.resources.mode_worktree_needs_server_upgrade, {
                   min: MIN_CAPABILITY_AWARE_SERVER_VERSION,
                 })
-              : unavailableReason === "daemon_outdated"
-                ? t(($) => $.resources.mode_worktree_needs_upgrade)
-                : undefined
+              : unavailableReason === "runtime_stale"
+                ? t(($) => $.resources.mode_worktree_needs_reregister)
+                : unavailableReason === "daemon_outdated"
+                  ? t(($) => $.resources.mode_worktree_needs_upgrade)
+                  : undefined
         }
         onSelect={() => onChange("worktree")}
       />

@@ -71,6 +71,7 @@ import {
   localWorktreeSupport,
   runtimeListOptions,
 } from "@multica/core/runtimes";
+import { useConfigStore } from "@multica/core/config";
 import type { LocalDirectoryExecutionMode } from "@multica/core/types";
 import { LocalDirectoryModeOptions } from "../projects/components/local-directory-mode-dialog";
 
@@ -210,15 +211,20 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
   // with no worktree implementation (MUL-5707). A backend too old to record the
   // capability at all is its own answer — blaming this machine for that sent a
   // user off to update the one piece already on the newest release (#7113).
-  const localWorktree = localWorktreeSupport(runtimes, daemonStatus.daemonId);
+  // Asked of the live backend: a runtime row written before the server learned
+  // to record capabilities would otherwise keep reporting it as stale forever.
+  const serverVersion = useConfigStore((state) => state.serverVersion);
+  const localWorktree = localWorktreeSupport(runtimes, daemonStatus.daemonId, serverVersion);
   const worktreeUnavailableReason =
     localIsGitRepo === false
       ? ("not_git" as const)
       : localWorktree === "server_capability_blind"
         ? ("server_outdated" as const)
-        : localWorktree === "daemon_unsupported"
-          ? ("daemon_outdated" as const)
-          : undefined;
+        : localWorktree === "runtime_registration_stale"
+          ? ("runtime_stale" as const)
+          : localWorktree === "daemon_unsupported"
+            ? ("daemon_outdated" as const)
+            : undefined;
   // Preselection, not a default behavior change: when the folder is a git repo
   // and the runtime can actually run worktree mode, parallel is the better fit,
   // so it starts selected — visibly, in a control the user can flip in one

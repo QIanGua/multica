@@ -100,12 +100,22 @@ describe("LocalDirectoryModeDialog", () => {
   // floor told a user on v0.4.28 they needed v0.4.24 or newer. Any version
   // number in this copy is a regression, whichever blocker fired.
   it("never quotes a daemon version at the user", () => {
-    for (const reason of ["daemon_outdated", "server_outdated"] as const) {
+    for (const reason of ["daemon_outdated", "server_outdated", "runtime_stale"] as const) {
       const { unmount } = renderDialog({ unavailableReason: reason });
       expect(screen.queryByText(/0\.4\.24/)).toBeNull();
       expect(screen.queryByText(/an older version/i)).toBeNull();
       unmount();
     }
+  });
+
+  // Neither half is broken here: the backend has been upgraded, the row just
+  // predates it. Telling this user to upgrade anything would be a dead end.
+  it("asks for a re-register when only the stored row is stale", () => {
+    renderDialog({ unavailableReason: "runtime_stale" });
+
+    expect(worktreeOption().hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(/Restart Multica there/i)).toBeTruthy();
+    expect(screen.queryByText(/Multica server is older/i)).toBeNull();
   });
 
   // The remedy is on the backend, and no amount of updating the machine can

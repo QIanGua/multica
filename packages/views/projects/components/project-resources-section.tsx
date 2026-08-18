@@ -31,6 +31,7 @@ import {
   localWorktreeSupport,
   runtimeListOptions,
 } from "@multica/core/runtimes";
+import { useConfigStore } from "@multica/core/config";
 import type { LocalWorktreeSupport } from "@multica/core/runtimes";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
@@ -143,8 +144,11 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
   // see localWorktreeSupport for why an any-match would keep saying yes after a
   // downgrade, and why "no capability recorded" is a distinct answer from "this
   // daemon cannot do it".
+  // The live backend, not the runtime row: a row written before the server
+  // learned to record capabilities keeps saying so long after the upgrade.
+  const serverVersion = useConfigStore((state) => state.serverVersion);
   const worktreeSupport = (daemonId: string | null) =>
-    localWorktreeSupport(runtimes, daemonId);
+    localWorktreeSupport(runtimes, daemonId, serverVersion);
 
   const attachedUrls = new Set(
     resources.filter(isGithubRef).map((r) => r.resource_ref.url),
@@ -561,6 +565,7 @@ function worktreeUnavailableReason(
 ): WorktreeUnavailableReason | undefined {
   if (isGitRepo === false) return "not_git";
   if (support === "server_capability_blind") return "server_outdated";
+  if (support === "runtime_registration_stale") return "runtime_stale";
   if (support === "daemon_unsupported") return "daemon_outdated";
   return undefined;
 }

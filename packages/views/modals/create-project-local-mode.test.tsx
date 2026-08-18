@@ -87,6 +87,13 @@ vi.mock("@multica/core/projects", () => ({
     }),
 }));
 
+// The worktree gate asks the live backend, not the stored runtime row.
+let serverVersion = "";
+vi.mock("@multica/core/config", () => ({
+  useConfigStore: (selector: (state: { serverVersion: string }) => unknown) =>
+    selector({ serverVersion }),
+}));
+
 vi.mock("@multica/core/hooks", () => ({ useWorkspaceId: () => "workspace-1" }));
 vi.mock("@multica/core/paths", () => ({
   useCurrentWorkspace: () => ({ id: "workspace-1", slug: "ws", repos: [] }),
@@ -172,6 +179,7 @@ describe("CreateProjectModal — local directory execution mode", () => {
     createProjectMock.mockClear();
     runtimeCliVersion = "9.9.9";
     runtimeWorktreeMetadata = "advertised";
+    serverVersion = "";
     pickedIsGitRepo = true;
   });
 
@@ -280,10 +288,12 @@ describe("CreateProjectModal — local directory execution mode", () => {
 
   // Self-hosted skew: Desktop ships its own renderer and daemon and updates
   // both, so it routinely runs ahead of a hand-upgraded backend. The daemon is
-  // fine here — the backend simply never recorded what it advertised.
-  it("blames the backend when the server recorded no capabilities at all", async () => {
+  // fine here — the backend never recorded what it advertised, and says so
+  // itself via /api/config.
+  it("blames the backend when the running server predates the handshake", async () => {
     runtimeWorktreeMetadata = "server_recorded_nothing";
     runtimeCliVersion = "v0.4.28";
+    serverVersion = "0.4.24";
     const user = userEvent.setup();
     renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
 
@@ -293,6 +303,22 @@ describe("CreateProjectModal — local directory execution mode", () => {
     expect(screen.getByText(/Multica server is older/i)).toBeInTheDocument();
     // Telling this user to update the machine is the bug: it is already newest.
     expect(screen.queryByText(/Update Multica there/i)).not.toBeInTheDocument();
+  });
+
+  // Same stored row, backend since upgraded. Upgrading it again fixes nothing —
+  // the row simply predates the upgrade, so the machine has to register again.
+  it("asks for a re-register when the backend is current but the row is old", async () => {
+    runtimeWorktreeMetadata = "server_recorded_nothing";
+    runtimeCliVersion = "v0.4.28";
+    serverVersion = "0.4.28";
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+
+    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).toBeDisabled();
+    expect(screen.getByText(/Restart Multica there/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Multica server is older/i)).not.toBeInTheDocument();
   });
 
   it("blocks parallel mode for a folder that is not a git repository", async () => {

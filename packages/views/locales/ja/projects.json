@@ -128,6 +128,7 @@
     "mode_worktree_needs_git": "このフォルダは git リポジトリではないため、ブランチを作成できません。リポジトリを選ぶか、フォルダを直接編集してください。",
     "mode_worktree_needs_upgrade": "このフォルダがあるマシンの Multica は並行実行に対応していません。そのマシンで Multica を更新してから有効にしてください。",
     "mode_worktree_needs_server_upgrade": "このワークスペースの Multica サーバーが v{{min}} より古いため、そのマシンが並行実行に対応しているか判定できません。サーバーを更新してから有効にしてください。",
+    "mode_worktree_needs_reregister": "このフォルダがあるマシンの Multica は、サーバーが対応状況を記録できるようになる前に登録されました。そのマシンで Multica を再起動して登録し直すと有効にできます。",
     "mode_cancel": "キャンセル",
     "mode_save": "保存",
     "mode_add": "フォルダを追加",

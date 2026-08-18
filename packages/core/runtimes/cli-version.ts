@@ -170,33 +170,71 @@ export const LOCAL_WORKTREE_CAPABILITY = "local-worktree-v1";
 export const MIN_CAPABILITY_AWARE_SERVER_VERSION = "0.4.25";
 
 /**
+ * Whether the server the client is TALKING TO records daemon capabilities.
+ *
+ * Asks the running backend (`/api/config` → `server_version`), never a stored
+ * runtime row. A row without capabilities only proves the server was old WHEN
+ * IT WAS WRITTEN: upgrading the backend does not rewrite existing metadata and
+ * heartbeats touch only `last_seen_at`, so an upgraded deployment would go on
+ * being called stale, and re-upgrading it would fix nothing.
+ *
+ * An ABSENT version reads as capability-aware, which is the load-bearing part.
+ * `/api/config` omits the field on the managed cloud on purpose (MUL-4108) and
+ * leaves it empty for unstamped dev builds — both record capabilities — while
+ * the field itself shipped in v0.4.2, 23 patches before the handshake. So every
+ * self-hosted release that could actually be blind still names itself, and
+ * guessing "old" here would tell cloud users to upgrade a backend they do not
+ * run.
+ */
+export function serverRecordsDaemonCapabilities(
+  detected: string | undefined | null,
+): boolean {
+  const current = (detected ?? "").trim();
+  if (!current) return true;
+  if (DEV_DESCRIBE_RE.test(current)) return true;
+  const parsed = parseSemver(current);
+  if (!parsed) return true;
+  return !lessThan(parsed, parseSemver(MIN_CAPABILITY_AWARE_SERVER_VERSION)!);
+}
+
+/**
  * Whether a machine can run worktree mode, and if not, whose problem it is.
  *
- * Both negative cases fail closed — the mode exists to keep agents out of the
- * user's working copy, so "just try it" is never the fallback — but they are
- * fixed in different places: `daemon_unsupported` on the machine holding the
- * folder, `server_capability_blind` on the backend. A single boolean forced the
- * UI to blame the machine for both, which is how a user on the newest release
- * was told to upgrade the very machine that was already newest (#7113).
+ * Every negative fails closed — the mode exists to keep agents out of the
+ * user's working copy, so "just try it" is never the fallback — but each is
+ * fixed somewhere else, and a single boolean forced the UI to blame the machine
+ * for all of them. That is how a user on the newest release was told to upgrade
+ * the very machine that was already newest (#7113).
+ *
+ * - `daemon_unsupported`: the row records what this daemon can do, and worktree
+ *   is not in it. Update Multica on that machine.
+ * - `server_capability_blind`: the backend in front of us predates the
+ *   handshake, so no daemon can be seen through it. Upgrade the backend.
+ * - `runtime_registration_stale`: the backend records capabilities, but this
+ *   row was written before it learned to. Nothing is wrong with either half —
+ *   the machine just has to register again.
  */
 export type LocalWorktreeSupport =
   | "supported"
   | "daemon_unsupported"
-  | "server_capability_blind";
+  | "server_capability_blind"
+  | "runtime_registration_stale";
 
 /**
  * Read one runtime row's answer.
  *
- * The discriminator between the two negatives is the PRESENCE of the
- * `capabilities` key, not its contents: a capability-aware server always writes
- * the key — `null` when the daemon sent no header — so a row without it can
- * only have been written by a server that predates the handshake. Reading a
- * missing key as "this daemon lacks the feature" is precisely the misdiagnosis
- * this type exists to prevent.
+ * The `capabilities` key is written by the server, always — `null` when the
+ * daemon sent no header — so its ABSENCE says something about the writer, not
+ * about the daemon. Reading a missing key as "this daemon lacks the feature" is
+ * the misdiagnosis this type exists to prevent; `serverRecordsCapabilities`
+ * then decides whether that writer is still what we are talking to.
  */
-function runtimeWorktreeSupport(metadata: unknown): LocalWorktreeSupport {
+function runtimeWorktreeSupport(
+  metadata: unknown,
+  serverRecordsCapabilities: boolean,
+): LocalWorktreeSupport {
   if (!metadata || typeof metadata !== "object" || !("capabilities" in metadata)) {
-    return "server_capability_blind";
+    return serverRecordsCapabilities ? "runtime_registration_stale" : "server_capability_blind";
   }
   const caps = (metadata as { capabilities?: unknown }).capabilities;
   return Array.isArray(caps) && caps.includes(LOCAL_WORKTREE_CAPABILITY)
@@ -224,10 +262,15 @@ type RuntimeCapabilityRow = {
  *
  * A daemon with no runtime row at all reads as `daemon_unsupported`: nothing
  * there can run the task, and "update Multica on that machine" is the remedy.
+ *
+ * `serverVersion` is `/api/config`'s `server_version` for the backend this
+ * client is connected to — see `serverRecordsDaemonCapabilities` for why the
+ * question has to be asked of the live server rather than inferred from the row.
  */
 export function localWorktreeSupport(
   runtimes: RuntimeCapabilityRow[],
   daemonId: string | null | undefined,
+  serverVersion: string | undefined | null,
 ): LocalWorktreeSupport {
   if (!daemonId) return "daemon_unsupported";
   let newest: RuntimeCapabilityRow | undefined;
@@ -242,5 +285,6 @@ export function localWorktreeSupport(
     const currentSeen = newest.last_seen_at ?? "";
     if (candidateSeen > currentSeen) newest = rt;
   }
-  return newest ? runtimeWorktreeSupport(newest.metadata) : "daemon_unsupported";
+  if (!newest) return "daemon_unsupported";
+  return runtimeWorktreeSupport(newest.metadata, serverRecordsDaemonCapabilities(serverVersion));
 }
