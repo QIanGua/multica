@@ -2,10 +2,7 @@ package execenv
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -179,13 +176,43 @@ func formatProjectResource(r ProjectResourceForEnv) string {
 // For Grok:        writes {workDir}/AGENTS.md  (Grok Build CLI reads AGENTS.md natively from the workdir)
 // For Qwen:        writes {workDir}/QWEN.md (Qwen Code's native context file; it also reads AGENTS.md, but QWEN.md avoids cross-runtime ambiguity)
 func InjectRuntimeConfig(workDir, provider string, ctx TaskContextForEnv) (string, error) {
-	content := buildMetaSkillContent(provider, ctx)
+	content, _, err := InjectRuntimeConfigCreated(workDir, provider, ctx)
+	return content, err
+}
+
+// InjectRuntimeConfigCreated is InjectRuntimeConfig plus whether the config
+// file had to be created because it did not already exist.
+//
+// The in_place local_directory flow needs that distinction. A config file we
+// created is wholly Multica's and is an untracked new file in the user's
+// repository, so it can — and must — be kept out of their git status for the
+// run. A config file that pre-existed is the user's own, usually tracked, and
+// nothing in git's ignore machinery applies to it; only the marker block
+// inside it is ours, and CleanupRuntimeConfig is what reverses that.
+func InjectRuntimeConfigCreated(workDir, provider string, ctx TaskContextForEnv) (content string, created bool, err error) {
+	content = buildMetaSkillContent(provider, ctx)
 	path := runtimeConfigPath(workDir, provider)
 	if path == "" {
 		// Unknown provider — skip config injection, prompt-only mode.
-		return content, nil
+		return content, false, nil
 	}
-	return content, writeRuntimeConfigFile(path, content)
+	created, err = writeRuntimeConfigFileCreated(path, content)
+	return content, created, err
+}
+
+// BuildRuntimeBrief returns the runtime brief for a provider WITHOUT writing
+// it anywhere. Used by the in_place local_directory flow for runtimes that can
+// receive the brief inline in the turn, where writing it to disk would mean
+// appending a Multica-managed block to a file the user's project versions as
+// its own instructions (GitHub #7114).
+func BuildRuntimeBrief(provider string, ctx TaskContextForEnv) string {
+	return buildMetaSkillContent(provider, ctx)
+}
+
+// RuntimeConfigPath exposes the config file a provider's brief would be
+// written to, or "" when the provider has no file-based target.
+func RuntimeConfigPath(workDir, provider string) string {
+	return runtimeConfigPath(workDir, provider)
 }
 
 // runtimeConfigPath returns the absolute path to the runtime config file that
@@ -221,127 +248,48 @@ func runtimeConfigPath(workDir, provider string) string {
 	}
 }
 
-// writeRuntimeConfigFile writes the Multica runtime brief to path without
-// clobbering any user-authored content already present. Behaviour by file
-// state:
-//
-//   - file missing → create the file containing only the marker block, no
-//     leading separator. Cleanup detects the absence of the separator and
-//     restores the missing-file state by removing the file outright.
-//   - file present (any content, including empty), no marker block →
-//     append `<runtimeManagedSeparator>` + the marker block. The
-//     separator's bytes are part of the managed region so Cleanup can
-//     restore the user's pre-injection bytes exactly (no trailing-newline
-//     normalisation, no surprises for files that ended without a newline
-//     or with extra trailing newlines).
-//   - file present, marker block already there → replace the body between
-//     the markers in place so repeated runs in the same workdir don't grow
-//     the file unboundedly. The pre-block content (including any managed
-//     separator established by the first inject) is preserved verbatim.
-//
-// The previous implementation called os.WriteFile unconditionally, which
-// silently truncated a repository's CLAUDE.md / AGENTS.md the
-// first time the agent was pointed at the user's own directory via the
-// local_directory project resource flow. See MUL-2753.
-func writeRuntimeConfigFile(path, brief string) error {
-	block := runtimeMarkerBegin + "\n" + strings.TrimRight(brief, "\n") + "\n" + runtimeMarkerEnd + "\n"
-
-	existing, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return os.WriteFile(path, []byte(block), 0o644)
-	}
-	if err != nil {
-		return fmt.Errorf("read existing runtime config %s: %w", path, err)
-	}
-
-	existingStr := string(existing)
-	if start, end, ok := locateMarkerBlock(existingStr); ok {
-		// Replace the existing block in place. locateMarkerBlock already
-		// consumes the trailing newline that closed the previous block, so
-		// successive runs don't accumulate blank lines around the block.
-		// The managed separator (if any) lives in existingStr[:start] and
-		// is preserved untouched.
-		newContent := existingStr[:start] + block + existingStr[end:]
-		return os.WriteFile(path, []byte(newContent), 0o644)
-	}
-
-	// No marker block present. Append the fixed managed separator followed
-	// by the block. The separator is unconditional — including for files
-	// that already end in two or more newlines — so the byte boundary
-	// between user content and the managed region is deterministic, which
-	// is what lets Cleanup roll back to the user's exact original bytes.
-	return os.WriteFile(path, []byte(existingStr+runtimeManagedSeparator+block), 0o644)
+// runtimeConfigBlock is the managed region Multica owns inside the runtime
+// config file. The surrounding user content — a repository's own CLAUDE.md or
+// AGENTS.md, which is exactly what a local_directory task points the agent at
+// — is never touched; see managedBlock for the full write/cleanup contract.
+var runtimeConfigBlock = managedBlock{
+	begin:     runtimeMarkerBegin,
+	end:       runtimeMarkerEnd,
+	separator: runtimeManagedSeparator,
 }
 
-// locateMarkerBlock finds the [start, end) byte range of the Multica marker
-// block inside content. The returned `end` is one past the block's trailing
-// newline (if any) so callers can splice the block out without leaving an
-// orphan blank line behind.
+// writeRuntimeConfigFile writes the Multica runtime brief into path's managed
+// block without clobbering user-authored content already present. Returns
+// whether the file had to be created (it did not exist before this call), which
+// the local_directory flow uses to decide whether the file is wholly Multica's
+// and therefore safe to keep out of the user's git status entirely.
 //
-// The end marker is searched for strictly after the begin marker. This
-// matters for two malformed cases that the previous naive `strings.Index`
-// pair would mishandle:
-//
-//   - User content carries a stray `<!-- END MULTICA-RUNTIME -->` (e.g. a
-//     documentation snippet showing what the wire format looks like) before
-//     any begin marker. The naive parser would find that end and reject the
-//     block (`endIdx > startIdx` false), then append a fresh block — and
-//     since the stray end stays in place, every subsequent run would append
-//     yet another block, growing the file unboundedly.
-//   - A previous run crashed between writing begin and end and left the file
-//     with a half-block. The naive parser would not find an end, fall
-//     through to the append branch, and stack a new block after the
-//     half-block. Treating "begin found, no end after" as "the block ends
-//     at EOF" makes the next write replace the half-block in place.
-func locateMarkerBlock(content string) (start, end int, found bool) {
-	start = strings.Index(content, runtimeMarkerBegin)
-	if start < 0 {
-		return 0, 0, false
-	}
-	afterBegin := start + len(runtimeMarkerBegin)
-	endRel := strings.Index(content[afterBegin:], runtimeMarkerEnd)
-	if endRel < 0 {
-		// Malformed — no end marker after begin. Treat the rest of the file
-		// as the block so the next write replaces it cleanly instead of
-		// stacking another block beneath the half-block.
-		return start, len(content), true
-	}
-	end = afterBegin + endRel + len(runtimeMarkerEnd)
-	if end < len(content) && content[end] == '\n' {
-		end++
-	}
-	return start, end, true
+// The previous implementation called os.WriteFile unconditionally, which
+// silently truncated a repository's CLAUDE.md / AGENTS.md the first time the
+// agent was pointed at the user's own directory via the local_directory
+// project resource flow. See MUL-2753.
+func writeRuntimeConfigFileCreated(path, brief string) (created bool, err error) {
+	return runtimeConfigBlock.write(path, brief)
+}
+
+// writeRuntimeConfigFile is the error-only form, for callers that do not care
+// whether the file pre-existed.
+func writeRuntimeConfigFile(path, brief string) error {
+	_, err := writeRuntimeConfigFileCreated(path, brief)
+	return err
 }
 
 // CleanupRuntimeConfig excises the Multica marker block from the runtime
 // config file for the given provider and restores the file to its exact
-// pre-injection state, byte for byte. The cleanup is the second half of
-// the contract `writeRuntimeConfigFile` establishes: together they must
-// round-trip a user's local repository config across an arbitrary number
-// of Multica runs without ever touching a single non-managed byte.
-//
-// Behaviour, mirroring the three Inject states:
-//
-//   - file has no marker block → no-op (nothing was ever injected here);
-//   - block is at the start of the file with no preceding managed
-//     separator → the file was created by Inject from a missing-file
-//     state. Remove the file outright so the post-cleanup directory
-//     listing is byte-identical to the pre-Inject one.
-//   - block is preceded by the fixed managed separator → strip the
-//     separator together with the block; whatever remains (which may be
-//     an empty pre-existing file, a whitespace-only file, or arbitrary
-//     user content) is the user's original file, written back verbatim
-//     with NO trailing-newline normalisation and NO TrimSpace-based file
-//     removal heuristic. Both of those were sources of subtle diff in
-//     PR #3438 review feedback.
+// pre-injection state, byte for byte.
 //
 // Required for the local_directory flow (WorkDir is the user's own repo):
-// without this pass, a manual `claude` / `codex` run started by
-// the user inside the same directory after a Multica task would pick up
-// the stale brief and act on the previous task's issue id, trigger
-// comment id, and reply rules. Cloud workspace runs never trigger this
-// pollution because their workdir is daemon scratch that the GC loop
-// deletes wholesale; the daemon skips this Cleanup on those workdirs.
+// without this pass, a manual `claude` / `codex` run started by the user
+// inside the same directory after a Multica task would pick up the stale
+// brief and act on the previous task's issue id, trigger comment id, and
+// reply rules. Cloud workspace runs never trigger this pollution because
+// their workdir is daemon scratch that the GC loop deletes wholesale; the
+// daemon skips this Cleanup on those workdirs.
 //
 // Missing files, unknown providers, and files without a marker block are
 // no-ops — Cleanup is safe to call defensively.
@@ -350,46 +298,7 @@ func CleanupRuntimeConfig(workDir, provider string) error {
 	if path == "" {
 		return nil
 	}
-	existing, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read runtime config %s: %w", path, err)
-	}
-	existingStr := string(existing)
-	start, end, ok := locateMarkerBlock(existingStr)
-	if !ok {
-		return nil
-	}
-	pre := existingStr[:start]
-	post := existingStr[end:]
-
-	// Detect — and strip — the fixed managed separator that Inject puts
-	// immediately before the block whenever it appended to a file that
-	// pre-existed. The absence of the separator is the marker that says
-	// "Inject created this file from scratch", which is the only case
-	// where Cleanup is allowed to delete the file.
-	hadManagedSeparator := strings.HasSuffix(pre, runtimeManagedSeparator)
-	if hadManagedSeparator {
-		pre = pre[:len(pre)-len(runtimeManagedSeparator)]
-	}
-	remainder := pre + post
-
-	if !hadManagedSeparator && remainder == "" {
-		// Inject created the file (no managed separator → block was the
-		// only content). Restore the missing-file state.
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("remove runtime config %s: %w", path, err)
-		}
-		return nil
-	}
-	// File pre-existed (possibly empty, possibly whitespace-only,
-	// possibly with user content) — write the remainder back exactly,
-	// without any normalisation. An empty `remainder` here means the
-	// user's original file was empty; we still write it (zero-byte file)
-	// so the file's existence is preserved.
-	return os.WriteFile(path, []byte(remainder), 0o644)
+	return runtimeConfigBlock.cleanup(path)
 }
 
 // buildMetaSkillContent generates the meta skill markdown that teaches the
