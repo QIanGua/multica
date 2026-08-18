@@ -15,13 +15,12 @@ function renderDialog(
   overrides: {
     value?: LocalDirectoryExecutionMode;
     unavailableReason?: WorktreeUnavailableReason;
-    currentVersion?: string;
     errorMessage?: string;
     onConfirm?: (mode: LocalDirectoryExecutionMode) => void;
   } = {},
 ) {
   const onConfirm = overrides.onConfirm ?? vi.fn();
-  render(
+  const { unmount } = render(
     <I18nProvider locale="en" resources={TEST_RESOURCES}>
       <LocalDirectoryModeDialog
         open
@@ -29,15 +28,13 @@ function renderDialog(
         path="/Users/dev/work/game-client"
         value={overrides.value ?? "in_place"}
         unavailableReason={overrides.unavailableReason}
-        currentVersion={overrides.currentVersion}
-        minVersion="0.4.24"
         errorMessage={overrides.errorMessage}
         confirmLabel="Save"
         onConfirm={onConfirm}
       />
     </I18nProvider>,
   );
-  return { onConfirm };
+  return { onConfirm, unmount };
 }
 
 function worktreeOption(): HTMLElement {
@@ -90,22 +87,37 @@ describe("LocalDirectoryModeDialog", () => {
     expect(onConfirm).toHaveBeenCalledWith("in_place");
   });
 
-  // The server refuses the save below the version floor; saying so up front
-  // beats a bare 422 after the user has already committed to the choice.
-  it("disables parallel mode for an outdated daemon and names both versions", () => {
-    renderDialog({
-      unavailableReason: "daemon_outdated",
-      currentVersion: "0.4.10",
-    });
+  // The server refuses the save when the machine cannot run the mode; saying so
+  // up front beats a bare 422 after the user has committed to the choice.
+  it("disables parallel mode for a daemon that cannot run it", () => {
+    renderDialog({ unavailableReason: "daemon_outdated" });
 
     expect(worktreeOption().hasAttribute("disabled")).toBe(true);
-    const notice = screen.getByText(/0\.4\.10/);
-    expect(notice.textContent).toContain("0.4.24");
+    expect(screen.getByText(/Update Multica there/i)).toBeTruthy();
   });
 
-  it("falls back to a readable phrase when the daemon reports no version", () => {
-    renderDialog({ unavailableReason: "daemon_outdated", currentVersion: "" });
-    expect(screen.getByText(/an older version/i)).toBeTruthy();
+  // #7113: nothing has gated on a version since MUL-5707, so quoting the old
+  // floor told a user on v0.4.28 they needed v0.4.24 or newer. Any version
+  // number in this copy is a regression, whichever blocker fired.
+  it("never quotes a daemon version at the user", () => {
+    for (const reason of ["daemon_outdated", "server_outdated"] as const) {
+      const { unmount } = renderDialog({ unavailableReason: reason });
+      expect(screen.queryByText(/0\.4\.24/)).toBeNull();
+      expect(screen.queryByText(/an older version/i)).toBeNull();
+      unmount();
+    }
+  });
+
+  // The remedy is on the backend, and no amount of updating the machine can
+  // reach it — so this must not read as "your machine is out of date".
+  it("blames the backend, not the machine, when the server records no capabilities", () => {
+    renderDialog({ unavailableReason: "server_outdated" });
+
+    expect(worktreeOption().hasAttribute("disabled")).toBe(true);
+    const notice = screen.getByText(/Multica server is older/i);
+    // The server floor is the one version worth naming: it is what the operator
+    // upgrades past, and it is not the daemon's.
+    expect(notice.textContent).toContain("0.4.25");
   });
 
   it("shows a server rejection inline so the dialog stays actionable", () => {

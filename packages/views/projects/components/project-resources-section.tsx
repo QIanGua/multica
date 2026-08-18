@@ -28,11 +28,10 @@ import type {
   ProjectResource,
 } from "@multica/core/types";
 import {
-  MIN_LOCAL_WORKTREE_CLI_VERSION,
-  daemonSupportsLocalWorktree,
-  readRuntimeCliVersion,
+  localWorktreeSupport,
   runtimeListOptions,
 } from "@multica/core/runtimes";
+import type { LocalWorktreeSupport } from "@multica/core/runtimes";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
 import {
@@ -141,19 +140,11 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
   // daemon here would report "too old" for every resource whenever the viewer
   // is not on that machine.
   // Capability, not version, and judged by the daemon's newest runtime row —
-  // see daemonSupportsLocalWorktree for why an any-match would keep saying yes
-  // after a downgrade.
-  const daemonSupportsWorktree = (daemonId: string | null): boolean =>
-    daemonSupportsLocalWorktree(runtimes, daemonId);
-  const cliVersionForDaemon = (daemonId: string | null): string => {
-    if (!daemonId) return "";
-    return (
-      runtimes
-        .filter((rt) => rt.daemon_id === daemonId)
-        .map((rt) => readRuntimeCliVersion(rt.metadata))
-        .find((v) => v && v.length > 0) ?? ""
-    );
-  };
+  // see localWorktreeSupport for why an any-match would keep saying yes after a
+  // downgrade, and why "no capability recorded" is a distinct answer from "this
+  // daemon cannot do it".
+  const worktreeSupport = (daemonId: string | null) =>
+    localWorktreeSupport(runtimes, daemonId);
 
   const attachedUrls = new Set(
     resources.filter(isGithubRef).map((r) => r.resource_ref.url),
@@ -249,7 +240,7 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
         // user still confirms, and existing resources keep whatever they have.
         mode:
           validation.is_git_repo === true &&
-          daemonSupportsWorktree(localDaemonId)
+          worktreeSupport(localDaemonId) === "supported"
             ? "worktree"
             : "in_place",
         isGitRepo: validation.is_git_repo,
@@ -536,10 +527,8 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
           value={modeDialog.mode}
           unavailableReason={worktreeUnavailableReason(
             modeDialog.isGitRepo,
-            daemonSupportsWorktree(modeDialog.daemonId),
+            worktreeSupport(modeDialog.daemonId),
           )}
-          currentVersion={cliVersionForDaemon(modeDialog.daemonId)}
-          minVersion={MIN_LOCAL_WORKTREE_CLI_VERSION}
           errorMessage={modeError ?? undefined}
           saving={modeSaving}
           confirmLabel={
@@ -561,15 +550,18 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
  * folder. `undefined` means we could not check (an older desktop build, or an
  * existing row whose path was validated at pick time), and is deliberately
  * permissive: the daemon re-checks authoritatively, so guessing "not a repo"
- * here would block a perfectly valid setup. The daemon-version gate is checked
- * second because upgrading is the more actionable of the two.
+ * here would block a perfectly valid setup. The capability blockers are checked
+ * second because upgrading is the more actionable of the two — and they are
+ * kept apart, because telling someone to update a machine that is already on
+ * the newest release when the backend is the stale half helps nobody (#7113).
  */
 function worktreeUnavailableReason(
   isGitRepo: boolean | undefined,
-  daemonSupportsWorktree: boolean,
+  support: LocalWorktreeSupport,
 ): WorktreeUnavailableReason | undefined {
   if (isGitRepo === false) return "not_git";
-  if (!daemonSupportsWorktree) return "daemon_outdated";
+  if (support === "server_capability_blind") return "server_outdated";
+  if (support === "daemon_unsupported") return "daemon_outdated";
   return undefined;
 }
 

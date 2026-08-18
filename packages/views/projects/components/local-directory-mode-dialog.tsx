@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { GitBranch, Pencil, TriangleAlert } from "lucide-react";
+import { MIN_CAPABILITY_AWARE_SERVER_VERSION } from "@multica/core/runtimes";
 import type { LocalDirectoryExecutionMode } from "@multica/core/types";
 import { Button } from "@multica/ui/components/ui/button";
 import {
@@ -15,14 +16,18 @@ import {
 import { useT } from "../../i18n/use-t";
 
 /**
- * Why the worktree option may be unavailable. The two cases need different
- * copy and different remedies, so they are distinct rather than one boolean:
- * `not_git` is fixed by choosing a different folder, `daemon_outdated` by
- * updating the app on that machine.
+ * Why the worktree option may be unavailable. Each case needs different copy
+ * because each is fixed somewhere else: `not_git` by choosing a different
+ * folder, `daemon_outdated` by updating the app on that machine, and
+ * `server_outdated` by upgrading the (self-hosted) backend — which no amount of
+ * updating that machine will fix.
  *
  * `undefined` means available.
  */
-export type WorktreeUnavailableReason = "not_git" | "daemon_outdated";
+export type WorktreeUnavailableReason =
+  | "not_git"
+  | "daemon_outdated"
+  | "server_outdated";
 
 interface LocalDirectoryModeDialogProps {
   open: boolean;
@@ -33,9 +38,6 @@ interface LocalDirectoryModeDialogProps {
   value: LocalDirectoryExecutionMode;
   /** Set when worktree cannot be chosen; the option renders disabled with a reason. */
   unavailableReason?: WorktreeUnavailableReason;
-  /** Daemon version strings for the outdated message. */
-  currentVersion?: string;
-  minVersion?: string;
   /** Server-side rejection to show inline (e.g. a 422 that only the API can detect). */
   errorMessage?: string;
   saving?: boolean;
@@ -59,8 +61,6 @@ export function LocalDirectoryModeDialog({
   path,
   value,
   unavailableReason,
-  currentVersion,
-  minVersion,
   errorMessage,
   saving = false,
   confirmLabel,
@@ -93,8 +93,6 @@ export function LocalDirectoryModeDialog({
           value={selected}
           onChange={setSelected}
           unavailableReason={unavailableReason}
-          currentVersion={currentVersion}
-          minVersion={minVersion}
         />
 
         {errorMessage && (
@@ -125,8 +123,6 @@ interface LocalDirectoryModeOptionsProps {
   value: LocalDirectoryExecutionMode;
   onChange: (mode: LocalDirectoryExecutionMode) => void;
   unavailableReason?: WorktreeUnavailableReason;
-  currentVersion?: string;
-  minVersion?: string;
 }
 
 /**
@@ -140,8 +136,6 @@ export function LocalDirectoryModeOptions({
   value,
   onChange,
   unavailableReason,
-  currentVersion,
-  minVersion,
 }: LocalDirectoryModeOptionsProps) {
   const { t } = useT("projects");
   const worktreeDisabled = unavailableReason !== undefined;
@@ -163,18 +157,20 @@ export function LocalDirectoryModeOptions({
         identifier="worktree"
         selected={value === "worktree"}
         disabled={worktreeDisabled}
+        // No version numbers in any of this copy. Nothing gates on a version
+        // any more (MUL-5707), so quoting the floor told a user running the
+        // newest release that they needed an older one (#7113); the server's
+        // own 422 was rewritten the same way.
         disabledReason={
           unavailableReason === "not_git"
             ? t(($) => $.resources.mode_worktree_needs_git)
-            : unavailableReason === "daemon_outdated"
-              ? t(($) => $.resources.mode_worktree_needs_upgrade, {
-                  current:
-                    currentVersion && currentVersion.length > 0
-                      ? currentVersion
-                      : t(($) => $.resources.mode_version_unknown),
-                  min: minVersion ?? "",
+            : unavailableReason === "server_outdated"
+              ? t(($) => $.resources.mode_worktree_needs_server_upgrade, {
+                  min: MIN_CAPABILITY_AWARE_SERVER_VERSION,
                 })
-              : undefined
+              : unavailableReason === "daemon_outdated"
+                ? t(($) => $.resources.mode_worktree_needs_upgrade)
+                : undefined
         }
         onSelect={() => onChange("worktree")}
       />

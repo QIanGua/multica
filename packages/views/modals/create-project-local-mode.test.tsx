@@ -9,9 +9,12 @@ import { renderWithI18n } from "../test/i18n";
 // Runtime list drives the worktree version gate. Each test sets the reported
 // CLI version before rendering.
 let runtimeCliVersion = "9.9.9";
-// Whether the fake runtime advertises worktree support. This — not the version
-// string — is what the gate reads now (MUL-5707).
-let runtimeAdvertisesWorktree = true;
+// What the fake runtime row says about worktree support. This — not the version
+// string — is what the gate reads now (MUL-5707), and the three values are
+// genuinely different states: "yes", "a daemon that cannot", and a row written
+// by a server too old to record capabilities at all (#7113).
+let runtimeWorktreeMetadata: "advertised" | "daemon_cannot" | "server_recorded_nothing" =
+  "advertised";
 // What the desktop validator reports for the picked folder.
 let pickedIsGitRepo: boolean | undefined = true;
 
@@ -42,7 +45,13 @@ vi.mock("@tanstack/react-query", () => ({
           daemon_id: "daemon-1",
           metadata: {
             cli_version: runtimeCliVersion,
-            ...(runtimeAdvertisesWorktree ? { capabilities: ["local-worktree-v1"] } : {}),
+            // A capability-aware server always writes the key — null when the
+            // daemon sent no header — so its absence means the SERVER is old.
+            ...(runtimeWorktreeMetadata === "advertised"
+              ? { capabilities: ["local-worktree-v1"] }
+              : runtimeWorktreeMetadata === "daemon_cannot"
+                ? { capabilities: ["skill-bundles-v1"] }
+                : {}),
           },
         },
       ],
@@ -162,7 +171,7 @@ describe("CreateProjectModal — local directory execution mode", () => {
   beforeEach(() => {
     createProjectMock.mockClear();
     runtimeCliVersion = "9.9.9";
-    runtimeAdvertisesWorktree = true;
+    runtimeWorktreeMetadata = "advertised";
     pickedIsGitRepo = true;
   });
 
@@ -196,7 +205,7 @@ describe("CreateProjectModal — local directory execution mode", () => {
   // A runtime that cannot run the mode must not be preselected into it, or the
   // create call would be rejected by the server's version gate.
   it("preselects direct when the daemon does not support it, even for a git repository", async () => {
-    runtimeAdvertisesWorktree = false;
+    runtimeWorktreeMetadata = "daemon_cannot";
     const user = userEvent.setup();
     renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
 
@@ -251,11 +260,11 @@ describe("CreateProjectModal — local directory execution mode", () => {
     expect(screen.getByRole("button", { name: /Change directory/i })).toBeInTheDocument();
   });
 
-  // The server refuses to save a worktree resource below the version floor, and
+  // The server refuses to save a worktree resource the machine cannot run, and
   // here that rejection would fail the whole project creation — so the option
   // has to be blocked before submit, not after.
   it("blocks parallel mode when the daemon does not support it", async () => {
-    runtimeAdvertisesWorktree = false;
+    runtimeWorktreeMetadata = "daemon_cannot";
     const user = userEvent.setup();
     renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
 
@@ -263,7 +272,27 @@ describe("CreateProjectModal — local directory execution mode", () => {
 
     const worktreeOption = screen.getByRole("radio", { name: /Run in parallel, isolated/i });
     expect(worktreeOption).toBeDisabled();
-    expect(screen.getByText(/needs 0\.4\.24 or newer/i)).toBeInTheDocument();
+    expect(screen.getByText(/Update Multica there/i)).toBeInTheDocument();
+    // Nothing gates on a version any more; quoting the old floor is what told a
+    // user on v0.4.28 to upgrade past v0.4.24 (#7113).
+    expect(screen.queryByText(/0\.4\.24/)).not.toBeInTheDocument();
+  });
+
+  // Self-hosted skew: Desktop ships its own renderer and daemon and updates
+  // both, so it routinely runs ahead of a hand-upgraded backend. The daemon is
+  // fine here — the backend simply never recorded what it advertised.
+  it("blames the backend when the server recorded no capabilities at all", async () => {
+    runtimeWorktreeMetadata = "server_recorded_nothing";
+    runtimeCliVersion = "v0.4.28";
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+
+    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).toBeDisabled();
+    expect(screen.getByText(/Multica server is older/i)).toBeInTheDocument();
+    // Telling this user to update the machine is the bug: it is already newest.
+    expect(screen.queryByText(/Update Multica there/i)).not.toBeInTheDocument();
   });
 
   it("blocks parallel mode for a folder that is not a git repository", async () => {

@@ -146,53 +146,62 @@ function meetsMinCliVersion(detected: string | undefined | null, minimum: string
 }
 
 /**
- * Minimum daemon CLI version that implements worktree mode for
- * `local_directory` resources (`execution_mode: "worktree"`).
- *
- * Server twin: `MinLocalWorktreeCLIVersion` in `server/pkg/agent/version.go`.
- * Keep the two in lockstep — the server refuses to SAVE a worktree resource
- * below this floor, and this constant only exists so the UI can say so before
- * the user submits rather than surfacing a bare 422.
- *
- * HARD gate, unlike `handoffSupported`: a daemon below the floor does not know
- * the field exists, so it would run the task in place — editing the working
- * copy the user asked to isolate. Degrading to "just try it" is not an option.
- */
-export const MIN_LOCAL_WORKTREE_CLI_VERSION = "0.4.24";
-
-/**
- * Whether a daemon-reported CLI version can run worktree mode. Missing /
- * unparsable / below-minimum are `false`; dev-built daemons (git-describe
- * shape) pass, matching every other gate in this file.
- */
-export function localWorktreeSupported(detected: string | undefined | null): boolean {
-  return meetsMinCliVersion(detected, MIN_LOCAL_WORKTREE_CLI_VERSION);
-}
-
-/**
  * Capability a daemon advertises when it implements worktree mode for
  * local_directory resources. Mirrors `DaemonCapabilityLocalWorktreeV1` in
  * `server/pkg/protocol/messages.go`.
+ *
+ * This is the whole signal. There is deliberately no version floor left on
+ * this side: a dev build reports a git-describe string that `meetsMinCliVersion`
+ * exempts, so a daemon with no worktree code at all used to pass a version
+ * check (MUL-5707).
  */
 export const LOCAL_WORKTREE_CAPABILITY = "local-worktree-v1";
 
 /**
- * Whether a runtime advertised worktree support at registration.
+ * First server release that records `X-Client-Capabilities` onto the runtime
+ * row it registers (PR #6904, ships in v0.4.25). Every older server stores
+ * runtime metadata with no `capabilities` key at all, so through one of them no
+ * daemon can be seen to support worktree mode, however new it is.
  *
- * This replaces a version comparison on purpose. A daemon without the
- * implementation does not merely lose concurrency — it ignores `execution_mode`
- * and edits the user's working copy, which is what the mode exists to prevent.
- * Version strings could not answer that: a dev build reports a git-describe
- * string that `meetsMinCliVersion` deliberately exempts, so a daemon with no
- * worktree code at all passed the check (MUL-5707).
- *
- * Absent metadata (an older daemon that never sent the header) is `false` —
- * this must fail closed, and the server enforces the same thing at claim time.
+ * Self-hosted deployments are where this bites: Desktop ships its own renderer
+ * AND its own daemon binary and updates both together, so the client routinely
+ * runs ahead of a backend the operator upgrades by hand (#7113).
  */
-export function runtimeSupportsLocalWorktree(metadata: unknown): boolean {
-  if (!metadata || typeof metadata !== "object") return false;
+export const MIN_CAPABILITY_AWARE_SERVER_VERSION = "0.4.25";
+
+/**
+ * Whether a machine can run worktree mode, and if not, whose problem it is.
+ *
+ * Both negative cases fail closed — the mode exists to keep agents out of the
+ * user's working copy, so "just try it" is never the fallback — but they are
+ * fixed in different places: `daemon_unsupported` on the machine holding the
+ * folder, `server_capability_blind` on the backend. A single boolean forced the
+ * UI to blame the machine for both, which is how a user on the newest release
+ * was told to upgrade the very machine that was already newest (#7113).
+ */
+export type LocalWorktreeSupport =
+  | "supported"
+  | "daemon_unsupported"
+  | "server_capability_blind";
+
+/**
+ * Read one runtime row's answer.
+ *
+ * The discriminator between the two negatives is the PRESENCE of the
+ * `capabilities` key, not its contents: a capability-aware server always writes
+ * the key — `null` when the daemon sent no header — so a row without it can
+ * only have been written by a server that predates the handshake. Reading a
+ * missing key as "this daemon lacks the feature" is precisely the misdiagnosis
+ * this type exists to prevent.
+ */
+function runtimeWorktreeSupport(metadata: unknown): LocalWorktreeSupport {
+  if (!metadata || typeof metadata !== "object" || !("capabilities" in metadata)) {
+    return "server_capability_blind";
+  }
   const caps = (metadata as { capabilities?: unknown }).capabilities;
-  return Array.isArray(caps) && caps.includes(LOCAL_WORKTREE_CAPABILITY);
+  return Array.isArray(caps) && caps.includes(LOCAL_WORKTREE_CAPABILITY)
+    ? "supported"
+    : "daemon_unsupported";
 }
 
 /** Minimal runtime shape this module needs; keeps callers from importing types. */
@@ -212,12 +221,15 @@ type RuntimeCapabilityRow = {
  * fresh incapable one, and an any-match would answer yes forever. The server's
  * `daemonAdvertisesWorktree` uses the same newest-wins rule; the two must agree
  * or the UI offers a mode the API will refuse.
+ *
+ * A daemon with no runtime row at all reads as `daemon_unsupported`: nothing
+ * there can run the task, and "update Multica on that machine" is the remedy.
  */
-export function daemonSupportsLocalWorktree(
+export function localWorktreeSupport(
   runtimes: RuntimeCapabilityRow[],
   daemonId: string | null | undefined,
-): boolean {
-  if (!daemonId) return false;
+): LocalWorktreeSupport {
+  if (!daemonId) return "daemon_unsupported";
   let newest: RuntimeCapabilityRow | undefined;
   for (const rt of runtimes) {
     if (rt.daemon_id !== daemonId) continue;
@@ -230,5 +242,5 @@ export function daemonSupportsLocalWorktree(
     const currentSeen = newest.last_seen_at ?? "";
     if (candidateSeen > currentSeen) newest = rt;
   }
-  return newest ? runtimeSupportsLocalWorktree(newest.metadata) : false;
+  return newest ? runtimeWorktreeSupport(newest.metadata) : "daemon_unsupported";
 }
