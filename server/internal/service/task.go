@@ -4669,7 +4669,11 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		}
 	}
 
-	// Cancel only the target agent's active/queued tasks on this issue.
+	// Cancel only the target agent's active/queued tasks on this issue. A manual
+	// rerun is a request to resume the issue, not to dismiss planned recovery
+	// signals, so this intentionally stays on the server-cancel query. Any
+	// undelivered delegated-failure signal remains an outbox obligation and the
+	// sweeper can merge it into the fresh rerun task.
 	cancelled, err := s.Queries.CancelAgentTasksByIssueAndAgent(ctx, db.CancelAgentTasksByIssueAndAgentParams{
 		IssueID: issueID,
 		AgentID: agentID,
@@ -4891,6 +4895,22 @@ const (
 	delegatedFailureRecoveryCommentType     = "progress_update"
 )
 
+type delegatedFailureRecoveryDispatchOutcome uint8
+
+const (
+	delegatedFailureRecoveryCovered delegatedFailureRecoveryDispatchOutcome = iota
+	delegatedFailureRecoveryReplayed
+	delegatedFailureRecoveryExhausted
+)
+
+// DelegatedFailureRecoverySweepResult separates successful coordinator
+// replays from terminally exhausted outbox entries so operators never mistake
+// a bounded stop for a successful replay.
+type DelegatedFailureRecoverySweepResult struct {
+	Replayed  int
+	Exhausted int
+}
+
 type delegatedFailureRecoveryTarget struct {
 	failed  db.AgentTaskQueue
 	source  db.AgentTaskQueue
@@ -5064,13 +5084,33 @@ func delegatedFailureRecoveryExhaustionContent(target *delegatedFailureRecoveryT
 	)
 }
 
+func delegatedFailureRecoveryAttribution(target *delegatedFailureRecoveryTarget) (pgtype.UUID, pgtype.UUID) {
+	originator := target.failed.OriginatorUserID
+	accountable := target.failed.AccountableUserID
+	if originator.Valid {
+		accountable = originator
+	}
+	if !originator.Valid && !accountable.Valid {
+		originator = target.source.OriginatorUserID
+		accountable = target.source.AccountableUserID
+		if originator.Valid {
+			accountable = originator
+		}
+	}
+	return originator, accountable
+}
+
 // exhaustDelegatedFailureRecovery atomically settles the recovery outbox after
-// its bounded automatic attempts and creates one visible system explanation.
-// Updating the newest attempt first serializes concurrent sweepers; the second
-// caller then observes the explanation written by the first.
-func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, target *delegatedFailureRecoveryTarget) error {
+// its bounded automatic attempts, creates one visible system explanation, and
+// notifies the responsible human. The bool reports whether this caller created
+// that terminal outcome. Updating the newest attempt first serializes
+// concurrent sweepers; the second caller then observes the explanation written
+// by the first and does not report another exhaustion.
+func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, target *delegatedFailureRecoveryTarget) (bool, error) {
 	var exhaustedComment db.Comment
+	var exhaustedInbox db.InboxItem
 	created := false
+	inboxCreated := false
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		if _, err := qtx.AcknowledgeExhaustedDelegatedFailureRecovery(ctx, db.AcknowledgeExhaustedDelegatedFailureRecoveryParams{
 			CommentID:    target.comment.ID,
@@ -5107,9 +5147,54 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 		}
 		exhaustedComment = comment
 		created = true
+
+		// Exhaustion deliberately does not @mention the coordinator agent: doing
+		// so would enqueue a fourth recovery run and defeat the attempt bound.
+		// Instead, create one durable action-required inbox item for the human
+		// who originated (or is accountable for) the delegated work.
+		_, recipient := delegatedFailureRecoveryAttribution(target)
+		if recipient.Valid {
+			_, err = qtx.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+				UserID:      recipient,
+				WorkspaceID: target.issue.WorkspaceID,
+			})
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("validate delegated failure exhaustion recipient: %w", err)
+			}
+
+			details, err := json.Marshal(map[string]any{
+				"failed_task_id":       util.UUIDToString(target.failed.ID),
+				"source_task_id":       util.UUIDToString(target.source.ID),
+				"coordinator_agent_id": util.UUIDToString(target.agent.ID),
+				"max_attempts":         delegatedFailureRecoveryMaxTaskAttempts,
+			})
+			if err != nil {
+				return fmt.Errorf("encode delegated failure exhaustion details: %w", err)
+			}
+			exhaustedInbox, err = qtx.CreateInboxItem(ctx, db.CreateInboxItemParams{
+				WorkspaceID:   target.issue.WorkspaceID,
+				RecipientType: "member",
+				RecipientID:   recipient,
+				Type:          "task_failed",
+				Severity:      "action_required",
+				IssueID:       target.issue.ID,
+				Title:         target.issue.Title,
+				Body:          pgtype.Text{String: exhaustedComment.Content, Valid: true},
+				ActorType:     pgtype.Text{String: "system", Valid: true},
+				ActorID:       pgtype.UUID{},
+				Details:       details,
+			})
+			if err != nil {
+				return fmt.Errorf("create delegated failure exhaustion inbox item: %w", err)
+			}
+			inboxCreated = true
+		}
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
 
 	if created && s.Bus != nil {
@@ -5135,7 +5220,33 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 			},
 		})
 	}
-	return nil
+	if inboxCreated && s.Bus != nil {
+		s.Bus.Publish(events.Event{
+			Type:        protocol.EventInboxNew,
+			WorkspaceID: util.UUIDToString(target.issue.WorkspaceID),
+			ActorType:   "system",
+			ActorID:     "",
+			Payload: map[string]any{"item": map[string]any{
+				"id":             util.UUIDToString(exhaustedInbox.ID),
+				"workspace_id":   util.UUIDToString(exhaustedInbox.WorkspaceID),
+				"recipient_type": exhaustedInbox.RecipientType,
+				"recipient_id":   util.UUIDToString(exhaustedInbox.RecipientID),
+				"type":           exhaustedInbox.Type,
+				"severity":       exhaustedInbox.Severity,
+				"issue_id":       util.UUIDToPtr(exhaustedInbox.IssueID),
+				"title":          exhaustedInbox.Title,
+				"body":           util.TextToPtr(exhaustedInbox.Body),
+				"read":           exhaustedInbox.Read,
+				"archived":       exhaustedInbox.Archived,
+				"created_at":     util.TimestampToString(exhaustedInbox.CreatedAt),
+				"actor_type":     util.TextToPtr(exhaustedInbox.ActorType),
+				"actor_id":       util.UUIDToPtr(exhaustedInbox.ActorID),
+				"details":        json.RawMessage(exhaustedInbox.Details),
+				"issue_status":   target.issue.Status,
+			}},
+		})
+	}
+	return created, nil
 }
 
 // dispatchDelegatedFailureRecovery routes a recovery comment to the source
@@ -5146,7 +5257,7 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 // race records the comment as planned-but-undelivered and lets completion
 // reconciliation schedule the follow-up. The three-pass loop closes state
 // changes around those writes.
-func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, target *delegatedFailureRecoveryTarget, excludeTaskID pgtype.UUID) error {
+func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, target *delegatedFailureRecoveryTarget, excludeTaskID pgtype.UUID) (delegatedFailureRecoveryDispatchOutcome, error) {
 	const maxAttempts = 3
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		covered, err := s.Queries.HasTaskCoveringDelegatedFailureComment(ctx, db.HasTaskCoveringDelegatedFailureCommentParams{
@@ -5156,18 +5267,25 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			ExcludeTaskID: excludeTaskID,
 		})
 		if err != nil {
-			return fmt.Errorf("check recovery coverage: %w", err)
+			return delegatedFailureRecoveryCovered, fmt.Errorf("check recovery coverage: %w", err)
 		}
 		if covered {
-			return nil
+			return delegatedFailureRecoveryCovered, nil
 		}
 
 		recoveryTasks, err := s.Queries.CountDelegatedFailureRecoveryTasks(ctx, target.failed.ID)
 		if err != nil {
-			return fmt.Errorf("count delegated failure recovery tasks: %w", err)
+			return delegatedFailureRecoveryCovered, fmt.Errorf("count delegated failure recovery tasks: %w", err)
 		}
 		if recoveryTasks >= delegatedFailureRecoveryMaxTaskAttempts {
-			return s.exhaustDelegatedFailureRecovery(ctx, target)
+			exhausted, err := s.exhaustDelegatedFailureRecovery(ctx, target)
+			if err != nil {
+				return delegatedFailureRecoveryCovered, err
+			}
+			if exhausted {
+				return delegatedFailureRecoveryExhausted, nil
+			}
+			return delegatedFailureRecoveryCovered, nil
 		}
 
 		if merged, err := s.Queries.MergeDelegatedFailureCommentIntoPendingTask(ctx, db.MergeDelegatedFailureCommentIntoPendingTaskParams{
@@ -5180,23 +5298,12 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 				"failed_task_id", util.UUIDToString(target.failed.ID),
 				"coordinator_task_id", util.UUIDToString(merged.ID),
 			)
-			return nil
+			return delegatedFailureRecoveryReplayed, nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("merge recovery into pending task: %w", err)
+			return delegatedFailureRecoveryCovered, fmt.Errorf("merge recovery into pending task: %w", err)
 		}
 
-		originator := target.failed.OriginatorUserID
-		accountable := target.failed.AccountableUserID
-		if originator.Valid {
-			accountable = originator
-		}
-		if !originator.Valid && !accountable.Valid {
-			originator = target.source.OriginatorUserID
-			accountable = target.source.AccountableUserID
-			if originator.Valid {
-				accountable = originator
-			}
-		}
+		originator, accountable := delegatedFailureRecoveryAttribution(target)
 		source := attribution.SourceDelegation
 		if !originator.Valid && !accountable.Valid {
 			source = attribution.SourceUnattributed
@@ -5235,10 +5342,10 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			)
 			s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 			s.NotifyTaskEnqueued(ctx, task)
-			return nil
+			return delegatedFailureRecoveryReplayed, nil
 		}
 		if !isDuplicatePendingTaskErr(err) {
-			return fmt.Errorf("create recovery task: %w", err)
+			return delegatedFailureRecoveryCovered, fmt.Errorf("create recovery task: %w", err)
 		}
 
 		// A dispatched task still owns the unique queued/dispatched slot, but
@@ -5254,12 +5361,12 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 				"failed_task_id", util.UUIDToString(target.failed.ID),
 				"coordinator_task_id", util.UUIDToString(active.ID),
 			)
-			return nil
+			return delegatedFailureRecoveryReplayed, nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("register recovery on dispatched task: %w", err)
+			return delegatedFailureRecoveryCovered, fmt.Errorf("register recovery on dispatched task: %w", err)
 		}
 	}
-	return fmt.Errorf("delegate failure recovery could not acquire coordinator task slot")
+	return delegatedFailureRecoveryCovered, fmt.Errorf("delegate failure recovery could not acquire coordinator task slot")
 }
 
 // recoverDelegatedTaskFailure is the shared post-terminal hook for FailTask and
@@ -5271,7 +5378,8 @@ func (s *TaskService) recoverDelegatedTaskFailure(ctx context.Context, failed db
 	if err != nil || target == nil {
 		return false, err
 	}
-	return true, s.dispatchDelegatedFailureRecovery(ctx, target, pgtype.UUID{})
+	_, err = s.dispatchDelegatedFailureRecovery(ctx, target, pgtype.UUID{})
+	return true, err
 }
 
 // RecoverPendingDelegatedFailures replays the durable recovery outbox. The
@@ -5280,26 +5388,31 @@ func (s *TaskService) recoverDelegatedTaskFailure(ctx context.Context, failed db
 // delivered_comment_ids. This lets a later sweeper repair a process crash or
 // transient database error between comment creation and coordinator dispatch
 // without producing duplicate runnable tasks.
-func (s *TaskService) RecoverPendingDelegatedFailures(ctx context.Context, maxPerTick int32) (int, error) {
+func (s *TaskService) RecoverPendingDelegatedFailures(ctx context.Context, maxPerTick int32) (DelegatedFailureRecoverySweepResult, error) {
+	result := DelegatedFailureRecoverySweepResult{}
 	if maxPerTick <= 0 {
-		return 0, nil
+		return result, nil
 	}
 	pending, err := s.Queries.ListPendingDelegatedFailureRecoveries(ctx, maxPerTick)
 	if err != nil {
-		return 0, fmt.Errorf("list pending delegated failure recoveries: %w", err)
+		return result, fmt.Errorf("list pending delegated failure recoveries: %w", err)
 	}
 
-	recovered := 0
 	errs := make([]error, 0)
 	for _, comment := range pending {
-		recoveryErr := s.DispatchDelegatedFailureRecoveryComment(ctx, comment, pgtype.UUID{})
+		outcome, recoveryErr := s.dispatchDelegatedFailureRecoveryComment(ctx, comment, pgtype.UUID{})
 		if recoveryErr != nil {
 			errs = append(errs, fmt.Errorf("dispatch recovery comment %s: %w", util.UUIDToString(comment.ID), recoveryErr))
 			continue
 		}
-		recovered++
+		switch outcome {
+		case delegatedFailureRecoveryReplayed:
+			result.Replayed++
+		case delegatedFailureRecoveryExhausted:
+			result.Exhausted++
+		}
 	}
-	return recovered, errors.Join(errs...)
+	return result, errors.Join(errs...)
 }
 
 // DispatchDelegatedFailureRecoveryComment is used by completion reconciliation
@@ -5308,19 +5421,24 @@ func (s *TaskService) RecoverPendingDelegatedFailures(ctx context.Context, maxPe
 // planned but not delivered to it; routing then merges/enqueues exactly one
 // follow-up.
 func (s *TaskService) DispatchDelegatedFailureRecoveryComment(ctx context.Context, comment db.Comment, completedTaskID pgtype.UUID) error {
+	_, err := s.dispatchDelegatedFailureRecoveryComment(ctx, comment, completedTaskID)
+	return err
+}
+
+func (s *TaskService) dispatchDelegatedFailureRecoveryComment(ctx context.Context, comment db.Comment, completedTaskID pgtype.UUID) (delegatedFailureRecoveryDispatchOutcome, error) {
 	if !IsDelegatedFailureRecoveryComment(comment) {
-		return nil
+		return delegatedFailureRecoveryCovered, nil
 	}
 	failed, err := s.Queries.GetAgentTask(ctx, comment.SourceTaskID)
 	if err != nil {
-		return fmt.Errorf("load failed recovery source: %w", err)
+		return delegatedFailureRecoveryCovered, fmt.Errorf("load failed recovery source: %w", err)
 	}
 	target, err := loadDelegatedFailureRecoveryTarget(ctx, s.Queries, failed)
 	if err != nil || target == nil {
-		return err
+		return delegatedFailureRecoveryCovered, err
 	}
 	if target.issue.ID != comment.IssueID || target.issue.WorkspaceID != comment.WorkspaceID {
-		return fmt.Errorf("delegated failure recovery comment scope mismatch")
+		return delegatedFailureRecoveryCovered, fmt.Errorf("delegated failure recovery comment scope mismatch")
 	}
 	target.comment = comment
 	return s.dispatchDelegatedFailureRecovery(ctx, target, completedTaskID)

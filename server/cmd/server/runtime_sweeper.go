@@ -138,13 +138,20 @@ func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, querie
 // task was found in this tick, which is what repairs a recovery dispatch lost
 // before a server restart.
 func sweepPendingDelegatedFailureRecoveries(ctx context.Context, taskSvc *service.TaskService) {
-	recovered, err := taskSvc.RecoverPendingDelegatedFailures(ctx, delegatedFailureRecoveryBatchSize)
+	result, err := taskSvc.RecoverPendingDelegatedFailures(ctx, delegatedFailureRecoveryBatchSize)
 	if err != nil {
-		slog.Warn("delegated failure recovery sweeper: replay failed", "recovered", recovered, "error", err)
+		slog.Warn("delegated failure recovery sweeper: replay failed",
+			"replayed", result.Replayed,
+			"exhausted", result.Exhausted,
+			"error", err,
+		)
 		return
 	}
-	if recovered > 0 {
-		slog.Info("delegated failure recovery sweeper: replayed pending recoveries", "count", recovered)
+	if result.Replayed > 0 {
+		slog.Info("delegated failure recovery sweeper: replayed pending recoveries", "count", result.Replayed)
+	}
+	if result.Exhausted > 0 {
+		slog.Warn("delegated failure recovery sweeper: automatic attempts exhausted", "count", result.Exhausted)
 	}
 }
 

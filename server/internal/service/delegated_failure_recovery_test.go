@@ -208,8 +208,8 @@ func TestPendingDelegatedFailureSweepRepairsCommittedCommentWithoutTask(t *testi
 	// The durable outbox starts at the explicit platform comment. Do not
 	// retroactively wake arbitrary historical delegated failures that predate
 	// this recovery mechanism.
-	if recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || recovered != 0 {
-		t.Fatalf("pre-comment recovery sweep = %d, %v; want 0, nil", recovered, err)
+	if result, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || result != (DelegatedFailureRecoverySweepResult{}) {
+		t.Fatalf("pre-comment recovery sweep = %+v, %v; want zero result, nil", result, err)
 	}
 
 	// This is the durable intermediate state left when comment creation commits
@@ -228,9 +228,9 @@ func TestPendingDelegatedFailureSweepRepairsCommittedCommentWithoutTask(t *testi
 		t.Fatalf("recovery tasks before sweep = %d, want 0", tasksBefore)
 	}
 
-	recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
-	if err != nil || recovered != 1 {
-		t.Fatalf("RecoverPendingDelegatedFailures = %d, %v; want 1, nil", recovered, err)
+	result, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
+	if err != nil || result.Replayed != 1 || result.Exhausted != 0 {
+		t.Fatalf("RecoverPendingDelegatedFailures = %+v, %v; want one replay, nil", result, err)
 	}
 	var comments, tasks int
 	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM comment WHERE type = 'progress_update' AND source_task_id = $1`, failedID).Scan(&comments); err != nil {
@@ -244,8 +244,8 @@ func TestPendingDelegatedFailureSweepRepairsCommittedCommentWithoutTask(t *testi
 	if comments != 1 || tasks != 1 {
 		t.Fatalf("comments/tasks after sweep = %d/%d, want 1/1", comments, tasks)
 	}
-	if recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || recovered != 0 {
-		t.Fatalf("second recovery sweep = %d, %v; want 0, nil", recovered, err)
+	if result, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || result != (DelegatedFailureRecoverySweepResult{}) {
+		t.Fatalf("second recovery sweep = %+v, %v; want zero result, nil", result, err)
 	}
 }
 
@@ -286,9 +286,9 @@ func TestPendingDelegatedFailureSweepRequeuesTerminalUndeliveredTask(t *testing.
 				t.Fatalf("terminalize recovery before delivery: %v", err)
 			}
 
-			recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
-			if err != nil || recovered != 1 {
-				t.Fatalf("RecoverPendingDelegatedFailures = %d, %v; want 1, nil", recovered, err)
+			result, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
+			if err != nil || result.Replayed != 1 || result.Exhausted != 0 {
+				t.Fatalf("RecoverPendingDelegatedFailures = %+v, %v; want one replay, nil", result, err)
 			}
 			var active, total int
 			if err := f.pool.QueryRow(ctx, `
@@ -301,8 +301,8 @@ func TestPendingDelegatedFailureSweepRequeuesTerminalUndeliveredTask(t *testing.
 			if active != 1 || total != 2 {
 				t.Fatalf("active/total recovery tasks = %d/%d, want 1/2", active, total)
 			}
-			if recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || recovered != 0 {
-				t.Fatalf("second recovery sweep = %d, %v; want 0, nil", recovered, err)
+			if result, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || result != (DelegatedFailureRecoverySweepResult{}) {
+				t.Fatalf("second recovery sweep = %+v, %v; want zero result, nil", result, err)
 			}
 		})
 	}
@@ -352,8 +352,8 @@ func TestUserCancelledDelegatedFailureRecoveryStaysCancelled(t *testing.T) {
 	if !acknowledged {
 		t.Fatal("user cancellation did not terminally acknowledge the recovery signal")
 	}
-	if recovered, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || recovered != 0 {
-		t.Fatalf("recovery sweep after user cancel = %d, %v; want 0, nil", recovered, err)
+	if result, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || result != (DelegatedFailureRecoverySweepResult{}) {
+		t.Fatalf("recovery sweep after user cancel = %+v, %v; want zero result, nil", result, err)
 	}
 	var taskCount int
 	if err := f.pool.QueryRow(ctx, `
@@ -363,6 +363,81 @@ func TestUserCancelledDelegatedFailureRecoveryStaysCancelled(t *testing.T) {
 	}
 	if taskCount != 1 {
 		t.Fatalf("recovery tasks after user cancel = %d, want 1", taskCount)
+	}
+}
+
+func TestManualRerunKeepsDelegatedFailureRecoveryReplayable(t *testing.T) {
+	f, svc := seedDelegatedFailureFixture(t)
+	ctx := context.Background()
+	failedID := f.insertWorkerTask(t, "failed", "comment", 1, 2)
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET failure_reason = 'agent_error.process_failure', error = 'worker exited', completed_at = now()
+		WHERE id = $1`, failedID); err != nil {
+		t.Fatalf("stamp failed task: %v", err)
+	}
+	failed, err := svc.Queries.GetAgentTask(ctx, failedID)
+	if err != nil {
+		t.Fatalf("load failed task: %v", err)
+	}
+	if handled, err := svc.recoverDelegatedTaskFailure(ctx, failed); err != nil || !handled {
+		t.Fatalf("initial recovery = handled %v err %v", handled, err)
+	}
+
+	var firstRecoveryTaskID, recoveryCommentID pgtype.UUID
+	if err := f.pool.QueryRow(ctx, `
+		SELECT task.id, recovery.id
+		FROM agent_task_queue task
+		JOIN comment recovery ON recovery.id = task.trigger_comment_id
+		WHERE task.trigger_evidence_kind = 'delegated_failure'
+		  AND task.trigger_evidence_ref_id = $1`, failedID).Scan(&firstRecoveryTaskID, &recoveryCommentID); err != nil {
+		t.Fatalf("load initial recovery task/comment: %v", err)
+	}
+
+	rerun, err := svc.RerunIssue(
+		ctx,
+		util.MustParseUUID(f.issueID),
+		util.MustParseUUID(f.sourceTask),
+		pgtype.UUID{},
+		util.MustParseUUID(f.userID),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("RerunIssue: %v", err)
+	}
+	var firstStatus string
+	var acknowledged bool
+	if err := f.pool.QueryRow(ctx, `
+		SELECT status, $2::uuid = ANY(delivered_comment_ids)
+		FROM agent_task_queue WHERE id = $1`, firstRecoveryTaskID, recoveryCommentID).Scan(&firstStatus, &acknowledged); err != nil {
+		t.Fatalf("read rerun-cancelled recovery task: %v", err)
+	}
+	if firstStatus != "cancelled" || acknowledged {
+		t.Fatalf("rerun-cancelled recovery = status %q acknowledged %v, want cancelled and replayable", firstStatus, acknowledged)
+	}
+
+	result, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
+	if err != nil || result.Replayed != 1 || result.Exhausted != 0 {
+		t.Fatalf("recovery sweep after rerun = %+v, %v; want one replay", result, err)
+	}
+	var rerunTrigger string
+	if err := f.pool.QueryRow(ctx, `SELECT COALESCE(trigger_comment_id::text, '') FROM agent_task_queue WHERE id = $1`, rerun.ID).Scan(&rerunTrigger); err != nil {
+		t.Fatalf("read rerun trigger: %v", err)
+	}
+	if rerunTrigger != util.UUIDToString(recoveryCommentID) {
+		t.Fatalf("rerun trigger = %q, want recovery comment %s", rerunTrigger, util.UUIDToString(recoveryCommentID))
+	}
+	var dedicatedRecoveryTasks int
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_task_queue
+		WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&dedicatedRecoveryTasks); err != nil {
+		t.Fatalf("count dedicated recovery tasks: %v", err)
+	}
+	if dedicatedRecoveryTasks != 1 {
+		t.Fatalf("dedicated recovery task count after rerun = %d, want original cancelled task only", dedicatedRecoveryTasks)
+	}
+	if result, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || result != (DelegatedFailureRecoverySweepResult{}) {
+		t.Fatalf("second recovery sweep after rerun = %+v, %v; want zero result", result, err)
 	}
 }
 
@@ -403,9 +478,16 @@ func TestDelegatedFailureRecoveryStopsAfterBoundedUndeliveredAttempts(t *testing
 			t.Fatalf("fail recovery attempt %d: %v", attempt, err)
 		}
 
-		processed, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
-		if err != nil || processed != 1 {
-			t.Fatalf("recovery sweep after attempt %d = %d, %v; want 1, nil", attempt, processed, err)
+		result, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
+		if err != nil {
+			t.Fatalf("recovery sweep after attempt %d = %+v, %v", attempt, result, err)
+		}
+		if attempt < delegatedFailureRecoveryMaxTaskAttempts {
+			if result.Replayed != 1 || result.Exhausted != 0 {
+				t.Fatalf("recovery sweep after attempt %d = %+v, want one replay", attempt, result)
+			}
+		} else if result.Replayed != 0 || result.Exhausted != 1 {
+			t.Fatalf("recovery sweep after final attempt = %+v, want one exhaustion", result)
 		}
 		var active, total int
 		if err := f.pool.QueryRow(ctx, `
@@ -438,8 +520,33 @@ func TestDelegatedFailureRecoveryStopsAfterBoundedUndeliveredAttempts(t *testing
 	if exhaustionComments != 1 || !strings.Contains(exhaustionContent, "stopped after 3") {
 		t.Fatalf("exhaustion comment = count %d content %q, want one visible bounded-stop explanation", exhaustionComments, exhaustionContent)
 	}
-	if processed, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || processed != 0 {
-		t.Fatalf("post-exhaustion recovery sweep = %d, %v; want 0, nil", processed, err)
+	var inboxItems int
+	var inboxSeverity, inboxBody string
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*), COALESCE(max(severity), ''), COALESCE(max(body), '')
+		FROM inbox_item
+		WHERE workspace_id = $1
+		  AND recipient_type = 'member'
+		  AND recipient_id = $2
+		  AND issue_id = $3
+		  AND type = 'task_failed'`, f.workspaceID, f.userID, f.issueID).
+		Scan(&inboxItems, &inboxSeverity, &inboxBody); err != nil {
+		t.Fatalf("read exhaustion inbox item: %v", err)
+	}
+	if inboxItems != 1 || inboxSeverity != "action_required" || inboxBody != exhaustionContent {
+		t.Fatalf("exhaustion inbox = count %d severity %q body %q, want one action-required copy of explanation", inboxItems, inboxSeverity, inboxBody)
+	}
+	if result, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || result != (DelegatedFailureRecoverySweepResult{}) {
+		t.Fatalf("post-exhaustion recovery sweep = %+v, %v; want zero result, nil", result, err)
+	}
+	if err := f.pool.QueryRow(ctx, `
+		SELECT count(*) FROM inbox_item
+		WHERE workspace_id = $1 AND recipient_id = $2 AND issue_id = $3
+		  AND type = 'task_failed'`, f.workspaceID, f.userID, f.issueID).Scan(&inboxItems); err != nil {
+		t.Fatalf("recount exhaustion inbox items: %v", err)
+	}
+	if inboxItems != 1 {
+		t.Fatalf("post-exhaustion inbox count = %d, want 1", inboxItems)
 	}
 	var finalTasks int
 	if err := f.pool.QueryRow(ctx, `
