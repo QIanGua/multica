@@ -87,13 +87,6 @@ vi.mock("@multica/core/projects", () => ({
     }),
 }));
 
-// The worktree gate asks the live backend, not the stored runtime row.
-let serverVersion = "";
-vi.mock("@multica/core/config", () => ({
-  useConfigStore: (selector: (state: { serverVersion: string }) => unknown) =>
-    selector({ serverVersion }),
-}));
-
 vi.mock("@multica/core/hooks", () => ({ useWorkspaceId: () => "workspace-1" }));
 vi.mock("@multica/core/paths", () => ({
   useCurrentWorkspace: () => ({ id: "workspace-1", slug: "ws", repos: [] }),
@@ -179,7 +172,6 @@ describe("CreateProjectModal — local directory execution mode", () => {
     createProjectMock.mockClear();
     runtimeCliVersion = "9.9.9";
     runtimeWorktreeMetadata = "advertised";
-    serverVersion = "";
     pickedIsGitRepo = true;
   });
 
@@ -210,9 +202,12 @@ describe("CreateProjectModal — local directory execution mode", () => {
     expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument();
   });
 
-  // A runtime that cannot run the mode must not be preselected into it, or the
-  // create call would be rejected by the server's version gate.
-  it("preselects direct when the daemon does not support it, even for a git repository", async () => {
+  // A machine that has not advertised the capability must not be preselected
+  // into parallel: the server gates this create, and a rejection would fail the
+  // whole project creation over a mode the user never chose. It stays
+  // SELECTABLE — an un-advertised machine may still be able to run it, and only
+  // the server can say (#7113).
+  it("preselects direct when the machine has not advertised the capability", async () => {
     runtimeWorktreeMetadata = "daemon_cannot";
     const user = userEvent.setup();
     renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
@@ -268,74 +263,18 @@ describe("CreateProjectModal — local directory execution mode", () => {
     expect(screen.getByRole("button", { name: /Change directory/i })).toBeInTheDocument();
   });
 
-  // The server refuses to save a worktree resource the machine cannot run, and
-  // here that rejection would fail the whole project creation — so the option
-  // has to be blocked before submit, not after.
-  it("blocks parallel mode when the daemon does not support it", async () => {
-    runtimeWorktreeMetadata = "daemon_cannot";
-    const user = userEvent.setup();
-    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
 
-    await pickLocalDirectory(user);
 
-    const worktreeOption = screen.getByRole("radio", { name: /Run in parallel, isolated/i });
-    expect(worktreeOption).toBeDisabled();
-    expect(screen.getByText(/Update Multica there/i)).toBeInTheDocument();
-    // Nothing gates on a version any more; quoting the old floor is what told a
-    // user on v0.4.28 to upgrade past v0.4.24 (#7113).
-    expect(screen.queryByText(/0\.4\.24/)).not.toBeInTheDocument();
-  });
 
-  // Self-hosted skew: Desktop ships its own renderer and daemon and updates
-  // both, so it routinely runs ahead of a hand-upgraded backend. The daemon is
-  // fine here — the backend never recorded what it advertised, and says so
-  // itself via /api/config.
-  it("blames the backend when the running server predates the handshake", async () => {
+
+  it("still offers parallel mode when the machine has not advertised", async () => {
     runtimeWorktreeMetadata = "server_recorded_nothing";
-    runtimeCliVersion = "v0.4.28";
-    serverVersion = "0.4.24";
     const user = userEvent.setup();
     renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
 
     await pickLocalDirectory(user);
 
-    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).toBeDisabled();
-    expect(screen.getByText(/Multica server is older/i)).toBeInTheDocument();
-    // Telling this user to update the machine is the bug: it is already newest.
-    expect(screen.queryByText(/Update Multica there/i)).not.toBeInTheDocument();
-  });
-
-  // A pre-v0.4.2 self-hosted backend names no version and records no
-  // capabilities: the machine is the only runtime here, so nothing else
-  // identifies the server either. Sending this operator to restart the machine
-  // would loop against the same blind backend forever.
-  it("names both remedies when nothing identifies the backend", async () => {
-    runtimeWorktreeMetadata = "server_recorded_nothing";
-    runtimeCliVersion = "v0.4.28";
-    serverVersion = "";
-    const user = userEvent.setup();
-    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
-
-    await pickLocalDirectory(user);
-
-    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).toBeDisabled();
-    expect(screen.getByText(/can't confirm whether that machine/i)).toBeInTheDocument();
-  });
-
-  // Same stored row, backend since upgraded. Upgrading it again fixes nothing —
-  // the row simply predates the upgrade, so the machine has to register again.
-  it("asks for a re-register when the backend is current but the row is old", async () => {
-    runtimeWorktreeMetadata = "server_recorded_nothing";
-    runtimeCliVersion = "v0.4.28";
-    serverVersion = "0.4.28";
-    const user = userEvent.setup();
-    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
-
-    await pickLocalDirectory(user);
-
-    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).toBeDisabled();
-    expect(screen.getByText(/Restart Multica there/i)).toBeInTheDocument();
-    expect(screen.queryByText(/Multica server is older/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).not.toBeDisabled();
   });
 
   it("blocks parallel mode for a folder that is not a git repository", async () => {

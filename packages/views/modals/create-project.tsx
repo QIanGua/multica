@@ -68,10 +68,9 @@ import {
 } from "../platform/local-directory";
 import { useLocalDaemonStatus } from "../platform/use-local-daemon-status";
 import {
-  localWorktreeSupport,
+  runtimeAdvertisesLocalWorktree,
   runtimeListOptions,
 } from "@multica/core/runtimes";
-import { useConfigStore } from "@multica/core/config";
 import type { LocalDirectoryExecutionMode } from "@multica/core/types";
 import { LocalDirectoryModeOptions } from "../projects/components/local-directory-mode-dialog";
 
@@ -211,32 +210,27 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
   // with no worktree implementation (MUL-5707). A backend too old to record the
   // capability at all is its own answer — blaming this machine for that sent a
   // user off to update the one piece already on the newest release (#7113).
-  // Asked of the live backend: a runtime row written before the server learned
-  // to record capabilities would otherwise keep reporting it as stale forever.
-  const serverVersion = useConfigStore((state) => state.serverVersion);
-  const localWorktree = localWorktreeSupport(runtimes, daemonStatus.daemonId, serverVersion);
+  // Preselection only — the server gates the save, including on this bundled
+  // create path, and rejects with a message the modal surfaces.
+  const localAdvertisesWorktree = runtimeAdvertisesLocalWorktree(
+    runtimes,
+    daemonStatus.daemonId,
+  );
   const worktreeUnavailableReason =
-    localIsGitRepo === false
-      ? ("not_git" as const)
-      : localWorktree === "server_capability_blind"
-        ? ("server_outdated" as const)
-        : localWorktree === "runtime_registration_stale"
-          ? ("runtime_stale" as const)
-          : localWorktree === "capability_source_unknown"
-            ? ("capability_unknown" as const)
-            : localWorktree === "daemon_unsupported"
-              ? ("daemon_outdated" as const)
-              : undefined;
+    localIsGitRepo === false ? ("not_git" as const) : undefined;
   // Preselection, not a default behavior change: when the folder is a git repo
-  // and the runtime can actually run worktree mode, parallel is the better fit,
-  // so it starts selected — visibly, in a control the user can flip in one
-  // click before creating anything. A plain folder starts on direct.
+  // and the machine has advertised that it can run worktree mode, parallel is
+  // the better fit, so it starts selected — visibly, in a control the user can
+  // flip in one click before creating anything. A plain folder starts on
+  // direct, and so does a machine that has not advertised: it may still be able
+  // to (an old row proves nothing), but choosing it FOR the user is how a
+  // rejected save would turn into a failed project creation.
   //
   // `localIsGitRepo === undefined` (an older desktop build that doesn't report
   // it) preselects direct. The asymmetry is deliberate: permissive about what
   // the user MAY choose, conservative about what we choose FOR them.
   const preselectedLocalMode: LocalDirectoryExecutionMode =
-    localIsGitRepo === true && worktreeUnavailableReason === undefined
+    localIsGitRepo === true && localAdvertisesWorktree && worktreeUnavailableReason === undefined
       ? "worktree"
       : "in_place";
   // Never submit a mode the picker would have blocked — the folder can change

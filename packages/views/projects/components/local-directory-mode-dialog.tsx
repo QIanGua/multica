@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from "react";
 import { GitBranch, Pencil, TriangleAlert } from "lucide-react";
-import { MIN_CAPABILITY_AWARE_SERVER_VERSION } from "@multica/core/runtimes";
 import type { LocalDirectoryExecutionMode } from "@multica/core/types";
 import { Button } from "@multica/ui/components/ui/button";
 import {
@@ -16,25 +15,18 @@ import {
 import { useT } from "../../i18n/use-t";
 
 /**
- * Why the worktree option may be unavailable. Each case needs different copy
- * because each is fixed somewhere else: `not_git` by choosing a different
- * folder, `daemon_outdated` by updating the app on that machine,
- * `server_outdated` by upgrading the (self-hosted) backend — which no amount of
- * updating that machine will fix — and `runtime_stale` by getting that machine
- * to register again with a backend that has since been upgraded.
+ * Why the worktree option may be unavailable.
  *
- * `capability_unknown` is the honest fallback: the backend does not name a
- * version and nothing else proves which of those two it is, so the copy names
- * both remedies rather than sending the user down one that cannot work.
+ * Exactly one reason, on purpose. `not_git` is the only blocker the client can
+ * establish by itself: the folder either has a repository to branch from or it
+ * does not, and the desktop picker checked. Whether the MACHINE can run the
+ * mode is the server's question — it is the one that knows its own version,
+ * and it is asked on every save (#7113). A rejection comes back as
+ * `errorMessage` rather than as a disabled option guessed at up front.
  *
  * `undefined` means available.
  */
-export type WorktreeUnavailableReason =
-  | "not_git"
-  | "daemon_outdated"
-  | "server_outdated"
-  | "runtime_stale"
-  | "capability_unknown";
+export type WorktreeUnavailableReason = "not_git";
 
 interface LocalDirectoryModeDialogProps {
   open: boolean;
@@ -164,26 +156,10 @@ export function LocalDirectoryModeOptions({
         identifier="worktree"
         selected={value === "worktree"}
         disabled={worktreeDisabled}
-        // No DAEMON version numbers in any of this copy. Nothing gates on one
-        // any more (MUL-5707), so quoting the floor told a user running the
-        // newest release that they needed an older one (#7113); the server's
-        // own 422 was rewritten the same way. The backend floor below is a
-        // different thing: it is the number the operator upgrades past, and it
-        // is checked against the live server, not guessed from a runtime row.
         disabledReason={
           unavailableReason === "not_git"
             ? t(($) => $.resources.mode_worktree_needs_git)
-            : unavailableReason === "server_outdated"
-              ? t(($) => $.resources.mode_worktree_needs_server_upgrade, {
-                  min: MIN_CAPABILITY_AWARE_SERVER_VERSION,
-                })
-              : unavailableReason === "runtime_stale"
-                ? t(($) => $.resources.mode_worktree_needs_reregister)
-                : unavailableReason === "capability_unknown"
-                  ? t(($) => $.resources.mode_worktree_capability_unknown)
-                  : unavailableReason === "daemon_outdated"
-                    ? t(($) => $.resources.mode_worktree_needs_upgrade)
-                    : undefined
+            : undefined
         }
         onSelect={() => onChange("worktree")}
       />

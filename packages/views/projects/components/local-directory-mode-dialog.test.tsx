@@ -20,7 +20,7 @@ function renderDialog(
   } = {},
 ) {
   const onConfirm = overrides.onConfirm ?? vi.fn();
-  const { unmount } = render(
+  render(
     <I18nProvider locale="en" resources={TEST_RESOURCES}>
       <LocalDirectoryModeDialog
         open
@@ -34,7 +34,7 @@ function renderDialog(
       />
     </I18nProvider>,
   );
-  return { onConfirm, unmount };
+  return { onConfirm };
 }
 
 function worktreeOption(): HTMLElement {
@@ -87,68 +87,32 @@ describe("LocalDirectoryModeDialog", () => {
     expect(onConfirm).toHaveBeenCalledWith("in_place");
   });
 
-  // The server refuses the save when the machine cannot run the mode; saying so
-  // up front beats a bare 422 after the user has committed to the choice.
-  it("disables parallel mode for a daemon that cannot run it", () => {
-    renderDialog({ unavailableReason: "daemon_outdated" });
 
-    expect(worktreeOption().hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText(/Update Multica there/i)).toBeTruthy();
-  });
 
-  // #7113: nothing has gated on a version since MUL-5707, so quoting the old
-  // floor told a user on v0.4.28 they needed v0.4.24 or newer. Any version
-  // number in this copy is a regression, whichever blocker fired.
-  it("never quotes a daemon version at the user", () => {
-    for (const reason of [
-      "daemon_outdated",
-      "server_outdated",
-      "runtime_stale",
-      "capability_unknown",
-    ] as const) {
-      const { unmount } = renderDialog({ unavailableReason: reason });
-      expect(screen.queryByText(/0\.4\.24/)).toBeNull();
-      expect(screen.queryByText(/an older version/i)).toBeNull();
-      unmount();
-    }
-  });
 
-  // Neither half is broken here: the backend has been upgraded, the row just
-  // predates it. Telling this user to upgrade anything would be a dead end.
-  it("asks for a re-register when only the stored row is stale", () => {
-    renderDialog({ unavailableReason: "runtime_stale" });
 
-    expect(worktreeOption().hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText(/Restart Multica there/i)).toBeTruthy();
-    expect(screen.queryByText(/Multica server is older/i)).toBeNull();
-  });
 
-  // A pre-v0.4.2 self-hosted server reports no version and records no
-  // capabilities, so "restart that machine" would loop forever. When we cannot
-  // tell which half is behind, the copy has to carry both remedies.
-  it("names both remedies when the backend cannot be identified", () => {
-    renderDialog({ unavailableReason: "capability_unknown" });
-
-    expect(worktreeOption().hasAttribute("disabled")).toBe(true);
-    const notice = screen.getByText(/can't confirm whether that machine/i);
-    expect(notice.textContent).toMatch(/self-hosted Multica server, upgrade it/i);
-    expect(notice.textContent).toMatch(/restart Multica on that machine/i);
-  });
-
-  // The remedy is on the backend, and no amount of updating the machine can
-  // reach it — so this must not read as "your machine is out of date".
-  it("blames the backend, not the machine, when the server records no capabilities", () => {
-    renderDialog({ unavailableReason: "server_outdated" });
-
-    expect(worktreeOption().hasAttribute("disabled")).toBe(true);
-    const notice = screen.getByText(/Multica server is older/i);
-    // The server floor is the one version worth naming: it is what the operator
-    // upgrades past, and it is not the daemon's.
-    expect(notice.textContent).toContain("0.4.25");
-  });
-
+  // The client no longer predicts whether the machine can run the mode — the
+  // server decides on save, and this is where its answer lands. Guessing it up
+  // front is what disabled the option for a user whose machine was already on
+  // the newest release, with an instruction that could not help (#7113).
   it("shows a server rejection inline so the dialog stays actionable", () => {
-    renderDialog({ errorMessage: "daemon is too old to run worktree mode" });
-    expect(screen.getByText(/too old to run worktree mode/i)).toBeTruthy();
+    renderDialog({
+      errorMessage:
+        "the Multica runtime on that machine does not support it. Update the Multica app on that machine",
+    });
+    expect(screen.getByText(/does not support it/i)).toBeTruthy();
+  });
+
+  it("leaves parallel mode selectable for a git folder, whatever the runtime says", () => {
+    const onConfirm = vi.fn();
+    renderDialog({ onConfirm });
+
+    const option = worktreeOption();
+    expect(option.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(option);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(onConfirm).toHaveBeenCalledWith("worktree");
   });
 });

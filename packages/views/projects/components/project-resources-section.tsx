@@ -28,11 +28,9 @@ import type {
   ProjectResource,
 } from "@multica/core/types";
 import {
-  localWorktreeSupport,
+  runtimeAdvertisesLocalWorktree,
   runtimeListOptions,
 } from "@multica/core/runtimes";
-import { useConfigStore } from "@multica/core/config";
-import type { LocalWorktreeSupport } from "@multica/core/runtimes";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
 import {
@@ -129,11 +127,11 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
   const desktopMode = isDesktopShell();
   const localDaemonId = daemonStatus.daemonId;
 
-  // Worktree mode needs a daemon new enough to implement it. An older daemon
-  // does not know the field exists and would run the task in place — editing
-  // the working copy the user asked to isolate — so the server refuses the
-  // save. Checking here too turns that 422 into a disabled option with a
-  // reason, at the moment the user is choosing.
+  // Only ever used to decide what to PRESELECT. Whether the machine can run
+  // worktree mode is the server's call — it knows its own version, the client
+  // would have to infer it from data the server wrote, and that inference is
+  // what told a user on the newest release to upgrade it (#7113). The save is
+  // gated server-side and surfaced here as an inline error instead.
   const { data: runtimes = [] } = useQuery(runtimeListOptions(wsId));
   // Keyed on the resource's OWN daemon, not the machine the browser happens to
   // be on: a resource is pinned to one machine, and its mode can legitimately
@@ -144,11 +142,8 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
   // see localWorktreeSupport for why an any-match would keep saying yes after a
   // downgrade, and why "no capability recorded" is a distinct answer from "this
   // daemon cannot do it".
-  // The live backend, not the runtime row: a row written before the server
-  // learned to record capabilities keeps saying so long after the upgrade.
-  const serverVersion = useConfigStore((state) => state.serverVersion);
-  const worktreeSupport = (daemonId: string | null) =>
-    localWorktreeSupport(runtimes, daemonId, serverVersion);
+  const advertisesWorktree = (daemonId: string | null) =>
+    runtimeAdvertisesLocalWorktree(runtimes, daemonId);
 
   const attachedUrls = new Set(
     resources.filter(isGithubRef).map((r) => r.resource_ref.url),
@@ -244,7 +239,7 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
         // user still confirms, and existing resources keep whatever they have.
         mode:
           validation.is_git_repo === true &&
-          worktreeSupport(localDaemonId) === "supported"
+          advertisesWorktree(localDaemonId)
             ? "worktree"
             : "in_place",
         isGitRepo: validation.is_git_repo,
@@ -529,10 +524,7 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
           }}
           path={modeDialog.path}
           value={modeDialog.mode}
-          unavailableReason={worktreeUnavailableReason(
-            modeDialog.isGitRepo,
-            worktreeSupport(modeDialog.daemonId),
-          )}
+          unavailableReason={worktreeUnavailableReason(modeDialog.isGitRepo)}
           errorMessage={modeError ?? undefined}
           saving={modeSaving}
           confirmLabel={
@@ -554,21 +546,16 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
  * folder. `undefined` means we could not check (an older desktop build, or an
  * existing row whose path was validated at pick time), and is deliberately
  * permissive: the daemon re-checks authoritatively, so guessing "not a repo"
- * here would block a perfectly valid setup. The capability blockers are checked
- * second because upgrading is the more actionable of the two — and they are
- * kept apart, because telling someone to update a machine that is already on
- * the newest release when the backend is the stale half helps nobody (#7113).
+ * here would block a perfectly valid setup.
+ *
+ * Daemon capability is deliberately absent. It is the server's question, asked
+ * on save; predicting it here is what produced an unfixable blocker for a user
+ * already on the newest release (#7113).
  */
 function worktreeUnavailableReason(
   isGitRepo: boolean | undefined,
-  support: LocalWorktreeSupport,
 ): WorktreeUnavailableReason | undefined {
-  if (isGitRepo === false) return "not_git";
-  if (support === "server_capability_blind") return "server_outdated";
-  if (support === "runtime_registration_stale") return "runtime_stale";
-  if (support === "capability_source_unknown") return "capability_unknown";
-  if (support === "daemon_unsupported") return "daemon_outdated";
-  return undefined;
+  return isGitRepo === false ? "not_git" : undefined;
 }
 
 interface ResourceRowProps {

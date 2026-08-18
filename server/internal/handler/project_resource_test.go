@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -1237,5 +1238,54 @@ func TestLatestDaemonCLIVersion(t *testing.T) {
 				t.Errorf("latestDaemonCLIVersion = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// The bundled create path (project + resources in one transaction) skipped the
+// worktree save gate that POST/PUT /resources have always run, so a project
+// could be created with a mode the machine cannot run — surfacing only later,
+// as the claim gate cancelling the task.
+//
+// It matters more now that the client no longer predicts this answer: the UI
+// leaves parallel mode selectable and lets the server rule on it (#7113), which
+// only works if every write path actually asks.
+func TestCreateProjectGatesWorktreeLocalDirectory(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/projects?workspace_id="+testWorkspaceID, map[string]any{
+		"title": "Bundled worktree resource",
+		"resources": []map[string]any{
+			{
+				"resource_type": "local_directory",
+				"resource_ref": map[string]any{
+					"local_path":     "/Users/dev/work/game-client",
+					"daemon_id":      "daemon-with-no-runtime-row",
+					"execution_mode": "worktree",
+				},
+			},
+		},
+	})
+	testHandler.CreateProject(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("CreateProject with un-runnable worktree resource: expected 422, got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["code"] != "daemon_version_unsupported" {
+		t.Fatalf("expected the shared gate's error code, got %#v", resp["code"])
+	}
+
+	// The gate runs before the transaction opens, so the rejection must not
+	// leave a half-created project behind.
+	lw := httptest.NewRecorder()
+	lreq := newRequest("GET", "/api/projects?workspace_id="+testWorkspaceID, nil)
+	testHandler.ListProjects(lw, lreq)
+	if strings.Contains(lw.Body.String(), "Bundled worktree resource") {
+		t.Fatal("rejected create left a project behind")
 	}
 }

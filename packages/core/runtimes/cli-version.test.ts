@@ -6,8 +6,7 @@ import {
   handoffSupported,
   MIN_CHAT_PROJECT_CONTEXT_CLI_VERSION,
   MIN_HANDOFF_CLI_VERSION,
-  localWorktreeSupport,
-  serverCapabilityAwareness,
+  runtimeAdvertisesLocalWorktree,
 } from "./cli-version";
 
 describe("checkQuickCreateCliVersion", () => {
@@ -94,32 +93,8 @@ describe("chatProjectContextSupported", () => {
   });
 });
 
-describe("serverCapabilityAwareness", () => {
-  it("reads the running backend's version", () => {
-    expect(serverCapabilityAwareness("0.4.25")).toBe("aware");
-    expect(serverCapabilityAwareness("v0.4.28")).toBe("aware");
-    expect(serverCapabilityAwareness("v0.4.21-24-gcd3c0bb89")).toBe("aware");
-    expect(serverCapabilityAwareness("0.4.24")).toBe("blind");
-    expect(serverCapabilityAwareness("0.3.0")).toBe("blind");
-  });
-
-  // An absent version has three sources that do not share a remedy: the managed
-  // cloud (omits it on purpose, MUL-4108), an unstamped dev build, and a
-  // self-hosted server older than v0.4.2 where the field shipped. The first two
-  // record capabilities, the third does not — so this must not answer.
-  it("refuses to guess when the server does not name itself", () => {
-    for (const v of ["", "   ", undefined, null, "unknown"]) {
-      expect(serverCapabilityAwareness(v)).toBe("unknown");
-    }
-  });
-});
-
-describe("localWorktreeSupport", () => {
-  const CURRENT = "0.4.28";
-  const BLIND = "0.4.24";
+describe("runtimeAdvertisesLocalWorktree", () => {
   const capable = { capabilities: ["skill-bundles-v1", "local-worktree-v1"] };
-  // A capability-aware server writes the key even when the daemon sent no
-  // header, so `null` is what an old daemon on a current server looks like.
   const incapable = { cli_version: "9.9.9", capabilities: null };
   const row = (metadata: unknown, last_seen_at: string | null = "2026-08-13T00:00:00Z") => ({
     daemon_id: "d1",
@@ -128,128 +103,81 @@ describe("localWorktreeSupport", () => {
   });
 
   it("reads the advertised capability", () => {
-    expect(localWorktreeSupport([row(capable)], "d1", CURRENT)).toBe("supported");
-    expect(
-      localWorktreeSupport([row({ capabilities: ["skill-bundles-v1"] })], "d1", CURRENT),
-    ).toBe("daemon_unsupported");
+    expect(runtimeAdvertisesLocalWorktree([row(capable)], "d1")).toBe(true);
+    expect(runtimeAdvertisesLocalWorktree([row({ capabilities: ["skill-bundles-v1"] })], "d1")).toBe(
+      false,
+    );
   });
 
   // The whole reason this replaced a version check: a dev-built daemon reports a
   // git-describe string that the version floor exempts, so a binary with no
   // worktree implementation passed and two tasks ran in the user's own
-  // directory (MUL-5707). The capability must ignore daemon versions entirely.
+  // directory (MUL-5707).
   it("ignores the daemon version string in both directions", () => {
+    expect(runtimeAdvertisesLocalWorktree([row({ cli_version: "9.9.9" })], "d1")).toBe(false);
     expect(
-      localWorktreeSupport([row({ cli_version: "9.9.9", capabilities: [] })], "d1", CURRENT),
-    ).toBe("daemon_unsupported");
-    expect(
-      localWorktreeSupport(
+      runtimeAdvertisesLocalWorktree(
         [row({ cli_version: "0.0.1", capabilities: ["local-worktree-v1"] })],
         "d1",
-        CURRENT,
       ),
-    ).toBe("supported");
+    ).toBe(true);
   });
 
-  // #7113: a self-hosted backend older than the handshake stores no
-  // `capabilities` key at all, so the newest daemon on earth reads as
-  // unsupported through it. Blaming the machine sent a user on v0.4.28 off to
-  // upgrade past v0.4.24 — a floor they had already cleared.
-  it("blames a backend that predates the handshake", () => {
+  // Everything unreadable is simply "has not advertised". This function no
+  // longer tries to say WHY — an old daemon, a row written before the server
+  // recorded capabilities, and a server too old to record them are
+  // indistinguishable from here, and pretending otherwise is what blocked a
+  // user on the newest release with an instruction that could not help (#7113).
+  it("says nothing about the reason when no row advertises", () => {
     for (const metadata of [{}, { cli_version: "v0.4.28" }, undefined, null, "nope", 42]) {
-      expect(localWorktreeSupport([row(metadata)], "d1", BLIND)).toBe("server_capability_blind");
+      expect(runtimeAdvertisesLocalWorktree([row(metadata)], "d1")).toBe(false);
     }
-    // The key present but useless is the daemon's answer, not the server's —
-    // even when the server is old enough to be a suspect.
-    expect(localWorktreeSupport([row(incapable)], "d1", BLIND)).toBe("daemon_unsupported");
-    expect(
-      localWorktreeSupport([row({ capabilities: "local-worktree-v1" })], "d1", CURRENT),
-    ).toBe("daemon_unsupported");
-  });
-
-  // The row only proves the server was old WHEN IT WROTE. Upgrading the backend
-  // does not rewrite runtime metadata and heartbeats touch only last_seen_at, so
-  // an upgraded deployment would be called stale forever — and upgrading it
-  // again would change nothing. That is a different remedy: register again.
-  it("does not call an upgraded backend old just because an old row survives", () => {
-    expect(localWorktreeSupport([row({ cli_version: "v0.4.28" })], "d1", CURRENT)).toBe(
-      "runtime_registration_stale",
+    expect(runtimeAdvertisesLocalWorktree([row(incapable)], "d1")).toBe(false);
+    expect(runtimeAdvertisesLocalWorktree([row({ capabilities: "local-worktree-v1" })], "d1")).toBe(
+      false,
     );
-    // Same row, backend still behind: now the backend genuinely is the problem.
-    expect(localWorktreeSupport([row({ cli_version: "v0.4.28" })], "d1", BLIND)).toBe(
-      "server_capability_blind",
-    );
-    });
-
-  // A v0.4.1-era self-hosted server names no version AND records no
-  // capabilities. Reading its silence as "aware" tells the operator to restart
-  // the machine, which re-registers against the same blind server and writes
-  // the same key-less row — a loop whose only real exit (upgrade the backend)
-  // the copy never mentions.
-  it("does not guess a remedy when nothing identifies the backend", () => {
-    expect(localWorktreeSupport([row({ cli_version: "v0.4.28" })], "d1", "")).toBe(
-      "capability_source_unknown",
-    );
-    expect(localWorktreeSupport([row({})], "d1", undefined)).toBe("capability_source_unknown");
-  });
-
-  // ...but an unnamed server that has written capabilities for ANY machine has
-  // identified itself: the key does not appear unless a capability-aware server
-  // wrote it, and servers move forward. This is the managed-cloud shape — no
-  // version reported, several machines, one of them registered long ago.
-  it("resolves an unnamed backend from what it has written elsewhere", () => {
-    const stale = { daemon_id: "d1", last_seen_at: "2026-08-13T00:00:00Z", metadata: {} };
-    const other = { daemon_id: "d2", last_seen_at: "2026-08-13T00:00:00Z", metadata: capable };
-    expect(localWorktreeSupport([stale, other], "d1", "")).toBe("runtime_registration_stale");
-    // Evidence only ever promotes to "aware"; a named-blind server is not
-    // overridden by a row some earlier deployment wrote.
-    expect(localWorktreeSupport([stale, other], "d1", BLIND)).toBe("server_capability_blind");
   });
 
   // Deregistering only marks a runtime offline; its metadata survives and the
-  // list endpoint still returns it. An any-row match would therefore keep
-  // vouching for a machine that has since downgraded, so the UI would offer a
-  // mode the server refuses at claim time.
+  // list endpoint still returns it. An any-row match would keep preselecting
+  // parallel for a machine that has since downgraded.
   it("ignores a stale capable row once a newer row lacks the capability", () => {
     expect(
-      localWorktreeSupport(
+      runtimeAdvertisesLocalWorktree(
         [row(capable, "2026-08-01T00:00:00Z"), row(incapable, "2026-08-13T00:00:00Z")],
         "d1",
-        CURRENT,
       ),
-    ).toBe("daemon_unsupported");
+    ).toBe(false);
   });
 
   it("recognises an upgrade: newest row advertises it", () => {
     expect(
-      localWorktreeSupport(
+      runtimeAdvertisesLocalWorktree(
         [row(incapable, "2026-08-01T00:00:00Z"), row(capable, "2026-08-13T00:00:00Z")],
         "d1",
-        CURRENT,
       ),
-    ).toBe("supported");
+    ).toBe(true);
   });
 
   it("does not depend on array order", () => {
     const rows = [row(incapable, "2026-08-13T00:00:00Z"), row(capable, "2026-08-01T00:00:00Z")];
-    expect(localWorktreeSupport(rows, "d1", CURRENT)).toBe("daemon_unsupported");
-    expect(localWorktreeSupport([...rows].reverse(), "d1", CURRENT)).toBe("daemon_unsupported");
+    expect(runtimeAdvertisesLocalWorktree(rows, "d1")).toBe(false);
+    expect(runtimeAdvertisesLocalWorktree([...rows].reverse(), "d1")).toBe(false);
   });
 
   it("a row that never reported loses to one that did", () => {
     expect(
-      localWorktreeSupport(
+      runtimeAdvertisesLocalWorktree(
         [row(capable, null), row(incapable, "2026-08-13T00:00:00Z")],
         "d1",
-        CURRENT,
       ),
-    ).toBe("daemon_unsupported");
+    ).toBe(false);
   });
 
-  it("ignores other daemons, and fails closed with no rows or no id", () => {
+  it("ignores other daemons, and answers no with no rows or no id", () => {
     const other = [{ daemon_id: "d2", last_seen_at: "2026-08-13T00:00:00Z", metadata: capable }];
-    expect(localWorktreeSupport(other, "d1", CURRENT)).toBe("daemon_unsupported");
-    expect(localWorktreeSupport([], "d1", CURRENT)).toBe("daemon_unsupported");
-    expect(localWorktreeSupport(other, null, CURRENT)).toBe("daemon_unsupported");
+    expect(runtimeAdvertisesLocalWorktree(other, "d1")).toBe(false);
+    expect(runtimeAdvertisesLocalWorktree([], "d1")).toBe(false);
+    expect(runtimeAdvertisesLocalWorktree(other, null)).toBe(false);
   });
 });
