@@ -91,6 +91,7 @@ export function useIssueSurfaceData({
   serverGroupBranches,
   ganttShowCompleted,
   statusFilters,
+  hiddenStatusCategories,
   priorityFilters,
   assigneeFilters,
   includeNoAssignee,
@@ -115,6 +116,7 @@ export function useIssueSurfaceData({
    *  rows without it, so the working scope has to honour it too. */
   ganttShowCompleted: boolean;
   statusFilters: IssueStatus[];
+  hiddenStatusCategories: IssueStatusCategory[];
   priorityFilters: IssueFilterState["priorityFilters"];
   assigneeFilters: IssueFilterState["assigneeFilters"];
   includeNoAssignee: boolean;
@@ -321,16 +323,19 @@ export function useIssueSurfaceData({
 
   const visibleStatuses = useMemo<IssueStatusCategory[]>(() => {
     // Board columns are CATEGORIES, not status keys — adding a custom status
-    // must never add a column. A status filter is expressed in concrete keys
-    // (that is the point of custom statuses), so narrow by mapping each
-    // selected key back to the column it lands in. Default view shows every
-    // category, `cancelled` last (its canonical position in ALL_STATUSES).
-    if (statusFilters.length > 0) {
-      const selected = new Set(statusFilters.map(categoryOf));
-      return ALL_STATUSES.filter((s) => selected.has(s));
-    }
-    return ALL_STATUSES;
-  }, [statusFilters, categoryOf]);
+    // must never add a column. Two independent things narrow them: hidden
+    // columns (display state) and the status filter, which is expressed in
+    // concrete KEYS and so has to be mapped back to the columns those keys land
+    // in. Default view shows every category, `cancelled` last (its canonical
+    // position in ALL_STATUSES). (MUL-6243)
+    const selected =
+      statusFilters.length > 0 ? new Set(statusFilters.map(categoryOf)) : null;
+    return ALL_STATUSES.filter(
+      (s) =>
+        !hiddenStatusCategories.includes(s) &&
+        (selected === null || selected.has(s)),
+    );
+  }, [statusFilters, hiddenStatusCategories, categoryOf]);
 
   // Hidden columns are the lifecycle statuses not currently visible, so
   // `cancelled` participates in the board show/hide controls exactly like the

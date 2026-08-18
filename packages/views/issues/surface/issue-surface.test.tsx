@@ -163,6 +163,10 @@ describe("IssueSurface — scope switch loading semantics", () => {
       return Promise.resolve({ issues, total: issues.length });
     });
     setApiInstance({
+      // The board pages by category, so every surface stub answers the catalog
+      // read. Empty is the real shape for a workspace with no custom statuses:
+      // a built-in key IS its own category. (MUL-6243)
+      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
       listIssues,
       ...statusTableMethodsFromLegacy(listIssues),
       listGroupedIssues: vi.fn(() => never()),
@@ -250,6 +254,10 @@ describe("IssueSurface — scope switch loading semantics", () => {
       return Promise.resolve({ issues, total: issues.length });
     });
     setApiInstance({
+      // The board pages by category, so every surface stub answers the catalog
+      // read. Empty is the real shape for a workspace with no custom statuses:
+      // a built-in key IS its own category. (MUL-6243)
+      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
       listIssues,
       ...statusTableMethodsFromLegacy(listIssues),
       listGroupedIssues: vi.fn(() => never()),
@@ -325,6 +333,10 @@ describe("IssueSurface — table pagination ownership", () => {
     }));
     const listIssueTableRows = vi.fn(() => never());
     setApiInstance({
+      // The board pages by category, so every surface stub answers the catalog
+      // read. Empty is the real shape for a workspace with no custom statuses:
+      // a built-in key IS its own category. (MUL-6243)
+      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
       listIssues,
       listIssueTableRows,
       listIssueTableFacets: vi.fn(() => never()),
@@ -422,6 +434,10 @@ describe("IssueSurface — table pagination ownership", () => {
       ),
     );
     setApiInstance({
+      // The board pages by category, so every surface stub answers the catalog
+      // read. Empty is the real shape for a workspace with no custom statuses:
+      // a built-in key IS its own category. (MUL-6243)
+      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
       listIssues,
       listIssueTableRows,
       listIssueTableFacets: vi.fn(() => never()),
@@ -490,6 +506,10 @@ describe("IssueSurface — table pagination ownership", () => {
     const issue = makeIssue("table-selected", "Loaded Table issue", "pt-batch");
 
     setApiInstance({
+      // The board pages by category, so every surface stub answers the catalog
+      // read. Empty is the real shape for a workspace with no custom statuses:
+      // a built-in key IS its own category. (MUL-6243)
+      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
       listIssues,
       listIssueTableRows: vi.fn(() =>
         Promise.resolve({
@@ -558,6 +578,10 @@ describe("IssueSurface — table pagination ownership", () => {
         : never(),
     );
     setApiInstance({
+      // The board pages by category, so every surface stub answers the catalog
+      // read. Empty is the real shape for a workspace with no custom statuses:
+      // a built-in key IS its own category. (MUL-6243)
+      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
       listIssues,
       listIssueTableRows,
       listIssueTableFacets: vi.fn(() => never()),
@@ -626,6 +650,10 @@ describe("IssueSurface — table pagination ownership", () => {
     );
 
     setApiInstance({
+      // The board pages by category, so every surface stub answers the catalog
+      // read. Empty is the real shape for a workspace with no custom statuses:
+      // a built-in key IS its own category. (MUL-6243)
+      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
       listIssues,
       listIssueTableGroups: vi.fn(() =>
         Promise.resolve({
@@ -633,7 +661,7 @@ describe("IssueSurface — table pagination ownership", () => {
           total: 1,
           groups: [
             {
-              key: "status:todo",
+              key: "status_category:todo",
               value: { kind: "status", status: "todo" },
               count: 1,
             },
@@ -644,7 +672,7 @@ describe("IssueSurface — table pagination ownership", () => {
       listIssueTableRows: vi.fn(() =>
         Promise.resolve({
           query_fingerprint: "sha256:collapsed-rows",
-          group_key: "status:todo",
+          group_key: "status_category:todo",
           parent_id: null,
           total: 1,
           rows: [{ issue, direct_child_count: 0 }],
@@ -715,6 +743,10 @@ describe("IssueSurface — filtered empty state", () => {
       Promise.resolve({ issues: [], total: 0 } satisfies ListIssuesResponse),
     );
     setApiInstance({
+      // The board pages by category, so every surface stub answers the catalog
+      // read. Empty is the real shape for a workspace with no custom statuses:
+      // a built-in key IS its own category. (MUL-6243)
+      listIssueStatuses: async () => ({ statuses: [], categories: [], total: 0 }),
       listIssues,
       ...statusTableMethodsFromLegacy(listIssues),
       listGroupedIssues: vi.fn(() => never()),

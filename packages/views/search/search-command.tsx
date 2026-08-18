@@ -1,5 +1,6 @@
 "use client";
 
+import { issueStatusCategory } from "@multica/core/issues";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
@@ -191,7 +192,11 @@ function IssueResultRow({
       className="flex cursor-default select-none flex-col gap-1 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
     >
       <div className="flex items-center gap-2.5">
-        <StatusIcon status={issue.status} className="size-4 shrink-0" />
+        <StatusIcon
+          status={issue.status}
+          category={issueStatusCategory(issue) ?? undefined}
+          className="size-4 shrink-0"
+        />
         <span className="text-caption text-muted-foreground shrink-0">
           {issue.identifier}
         </span>
@@ -849,6 +854,7 @@ export function SearchCommand() {
                   >
                     <StatusIcon
                       status={item.status}
+                      category={issueStatusCategory(item) ?? undefined}
                       className="size-4 shrink-0"
                     />
                     <span className="text-caption text-muted-foreground shrink-0">

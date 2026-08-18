@@ -1,6 +1,7 @@
 "use client";
 
 import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
+import type { IssueStatusCatalog } from "@multica/core/issue-statuses";
 import { useWorkspaceId } from "@multica/core/hooks";
 import type { IssueStatus } from "@multica/core/types";
 import { StatusIcon } from "./status-icon";
@@ -14,12 +15,19 @@ import { StatusIcon } from "./status-icon";
  */
 export function useIsCustomStatus(status: IssueStatus): boolean {
   const wsId = useWorkspaceId();
-  const { entryOf, categoryOf } = useIssueStatuses(wsId);
-  const entry = entryOf(status);
+  return isCustomStatus(useIssueStatuses(wsId), status);
+}
+
+/**
+ * Pure predicate behind {@link useIsCustomStatus}, so a component that already
+ * holds the catalog does not open a second observer for the same question.
+ */
+function isCustomStatus(catalog: IssueStatusCatalog, status: IssueStatus): boolean {
+  const entry = catalog.entryOf(status);
   if (!entry) return false;
   // `is_system` is the authority; the key comparison covers the window before
   // the catalog lands, where a built-in must still stay silent.
-  return entry.is_system !== true && status !== categoryOf(status);
+  return entry.is_system !== true && status !== catalog.categoryOf(status);
 }
 
 /**
@@ -43,11 +51,13 @@ export function CustomStatusChip({
   className?: string;
 }) {
   const wsId = useWorkspaceId();
-  const { entryOf } = useIssueStatuses(wsId);
-  const isCustom = useIsCustomStatus(status);
-  const entry = entryOf(status);
+  // ONE catalog observer for both the predicate and the entry — subscribing
+  // twice per card is free on the network (React Query dedupes the request) but
+  // not on re-renders.
+  const catalog = useIssueStatuses(wsId);
+  const entry = catalog.entryOf(status);
 
-  if (!isCustom || !entry) return null;
+  if (!isCustomStatus(catalog, status) || !entry) return null;
 
   return (
     <span

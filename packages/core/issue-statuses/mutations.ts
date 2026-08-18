@@ -5,6 +5,7 @@ import { compareIssueStatusEntries, issueStatusKeys } from "./queries";
 import { issueKeys } from "../issues/queries";
 import type {
   CreateIssueStatusRequest,
+  IssueStatusCategory,
   IssueStatusEntry,
   ListIssueStatusesResponse,
   UpdateIssueStatusRequest,
@@ -96,26 +97,26 @@ export function useArchiveIssueStatus() {
 }
 
 /**
- * Commits a drag-reorder within ONE category as a `position` write per moved
- * row. `ordered` is that category's CUSTOM statuses in their new order.
+ * Commits a drag-reorder within ONE category.
  *
- * Positions are intra-category and start at 1, because the category's built-in
- * is seeded at 0 and is immovable — PATCH on a built-in is a 403, so it always
- * heads its category. Reordering rides the same PATCH as a rename since
- * position is just another field; there is no separate reorder endpoint.
- * Writes are sequential, so a mid-flight failure leaves a prefix applied rather
- * than an arbitrary interleaving.
+ * Sent as a single request, not a PATCH per row: a sequence of writes is not
+ * atomic, so a row rejected part-way (an archived status, a concurrent archive)
+ * would leave the rows before it already reordered while the caller is told the
+ * whole operation failed. `ordered` is that category's ACTIVE custom statuses;
+ * the server assigns positions from 1 because the category's built-in is seeded
+ * at 0 and never moves.
  */
 export function useReorderIssueStatuses() {
   const { qc, wsId, invalidate } = useCatalogInvalidation();
   return useMutation({
-    mutationFn: async (ordered: IssueStatusEntry[]) => {
-      for (const [index, entry] of ordered.entries()) {
-        if (entry.position === index + 1) continue;
-        await api.updateIssueStatus(entry.id, { position: index + 1 });
-      }
-    },
-    onMutate: async (ordered) => {
+    mutationFn: ({
+      category,
+      ordered,
+    }: {
+      category: IssueStatusCategory;
+      ordered: IssueStatusEntry[];
+    }) => api.reorderIssueStatuses(category, ordered.map((entry) => entry.id)),
+    onMutate: async ({ ordered }) => {
       const listKey = issueStatusKeys.list(wsId);
       await qc.cancelQueries({ queryKey: listKey });
       const previous = qc.getQueryData<ListIssueStatusesResponse>(listKey);

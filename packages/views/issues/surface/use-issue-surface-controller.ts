@@ -16,6 +16,7 @@ import type {
 import { workspaceWorkingAgentsOptions } from "@multica/core/agents";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { ALL_STATUSES } from "@multica/core/issues/config";
+import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
 import { dateOnlyToLocalDate } from "@multica/core/issues/date";
 import type { IssueSortParam } from "@multica/core/issues/queries";
 import { issueTableFacetsOptions } from "@multica/core/issues/queries";
@@ -224,6 +225,8 @@ export function useIssueSurfaceController({
   const swimlaneGrouping = useViewStore((s) => s.swimlaneGrouping);
   const tableColumns = useViewStore((s) => s.tableColumns);
   const listCollapsedStatuses = useViewStore((s) => s.listCollapsedStatuses);
+  const hiddenStatusCategories = useViewStore((s) => s.hiddenStatusCategories);
+  const { categoryOf } = useIssueStatuses(wsId);
   const [tableSearch, setTableSearch] = useState("");
 
   const allowedModes = useMemo(() => new Set<IssueSurfaceMode>(modes), [modes]);
@@ -319,17 +322,31 @@ export function useIssueSurfaceController({
     effectiveViewMode === "swimlane";
   const usesServerFacets =
     usesTable || usesServerStatusSurface || usesServerGroupSurface;
+  // Columns are CATEGORIES. Two independent things narrow them, and conflating
+  // them is what let "hide the Backlog column" also drop every custom status in
+  // other categories: `hiddenStatusCategories` is display state, `statusFilters`
+  // is a filter over concrete status KEYS which we map back to the columns those
+  // keys land in. (MUL-6243)
   const serverStatuses = useMemo<IssueStatusCategory[]>(
     () => {
-      const visible =
-        statusFilters.length > 0
-          ? ALL_STATUSES.filter((status) => statusFilters.includes(status))
-          : [...ALL_STATUSES];
+      const selected =
+        statusFilters.length > 0 ? new Set(statusFilters.map(categoryOf)) : null;
+      const visible = ALL_STATUSES.filter(
+        (category) =>
+          !hiddenStatusCategories.includes(category) &&
+          (selected === null || selected.has(category)),
+      );
       return effectiveViewMode === "list"
         ? visible.filter((status) => !listCollapsedStatuses.includes(status))
         : visible;
     },
-    [effectiveViewMode, listCollapsedStatuses, statusFilters],
+    [
+      categoryOf,
+      effectiveViewMode,
+      hiddenStatusCategories,
+      listCollapsedStatuses,
+      statusFilters,
+    ],
   );
 
   const projectFilterState = useMemo(
@@ -581,7 +598,7 @@ export function useIssueSurfaceController({
       return {
         kind: "compound",
         primary: swimlaneGrouping,
-        secondary: "status",
+        secondary: "status_category",
         secondary_values: serverStatuses,
       };
     }
@@ -673,6 +690,7 @@ export function useIssueSurfaceController({
     serverGroupBranches,
     ganttShowCompleted,
     statusFilters,
+    hiddenStatusCategories,
     priorityFilters,
     assigneeFilters,
     includeNoAssignee,

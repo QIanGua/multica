@@ -143,3 +143,21 @@ SELECT pg_advisory_xact_lock_shared(hashtextextended(sqlc.arg('workspace_id')::u
 SELECT key FROM issue_status
 WHERE workspace_id = sqlc.arg('workspace_id')::uuid
   AND category = ANY(sqlc.arg('categories')::text[]);
+
+-- name: ReorderIssueStatusEntries :exec
+-- Atomic intra-category reorder. One statement, so a failure leaves the whole
+-- order untouched instead of the partially-applied prefix a per-row PATCH loop
+-- produces.
+--
+-- Positions start at 1 because the category's built-in is seeded at 0 and can
+-- never move (is_system rows are excluded here, as they are in every write).
+-- Archived rows are excluded too: they are frozen, and letting one into the
+-- write sequence is exactly what made a drag past an archived row half-commit.
+UPDATE issue_status s
+SET position = v.ordinality::int,
+    updated_at = now()
+FROM unnest(sqlc.arg('ids')::uuid[]) WITH ORDINALITY AS v(id, ordinality)
+WHERE s.id = v.id
+  AND s.workspace_id = sqlc.arg('workspace_id')::uuid
+  AND s.is_system = FALSE
+  AND s.archived_at IS NULL;

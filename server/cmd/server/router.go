@@ -1645,6 +1645,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			r.Route("/api/issue-statuses", func(r chi.Router) {
 				r.Get("/", h.ListIssueStatuses)
 				r.Post("/", h.CreateIssueStatus)
+				r.Patch("/reorder", h.ReorderIssueStatuses)
 				r.Route("/{id}", func(r chi.Router) {
 					r.Patch("/", h.UpdateIssueStatus)
 					r.Delete("/", h.ArchiveIssueStatus)

@@ -258,14 +258,22 @@ function CategorySection({
     if (from < 0 || to < 0) return;
     const next = arrayMove(order, from, to);
     setOrder(next);
-    reorder.mutate(next, {
-      onError: (error) => {
-        setOrder(custom);
-        toast.error(
-          error instanceof Error ? error.message : t(($) => $.issue_statuses.reorder_failed),
-        );
+    // ACTIVE rows only. With "show archived" on, `order` also holds archived
+    // rows; sending those made the server reject the request, and before the
+    // write became atomic that rejection landed AFTER the active rows had
+    // already been reordered. Archived rows are frozen, so their absence from
+    // the payload is also what the user sees.
+    reorder.mutate(
+      { category, ordered: next.filter((entry) => !entry.archived_at) },
+      {
+        onError: (error) => {
+          setOrder(custom);
+          toast.error(
+            error instanceof Error ? error.message : t(($) => $.issue_statuses.reorder_failed),
+          );
+        },
       },
-    });
+    );
   };
 
   // Only rows that can actually move are draggable. A single custom status has

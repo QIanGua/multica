@@ -117,6 +117,7 @@ import type {
   UpdateLabelRequest,
   ListLabelsResponse,
   ListIssueStatusesResponse,
+  IssueStatusCategory,
   IssueStatusEntry,
   CreateIssueStatusRequest,
   UpdateIssueStatusRequest,
@@ -3281,6 +3282,25 @@ export class ApiClient {
     });
     return parseWithFallback(raw, IssueStatusEntrySchema, EMPTY_ISSUE_STATUS_ENTRY, {
       endpoint: "PATCH /api/issue-statuses/{id}",
+    });
+  }
+
+  /**
+   * Rewrites one category's custom-status order in a single server-side
+   * statement. Not expressible as a sequence of `updateIssueStatus` calls: a
+   * row rejected mid-sequence would leave the earlier rows already reordered
+   * while the caller sees a failure. (MUL-6243)
+   */
+  async reorderIssueStatuses(
+    category: IssueStatusCategory,
+    ids: string[],
+  ): Promise<ListIssueStatusesResponse> {
+    const raw = await this.fetch<unknown>(`/api/issue-statuses/reorder`, {
+      method: "PATCH",
+      body: JSON.stringify({ category, ids }),
+    });
+    return parseWithFallback(raw, ListIssueStatusesResponseSchema, EMPTY_LIST_ISSUE_STATUSES_RESPONSE, {
+      endpoint: "PATCH /api/issue-statuses/reorder",
     });
   }
 

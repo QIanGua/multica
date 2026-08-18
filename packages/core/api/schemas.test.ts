@@ -1507,6 +1507,19 @@ describe("issue status catalog schemas", () => {
     expect(parsed.archived_at).toBeNull();
   });
 
+  // PATCH /api/issue-statuses/reorder returns the same catalog shape as the
+  // list endpoint, so a malformed reorder response degrades the same way rather
+  // than leaving the settings page holding an unparsed blob. (MUL-6243)
+  it("falls back on a malformed reorder response", () => {
+    const parsed = parseWithFallback(
+      { statuses: [{ id: 1 }], total: "many" },
+      ListIssueStatusesResponseSchema,
+      EMPTY_LIST_ISSUE_STATUSES_RESPONSE,
+      { endpoint: "PATCH /api/issue-statuses/reorder" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_ISSUE_STATUSES_RESPONSE);
+  });
+
   it("keeps an unknown category as a string instead of failing the whole catalog", () => {
     // A newer server could report a category this build does not know. Dropping
     // the entry (or throwing) would leave the board unable to render issues

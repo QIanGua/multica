@@ -331,6 +331,35 @@ func (q *Queries) LockIssueStatusCatalogShared(ctx context.Context, workspaceID 
 	return err
 }
 
+const reorderIssueStatusEntries = `-- name: ReorderIssueStatusEntries :exec
+UPDATE issue_status s
+SET position = v.ordinality::int,
+    updated_at = now()
+FROM unnest($2::uuid[]) WITH ORDINALITY AS v(id, ordinality)
+WHERE s.id = v.id
+  AND s.workspace_id = $1::uuid
+  AND s.is_system = FALSE
+  AND s.archived_at IS NULL
+`
+
+type ReorderIssueStatusEntriesParams struct {
+	WorkspaceID pgtype.UUID   `json:"workspace_id"`
+	Ids         []pgtype.UUID `json:"ids"`
+}
+
+// Atomic intra-category reorder. One statement, so a failure leaves the whole
+// order untouched instead of the partially-applied prefix a per-row PATCH loop
+// produces.
+//
+// Positions start at 1 because the category's built-in is seeded at 0 and can
+// never move (is_system rows are excluded here, as they are in every write).
+// Archived rows are excluded too: they are frozen, and letting one into the
+// write sequence is exactly what made a drag past an archived row half-commit.
+func (q *Queries) ReorderIssueStatusEntries(ctx context.Context, arg ReorderIssueStatusEntriesParams) error {
+	_, err := q.db.Exec(ctx, reorderIssueStatusEntries, arg.WorkspaceID, arg.Ids)
+	return err
+}
+
 const seedIssueStatusEntries = `-- name: SeedIssueStatusEntries :exec
 
 INSERT INTO issue_status (workspace_id, key, name, description, category, color, is_system, position)

@@ -13,6 +13,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -371,4 +372,117 @@ func (h *Handler) loadIssueStatusForAdmin(w http.ResponseWriter, r *http.Request
 		return db.IssueStatus{}, pgtype.UUID{}, false
 	}
 	return entry, wsUUID, true
+}
+
+// ReorderIssueStatusesRequest carries one category's custom statuses in their
+// new order. Reordering is scoped to a category because position is
+// intra-category: a status can only move relative to its own column.
+type ReorderIssueStatusesRequest struct {
+	Category string   `json:"category"`
+	IDs      []string `json:"ids"`
+}
+
+// ReorderIssueStatuses rewrites the intra-category order of a category's custom
+// statuses in ONE statement.
+//
+// It exists because the alternative — a PATCH per row from the client — is not
+// atomic: a row that rejects mid-sequence (an archived status, a concurrent
+// archive) leaves the earlier rows already reordered while the caller is told
+// the operation failed, so the UI and the database disagree with no way back.
+func (h *Handler) ReorderIssueStatuses(w http.ResponseWriter, r *http.Request) {
+	workspaceID := h.resolveWorkspaceID(r)
+	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
+	if !ok {
+		return
+	}
+	if _, ok := h.requireWorkspaceRole(w, r, workspaceID, "workspace not found", "owner", "admin"); !ok {
+		return
+	}
+
+	var req ReorderIssueStatusesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !issuestatus.IsCategory(req.Category) {
+		writeError(w, http.StatusBadRequest, "category must be one of: "+strings.Join(issuestatus.Canonical(), ", "))
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "ids must not be empty")
+		return
+	}
+
+	// Validate every id up front rather than letting the UPDATE silently skip
+	// rows: a request naming a built-in, an archived status, another category's
+	// status or another workspace's row is a client bug, and reporting it is
+	// what stops a half-understood order from being written.
+	ids := make([]pgtype.UUID, 0, len(req.IDs))
+	seen := make(map[string]struct{}, len(req.IDs))
+	for _, raw := range req.IDs {
+		if _, duplicate := seen[raw]; duplicate {
+			writeError(w, http.StatusBadRequest, "duplicate ids")
+			return
+		}
+		seen[raw] = struct{}{}
+		idUUID, err := util.ParseUUID(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid issue status id")
+			return
+		}
+		entry, err := h.Queries.GetIssueStatusEntryByID(r.Context(), db.GetIssueStatusEntryByIDParams{
+			ID:          idUUID,
+			WorkspaceID: wsUUID,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "issue status not found")
+				return
+			}
+			slog.Warn("load issue status for reorder failed", append(logger.RequestAttrs(r), "error", err)...)
+			writeError(w, http.StatusInternalServerError, "failed to reorder issue statuses")
+			return
+		}
+		if entry.IsSystem {
+			writeError(w, http.StatusForbidden, "built-in statuses cannot be reordered")
+			return
+		}
+		if entry.ArchivedAt.Valid {
+			writeError(w, http.StatusConflict, "archived statuses cannot be reordered")
+			return
+		}
+		if entry.Category != req.Category {
+			writeError(w, http.StatusBadRequest, "ids must all belong to the requested category")
+			return
+		}
+		ids = append(ids, idUUID)
+	}
+
+	if err := h.Queries.ReorderIssueStatusEntries(r.Context(), db.ReorderIssueStatusEntriesParams{
+		Ids:         ids,
+		WorkspaceID: wsUUID,
+	}); err != nil {
+		slog.Warn("reorder issue statuses failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to reorder issue statuses")
+		return
+	}
+
+	entries, err := h.Queries.ListIssueStatusEntries(r.Context(), db.ListIssueStatusEntriesParams{
+		WorkspaceID:     wsUUID,
+		IncludeArchived: true,
+	})
+	if err != nil {
+		slog.Warn("list issue statuses after reorder failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to list issue statuses")
+		return
+	}
+	resp := make([]IssueStatusResponse, len(entries))
+	for i, e := range entries {
+		resp[i] = issueStatusToResponse(e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"statuses":   resp,
+		"categories": issuestatus.Canonical(),
+		"total":      len(resp),
+	})
 }

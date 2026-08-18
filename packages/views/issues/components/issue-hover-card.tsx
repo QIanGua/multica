@@ -1,5 +1,6 @@
 "use client";
 
+import { issueStatusCategory } from "@multica/core/issues";
 import { useStatusLabel } from "./../utils/status-label";
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -185,7 +186,11 @@ function IssueHoverCardBody({
           aria-label={resolveStatusLabel(issue.status)}
           className="flex shrink-0"
         >
-          <StatusIcon status={issue.status} className="h-3.5 w-3.5 shrink-0" />
+          <StatusIcon
+            status={issue.status}
+            category={issueStatusCategory(issue) ?? undefined}
+            className="h-3.5 w-3.5 shrink-0"
+          />
         </span>
         <span className="text-caption font-medium text-muted-foreground">
           {issue.identifier}

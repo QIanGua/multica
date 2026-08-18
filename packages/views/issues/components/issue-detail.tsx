@@ -1,7 +1,8 @@
 "use client";
 
-import { statusCategoryOfKey } from "@multica/core/issues";
+import { issueStatusCategory, statusCategoryOfKey } from "@multica/core/issues";
 import { useStatusLabel } from "../utils/status-label";
+import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useDefaultLayout, usePanelRef } from "react-resizable-panels";
@@ -54,7 +55,7 @@ import { AvatarGroup, AvatarGroupCount } from "@multica/ui/components/ui/avatar"
 import { ActorAvatar } from "../../common/actor-avatar";
 import { PropRow } from "../../common/prop-row";
 import { PropertyIcon } from "../../common/property-icon";
-import type { Attachment, Issue, IssueProperty, IssueStatus, IssuePriority, TimelineEntry, UpdateIssueRequest } from "@multica/core/types";
+import type { Attachment, Issue, IssueProperty, IssueStatus, IssueStatusCategory, IssuePriority, TimelineEntry, UpdateIssueRequest } from "@multica/core/types";
 import { contentReferencesAttachment } from "@multica/core/types";
 import { STATUS_CONFIG, PRIORITY_CONFIG } from "@multica/core/issues/config";
 import { formatDateOnly, isPastDateOnly } from "@multica/core/issues/date";
@@ -522,6 +523,7 @@ function ActivityBlock({
   onToggleShowOlder,
   getActorName,
   resolveStatusLabel,
+  resolveStatusCategory,
   t,
   timeAgo,
 }: {
@@ -536,6 +538,7 @@ function ActivityBlock({
   onToggleShowOlder: () => void;
   getActorName: (type: string, id: string) => string;
   resolveStatusLabel: (statusKey: string) => string;
+  resolveStatusCategory: (statusKey: string) => IssueStatusCategory;
   t: ActivityT;
   timeAgo: (dateStr: string) => string;
 }) {
@@ -598,7 +601,13 @@ function ActivityBlock({
 
         let leadIcon: React.ReactNode;
         if (isStatusChange && details.to) {
-          leadIcon = <StatusIcon status={details.to as IssueStatus} className="h-4 w-4 shrink-0" />;
+          leadIcon = (
+            <StatusIcon
+              status={details.to as IssueStatus}
+              category={resolveStatusCategory(details.to ?? "")}
+              className="h-4 w-4 shrink-0"
+            />
+          );
         } else if (isPriorityChange && details.to) {
           leadIcon = <PriorityIcon priority={details.to as IssuePriority} className="h-4 w-4 shrink-0" />;
         } else if (isStartDateChange) {
@@ -1112,6 +1121,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   const { data: allIssues = [] } = useQuery(issueListOptions(wsId));
   const { getActorName } = useActorName();
   const resolveStatusLabel = useStatusLabel(wsId);
+  const { categoryOf: resolveStatusCategory } = useIssueStatuses(wsId);
   // Description autosave is deliberately NOT gated (no explicit submit; the
   // editor already strips `blob:` before serializing and binds ids on the
   // later save). It still needs the failure toast, or a failed upload just
@@ -2317,7 +2327,11 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                 href={paths.issueDetail(parentIssue.id)}
                 className="flex flex-1 min-w-0 items-center gap-1.5 py-1.5 text-caption"
               >
-                <StatusIcon status={parentIssue.status} className="h-3.5 w-3.5 shrink-0" />
+                <StatusIcon
+                  status={parentIssue.status}
+                  category={issueStatusCategory(parentIssue) ?? undefined}
+                  className="h-3.5 w-3.5 shrink-0"
+                />
                 <span className="text-muted-foreground shrink-0">{parentIssue.identifier}</span>
                 <span className="truncate group-hover:text-foreground">{parentIssue.title}</span>
               </AppLink>
@@ -2481,6 +2495,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
         onToggleShowOlder={() => showOlderActivities(item.id)}
         getActorName={getActorName}
         resolveStatusLabel={resolveStatusLabel}
+        resolveStatusCategory={resolveStatusCategory}
         t={t}
         timeAgo={timeAgo}
       />
@@ -2709,7 +2724,11 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
               className="mt-2 inline-flex max-w-full items-center gap-1.5 text-caption text-muted-foreground hover:text-foreground transition-colors group/parent"
             >
               <span className="font-medium shrink-0">{t(($) => $.detail.sub_issue_of)}</span>
-              <StatusIcon status={parentIssue.status} className="h-3.5 w-3.5 shrink-0" />
+              <StatusIcon
+                  status={parentIssue.status}
+                  category={issueStatusCategory(parentIssue) ?? undefined}
+                  className="h-3.5 w-3.5 shrink-0"
+                />
               <span className="tabular-nums shrink-0">{parentIssue.identifier}</span>
               <span className="truncate group-hover/parent:text-foreground">
                 {parentIssue.title}
