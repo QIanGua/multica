@@ -2372,6 +2372,13 @@ func (s *TaskService) CancelTaskWithReason(ctx context.Context, taskID pgtype.UU
 // CancelTaskWithResult cancels a single task and returns any chat-specific
 // cleanup result needed by user-facing callers.
 func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UUID, opts CancelTaskOptions) (*CancelTaskResult, error) {
+	// Both fields are persisted onto the cancelled row's TEXT columns below, and
+	// at least one caller interpolates an externally-supplied path into
+	// ErrorMessage. A NUL in either rolls the cancellation back and leaves the
+	// task running — the same wedge as GH #7098 on the fail/complete paths.
+	opts.ErrorMessage = util.SanitizeTextForPostgres(opts.ErrorMessage)
+	opts.FailureReason = util.SanitizeTextForPostgres(opts.FailureReason)
+
 	if opts.UserInitiated && (opts.ErrorMessage != "" || opts.FailureReason != "") {
 		return nil, errors.New("user-initiated cancellation cannot carry a server failure reason")
 	}
@@ -3971,10 +3978,6 @@ func (s *TaskService) observeChatOutputLocalPath(task db.AgentTaskQueue, body st
 	)
 }
 
-func normalizeTaskFailureDiagnostic(errMsg string) string {
-	return strings.ReplaceAll(strings.ToValidUTF8(errMsg, "\uFFFD"), "\x00", "")
-}
-
 // FailTask marks a task as failed.
 // Issue status is NOT changed here — the agent manages it via the CLI.
 //
@@ -3992,7 +3995,12 @@ func normalizeTaskFailureDiagnostic(errMsg string) string {
 // (via classifyPoisonedError, the timeout / runtime classifier, etc.)
 // will have their value preserved untouched.
 func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID string) (*db.AgentTaskQueue, error) {
-	errMsg = normalizeTaskFailureDiagnostic(errMsg)
+	// Strip bytes PostgreSQL cannot store before anything else reads errMsg, so
+	// the classifier, the transaction and every downstream consumer see the one
+	// text we will actually persist (GH #7098). Kept at the service boundary
+	// rather than only in the /fail handler because failClaimedTaskBeforeLaunch
+	// reaches FailTask without going through request decoding.
+	errMsg = util.SanitizeTextForPostgres(errMsg)
 
 	// MUL-2946: synthesise a refined reason from the error text whenever the
 	// caller didn't supply one. This is the last write-path guard against
