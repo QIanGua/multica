@@ -309,6 +309,30 @@ describe("AgentTranscriptDialog", () => {
     expect(screen.getByText(/"command": "pnpm test"/)).toBeInTheDocument();
   });
 
+  // Regression, #7125: a run of short prose steps under a long agent name put
+  // the same semibold name above every one-line body, so the row's heaviest
+  // element was the one value that never changes. Identity belongs to the run,
+  // and the header already carries it.
+  it("states the agent once in the header, not on every prose row", () => {
+    renderWithI18n(
+      <AgentTranscriptDialog
+        open
+        onOpenChange={vi.fn()}
+        task={{ ...baseTask, agent_id: "agent-1" }}
+        items={[
+          { seq: 1, type: "text", content: "Cleanup done. Starting tests:" },
+          { seq: 2, type: "text", content: "Now adding the Feishu row:" },
+          { seq: 3, type: "text", content: "Now the version bump:" },
+        ]}
+        agentName="【Chores|Opus5】Multica Helper"
+      />,
+    );
+
+    expect(screen.getAllByTestId("rich-content")).toHaveLength(3);
+    expect(screen.getAllByText("【Chores|Opus5】Multica Helper")).toHaveLength(1);
+    expect(screen.getAllByTestId("actor-avatar")).toHaveLength(1);
+  });
+
   it("folds a call and its result into one step instead of two rows", () => {
     renderDialog([
       { seq: 1, type: "tool_use", tool: "Bash", input: { command: "ls" } },

@@ -1147,8 +1147,6 @@ export function AgentTranscriptDialog({
                 itemContent={(_, row) => (
                   <TranscriptRow
                     row={row}
-                    agentName={agentName || agentInfo?.name || ""}
-                    agentId={task.agent_id}
                     runStartMs={runStartMs}
                     isLive={isLive}
                     selectedSeq={selectedSeq}
@@ -1261,8 +1259,6 @@ function RunOutcomeRow({
 
 interface TranscriptRowProps {
   row: TraceRow;
-  agentName: string;
-  agentId?: string;
   runStartMs?: number;
   isLive: boolean;
   selectedSeq: number | null;
@@ -1316,30 +1312,21 @@ function DurationCell({ ms, pending }: { ms?: number; pending?: boolean }) {
  * This is the layer inversion the redesign turns on: the report used to look
  * exactly like a `Read`, so the one thing worth reading was the hardest thing
  * to find. Prose is content and stays open; tool calls are evidence and fold.
+ *
+ * Identity is deliberately absent here. A transcript is one run by one agent —
+ * `TraceMessageStep` carries no per-step actor, so an avatar and name on the
+ * row would be the same two values repeated for every step, and the header
+ * already states them. Repeating them cost a semibold 12px line above 12px
+ * body text, which on a run of short steps made the row's heaviest element its
+ * least informative one. The green rule is what marks prose as the agent
+ * speaking; it says the same thing in 2px.
  */
-function ProseRow({
-  row,
-  agentName,
-  agentId,
-  runStartMs,
-}: TranscriptRowProps & { row: TraceMessageStep }) {
+function ProseRow({ row, runStartMs }: TranscriptRowProps & { row: TraceMessageStep }) {
   return (
     <div className="group flex items-start gap-2 px-4 py-2.5">
       <OffsetCell startedAt={row.startedAt} runStartMs={runStartMs} />
       <span aria-hidden className="mt-1 w-0.5 self-stretch rounded-full bg-success" />
-      <div className="mt-0.5 shrink-0">
-        {agentId ? (
-          <ActorAvatar actorType="agent" actorId={agentId} size="sm" />
-        ) : (
-          <div className="flex h-5 w-5 items-center justify-center rounded-full bg-info/10 text-info">
-            <Bot className="h-3 w-3" />
-          </div>
-        )}
-      </div>
       <div className="min-w-0 flex-1 pr-2">
-        {agentName && (
-          <div className="mb-0.5 text-caption font-semibold">{agentName}</div>
-        )}
         <RichContent
           content={row.item.content ?? ""}
           density="compact"
