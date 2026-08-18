@@ -243,15 +243,20 @@ RETURNING id, workspace_id, owner_id, daemon_id, provider;
 
 -- name: FailTasksForOfflineRuntimes :many
 -- Marks dispatched/running/waiting_local_directory tasks as failed when
--- their runtime is offline. This cleans up orphaned tasks after a daemon
--- crash or network partition.
+-- their runtime has remained offline beyond the reconnect grace. A short or
+-- medium network partition must not terminate a daemon process that is still
+-- running locally; a real daemon restart is recovered separately through
+-- RecoverOrphanedTasksForRuntime.
 UPDATE agent_task_queue
 SET status = 'failed', completed_at = now(), error = 'runtime went offline',
     failure_reason = 'runtime_offline',
     wait_reason = NULL
 WHERE status IN ('dispatched', 'running', 'waiting_local_directory')
   AND runtime_id IN (
-    SELECT id FROM agent_runtime WHERE status = 'offline'
+    SELECT id FROM agent_runtime
+    WHERE status = 'offline'
+      AND COALESCE(last_seen_at, updated_at) <
+          now() - make_interval(secs => @reconnect_grace_secs::double precision)
   )
 RETURNING *;
 

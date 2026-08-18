@@ -163,6 +163,12 @@ func truncateFallbackCommentBody(body string, maxRunes int) string {
 
 const (
 	taskAnalyticsContextCacheMax = 4096
+	// RuntimeClaimFreshnessSeconds is the maximum DB heartbeat age accepted by
+	// every task release path (deferred promotion, stale-dispatch reclaim, and
+	// fresh claim). Keep the runtime sweeper threshold aligned with this value:
+	// a runtime must not be able to start more work after it is stale enough to
+	// be marked offline.
+	RuntimeClaimFreshnessSeconds = 150.0
 	// claimResponseRecoveryWindow must exceed daemon client.Timeout for
 	// /tasks/claim (30s) plus /tasks/{id}/start (30s) plus scheduling slack.
 	// Longer pre-start work is protected by prepareLeaseDuration instead of
@@ -2915,9 +2921,18 @@ func (s *TaskService) broadcastChatCancelFinalized(ctx context.Context, task db.
 	})
 }
 
-// ClaimTask atomically claims the next queued task for an agent,
-// respecting max_concurrent_tasks.
+// ClaimTask atomically claims the next queued task for an agent on its current
+// runtime, respecting max_concurrent_tasks.
 func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	return s.claimTask(ctx, agentID, pgtype.UUID{})
+}
+
+// claimTask is the runtime-scoped claim primitive used by daemon poll paths.
+// When runtimeID is invalid, the agent's current runtime is used for legacy
+// internal callers. Scoping the SQL claim itself prevents an offline candidate
+// on runtime A from causing the same agent's task on runtime B to be dispatched
+// and then dropped by the caller's runtime guard.
+func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
 	start := time.Now()
 	outcome := "unknown"
 	var getAgentMs, countRunningMs, claimAgentMs, reanchorMs, updateStatusMs, dispatchMs int64
@@ -2933,6 +2948,14 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 		if err != nil {
 			outcome = "error_get_agent"
 			return fmt.Errorf("agent not found: %w", err)
+		}
+		claimRuntimeID := runtimeID
+		if !claimRuntimeID.Valid {
+			claimRuntimeID = agent.RuntimeID
+		}
+		if !claimRuntimeID.Valid {
+			outcome = "no_runtime"
+			return nil
 		}
 
 		t0 = time.Now()
@@ -2951,7 +2974,9 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 		t0 = time.Now()
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
 			AgentID:          agentID,
+			RuntimeID:        claimRuntimeID,
 			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
 		})
 		claimAgentMs = time.Since(t0).Milliseconds()
 		if err != nil {
@@ -3064,6 +3089,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		RuntimeID:         runtimeID,
 		ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
 		PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
+		RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
 	})
 	if err == nil {
 		outcome = "reclaimed_dispatched"
@@ -3119,7 +3145,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		triedAgents[agentKey] = struct{}{}
 		tried++
 
-		task, err := s.ClaimTask(ctx, candidate.AgentID)
+		task, err := s.claimTask(ctx, candidate.AgentID, runtimeID)
 		if err != nil {
 			loopMs = time.Since(loopStart).Milliseconds()
 			outcome = "error_claim"
@@ -3231,9 +3257,9 @@ func (s *TaskService) RequeueTaskAfterClaimFailure(ctx context.Context, task db.
 //     invalidation version for the rest BEFORE the candidate SELECT;
 //  4. list queued candidates across the non-empty set (one SELECT);
 //  5. mark still-empty runtimes so their next idle poll skips Postgres;
-//  6. claim per distinct agent via ClaimTask (unchanged — preserves the
+//  6. claim per distinct agent via the runtime-scoped helper, preserving
 //     per-(issue, agent) serialization, the agent concurrency cap, and every
-//     dispatch side effect) until maxTasks is reached.
+//     dispatch side effect until maxTasks is reached.
 //
 // The returned slice contains both reclaimed and freshly-claimed tasks, each
 // already carrying its runtime_id so the daemon routes it to the matching
@@ -3269,7 +3295,10 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	// MarkEmpty from a prior idle poll would short-circuit the runtime and the
 	// promoted task would sit unclaimed until the empty key's TTL. Also emits
 	// the deferred→queued UI event and the enqueue analytics sample.
-	promoted, err := s.Queries.PromoteDueDeferredTasksForRuntimes(ctx, uniqueIDs)
+	promoted, err := s.Queries.PromoteDueDeferredTasksForRuntimes(ctx, db.PromoteDueDeferredTasksForRuntimesParams{
+		RuntimeIds:       uniqueIDs,
+		RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("promote deferred tasks: %w", err)
 	}
@@ -3288,6 +3317,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		RuntimeIds:        uniqueIDs,
 		ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
 		PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
+		RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
 		MaxTasks:          int32(maxTasks),
 	})
 	if err != nil {
@@ -3354,9 +3384,8 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		}
 	}
 
-	// 6. Claim per distinct agent (unchanged path → same per-(issue, agent)
-	// serialization, capacity cap, and dispatch side effects) until maxTasks is
-	// reached.
+	// 6. Claim per distinct agent through the runtime-scoped helper, preserving
+	// per-(issue, agent) serialization, capacity caps, and dispatch side effects.
 	triedAgents := make(map[string]struct{}, len(candidates))
 	for i := range candidates {
 		if len(claimed) >= maxTasks {
@@ -3368,9 +3397,9 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		}
 		triedAgents[agentKey] = struct{}{}
 
-		task, err := s.ClaimTask(ctx, candidates[i].AgentID)
+		task, err := s.claimTask(ctx, candidates[i].AgentID, candidates[i].RuntimeID)
 		if err != nil {
-			// Each ClaimTask commits in its own transaction, so earlier
+			// Each scoped claim commits in its own transaction, so earlier
 			// iterations (and step-2 reclaims) are already dispatched
 			// server-side. Returning nil here would drop them and force the
 			// daemon to double-claim via HTTP fallback (MUL-4257). Return the
@@ -3385,12 +3414,9 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		if task == nil {
 			continue
 		}
-		// ClaimAgentTask selects by agent only; guard that the claimed task
-		// belongs to a runtime this daemon hosts. An agent with a
-		// higher-priority queued task on ANOTHER daemon's runtime could
-		// otherwise be dispatched here and dropped — matching the singular
-		// path's runtime_id guard. Such a stray dispatch is recovered by the
-		// reclaim path on the owning daemon's next poll.
+		// The SQL claim is scoped to the candidate runtime. Retain this guard as
+		// a defensive contract check so a future query change cannot route work
+		// to a runtime this daemon does not host.
 		if _, ok := runtimeInSet[util.UUIDToString(task.RuntimeID)]; !ok {
 			continue
 		}
@@ -3401,7 +3427,10 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 }
 
 func (s *TaskService) PromoteDueDeferredTasksForRuntime(ctx context.Context, runtimeID pgtype.UUID) error {
-	tasks, err := s.Queries.PromoteDueDeferredTasksForRuntime(ctx, runtimeID)
+	tasks, err := s.Queries.PromoteDueDeferredTasksForRuntime(ctx, db.PromoteDueDeferredTasksForRuntimeParams{
+		RuntimeID:        runtimeID,
+		RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+	})
 	if err != nil {
 		return fmt.Errorf("promote due deferred tasks: %w", err)
 	}
@@ -4273,12 +4302,20 @@ var retryableReasons = map[string]bool{
 	string(taskfailure.ReasonSkillBundleUnavailable): true,
 }
 
+// runtime_offline retries start deferred, not queued: their positive fire_at
+// routes them through health-gated promotion after a fresh runtime heartbeat
+// returns. The queue sweeper also exempts this retry lineage, covering the race
+// where a runtime disconnects again after promotion but before claim. This
+// delay is only a state marker, not the reconnect policy; the heartbeat gate is
+// authoritative.
+//
 // Transient provider stream cuts (provider_network) get a bespoke three-tier
 // schedule (MUL-4910): first run + immediate retry + one retry deferred ~5s.
 // A blip that survives the immediate retry gets a short cooldown before the
 // final attempt instead of firing back-to-back. Every other retryable reason
 // keeps the task's generic max_attempts ceiling and retries immediately.
 const (
+	runtimeOfflineRetryDeferral   = time.Second
 	providerNetworkMaxAttempts    = 3
 	providerNetworkFinalRetryWait = 5 * time.Second
 )
@@ -4305,11 +4342,15 @@ func retryAttemptCeiling(reason string, taskMaxAttempts int32) int32 {
 }
 
 // retryDelayForAttempt reports how long to defer the NEXT attempt after a
-// failure at failedAttempt. Only provider_network's final attempt is deferred
-// (~5s); every other retry — including provider_network's first — is immediate
-// (zero delay → the child is created 'queued', claimable at once). Callers pass
-// the returned delay to CreateRetryTask via fire_at.
+// failure at failedAttempt. runtime_offline always gets a positive fire_at so
+// it waits for the health-gated promotion path. provider_network's final
+// attempt is deferred ~5s; every other retry remains immediate (zero delay →
+// the child is created 'queued', claimable at once). Callers pass the returned
+// delay to CreateRetryTask via fire_at.
 func retryDelayForAttempt(reason string, failedAttempt int32) time.Duration {
+	if reason == "runtime_offline" {
+		return runtimeOfflineRetryDeferral
+	}
 	if reason == string(taskfailure.ReasonAgentProviderNetwork) &&
 		failedAttempt >= providerNetworkMaxAttempts-1 {
 		return providerNetworkFinalRetryWait

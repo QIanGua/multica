@@ -33,7 +33,17 @@ const (
 	// 150s leaves a 45s buffer above the 105s worst-case DB age, and keeps
 	// detection latency for a genuinely-dead runtime under staleThreshold +
 	// sweepInterval = 180s (~3 minutes).
-	staleThresholdSeconds = 150.0
+	staleThresholdSeconds = service.RuntimeClaimFreshnessSeconds
+	// defaultRuntimeReconnectGrace keeps locally-running work alive through a
+	// sustained API/network partition. Runtime state still flips offline after
+	// staleThresholdSeconds so the UI remains truthful; only task termination is
+	// delayed. A daemon that actually restarts bypasses this grace through the
+	// explicit RecoverOrphanedTasksForRuntime path.
+	defaultRuntimeReconnectGrace = 3 * time.Hour
+	// A reconnect grace below the heartbeat freshness window would allow the
+	// stale-task backstop to fail work while the same runtime was still eligible
+	// to claim new work. Clamp configuration to keep those policies ordered.
+	minimumRuntimeReconnectGrace = time.Duration(staleThresholdSeconds) * time.Second
 	// offlineRuntimeTTLSeconds deletes offline runtimes with no active agents
 	// after this duration. 7 days gives users plenty of time to restart daemons.
 	offlineRuntimeTTLSeconds = 7 * 24 * 3600.0
@@ -111,7 +121,7 @@ type runtimeGCTxStarter interface {
 // hot heartbeat path; the DB is allowed to lag up to runtimeHeartbeatDBFlushInterval).
 // When liveness is unavailable or errors, we fall back to trusting the DB
 // stale window — that is the original behavior.
-func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Queries, liveness handler.LivenessStore, taskSvc *service.TaskService, bus *events.Bus) {
+func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Queries, liveness handler.LivenessStore, taskSvc *service.TaskService, bus *events.Bus, reconnectGrace time.Duration) {
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
 
@@ -121,7 +131,8 @@ func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, querie
 			return
 		case <-ticker.C:
 			sweepStaleRuntimes(ctx, queries, liveness, taskSvc, bus)
-			sweepStaleTasks(ctx, queries, taskSvc, bus)
+			sweepOfflineRuntimeTasks(ctx, queries, taskSvc, reconnectGrace)
+			sweepStaleTasks(ctx, queries, taskSvc, bus, reconnectGrace)
 			sweepExpiredQueuedTasks(ctx, queries, taskSvc)
 			sweepDeferredChatFinalizations(ctx, queries, taskSvc)
 			gcRuntimes(ctx, txStarter, queries, taskSvc.Metrics, bus)
@@ -129,8 +140,9 @@ func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, querie
 	}
 }
 
-// sweepStaleRuntimes marks runtimes offline if they haven't heartbeated,
-// then fails any tasks belonging to those offline runtimes.
+// sweepStaleRuntimes marks runtimes offline if they haven't heartbeated. Task
+// termination is a separate every-tick stage so reconnect grace is measured
+// independently of the one tick where the runtime first flips offline.
 func sweepStaleRuntimes(ctx context.Context, queries *db.Queries, liveness handler.LivenessStore, taskSvc *service.TaskService, bus *events.Bus) {
 	candidates, err := queries.SelectStaleOnlineRuntimes(ctx, staleThresholdSeconds)
 	if err != nil {
@@ -189,15 +201,6 @@ func sweepStaleRuntimes(ctx context.Context, queries *db.Queries, liveness handl
 
 	slog.Info("runtime sweeper: marked stale runtimes offline", "count", len(staleRows), "workspaces", len(workspaces))
 
-	// Fail orphaned tasks (dispatched/running) whose runtimes just went offline.
-	failedTasks, err := queries.FailTasksForOfflineRuntimes(ctx)
-	if err != nil {
-		slog.Warn("runtime sweeper: failed to clean up stale tasks", "error", err)
-	} else if len(failedTasks) > 0 {
-		slog.Info("runtime sweeper: failed orphaned tasks", "count", len(failedTasks))
-		taskSvc.HandleFailedTasks(ctx, failedTasks)
-	}
-
 	// Notify frontend clients so they re-fetch runtime list.
 	for wsID := range workspaces {
 		bus.Publish(events.Event{
@@ -209,6 +212,24 @@ func sweepStaleRuntimes(ctx context.Context, queries *db.Queries, liveness handl
 			},
 		})
 	}
+}
+
+// sweepOfflineRuntimeTasks terminates work only after the runtime's last
+// heartbeat has exceeded the bounded reconnect grace. Running it every tick is
+// essential: the grace usually expires long after sweepStaleRuntimes performed
+// the one-time online→offline transition.
+func sweepOfflineRuntimeTasks(ctx context.Context, queries *db.Queries, taskSvc *service.TaskService, reconnectGrace time.Duration) {
+	failedTasks, err := queries.FailTasksForOfflineRuntimes(ctx, reconnectGrace.Seconds())
+	if err != nil {
+		slog.Warn("runtime sweeper: failed to clean up long-offline tasks", "error", err)
+		return
+	}
+	if len(failedTasks) == 0 {
+		return
+	}
+
+	slog.Info("runtime sweeper: failed tasks beyond reconnect grace", "count", len(failedTasks))
+	taskSvc.HandleFailedTasks(ctx, failedTasks)
 }
 
 // filterStaleRuntimesByLiveness narrows a SELECT-of-stale-candidates down to
@@ -424,13 +445,14 @@ func gcRuntime(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Qu
 // in the same tick; this function is a defensive backstop for the residual
 // edge where a runtime row lingers online-with-stale-heartbeat past the
 // wall clock (MUL-4107).
-func sweepStaleTasks(ctx context.Context, queries *db.Queries, taskSvc *service.TaskService, bus *events.Bus) {
+func sweepStaleTasks(ctx context.Context, queries *db.Queries, taskSvc *service.TaskService, bus *events.Bus, reconnectGrace time.Duration) {
 	failedTasks, err := queries.FailStaleTasks(ctx, db.FailStaleTasksParams{
 		DispatchTimeoutSecs: dispatchTimeoutSeconds,
 		RunningTimeoutSecs:  runningTimeoutSeconds,
 		// Reuse the runtime stale window so the running-task backstop
 		// exactly matches what sweepStaleRuntimes considers "not alive".
-		RuntimeStaleSecs: staleThresholdSeconds,
+		RuntimeStaleSecs:          staleThresholdSeconds,
+		RuntimeReconnectGraceSecs: reconnectGrace.Seconds(),
 	})
 	if err != nil {
 		slog.Warn("task sweeper: failed to clean up stale tasks", "error", err)
