@@ -370,33 +370,72 @@ func TestNetDomainsOnlyReturnsNetScopes(t *testing.T) {
 	}
 }
 
+// The gate's job, stated without naming today's configuration.
+//
+// An earlier version listed the specific contributions HostCapabilities had not
+// shipped yet, so every staged flip turned this red with a message about the
+// flip rather than about the gate. What has to stay true is the mechanism:
+// everything the host cannot run is reported, everything it can run is not, and
+// all of it arrives at once.
 func TestCheckCapabilitiesReportsEveryUnavailableContribution(t *testing.T) {
 	manifest, _, err := ParseManifest([]byte(validManifest))
 	if err != nil {
 		t.Fatalf("ParseManifest: %v", err)
 	}
 
-	// The shipped host set is what gates a staged rollout: a manifest naming a
-	// capability this build cannot run must fail loudly, never install
-	// half-working. Surfaces ship with the surface runtime; hooks and skill
-	// resources are still ahead, so they are what must be reported here.
-	err = manifest.CheckCapabilities(HostCapabilities())
+	// Against a host that supports nothing, every declared contribution in the
+	// fixture must be named — not the first one found.
+	err = manifest.CheckCapabilities(Capabilities{})
 	if err == nil {
-		t.Fatal("CheckCapabilities accepted contributions the host cannot run")
+		t.Fatal("a host with no capabilities accepted contributions it cannot run")
 	}
 	var unavailable *ErrCapabilityUnavailable
 	if !asCapabilityError(err, &unavailable) {
 		t.Fatalf("error type = %T, want *ErrCapabilityUnavailable", err)
 	}
-	for _, want := range []string{"hook trigger ui", "hook transport http", "resource skill"} {
+	wantAll := []string{}
+	for _, surface := range manifest.Contributes.Surfaces {
+		wantAll = append(wantAll, "surface "+surface.Type)
+	}
+	for _, hook := range manifest.Contributes.Hooks {
+		for _, trigger := range hook.Triggers {
+			wantAll = append(wantAll, "hook trigger "+trigger)
+		}
+		wantAll = append(wantAll, "hook transport "+hook.Transport.Type)
+	}
+	for _, resource := range manifest.Contributes.Resources {
+		wantAll = append(wantAll, "resource "+resource.Type)
+	}
+	for _, want := range wantAll {
 		if !containsString(unavailable.Missing, want) {
-			t.Fatalf("missing = %v, want it to include %q", unavailable.Missing, want)
+			t.Fatalf("missing = %v, want it to include %q — every gap must be reported at once, not one install at a time", unavailable.Missing, want)
 		}
 	}
-	// A shipped capability must NOT be reported, or every install of a plain
-	// panel plugin would fail on a capability the host can actually run.
-	if containsString(unavailable.Missing, "surface "+SurfaceIssuePanel) {
-		t.Fatalf("missing = %v, want it to exclude the shipped issue_panel surface", unavailable.Missing)
+
+	// Against the real host set: whatever is shipped must NOT be reported, and
+	// whatever is not shipped must be. Derived from HostCapabilities rather than
+	// restated, so a flip changes one place and this keeps testing the gate.
+	host := HostCapabilities()
+	hostErr := manifest.CheckCapabilities(host)
+	reported := []string{}
+	if hostErr != nil {
+		var hostUnavailable *ErrCapabilityUnavailable
+		if !asCapabilityError(hostErr, &hostUnavailable) {
+			t.Fatalf("error type = %T, want *ErrCapabilityUnavailable", hostErr)
+		}
+		reported = hostUnavailable.Missing
+	}
+	for _, surface := range manifest.Contributes.Surfaces {
+		assertGateAgrees(t, reported, "surface "+surface.Type, host.SurfaceTypes[surface.Type])
+	}
+	for _, hook := range manifest.Contributes.Hooks {
+		for _, trigger := range hook.Triggers {
+			assertGateAgrees(t, reported, "hook trigger "+trigger, host.HookTriggers[trigger])
+		}
+		assertGateAgrees(t, reported, "hook transport "+hook.Transport.Type, host.HookTransport[hook.Transport.Type])
+	}
+	for _, resource := range manifest.Contributes.Resources {
+		assertGateAgrees(t, reported, "resource "+resource.Type, host.ResourceTypes[resource.Type])
 	}
 
 	full := Capabilities{
@@ -407,6 +446,20 @@ func TestCheckCapabilitiesReportsEveryUnavailableContribution(t *testing.T) {
 	}
 	if err := manifest.CheckCapabilities(full); err != nil {
 		t.Fatalf("CheckCapabilities with full host support: %v", err)
+	}
+}
+
+// assertGateAgrees pins the gate to the host set in both directions: a shipped
+// capability reported as missing would fail every install of a plugin the host
+// can actually run, and an unshipped one left unreported would install a
+// contribution that silently never fires.
+func assertGateAgrees(t *testing.T, reported []string, name string, shipped bool) {
+	t.Helper()
+	if shipped && containsString(reported, name) {
+		t.Fatalf("%q is shipped by this host but was reported unavailable", name)
+	}
+	if !shipped && !containsString(reported, name) {
+		t.Fatalf("%q is NOT shipped by this host but was not reported — it would install and never fire", name)
 	}
 }
 
