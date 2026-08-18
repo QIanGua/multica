@@ -449,3 +449,65 @@ func TestIssueTableStatusGroupingCarriesCustomStatusGroups(t *testing.T) {
 		t.Fatalf("custom status rows = %d, want 2", len(rows.Rows))
 	}
 }
+
+// The surface sends the user's EXACT status keys in `filters.statuses` — that
+// is what "filter by QA" means, and it is the whole point of a custom status.
+// Validating that list against the 7 built-ins 400s the entire request, so the
+// board, list and table all error out instead of filtering.
+func TestIssueTableFiltersAcceptCustomStatusKeys(t *testing.T) {
+	projectID, customKey := seedStatusCategoryFixture(t)
+
+	query := statusCategoryQuery(projectID)
+	query.Filters = issueTableFiltersRequest{Statuses: []string{customKey}}
+
+	w := httptest.NewRecorder()
+	testHandler.ListIssueTableGroups(w, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
+		Query: query,
+		Group: issueTableGroupSpec{Kind: "status_category"},
+		Page:  issueTablePageRequest{Limit: 100},
+	}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("groups status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var groups issueTableGroupsResponse
+	if err := json.NewDecoder(w.Body).Decode(&groups); err != nil {
+		t.Fatalf("decode groups: %v", err)
+	}
+	if groups.Total != 2 {
+		t.Fatalf("total = %d, want 2 (only the QA rows)", groups.Total)
+	}
+
+	groupKey := statusCategoryGroupKey("in_review")
+	rowsRecorder := httptest.NewRecorder()
+	testHandler.ListIssueTableRows(rowsRecorder, newRequest(http.MethodPost, "/api/issues/table/rows", issueTableRowsRequest{
+		Query:    query,
+		Group:    issueTableGroupSpec{Kind: "status_category"},
+		GroupKey: &groupKey,
+		Page:     issueTablePageRequest{Limit: 50},
+	}))
+	if rowsRecorder.Code != http.StatusOK {
+		t.Fatalf("rows status = %d, want 200: %s", rowsRecorder.Code, rowsRecorder.Body.String())
+	}
+	var rows issueTableRowsResponse
+	if err := json.NewDecoder(rowsRecorder.Body).Decode(&rows); err != nil {
+		t.Fatalf("decode rows: %v", err)
+	}
+	// The in_review column holds 3 issues, but only the 2 on `qa` match the filter.
+	if len(rows.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows.Rows))
+	}
+	for _, row := range rows.Rows {
+		if row.Issue.Status != customKey {
+			t.Fatalf("row %q status = %q, want %q", row.Issue.Title, row.Issue.Status, customKey)
+		}
+	}
+
+	facetsRecorder := httptest.NewRecorder()
+	testHandler.ListIssueTableFacets(facetsRecorder, newRequest(http.MethodPost, "/api/issues/table/facets", issueTableFacetsRequest{
+		Query:  query,
+		Facets: []issueTableFacetSpec{{Kind: "status"}},
+	}))
+	if facetsRecorder.Code != http.StatusOK {
+		t.Fatalf("facets status = %d, want 200: %s", facetsRecorder.Code, facetsRecorder.Body.String())
+	}
+}
