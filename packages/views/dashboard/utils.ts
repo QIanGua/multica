@@ -65,7 +65,7 @@ function formatDateLabel(d: string): string {
   return `${date.getMonth() + 1}/${date.getDate()}`;
 }
 
-// Per-(date, model) rows → 1 row per date with cost broken into the three
+// Per-(date, model) rows → 1 row per date with cost broken into the four
 // segments the stacked bar chart consumes. Stable sort by date asc so the
 // chart x-axis is left-to-right oldest-to-newest.
 export function aggregateDailyCost(usage: DashboardUsageDaily[]): DailyCostStack[] {

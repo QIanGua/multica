@@ -611,8 +611,8 @@ function CustomPricingBar({ usage }: { usage: RuntimeUsage[] }) {
 }
 
 // ---------------------------------------------------------------------------
-// Chart legend — three coloured dots + labels, rendered in WhenChart's
-// header so the chart body keeps its full vertical real estate.
+// Chart legend — one coloured dot + label per stack segment, rendered in
+// WhenChart's header so the chart body keeps its full vertical real estate.
 // ---------------------------------------------------------------------------
 
 function ChartLegend({ includeCacheRead = false }: { includeCacheRead?: boolean }) {
