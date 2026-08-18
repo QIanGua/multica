@@ -745,7 +745,10 @@ func TestProjectResourceUpdateLifecycle(t *testing.T) {
 		t.Fatalf("decode CreateProjectResource: %v", err)
 	}
 
-	// Update only the label; ref/position/type must stay untouched.
+	// Update only the label. Path/daemon/type must stay untouched, but the
+	// ref's embedded label FOLLOWS the rename: older desktop builds read (and
+	// write) only that copy, so leaving it behind would show them the previous
+	// name forever (MUL-6323).
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/projects/"+project.ID+"/resources/"+created.ID, map[string]any{
 		"label": "renamed",
@@ -766,8 +769,11 @@ func TestProjectResourceUpdateLifecycle(t *testing.T) {
 	if err := json.Unmarshal(updated.ResourceRef, &ref); err != nil {
 		t.Fatalf("decode resource_ref: %v", err)
 	}
-	if ref.LocalPath != "/Users/foo/work/a" || ref.DaemonID != "d1" || ref.Label != "A" {
+	if ref.LocalPath != "/Users/foo/work/a" || ref.DaemonID != "d1" {
 		t.Errorf("label-only update leaked into resource_ref: %+v", ref)
+	}
+	if ref.Label != "renamed" {
+		t.Errorf("ref label should mirror the rename, got %q", ref.Label)
 	}
 
 	// Update the ref payload (move to a new daemon path) and bump position.
@@ -797,11 +803,15 @@ func TestProjectResourceUpdateLifecycle(t *testing.T) {
 	if updated.Position != 5 {
 		t.Errorf("position = %d, want 5", updated.Position)
 	}
-	if updated.Label == nil || *updated.Label != "renamed" {
-		t.Errorf("label should survive ref edit, got %v", updated.Label)
+	// The ref's label changed ("renamed" → "B") with no label field in the
+	// request: that is the pre-v0.4.29 desktop rename shape, so the column
+	// follows it. TestProjectResourceLabelConvergence pins the full matrix.
+	if updated.Label == nil || *updated.Label != "B" {
+		t.Errorf("column should follow a legacy ref rename, got %v", updated.Label)
 	}
 
-	// Explicit null clears the outer label.
+	// Explicit null clears the outer label — and the ref's copy with it, or
+	// the UI would fall back to the very name the user deleted.
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/projects/"+project.ID+"/resources/"+created.ID, map[string]any{
 		"label": nil,
@@ -816,6 +826,13 @@ func TestProjectResourceUpdateLifecycle(t *testing.T) {
 	}
 	if updated.Label != nil {
 		t.Errorf("label should be cleared, got %v", *updated.Label)
+	}
+	var clearedFields map[string]json.RawMessage
+	if err := json.Unmarshal(updated.ResourceRef, &clearedFields); err != nil {
+		t.Fatalf("decode cleared resource_ref: %v", err)
+	}
+	if _, hasLabel := clearedFields["label"]; hasLabel {
+		t.Errorf("clearing the label must also drop the ref copy, got %s", updated.ResourceRef)
 	}
 
 	// Bad ref payload must reject with 400 (relative path).
@@ -838,6 +855,200 @@ func TestProjectResourceUpdateLifecycle(t *testing.T) {
 	testHandler.UpdateProjectResource(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("missing resource: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestProjectResourceLabelConvergence pins how the server converges the two
+// homes a local_directory display name historically has: the top-level label
+// column (written by renames since they stopped resending the ref) and the
+// legacy copy inside resource_ref (the only home desktop ≤ v0.4.28 knows,
+// which those builds both read first and write renames into). The server is
+// the only writer that sees both client generations, so every write must
+// leave the two agreeing — otherwise each generation edits its own copy and
+// the same row shows different names on different devices (MUL-6323).
+func TestProjectResourceLabelConvergence(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/projects?workspace_id="+testWorkspaceID, map[string]any{
+		"title": "Label convergence project",
+	})
+	testHandler.CreateProject(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateProject: %d %s", w.Code, w.Body.String())
+	}
+	var project ProjectResponse
+	if err := json.NewDecoder(w.Body).Decode(&project); err != nil {
+		t.Fatalf("decode CreateProject: %v", err)
+	}
+	defer func() {
+		r := newRequest("DELETE", "/api/projects/"+project.ID, nil)
+		r = withURLParam(r, "id", project.ID)
+		testHandler.DeleteProject(httptest.NewRecorder(), r)
+	}()
+
+	// Created the way current clients do: name inside the ref, no column.
+	w = httptest.NewRecorder()
+	req = newRequest("POST", "/api/projects/"+project.ID+"/resources", map[string]any{
+		"resource_type": "local_directory",
+		"resource_ref": map[string]any{
+			"local_path":     "/Users/dev/work/game-client",
+			"daemon_id":      "daemon-label-convergence",
+			"label":          "Game Client",
+			"execution_mode": "in_place",
+		},
+	})
+	req = withURLParam(req, "id", project.ID)
+	testHandler.CreateProjectResource(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateProjectResource: %d %s", w.Code, w.Body.String())
+	}
+	var created ProjectResourceResponse
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+		t.Fatalf("decode CreateProjectResource: %v", err)
+	}
+
+	update := func(body map[string]any) ProjectResourceResponse {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := newRequest("PUT", "/api/projects/"+project.ID+"/resources/"+created.ID, body)
+		req = withURLParams(req, "id", project.ID, "resourceId", created.ID)
+		testHandler.UpdateProjectResource(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("UpdateProjectResource %v: %d %s", body, w.Code, w.Body.String())
+		}
+		var resp ProjectResourceResponse
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode UpdateProjectResource: %v", err)
+		}
+		return resp
+	}
+	refFields := func(resp ProjectResourceResponse) map[string]json.RawMessage {
+		t.Helper()
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(resp.ResourceRef, &fields); err != nil {
+			t.Fatalf("decode resource_ref: %v", err)
+		}
+		return fields
+	}
+	refString := func(fields map[string]json.RawMessage, key string) string {
+		t.Helper()
+		rawValue, ok := fields[key]
+		if !ok {
+			return ""
+		}
+		var s string
+		if err := json.Unmarshal(rawValue, &s); err != nil {
+			t.Fatalf("ref[%q] not a string: %s", key, rawValue)
+		}
+		return s
+	}
+
+	// A rename from a desktop ≤ v0.4.28: the whole ref comes back with a new
+	// embedded label and no label field. The column must follow, or clients
+	// that read the column first keep showing the name this rename replaced.
+	resp := update(map[string]any{
+		"resource_ref": map[string]any{
+			"local_path":     "/Users/dev/work/game-client",
+			"daemon_id":      "daemon-label-convergence",
+			"label":          "Renamed On Old Desktop",
+			"execution_mode": "in_place",
+		},
+	})
+	if resp.Label == nil || *resp.Label != "Renamed On Old Desktop" {
+		t.Fatalf("column should follow a legacy ref rename, got %v", resp.Label)
+	}
+
+	// Plant what an even newer server may leave in the row: a ref field this
+	// binary does not know. Label writes must patch around it, not re-marshal
+	// it away — dropping unknown fields on an unrelated edit is the exact
+	// failure this PR closes for execution_mode on old servers.
+	futureRef := json.RawMessage(`{"local_path":"/Users/dev/work/game-client","daemon_id":"daemon-label-convergence","label":"Renamed On Old Desktop","execution_mode":"in_place","future_field":{"keep":"me"}}`)
+	if _, err := testHandler.Queries.UpdateProjectResource(context.Background(), db.UpdateProjectResourceParams{
+		ID:          parseUUID(created.ID),
+		ResourceRef: futureRef,
+		Label:       pgtype.Text{String: "Renamed On Old Desktop", Valid: true},
+		Position:    0,
+	}); err != nil {
+		t.Fatalf("plant future ref: %v", err)
+	}
+
+	// A rename from a current client: label only, no ref. The ref's embedded
+	// copy must follow so ≤ v0.4.28 readers see the new name — with the mode
+	// and the unknown field untouched.
+	resp = update(map[string]any{"label": "Renamed On New Desktop"})
+	if resp.Label == nil || *resp.Label != "Renamed On New Desktop" {
+		t.Fatalf("label-only rename: column = %v", resp.Label)
+	}
+	fields := refFields(resp)
+	if got := refString(fields, "label"); got != "Renamed On New Desktop" {
+		t.Errorf("ref label should mirror the rename for legacy readers, got %q", got)
+	}
+	if got := refString(fields, "execution_mode"); got != "in_place" {
+		t.Errorf("rename must not touch execution_mode, got %q", got)
+	}
+	if string(fields["future_field"]) != `{"keep":"me"}` {
+		t.Errorf("rename must preserve unknown ref fields byte-for-byte, got %s", fields["future_field"])
+	}
+
+	// A ref resent with its embedded label UNCHANGED — the execution-mode
+	// dialog spreads the stored ref back — is not a rename. It must not
+	// overwrite a column rename... but this write may converge the ref copy
+	// onto the column. (The resend goes through ref normalization, so this is
+	// also where future_field legitimately disappears on THIS server: that is
+	// the documented normalize contract for provided refs, not label code.)
+	if _, err := testHandler.Queries.UpdateProjectResource(context.Background(), db.UpdateProjectResourceParams{
+		ID:          parseUUID(created.ID),
+		ResourceRef: json.RawMessage(`{"local_path":"/Users/dev/work/game-client","daemon_id":"daemon-label-convergence","label":"Stale Ref Copy","execution_mode":"in_place"}`),
+		Label:       pgtype.Text{String: "Column Rename", Valid: true},
+		Position:    0,
+	}); err != nil {
+		t.Fatalf("plant diverged row: %v", err)
+	}
+	resp = update(map[string]any{
+		"resource_ref": map[string]any{
+			"local_path":     "/Users/dev/work/game-client",
+			"daemon_id":      "daemon-label-convergence",
+			"label":          "Stale Ref Copy",
+			"execution_mode": "in_place",
+		},
+	})
+	if resp.Label == nil || *resp.Label != "Column Rename" {
+		t.Fatalf("unchanged ref label must not overwrite a column rename, got %v", resp.Label)
+	}
+	if got := refString(refFields(resp), "label"); got != "Column Rename" {
+		t.Errorf("diverged ref copy should heal onto the column, got %q", got)
+	}
+
+	// Clearing the name removes BOTH copies: with either one left behind the
+	// UI would resurrect the name the user just deleted.
+	resp = update(map[string]any{"label": ""})
+	if resp.Label != nil {
+		t.Fatalf("clear: column = %v", *resp.Label)
+	}
+	fields = refFields(resp)
+	if _, hasLabel := fields["label"]; hasLabel {
+		t.Errorf("clear must drop the ref copy too, got %s", resp.ResourceRef)
+	}
+	if got := refString(fields, "execution_mode"); got != "in_place" {
+		t.Errorf("clear must not touch execution_mode, got %q", got)
+	}
+
+	// A write that decides no label — position only — must leave the name of
+	// a row whose only copy lives in the ref alone: NULL column here means
+	// "never set", not "cleared".
+	if _, err := testHandler.Queries.UpdateProjectResource(context.Background(), db.UpdateProjectResourceParams{
+		ID:          parseUUID(created.ID),
+		ResourceRef: json.RawMessage(`{"local_path":"/Users/dev/work/game-client","daemon_id":"daemon-label-convergence","label":"Ref Only Name","execution_mode":"in_place"}`),
+		Label:       pgtype.Text{},
+		Position:    0,
+	}); err != nil {
+		t.Fatalf("plant legacy row: %v", err)
+	}
+	resp = update(map[string]any{"position": 3})
+	if got := refString(refFields(resp), "label"); got != "Ref Only Name" {
+		t.Errorf("position-only update must not strip a ref-only name, got %q", got)
+	}
+	if resp.Label != nil {
+		t.Errorf("position-only update invented a column label: %v", *resp.Label)
 	}
 }
 

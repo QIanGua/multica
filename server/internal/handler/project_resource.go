@@ -296,6 +296,51 @@ func validateLocalDirectoryRef(ref json.RawMessage) (json.RawMessage, error) {
 	return out, nil
 }
 
+// localDirectoryRefLabel reads the label carried inside a local_directory ref,
+// trimmed. Returns "" for a missing label or a ref that does not parse — the
+// callers only compare labels, so an unreadable ref behaves like an unlabeled
+// one instead of failing the write.
+func localDirectoryRefLabel(ref json.RawMessage) string {
+	var payload localDirectoryRef
+	if err := json.Unmarshal(ref, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Label)
+}
+
+// withLocalDirectoryRefLabel returns ref with only its "label" key set (or
+// removed, when label is NULL) and every other key preserved byte-for-byte.
+//
+// A local_directory's display name has two homes: desktop builds up to v0.4.28
+// rename by rewriting resource_ref.label, newer clients rename the top-level
+// column precisely so they never resend the ref (an older server re-normalizes
+// a resent ref and silently drops the fields it does not know — see
+// handleRenameLocalDirectory in project-resources-section.tsx). This server is
+// the only writer that sees both kinds of client, so it converges the two
+// copies on every write; without that, each client generation keeps editing
+// its own copy and the same row shows different names on different devices.
+//
+// Patch the raw map rather than round-tripping localDirectoryRef: the stored
+// ref may carry fields written by a NEWER server, and re-marshaling through
+// this binary's struct would drop them — the exact failure mode this PR exists
+// to close.
+func withLocalDirectoryRefLabel(ref json.RawMessage, label pgtype.Text) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(ref, &fields); err != nil {
+		return nil, err
+	}
+	if label.Valid {
+		encoded, err := json.Marshal(label.String)
+		if err != nil {
+			return nil, err
+		}
+		fields["label"] = encoded
+	} else {
+		delete(fields, "label")
+	}
+	return json.Marshal(fields)
+}
+
 // isAbsoluteLocalPath checks the path looks absolute on either POSIX or
 // Windows daemons. The server can't know which OS the daemon runs on, so we
 // accept the union: a leading "/" (POSIX), a UNC prefix "\\", or a drive
@@ -526,7 +571,8 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 	}
 
 	nextRef := json.RawMessage(existing.ResourceRef)
-	if rawRef, ok := raw["resource_ref"]; ok {
+	rawRef, refProvided := raw["resource_ref"]
+	if refProvided {
 		normalized, err := validateAndNormalizeResourceRef(existing.ResourceType, rawRef)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -546,13 +592,18 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 	// Gate only when the caller is changing the ref: a label/position-only
 	// update must not start failing because the daemon's version drifted
 	// after the mode was legitimately saved.
-	if _, refProvided := raw["resource_ref"]; refProvided {
+	if refProvided {
 		if !h.requireWorktreeCapableDaemon(w, r, project.WorkspaceID, existing.ResourceType, nextRef) {
 			return
 		}
 	}
 
 	nextLabel := existing.Label
+	// Tracks an explicit clear, as opposed to a column that was never set.
+	// Only the former may remove the ref's legacy label copy below: rows
+	// created by older clients keep their only name inside the ref, and an
+	// unrelated update must not strip it just because the column is NULL.
+	labelCleared := false
 	if rawLabel, ok := raw["label"]; ok {
 		var labelStr *string
 		if err := json.Unmarshal(rawLabel, &labelStr); err != nil {
@@ -561,8 +612,28 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 		}
 		if labelStr == nil || strings.TrimSpace(*labelStr) == "" {
 			nextLabel = pgtype.Text{}
+			labelCleared = true
 		} else {
 			nextLabel = pgtype.Text{String: strings.TrimSpace(*labelStr), Valid: true}
+		}
+	} else if refProvided && existing.ResourceType == "local_directory" {
+		// No label field, but the ref's embedded label changed: that is how
+		// desktop builds up to v0.4.28 rename — they rewrite ref.label and
+		// never send the column. Follow the rename into the column, or the
+		// newer clients (which read the column first) keep showing the old
+		// name this rename just replaced.
+		//
+		// Only a CHANGED ref label counts as a rename. Ref-resending edits
+		// (the execution-mode dialog spreads the stored ref back) carry the
+		// embedded label along unchanged, and must not overwrite a column
+		// rename done since the row was last written.
+		if refLabel := localDirectoryRefLabel(nextRef); refLabel != localDirectoryRefLabel(existing.ResourceRef) {
+			if refLabel == "" {
+				nextLabel = pgtype.Text{}
+				labelCleared = true
+			} else {
+				nextLabel = pgtype.Text{String: refLabel, Valid: true}
+			}
 		}
 	}
 
@@ -576,6 +647,21 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 		if pos != nil {
 			nextPosition = *pos
 		}
+	}
+
+	// Mirror the final label into the ref's legacy copy so both client
+	// generations read the same name, including removing it on an explicit
+	// clear — otherwise the display falls back to the name the user just
+	// deleted. Rows the two-copy era left disagreeing converge on their first
+	// write here. A NULL column that was never set stays out of the ref: for
+	// rows created by older clients the ref copy IS the name.
+	if existing.ResourceType == "local_directory" && (nextLabel.Valid || labelCleared) {
+		synced, err := withLocalDirectoryRefLabel(nextRef, nextLabel)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to update project resource")
+			return
+		}
+		nextRef = synced
 	}
 
 	updated, err := h.Queries.UpdateProjectResource(r.Context(), db.UpdateProjectResourceParams{

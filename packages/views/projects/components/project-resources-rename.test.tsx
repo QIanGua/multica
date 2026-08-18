@@ -93,9 +93,27 @@ describe("ProjectResourcesSection — renaming a worktree local directory", () =
 
   // The new name has to be what the user sees afterwards, which only holds if
   // the top-level label outranks the stale one still sitting inside the ref.
+  // Full read-order matrix: local-directory-label.test.ts.
   it("shows the top-level label over the one left behind in the ref", () => {
     renderWithI18n(<ProjectResourcesSection projectId="p1" />);
     expect(screen.getByText("Renamed Client")).toBeInTheDocument();
     expect(screen.queryByText("Game Client")).not.toBeInTheDocument();
+  });
+
+  // Clearing goes through the same label-only path as renaming: an emptied
+  // input must not fall back to resending the ref either, and the server is
+  // the one that drops BOTH label copies so the old name cannot resurrect.
+  it("sends a label-only clear when the input is emptied", async () => {
+    renderWithI18n(<ProjectResourcesSection projectId="p1" />);
+
+    fireEvent.click(screen.getByTitle(/rename/i));
+    const input = screen.getByRole("textbox");
+    fireEvent.change(input, { target: { value: "   " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    const payload = updateMock.mock.calls[0]?.[0] as { data: unknown };
+    expect(payload.data).toEqual({ label: "" });
+    expect(payload.data).not.toHaveProperty("resource_ref");
   });
 });
