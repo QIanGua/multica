@@ -3985,3 +3985,108 @@ func TestHermesBackendIgnoresRefusalOnFreshSession(t *testing.T) {
 		t.Error("ResumeRejected = true, want false on a fresh session")
 	}
 }
+
+// TestHermesClientEmitsToolUseWhenStartFrameCarriesCommand pins GH#6583.
+//
+// The tool_call line is a verbatim capture from `hermes acp` (Hermes Agent
+// v0.20.0) driven with this client's own handshake: it carries the full
+// invocation in `content` but no rawInput. Before the fix that combination hit
+// the kimi deferral path, so nothing was emitted until the call completed —
+// an in-flight Hermes tool was invisible in run-messages, and the daemon's
+// in-flight tool counter (which only advances on MessageToolUse) never saw it.
+func TestHermesClientEmitsToolUseWhenStartFrameCarriesCommand(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"$ multica issue get 7473e16c --output json","type":"text"},"type":"content"}],"kind":"execute","locations":[],"title":"terminal: multica issue get 7473e16c --output json","toolCallId":"tc-305462f5d67d","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 1 {
+		t.Fatalf("expected MessageToolUse on the start frame, got %d: %+v", len(got), got)
+	}
+	if got[0].Type != MessageToolUse {
+		t.Fatalf("type: got %v, want MessageToolUse", got[0].Type)
+	}
+	if got[0].Tool != "terminal" {
+		t.Errorf("tool: got %q, want %q", got[0].Tool, "terminal")
+	}
+	if got[0].CallID != "tc-305462f5d67d" {
+		t.Errorf("callID: got %q", got[0].CallID)
+	}
+	if text, _ := got[0].Input["text"].(string); text != "$ multica issue get 7473e16c --output json" {
+		t.Errorf("input.text: got %v", got[0].Input["text"])
+	}
+
+	// Completion must add only the result — never a second MessageToolUse.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"terminal result\n- **exit_code:** 0","type":"text"},"type":"content"}],"kind":"execute","status":"completed","toolCallId":"tc-305462f5d67d","sessionUpdate":"tool_call_update"}}}`)
+
+	if len(got) != 2 {
+		t.Fatalf("expected [ToolUse, ToolResult], got %d: %+v", len(got), got)
+	}
+	if got[1].Type != MessageToolResult {
+		t.Errorf("second message: got %v, want MessageToolResult", got[1].Type)
+	}
+	if got[1].Status != "completed" {
+		t.Errorf("result status: got %q", got[1].Status)
+	}
+}
+
+// TestHermesClientDefersToolUseForPartialStreamedArgs guards the kimi path the
+// fix above must not regress: a start frame carrying an unterminated JSON
+// fragment is still buffered, so the UI never sees a half-streamed command.
+func TestHermesClientDefersToolUseForPartialStreamedArgs(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-kimi","title":"Shell","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"{\"comm"}}]}}}`)
+
+	if len(got) != 0 {
+		t.Fatalf("expected partial args to stay deferred, got %+v", got)
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-kimi","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"{\"command\":\"echo hi\"}"}}]}}}`)
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-kimi","status":"completed","content":[{"type":"content","content":{"type":"text","text":"hi\n"}}]}}}`)
+
+	if len(got) != 2 || got[0].Type != MessageToolUse || got[1].Type != MessageToolResult {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if cmd, _ := got[0].Input["command"].(string); cmd != "echo hi" {
+		t.Errorf("streamed args should be parsed at completion: got %v", got[0].Input)
+	}
+}
+
+func TestACPToolCallArgsSettled(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		argsText string
+		want     bool
+	}{
+		{"empty", "", false},
+		{"whitespace only", "   \n ", false},
+		{"partial json object", `{"comm`, false},
+		{"partial json array", `[{"a":1}`, false},
+		{"complete json object", `{"command":"echo hi"}`, true},
+		{"complete json array", `[1,2]`, true},
+		{"hermes shell text", "$ ls -la", true},
+		{"plain text", "not-json", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := acpToolCallArgsSettled(tt.argsText); got != tt.want {
+				t.Errorf("acpToolCallArgsSettled(%q) = %v, want %v", tt.argsText, got, tt.want)
+			}
+		})
+	}
+}

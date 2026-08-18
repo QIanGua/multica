@@ -1562,15 +1562,72 @@ func (c *hermesClient) handleToolCallStart(data json.RawMessage) {
 		return
 	}
 
+	// No rawInput: the args, if any, live in the content blocks. Whether we
+	// can emit now depends on whether those args are already complete.
+	argsText := extractACPToolCallText(msg.Content)
+
+	// Hermes puts the whole invocation in the start frame's content (its
+	// terminal tool sends `$ <command>` and never streams more), so deferring
+	// buys nothing and costs the run its only evidence that a tool is running:
+	// nothing at all is emitted until tool_call_update completes. A tool that
+	// stalls then renders as a blank run with no visible tool call — the
+	// symptom in GH#6583 — and, because the daemon's in-flight tool counter
+	// only advances on MessageToolUse, such a call never gets charged to
+	// AgentToolWatchdog and is judged by the much shorter AgentIdleWatchdog
+	// instead, so a legitimately long tool call is force-stopped early.
+	if acpToolCallArgsSettled(argsText) {
+		c.trackTool(msg.ToolCallID, &pendingToolCall{
+			toolName: toolName,
+			argsText: argsText,
+			emitted:  true,
+		})
+		if c.onMessage != nil {
+			c.onMessage(Message{
+				Type:   MessageToolUse,
+				Tool:   toolName,
+				CallID: msg.ToolCallID,
+				Input:  parseToolArgsJSON(argsText),
+			})
+		}
+		return
+	}
+
 	// Kimi streams args token-by-token across tool_call_update messages;
 	// the initial tool_call often carries an empty content block. Buffer
 	// the tool and defer MessageToolUse emission to avoid the UI seeing
 	// a command with `{""` as its input.
 	c.trackTool(msg.ToolCallID, &pendingToolCall{
 		toolName: toolName,
-		argsText: extractACPToolCallText(msg.Content),
+		argsText: argsText,
 		emitted:  false,
 	})
+}
+
+// acpToolCallArgsSettled reports whether a tool_call start frame's content
+// already carries the complete tool arguments, so MessageToolUse can be emitted
+// immediately instead of being held until the call completes.
+//
+// The discriminator is the shape of the text, not the backend, because all nine
+// ACP backends share this client and each may change independently. Kimi streams
+// its args as a JSON object built up token by token, so a mid-stream fragment is
+// always an *unterminated* JSON object or array (`{"comm`). Everything else is
+// as complete as it will ever be: a whole JSON object, or plain text like
+// Hermes' `$ ls -la`. Empty content carries nothing to show and stays deferred.
+//
+// Emitting early does not change what the UI renders — parseToolArgsJSON turns
+// the same text into the same Input map the deferred path would have produced at
+// completion time — it only changes when it appears.
+func acpToolCallArgsSettled(argsText string) bool {
+	trimmed := strings.TrimSpace(argsText)
+	if trimmed == "" {
+		return false
+	}
+	// Only a JSON object/array can be a partially-streamed fragment; treat it
+	// as settled once it parses as a complete value.
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		return json.Valid([]byte(trimmed))
+	}
+	return true
 }
 
 func (c *hermesClient) handleToolCallUpdate(data json.RawMessage) {
