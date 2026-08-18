@@ -4343,6 +4343,7 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		// retry on the daemon side, so an unsanitized batch is silently lost
 		// (GH #7098). Input is a JSONB column, so it needs the deep walk: the
 		// offending byte can sit at any depth of a tool's arguments.
+		msg.Type = util.SanitizeTextForPostgres(msg.Type)
 		msg.Tool = util.SanitizeTextForPostgres(msg.Tool)
 		msg.Content = util.SanitizeTextForPostgres(msg.Content)
 		msg.Output = util.SanitizeTextForPostgres(msg.Output)
