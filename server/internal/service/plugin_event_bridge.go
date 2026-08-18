@@ -17,12 +17,21 @@ import (
 // published contract. Mapping in one place means a rename on our side is a
 // change to this file rather than a break in every installed plugin.
 
+// EventSink is the half of the dispatcher the bridge needs.
+//
+// An interface so the vocabulary mapping can be tested without a network: what
+// this file decides is WHICH plugin event an internal one becomes, and that is
+// worth asserting on its own rather than through a live endpoint.
+type EventSink interface {
+	Dispatch(eventType, workspaceID string, issueID pgtype.UUID, payload any)
+}
+
 // SubscribePluginEvents wires the dispatcher onto the bus.
 //
 // Bus.Publish calls its listeners INLINE, on the goroutine of the request that
 // published — so everything these closures do must be cheap and non-blocking.
 // They extract an id and hand off; the network call happens on a worker.
-func SubscribePluginEvents(bus *events.Bus, dispatcher *PluginEventDispatcher) {
+func SubscribePluginEvents(bus *events.Bus, dispatcher EventSink) {
 	if bus == nil || dispatcher == nil {
 		return
 	}

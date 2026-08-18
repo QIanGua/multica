@@ -126,6 +126,11 @@ var knownEvents = map[string]bool{
 	EventTaskFailed:         true,
 }
 
+// IsKnownEvent reports whether an event may be subscribed to by a manifest.
+// Exported so the dispatcher cannot publish an event no plugin could ever
+// receive — the two lists have to agree, and only one of them is authoritative.
+func IsKnownEvent(event string) bool { return knownEvents[event] }
+
 var (
 	pluginKeySegmentPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
 	contributionKeyPattern  = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$`)

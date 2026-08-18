@@ -114,13 +114,34 @@ func (d *PluginEventDispatcher) work() {
 		case <-d.stop:
 			return
 		case job := <-d.queue:
-			d.run(job)
+			d.runGuarded(job)
 		}
 	}
 }
 
+// runGuarded contains a panic to the delivery that caused it.
+//
+// Bus.Publish recovers panics in its listeners so one bad handler cannot take
+// down the request that published. Moving delivery onto a worker goroutine
+// steps outside that protection, and a panic on a bare goroutine is not a
+// failed hook but a dead process. Restoring the guarantee is the cost of the
+// hand-off, not an optional extra.
+func (d *PluginEventDispatcher) runGuarded(job dispatchJob) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error("plugins: panic while delivering an event hook",
+				"event_type", job.eventType, "recovered", recovered)
+		}
+	}()
+	d.run(job)
+}
+
 // run resolves which hooks want this event and calls each one.
 func (d *PluginEventDispatcher) run(job dispatchJob) {
+	if d.service.Queries == nil {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 

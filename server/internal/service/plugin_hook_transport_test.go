@@ -69,6 +69,12 @@ func hookTestService(t *testing.T, harness *hookTestServer) *PluginService {
 	return service
 }
 
+// hookTestHost is the bare hostname of the test server, which is what a net:
+// scope names — the scope is an exact host, never a URL.
+func hookTestHost(harness *hookTestServer) string {
+	return strings.Split(strings.TrimPrefix(harness.server.URL, "https://"), ":")[0]
+}
+
 func hookTestInstallation(t *testing.T, endpoint, netScope string, triggers []string) db.PluginInstallation {
 	t.Helper()
 	triggerJSON, err := json.Marshal(triggers)
@@ -111,8 +117,7 @@ func hookTestInstallation(t *testing.T, endpoint, netScope string, triggers []st
 func TestHookRequestIsSignedAndVerifiableByTheReceiver(t *testing.T) {
 	harness := newHookTestServer(t)
 	service := hookTestService(t, harness)
-	host := strings.TrimPrefix(harness.server.URL, "https://")
-	host = strings.Split(host, ":")[0]
+	host := hookTestHost(harness)
 	installation := hookTestInstallation(t, harness.server.URL+"/hooks/summarize", host, []string{plugincontract.TriggerManual})
 
 	hook, err := FindHook(installation, "summarize")
@@ -209,7 +214,7 @@ func TestHookRefusesWhenNoNetScopeGranted(t *testing.T) {
 func TestHookCarriesAOneShotCallbackToken(t *testing.T) {
 	harness := newHookTestServer(t)
 	service := hookTestService(t, harness)
-	host := strings.Split(strings.TrimPrefix(harness.server.URL, "https://"), ":")[0]
+	host := hookTestHost(harness)
 	installation := hookTestInstallation(t, harness.server.URL+"/hooks/summarize", host, []string{plugincontract.TriggerManual})
 
 	hook, err := FindHook(installation, "summarize")
@@ -258,7 +263,7 @@ func TestHookCarriesAOneShotCallbackToken(t *testing.T) {
 func TestInvokeHookRefusesUndeclaredTrigger(t *testing.T) {
 	harness := newHookTestServer(t)
 	service := hookTestService(t, harness)
-	host := strings.Split(strings.TrimPrefix(harness.server.URL, "https://"), ":")[0]
+	host := hookTestHost(harness)
 	installation := hookTestInstallation(t, harness.server.URL+"/hooks/summarize", host, []string{plugincontract.TriggerManual})
 
 	hook, err := FindHook(installation, "summarize")
@@ -283,7 +288,7 @@ func TestInvokeHookRefusesUndeclaredTrigger(t *testing.T) {
 func TestInvokeHookRefusesDisabledInstallation(t *testing.T) {
 	harness := newHookTestServer(t)
 	service := hookTestService(t, harness)
-	host := strings.Split(strings.TrimPrefix(harness.server.URL, "https://"), ":")[0]
+	host := hookTestHost(harness)
 	installation := hookTestInstallation(t, harness.server.URL+"/hooks/summarize", host, []string{plugincontract.TriggerManual})
 	installation.Enabled = false
 
@@ -309,7 +314,7 @@ func TestHookFailureIsRedactedAndClassified(t *testing.T) {
 		_, _ = w.Write([]byte("internal detail: secret-token-abc123 and an issue title"))
 	}
 	service := hookTestService(t, harness)
-	host := strings.Split(strings.TrimPrefix(harness.server.URL, "https://"), ":")[0]
+	host := hookTestHost(harness)
 	installation := hookTestInstallation(t, harness.server.URL+"/hooks/summarize", host, []string{plugincontract.TriggerManual})
 
 	hook, err := FindHook(installation, "summarize")
