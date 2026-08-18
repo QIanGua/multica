@@ -10,6 +10,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // The Action API is what a plugin surface reaches through the host bridge.
@@ -297,6 +298,7 @@ func (h *Handler) CreatePluginComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var parentID pgtype.UUID
+	var rootComment *db.Comment
 	if req.ParentID != nil && *req.ParentID != "" {
 		parsed, ok := parseUUIDOrBadRequest(w, *req.ParentID, "parent_id")
 		if !ok {
@@ -308,6 +310,7 @@ func (h *Handler) CreatePluginComment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		parentID = parsed
+		rootComment = &parent
 	}
 
 	comment, err := h.Queries.CreateComment(r.Context(), db.CreateCommentParams{
@@ -323,6 +326,22 @@ func (h *Handler) CreatePluginComment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create the comment")
 		return
+	}
+
+	// The same two follow-ups every other comment path performs. Skipping them
+	// made a plugin-posted comment invisible until the next refetch, and left a
+	// reply into a resolved thread without re-opening it — a comment that lands
+	// as the user should behave like the user's, minus only what was refused on
+	// purpose (mention dispatch).
+	h.publish(protocol.EventCommentCreated, uuidToString(caller.WorkspaceID), "member", uuidToString(member.UserID), map[string]any{
+		"comment":             commentToResponse(comment, nil, nil),
+		"issue_title":         issue.Title,
+		"issue_assignee_type": textToPtr(issue.AssigneeType),
+		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
+		"issue_status":        issue.Status,
+	})
+	if rootComment != nil {
+		h.TaskService.AutoUnresolveThreadOnReply(r.Context(), rootComment, uuidToString(caller.WorkspaceID), "member", uuidToString(member.UserID))
 	}
 
 	writeJSON(w, http.StatusCreated, pluginCommentResponse{

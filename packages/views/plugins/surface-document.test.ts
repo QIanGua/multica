@@ -47,10 +47,20 @@ describe("surface connect-src", () => {
       .toEqual(["https://example.com", "https://api.example.com"]);
   });
 
-  it("locks a surface with no net: scope out of the network entirely", () => {
-    // Not merely "nothing allowlisted" — 'none' is what makes the absence of a
-    // net: scope mean the plugin cannot phone home at all.
+  it("gives a surface with no net: scope no third-party destination at all", () => {
+    // 'none', not merely an empty allowlist. This bounds THIRD-PARTY hosts; the
+    // author's own origin stays reachable through script-src, because the code
+    // has to load from somewhere. Saying otherwise would overclaim.
     expect(buildSurfaceCSP(["issues:read"], "https://example.com")).toContain("connect-src 'none'");
+  });
+
+  it("keeps the cheapest side channels closed", () => {
+    // <img> and webfont URLs are the two exfiltration paths that need no
+    // scripting at all, so neither gets the script origin.
+    const csp = buildSurfaceCSP(["net:example.com"], "https://cdn.example.com");
+    expect(csp).toContain("img-src data: blob:");
+    expect(csp).toContain("font-src data:");
+    expect(csp).not.toContain("img-src https://cdn.example.com");
   });
 
   it("does not let an undeclared domain in through the script origin", () => {

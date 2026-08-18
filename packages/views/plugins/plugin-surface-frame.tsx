@@ -65,7 +65,11 @@ export function PluginSurfaceFrame({ installation, surface, issueId, className }
     // A surface whose script 404s posts this to the parent window rather than
     // rendering blank — the frame has no other way to tell us.
     const onMessage = (event: MessageEvent) => {
-      if ((event.data as { type?: string } | null)?.type === "multica:plugin-surface-error") setFailed(true);
+      if ((event.data as { type?: string } | null)?.type !== "multica:plugin-surface-error") return;
+      // Same window-identity rule as the bridge: without it any frame on the
+      // page could light up the failure banner on every other panel.
+      if (!frameRef.current?.contentWindow || event.source !== frameRef.current.contentWindow) return;
+      setFailed(true);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -89,6 +93,10 @@ export function PluginSurfaceFrame({ installation, surface, issueId, className }
         </div>
       ) : null}
       <iframe
+        // Keyed on the issue as well: a new bridge is created when issueId
+        // changes, but an unchanged document would not reload, and the guest
+        // stops announcing once answered — the fresh bridge would wait forever.
+        key={`${installation.id}:${surface.key}:${issueId ?? ""}`}
         ref={frameRef}
         title={`${installation.name} — ${surface.name}`}
         srcDoc={surfaceDocument}

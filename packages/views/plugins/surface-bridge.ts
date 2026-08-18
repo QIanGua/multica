@@ -40,6 +40,8 @@ function isAllowedPath(path: string): boolean {
   return ALLOWED_PATHS.some((pattern) => pattern.test(path));
 }
 
+const ALLOWED_METHODS = new Set(["GET", "POST", "PATCH", "PUT", "DELETE"]);
+
 function isBridgeRequest(value: unknown): value is BridgeRequest {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
@@ -48,7 +50,9 @@ function isBridgeRequest(value: unknown): value is BridgeRequest {
   return (
     candidate.kind === "action" &&
     typeof candidate.path === "string" &&
-    typeof candidate.method === "string"
+    // An allowlist, not "is a string": an arbitrary verb would otherwise reach
+    // fetch and rely on the server's 405 to stop it.
+    typeof candidate.method === "string" && ALLOWED_METHODS.has(candidate.method)
   );
 }
 

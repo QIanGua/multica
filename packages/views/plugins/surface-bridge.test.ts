@@ -91,6 +91,16 @@ describe("surface bridge", () => {
     expect(posted[0]).toMatchObject({ id: "r1", ok: false, status: 403 });
   });
 
+  it("refuses a method outside the allowlist before it reaches fetch", async () => {
+    const { frame, posted } = connectedBridge();
+    frame.port.postMessage({ id: "r1", kind: "action", method: "TRACE", path: "/context" });
+    frame.port.postMessage({ id: "r2", kind: "action", method: "get", path: "/context" });
+    await settle();
+
+    expect(mockCall).not.toHaveBeenCalled();
+    expect(posted).toHaveLength(0);
+  });
+
   it("ignores messages that are not bridge requests", async () => {
     const { frame, posted } = connectedBridge();
     frame.port.postMessage({ hello: "world" });

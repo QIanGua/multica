@@ -13,10 +13,15 @@
     ".": "./index.ts",
     "./protocol": "./protocol.ts"
   },
-  "files": ["index.ts", "protocol.ts", "README.md"],
+  "files": [
+    "index.ts",
+    "protocol.ts",
+    "README.md"
+  ],
   "devDependencies": {
     "@multica/eslint-config": "workspace:*",
     "@multica/tsconfig": "workspace:*",
+    "jsdom": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   }

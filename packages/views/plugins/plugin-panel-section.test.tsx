@@ -16,6 +16,7 @@ vi.mock("@tanstack/react-query", () => ({
 vi.mock("@multica/core/plugins", () => ({ pluginInstallationsOptions: () => ({ queryKey: ["plugins"] }) }));
 vi.mock("@multica/core/paths", () => ({ useCurrentWorkspace: () => ({ id: "workspace-1", name: "Acme", slug: "acme" }) }));
 vi.mock("@multica/core/config", () => ({ useFeatureEnabled: () => data.flagEnabled }));
+vi.mock("../platform/local-directory", () => ({ isDesktopShell: () => false }));
 
 import { PluginPanelSection } from "./plugin-panel-section";
 
@@ -79,6 +80,22 @@ describe("PluginPanelSection", () => {
     })];
     render(<PluginPanelSection issueId="issue-1" />, { wrapper: Wrapper });
     expect(screen.queryByTitle("Hello Panel — Side")).not.toBeInTheDocument();
+  });
+
+  it("does not render a surface this platform is excluded from", () => {
+    // platforms is a filter, not a hint: a desktop-only panel appearing on web
+    // is a surface running somewhere its author said it should not.
+    data.installed.plugins = [installation({
+      surfaces: [{ key: "hello", type: "issue_panel", name: "Hello", entry: "ui/main.js", platforms: ["desktop"] }],
+    })];
+    render(<PluginPanelSection issueId="issue-1" />, { wrapper: Wrapper });
+    expect(screen.queryByTitle("Hello Panel — Hello")).not.toBeInTheDocument();
+  });
+
+  it("renders a surface that declares no platforms at all", () => {
+    data.installed.plugins = [installation()];
+    render(<PluginPanelSection issueId="issue-1" />, { wrapper: Wrapper });
+    expect(screen.getByTitle("Hello Panel — Hello")).toBeInTheDocument();
   });
 
   it("renders nothing when the feature flag is off", () => {

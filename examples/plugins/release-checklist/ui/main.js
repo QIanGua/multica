@@ -16,6 +16,13 @@ let sequence = 0;
 window.addEventListener("message", (event) => {
   const data = event.data;
   if (!data || data.type !== "multica:plugin-bridge-init" || !event.ports[0]) return;
+  // Only the embedder may hand this frame a port, and only once. Sibling frames
+  // are mutually opaque but `parent.frames[i]` is an allowed cross-origin
+  // access, so another plugin on this page could otherwise deliver its own port
+  // and become this surface's "host" — reading everything it writes. Origin is
+  // useless here (a sandboxed frame sees "null"), so identity is the window
+  // reference.
+  if (event.source !== window.parent || port) return;
   port = event.ports[0];
   port.onmessage = (message) => {
     const payload = message.data;

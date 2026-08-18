@@ -7,6 +7,7 @@ import { useCurrentWorkspace } from "@multica/core/paths";
 import { useFeatureEnabled } from "@multica/core/config";
 import { PLUGINS_V1_FLAG } from "@multica/core/feature-flags";
 import { useT } from "../i18n";
+import { isDesktopShell } from "../platform/local-directory";
 import { PluginSurfaceFrame } from "./plugin-surface-frame";
 
 /**
@@ -19,6 +20,7 @@ import { PluginSurfaceFrame } from "./plugin-surface-frame";
  */
 export function PluginPanelSection({ issueId }: { issueId: string }) {
   const { t } = useT("issues");
+  const platform = isDesktopShell() ? "desktop" : "web";
   const workspace = useCurrentWorkspace();
   const wsId = workspace?.id ?? "";
   const pluginsEnabled = useFeatureEnabled(PLUGINS_V1_FLAG, false);
@@ -32,9 +34,12 @@ export function PluginPanelSection({ issueId }: { issueId: string }) {
       .flatMap((installation) =>
         installation.surfaces
           .filter((surface) => surface.type === "issue_panel")
+          // An empty list means "anywhere"; a declared list is a filter, not a
+          // hint, or a desktop-only panel renders on web anyway.
+          .filter((surface) => (surface.platforms ?? []).length === 0 || (surface.platforms ?? []).includes(platform))
           .map((surface) => ({ installation, surface })),
       );
-  }, [data]);
+  }, [data, platform]);
 
   if (!pluginsEnabled || panels.length === 0) return null;
 

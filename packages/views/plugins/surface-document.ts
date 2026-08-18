@@ -92,12 +92,24 @@ export function buildSurfaceCSP(grantedScopes: string[], scriptOrigin: string): 
   const connect = surfaceConnectSources(grantedScopes);
   return [
     "default-src 'none'",
-    // The surface's own script, and nothing else executable.
+    // The surface's own script, and nothing else executable. This origin is
+    // unavoidable — the code has to load from somewhere — and it is the reason
+    // `net:` bounds THIRD-PARTY destinations rather than exfiltration in
+    // general: a script served by its author can always reach its author back,
+    // and closing that would mean re-hosting third-party code, which this design
+    // deliberately does not do.
     `script-src ${scriptOrigin} 'unsafe-inline'`,
     "style-src 'unsafe-inline'",
-    `img-src ${scriptOrigin} data: blob:`,
-    `font-src ${scriptOrigin} data:`,
-    // No net: scope means a surface that literally cannot phone home.
+    // Narrowed to inline data rather than the script origin: an <img> or webfont
+    // URL is the cheapest possible side channel back to the author, and a
+    // surface that needs artwork can inline it. It does not make the channel
+    // impossible — a dynamic import of the author's own origin remains — but it
+    // removes the two that cost nothing to use.
+    "img-src data: blob:",
+    "font-src data:",
+    // With no net: scope this is 'none', so a surface cannot reach any
+    // third-party host. Its author's own origin is still reachable via
+    // script-src; see above.
     `connect-src ${connect.length > 0 ? connect.join(" ") : "'none'"}`,
     // A sandboxed frame cannot navigate the top level anyway; saying so keeps
     // the policy honest if the sandbox attribute is ever loosened.

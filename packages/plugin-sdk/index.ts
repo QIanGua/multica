@@ -128,9 +128,20 @@ class Bridge {
     if (!data || data.type !== BRIDGE_INIT_MESSAGE) return;
     const port = event.ports?.[0];
     if (!port) return;
-    // The host is the only party that can transfer a port into this frame, so
-    // holding one is itself the proof of who we are talking to. There is no
-    // origin to check: a sandboxed frame without allow-same-origin sees "null".
+    // Only the embedder may hand this frame a port.
+    //
+    // Sibling frames are mutually opaque, but `parent.frames[i]` is an indexed
+    // cross-origin access the spec allows, so another plugin on the same page
+    // can postMessage into this one. Without this check it could deliver its own
+    // MessagePort and become this surface's "host": feed it fabricated issue
+    // data and read everything the surface writes, including whatever it puts in
+    // storage:user. Origin cannot be compared — a sandboxed frame sees "null" —
+    // so the embedder is identified by window reference, mirroring the host's
+    // own check on the readiness signal.
+    if (event.source !== window.parent) return;
+    // First init wins. A hijacker that lost the race could otherwise send a
+    // second init and take the channel over afterwards.
+    if (this.port) return;
     if (data.version !== BRIDGE_PROTOCOL_VERSION) {
       // A host newer or older than this SDK: fail loudly rather than guess at a
       // shape neither side agreed on.
