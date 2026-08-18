@@ -17,19 +17,10 @@ _features
 
 /.dockerignore
 /.goreleaser.yml
-/AGENTS.md
-/CLAUDE.md
-/CLI_AND_DAEMON.md
-/CLI_INSTALL.md
-/CONTRIBUTING.md
 /Dockerfile
 /Dockerfile.web
 /Makefile
-/README.md
-/README.zh.md
-/SELF_HOSTING.md
-/SELF_HOSTING_ADVANCED.md
-/SELF_HOSTING_AI.md
+/*.md
 /docker-compose*.yml
 /playwright.config.ts
 /skills-lock.json

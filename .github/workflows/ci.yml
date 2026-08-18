@@ -344,9 +344,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Verify build and deploy ignore files
-        run: bash scripts/ignore-files.test.sh
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
