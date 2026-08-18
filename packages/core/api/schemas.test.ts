@@ -841,6 +841,33 @@ describe("dashboard + runtime usage schema drift", () => {
   });
 });
 
+// A server that never heard of worktree mode also never sends this flag, and
+// it does not reject the mode either — it drops execution_mode and answers 201,
+// leaving the task to run in the user's working copy (#7113). So the absent
+// case has to parse as false, not as "unknown, probably fine".
+describe("AppConfigSchema local_worktree_supported drift", () => {
+  it("defaults to false when the server omits it (pre-v0.4.25 servers)", () => {
+    const parsed = AppConfigSchema.parse({ cdn_domain: "cdn.example.com" });
+    expect(parsed.local_worktree_supported).toBe(false);
+  });
+
+  it("coerces a malformed value to false rather than trusting it", () => {
+    const parsed = AppConfigSchema.parse({
+      cdn_domain: "cdn.example.com",
+      local_worktree_supported: "yes",
+    });
+    expect(parsed.local_worktree_supported).toBe(false);
+  });
+
+  it("carries a genuine true through", () => {
+    const parsed = AppConfigSchema.parse({
+      cdn_domain: "cdn.example.com",
+      local_worktree_supported: true,
+    });
+    expect(parsed.local_worktree_supported).toBe(true);
+  });
+});
+
 describe("AppConfigSchema cdn_signed drift", () => {
   it("defaults cdn_signed to false when the server omits it (pre-MUL-3254 servers)", () => {
     const parsed = AppConfigSchema.parse({ cdn_domain: "cdn.example.com" });

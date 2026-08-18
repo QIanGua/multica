@@ -71,6 +71,7 @@ import {
   runtimeAdvertisesLocalWorktree,
   runtimeListOptions,
 } from "@multica/core/runtimes";
+import { useConfigStore } from "@multica/core/config";
 import type { LocalDirectoryExecutionMode } from "@multica/core/types";
 import { LocalDirectoryModeOptions } from "../projects/components/local-directory-mode-dialog";
 
@@ -216,8 +217,16 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
     runtimes,
     daemonStatus.daemonId,
   );
+  // One declared boolean from the live server. Servers older than the worktree
+  // save gate drop execution_mode and answer 201, so "the backend will check"
+  // is only true once the backend says it checks (#7113).
+  const serverValidatesWorktree = useConfigStore((state) => state.localWorktreeSupported);
   const worktreeUnavailableReason =
-    localIsGitRepo === false ? ("not_git" as const) : undefined;
+    localIsGitRepo === false
+      ? ("not_git" as const)
+      : !serverValidatesWorktree
+        ? ("server_outdated" as const)
+        : undefined;
   // Preselection, not a default behavior change: when the folder is a git repo
   // and the machine has advertised that it can run worktree mode, parallel is
   // the better fit, so it starts selected — visibly, in a control the user can

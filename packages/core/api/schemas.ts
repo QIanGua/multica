@@ -662,6 +662,12 @@ export interface AppConfigResponse {
    * Settings → Integrations "Git providers" section. */
   vcs_integration_available?: boolean;
   feature_flags?: Record<string, boolean>;
+  /** Whether this server understands local_directory `execution_mode` and
+   * gates worktree mode at save time. Servers before v0.4.25 silently dropped
+   * an unknown `execution_mode` and answered 201, so the resource ran in place
+   * while the user was promised isolation (#7113). Absent means exactly that
+   * kind of server — clients must fail closed, never assume validation. */
+  local_worktree_supported?: boolean;
   server_version?: string;
 }
 
@@ -856,6 +862,7 @@ export const AppConfigSchema = z.object({
   workspace_creation_disabled: BooleanWithDefaultSchema(false).optional(),
   vcs_integration_available: BooleanWithDefaultSchema(false).optional(),
   feature_flags: FeatureFlagsSchema,
+  local_worktree_supported: BooleanWithDefaultSchema(false),
   server_version: OptionalStringSchema,
 }).loose();
 
@@ -868,6 +875,9 @@ export const EMPTY_APP_CONFIG: AppConfigResponse = {
   daemon_app_url: "",
   workspace_creation_disabled: false,
   vcs_integration_available: false,
+  // Fail closed: an unreadable config must not look like a server that
+  // validates execution_mode.
+  local_worktree_supported: false,
   feature_flags: {},
 };
 

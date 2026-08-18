@@ -87,6 +87,14 @@ vi.mock("@multica/core/projects", () => ({
     }),
 }));
 
+// Whether the connected server validates execution_mode at all. Absent on every
+// release before the worktree save gate.
+let serverValidatesWorktree = true;
+vi.mock("@multica/core/config", () => ({
+  useConfigStore: (selector: (state: { localWorktreeSupported: boolean }) => unknown) =>
+    selector({ localWorktreeSupported: serverValidatesWorktree }),
+}));
+
 vi.mock("@multica/core/hooks", () => ({ useWorkspaceId: () => "workspace-1" }));
 vi.mock("@multica/core/paths", () => ({
   useCurrentWorkspace: () => ({ id: "workspace-1", slug: "ws", repos: [] }),
@@ -172,6 +180,7 @@ describe("CreateProjectModal — local directory execution mode", () => {
     createProjectMock.mockClear();
     runtimeCliVersion = "9.9.9";
     runtimeWorktreeMetadata = "advertised";
+    serverValidatesWorktree = true;
     pickedIsGitRepo = true;
   });
 
@@ -263,10 +272,6 @@ describe("CreateProjectModal — local directory execution mode", () => {
     expect(screen.getByRole("button", { name: /Change directory/i })).toBeInTheDocument();
   });
 
-
-
-
-
   it("still offers parallel mode when the machine has not advertised", async () => {
     runtimeWorktreeMetadata = "server_recorded_nothing";
     const user = userEvent.setup();
@@ -275,6 +280,24 @@ describe("CreateProjectModal — local directory execution mode", () => {
     await pickLocalDirectory(user);
 
     expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).not.toBeDisabled();
+  });
+
+  // The version skew this whole issue is about: newest Desktop, newest daemon,
+  // a self-hosted backend from before v0.4.25. That server accepts the save and
+  // silently strips execution_mode, so trusting it to reject would hand the
+  // agent the user's working copy while promising isolation.
+  it("blocks parallel mode against a server that cannot honour it", async () => {
+    serverValidatesWorktree = false;
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await pickLocalDirectory(user);
+
+    expect(screen.getByRole("radio", { name: /Run in parallel, isolated/i })).toBeDisabled();
+    expect(screen.getByText(/Multica server is too old/i)).toBeInTheDocument();
+    // And it must not have been preselected either — that would submit a mode
+    // the server would silently downgrade.
+    expect(screen.getByRole("button", { name: /^Direct$/i })).toBeInTheDocument();
   });
 
   it("blocks parallel mode for a folder that is not a git repository", async () => {

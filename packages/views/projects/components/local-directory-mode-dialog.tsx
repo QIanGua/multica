@@ -17,16 +17,21 @@ import { useT } from "../../i18n/use-t";
 /**
  * Why the worktree option may be unavailable.
  *
- * Exactly one reason, on purpose. `not_git` is the only blocker the client can
- * establish by itself: the folder either has a repository to branch from or it
- * does not, and the desktop picker checked. Whether the MACHINE can run the
- * mode is the server's question — it is the one that knows its own version,
- * and it is asked on every save (#7113). A rejection comes back as
- * `errorMessage` rather than as a disabled option guessed at up front.
+ * Two reasons, and neither is a guess about the machine. `not_git` the client
+ * establishes by itself — the folder either has a repository to branch from or
+ * it does not, and the desktop picker checked. `server_outdated` is what the
+ * SERVER says about itself: whether it understands `execution_mode` at all.
+ *
+ * Whether the MACHINE can run the mode is deliberately absent. That is the
+ * server's question, asked on every save, and a rejection comes back as
+ * `errorMessage` rather than as a disabled option guessed at up front (#7113).
+ * But deferring to the server is only safe once the server has said it will
+ * actually check: older ones drop the field and answer 201, and the task then
+ * edits the directory the user asked to isolate.
  *
  * `undefined` means available.
  */
-export type WorktreeUnavailableReason = "not_git";
+export type WorktreeUnavailableReason = "not_git" | "server_outdated";
 
 interface LocalDirectoryModeDialogProps {
   open: boolean;
@@ -159,7 +164,9 @@ export function LocalDirectoryModeOptions({
         disabledReason={
           unavailableReason === "not_git"
             ? t(($) => $.resources.mode_worktree_needs_git)
-            : undefined
+            : unavailableReason === "server_outdated"
+              ? t(($) => $.resources.mode_worktree_needs_server_upgrade)
+              : undefined
         }
         onSelect={() => onChange("worktree")}
       />

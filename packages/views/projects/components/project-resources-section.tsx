@@ -31,6 +31,7 @@ import {
   runtimeAdvertisesLocalWorktree,
   runtimeListOptions,
 } from "@multica/core/runtimes";
+import { useConfigStore } from "@multica/core/config";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
 import {
@@ -133,15 +134,18 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
   // what told a user on the newest release to upgrade it (#7113). The save is
   // gated server-side and surfaced here as an inline error instead.
   const { data: runtimes = [] } = useQuery(runtimeListOptions(wsId));
+  // The one thing the client must still check up front: whether this server
+  // performs that gate at all. One declared boolean, no inference — servers
+  // that predate it drop execution_mode and answer 201.
+  const serverValidatesWorktree = useConfigStore((state) => state.localWorktreeSupported);
   // Keyed on the resource's OWN daemon, not the machine the browser happens to
   // be on: a resource is pinned to one machine, and its mode can legitimately
   // be changed from the web app or from a different device. Using the local
   // daemon here would report "too old" for every resource whenever the viewer
   // is not on that machine.
   // Capability, not version, and judged by the daemon's newest runtime row —
-  // see localWorktreeSupport for why an any-match would keep saying yes after a
-  // downgrade, and why "no capability recorded" is a distinct answer from "this
-  // daemon cannot do it".
+  // see runtimeAdvertisesLocalWorktree for why an any-match would keep saying
+  // yes after a downgrade.
   const advertisesWorktree = (daemonId: string | null) =>
     runtimeAdvertisesLocalWorktree(runtimes, daemonId);
 
@@ -239,6 +243,7 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
         // user still confirms, and existing resources keep whatever they have.
         mode:
           validation.is_git_repo === true &&
+          serverValidatesWorktree &&
           advertisesWorktree(localDaemonId)
             ? "worktree"
             : "in_place",
@@ -524,7 +529,10 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
           }}
           path={modeDialog.path}
           value={modeDialog.mode}
-          unavailableReason={worktreeUnavailableReason(modeDialog.isGitRepo)}
+          unavailableReason={worktreeUnavailableReason(
+            modeDialog.isGitRepo,
+            serverValidatesWorktree,
+          )}
           errorMessage={modeError ?? undefined}
           saving={modeSaving}
           confirmLabel={
@@ -550,12 +558,16 @@ export function ProjectResourcesSection({ projectId }: { projectId: string }) {
  *
  * Daemon capability is deliberately absent. It is the server's question, asked
  * on save; predicting it here is what produced an unfixable blocker for a user
- * already on the newest release (#7113).
+ * already on the newest release (#7113). Deferring to the server does require
+ * knowing it will answer, though — `serverValidates` is the server saying so.
  */
 function worktreeUnavailableReason(
   isGitRepo: boolean | undefined,
+  serverValidates: boolean,
 ): WorktreeUnavailableReason | undefined {
-  return isGitRepo === false ? "not_git" : undefined;
+  if (isGitRepo === false) return "not_git";
+  if (!serverValidates) return "server_outdated";
+  return undefined;
 }
 
 interface ResourceRowProps {

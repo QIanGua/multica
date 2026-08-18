@@ -87,10 +87,23 @@ describe("LocalDirectoryModeDialog", () => {
     expect(onConfirm).toHaveBeenCalledWith("in_place");
   });
 
+  // A server older than the worktree save gate does not reject the mode — it
+  // drops execution_mode, answers 201, and the task then runs in the folder the
+  // user asked to isolate. Nothing downstream catches that, so the option has
+  // to be closed here, and the copy has to say what is actually wrong (#7113).
+  it("blocks parallel mode when the server cannot honour it", () => {
+    const onConfirm = vi.fn();
+    renderDialog({ unavailableReason: "server_outdated", onConfirm });
 
+    const option = worktreeOption();
+    expect(option.hasAttribute("disabled")).toBe(true);
+    const notice = screen.getByText(/Multica server is too old/i);
+    expect(notice.textContent).toMatch(/Update the server/i);
 
-
-
+    fireEvent.click(option);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(onConfirm).toHaveBeenCalledWith("in_place");
+  });
 
   // The client no longer predicts whether the machine can run the mode — the
   // server decides on save, and this is where its answer lands. Guessing it up
