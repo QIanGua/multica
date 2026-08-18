@@ -1,4 +1,9 @@
 {
+  "status_catalog_error": {
+    "title": "상태 목록을 불러오지 못했습니다",
+    "hint": "이것 없이는 상태 필터를 적용할 수 없어 이슈를 표시하지 않습니다.",
+    "retry": "다시 시도"
+  },
   "page": {
     "breadcrumb_title": "태스크",
     "breadcrumb_workspace_fallback": "워크스페이스",

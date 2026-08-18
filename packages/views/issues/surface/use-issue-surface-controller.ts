@@ -126,6 +126,8 @@ export interface IssueSurfaceController {
    * than an unexplained empty board. (MUL-6243)
    */
   isStatusCatalogError: boolean;
+  /** Re-runs the failed catalog request behind {@link isStatusCatalogError}. */
+  retryStatusCatalog: () => void;
   openCreateIssue: (defaults?: IssueCreateDefaults) => void;
   moveIssue: (
     issueId: string,
@@ -848,6 +850,7 @@ export function useIssueSurfaceController({
       !data.isRefreshing &&
       !(usesTable && (tableSearch.trim() || debouncedActiveSearch)),
     isStatusCatalogError: data.isStatusCatalogError,
+    retryStatusCatalog: catalog.retry,
     sort,
     actions,
     selection,

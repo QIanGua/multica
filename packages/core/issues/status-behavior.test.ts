@@ -94,6 +94,19 @@ describe("statusFilterColumns", () => {
     expect(statusFilterColumns(["qa"], failed)).toEqual({ state: "error" });
   });
 
+  // A BACKGROUND refetch can fail while the last successful catalog is still
+  // cached. Blocking then would discard data that is perfectly serviceable and
+  // put a retry screen in front of a surface that could render fine.
+  it("keeps resolving from a cached catalog when a refetch fails", () => {
+    const stale = buildIssueStatusCatalog(
+      [entry("in_review", "in_review", true), entry("qa", "in_review")],
+      { isPending: false, isError: true },
+    );
+
+    expect(stale.isError).toBe(false);
+    expect(columns(statusFilterColumns(["qa"], stale))).toEqual(["in_review"]);
+  });
+
   // A LOADED catalog that does not know the key is authoritative: the status was
   // deleted, or belongs to another workspace. That is a resolved answer.
   it("resolves to no column for a key the loaded catalog has never heard of", () => {

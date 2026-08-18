@@ -1,4 +1,9 @@
 {
+  "status_catalog_error": {
+    "title": "ステータス一覧を読み込めませんでした",
+    "hint": "これがないとステータスの絞り込みを適用できないため、イシューは表示されません。",
+    "retry": "再試行"
+  },
   "page": {
     "breadcrumb_title": "タスク",
     "breadcrumb_workspace_fallback": "ワークスペース",

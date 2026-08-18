@@ -70,8 +70,17 @@ export interface IssueStatusCatalog {
    * showed neither — just a silently empty board. (MUL-6243)
    */
   isPending: boolean;
-  /** The catalog request failed. Surfaces that need it must offer a retry. */
+  /**
+   * The catalog request failed AND there is no usable snapshot to fall back on.
+   *
+   * Narrower than "the query errored" on purpose: a BACKGROUND refetch can fail
+   * while the last successful catalog is still cached, and blocking a surface
+   * then would throw away data that is perfectly serviceable. Only a failure
+   * with nothing behind it is worth stopping for. (MUL-6243)
+   */
   isError: boolean;
+  /** Re-runs the catalog request. Wired to the surface's retry affordance. */
+  retry: () => void;
   /**
    * True when the catalog is LOADED and holds at least one custom status.
    *
@@ -124,7 +133,7 @@ export function isIssueStatusCategory(value: string): value is IssueStatusCatego
  */
 export function buildIssueStatusCatalog(
   entries: IssueStatusEntry[] | undefined,
-  status: { isPending?: boolean; isError?: boolean } = {},
+  status: { isPending?: boolean; isError?: boolean; retry?: () => void } = {},
 ): IssueStatusCatalog {
   const list = entries ?? [];
   const byKey = new Map(list.map((e) => [e.key, e]));
@@ -156,7 +165,10 @@ export function buildIssueStatusCatalog(
     // Defaults describe a non-React caller holding a list it already has:
     // resolved when entries are present, still pending when they are not.
     isPending: status.isPending ?? entries === undefined,
-    isError: status.isError ?? false,
+    // A failure that still has entries behind it is a stale-data situation, not
+    // a blocking one.
+    isError: (status.isError ?? false) && entries === undefined,
+    retry: status.retry ?? (() => {}),
     hasCustomStatuses:
       entries !== undefined && list.some((e) => e.is_system !== true),
   };
