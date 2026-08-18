@@ -1,7 +1,9 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { isBridgeEvent, isBridgeRequest, isBridgeResponse } from "./protocol";
+import { isBridgeEvent, isBridgeRequest, isBridgeResponse } from "@multica/plugin-sdk/protocol";
 
+// Beside plugin-sdk-handshake.test.ts, and here for the same reason.
+//
 // The guards are the only thing standing between a hostile message and the
 // bridge's handlers on both sides. Anything that is not exactly the agreed
 // shape has to fall through, not be coerced into something close enough.

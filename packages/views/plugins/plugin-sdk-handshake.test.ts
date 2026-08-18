@@ -1,6 +1,10 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// Lives here rather than beside the SDK on purpose: @multica/plugin-sdk ships
+// as TypeScript source to third parties and carries no test runner of its own,
+// and packages/views is its only consumer in this repo.
+//
 // The guest half of the handshake. Sibling surfaces are mutually opaque but
 // `parent.frames[i]` is an allowed cross-origin access, so another plugin on the
 // same page can postMessage into this one. What stops it from becoming this
@@ -28,7 +32,7 @@ async function loadSdk() {
   // The SDK writes theme tokens to documentElement when a host sends them; no
   // theme is sent here, so a document is never touched.
   vi.stubGlobal("document", undefined);
-  return import("./index");
+  return import("@multica/plugin-sdk");
 }
 
 function initFrom(source: unknown, port: MessagePort) {
