@@ -2351,6 +2351,13 @@ func (s *TaskService) CancelTaskWithReason(ctx context.Context, taskID pgtype.UU
 // CancelTaskWithResult cancels a single task and returns any chat-specific
 // cleanup result needed by user-facing callers.
 func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UUID, opts CancelTaskOptions) (*CancelTaskResult, error) {
+	// Both fields are persisted onto the cancelled row's TEXT columns below, and
+	// at least one caller interpolates an externally-supplied path into
+	// ErrorMessage. A NUL in either rolls the cancellation back and leaves the
+	// task running — the same wedge as GH #7098 on the fail/complete paths.
+	opts.ErrorMessage = util.SanitizeTextForPostgres(opts.ErrorMessage)
+	opts.FailureReason = util.SanitizeTextForPostgres(opts.FailureReason)
+
 	var (
 		task                 db.AgentTaskQueue
 		cancelledChatMessage *CancelledChatMessageResult
