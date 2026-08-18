@@ -35,10 +35,10 @@ coverage
 /docs/
 *.md
 
-# Non-target workspaces
-/apps/desktop/
-/apps/docs/
-/apps/mobile/
+# Only the web workspace is used by Dockerfile.web. Default-exclude future
+# app workspaces so they do not silently enter the build context.
+/apps/*
+!/apps/web/
 
 # Repository-only tooling
 /.github/

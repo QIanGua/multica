@@ -30,8 +30,9 @@ _features
 /docs/
 /e2e/
 /server/
-/apps/desktop/
-/apps/mobile/
+/apps/*
+!/apps/web/
+!/apps/docs/
 /scripts/
 
 *.log
