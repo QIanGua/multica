@@ -3999,8 +3999,9 @@ func TestHermesClientEmitsToolUseWhenStartFrameCarriesCommand(t *testing.T) {
 
 	var got []Message
 	c := &hermesClient{
-		pending:   make(map[int]*pendingRPC),
-		onMessage: func(msg Message) { got = append(got, msg) },
+		pending:                    make(map[int]*pendingRPC),
+		toolStartCarriesFinalInput: true,
+		onMessage:                  func(msg Message) { got = append(got, msg) },
 	}
 
 	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"$ multica issue get 7473e16c --output json","type":"text"},"type":"content"}],"kind":"execute","locations":[],"title":"terminal: multica issue get 7473e16c --output json","toolCallId":"tc-305462f5d67d","sessionUpdate":"tool_call"}}}`)
@@ -4157,5 +4158,94 @@ func TestHermesClientDefersNonCommandStartContent(t *testing.T) {
 	}
 	if text, _ := got[0].Input["text"].(string); text != "not-json" {
 		t.Errorf("deferred fallback Input.text: got %v", got[0].Input)
+	}
+}
+
+// TestHermesClientEmitsToolUseForPolishedToolWithoutInput covers the rest of
+// GH#6583's defect: Hermes omits rawInput for its whole polished tool set, so
+// write / patch / web / browser / execute_code calls were invisible while
+// running and never advanced the daemon's in-flight tool counter, leaving them
+// on the short idle budget instead of the tool budget.
+//
+// They must now surface at the start frame like terminal does — but with no
+// Input, because their content is a rendering ("Preparing write to <path>"),
+// not the call's arguments.
+func TestHermesClientEmitsToolUseForPolishedToolWithoutInput(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:                    make(map[int]*pendingRPC),
+		toolStartCarriesFinalInput: true,
+		onMessage:                  func(msg Message) { got = append(got, msg) },
+	}
+
+	// Verbatim Hermes write_file start frame: prose content, no rawInput.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"Preparing write to /tmp/hello.txt. Approval prompt shows the diff.","type":"text"},"type":"content"}],"kind":"edit","locations":[{"path":"/tmp/hello.txt"}],"title":"write: /tmp/hello.txt","toolCallId":"tc-w9","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 1 || got[0].Type != MessageToolUse {
+		t.Fatalf("expected MessageToolUse at the start frame, got %+v", got)
+	}
+	if got[0].Tool != "write_file" {
+		t.Errorf("tool: got %q, want %q", got[0].Tool, "write_file")
+	}
+	if got[0].CallID != "tc-w9" {
+		t.Errorf("callID: got %q", got[0].CallID)
+	}
+	if got[0].Input != nil {
+		t.Errorf("display prose must not be reported as input, got Input = %v", got[0].Input)
+	}
+
+	// Completion adds only the result — no second MessageToolUse.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-w9","status":"completed","kind":"edit","content":[{"type":"content","content":{"type":"text","text":"wrote 2 bytes"}}]}}}`)
+
+	if len(got) != 2 || got[1].Type != MessageToolResult {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if got[1].Output != "wrote 2 bytes" {
+		t.Errorf("result output: got %q", got[1].Output)
+	}
+}
+
+// TestHermesClientReadFileStartWithNoContentStillVisible: read_file sends a
+// start frame with no content at all. It must still register as an in-flight
+// tool so the run shows it and the daemon counts it.
+func TestHermesClientReadFileStartWithNoContentStillVisible(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:                    make(map[int]*pendingRPC),
+		toolStartCarriesFinalInput: true,
+		onMessage:                  func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"kind":"read","locations":[{"path":"/tmp/a.go"}],"title":"read: /tmp/a.go","toolCallId":"tc-r1","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 1 || got[0].Type != MessageToolUse || got[0].Tool != "read_file" {
+		t.Fatalf("expected a read_file MessageToolUse at start, got %+v", got)
+	}
+	if got[0].Input != nil {
+		t.Errorf("expected no fabricated input, got %v", got[0].Input)
+	}
+}
+
+// TestHermesClientOtherDialectsStillDefer: the flag is opt-in, so a backend
+// that has not set it (kimi, kiro, qoder, grok, mcode, qwenpaw, reasonix,
+// traecli) keeps the previous deferred behaviour even for a terminal-shaped
+// frame.
+func TestHermesClientOtherDialectsStillDefer(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"$ ls -la","type":"text"},"type":"content"}],"kind":"execute","title":"terminal: ls -la","toolCallId":"tc-x","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 0 {
+		t.Fatalf("dialects without toolStartCarriesFinalInput must still defer, got %+v", got)
 	}
 }

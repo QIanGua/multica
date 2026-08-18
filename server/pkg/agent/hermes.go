@@ -377,10 +377,11 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	activity := make(chan struct{}, 1)
 
 	c := &hermesClient{
-		cfg:          b.cfg,
-		stdin:        stdin,
-		pending:      make(map[int]*pendingRPC),
-		pendingTools: make(map[string]*pendingToolCall),
+		cfg:                        b.cfg,
+		stdin:                      stdin,
+		pending:                    make(map[int]*pendingRPC),
+		pendingTools:               make(map[string]*pendingToolCall),
+		toolStartCarriesFinalInput: true,
 		acceptNotification: func(string) bool {
 			return streamingCurrentTurn.Load()
 		},
@@ -892,6 +893,19 @@ type hermesClient struct {
 	// acceptNotification can drop ACP session updates before dispatching to
 	// handlers that mutate client state such as usage or pending tool calls.
 	acceptNotification func(updateType string) bool
+	// toolStartCarriesFinalInput marks a dialect whose tool_call start frame is
+	// the only place a call's input ever appears, so MessageToolUse can be
+	// emitted as soon as the call starts instead of being held until it
+	// completes. Hermes sets it: it attaches rawInput on the start frame for
+	// ordinary tools, deliberately omits it for its "polished" tool set, and
+	// never sends rawInput on an update (acp_adapter/tools.py — build_tool_call
+	// passes `raw_input=None if tool_name in _POLISHED_TOOLS else arguments`,
+	// and build_tool_complete passes none at all). Waiting therefore cannot
+	// yield more input, and only costs the run its in-flight visibility.
+	//
+	// Other backends leave it false and keep deferring — Kimi streams its args
+	// across updates, so for it the start frame is genuinely incomplete.
+	toolStartCarriesFinalInput bool
 
 	// pendingTools buffers the args for tool calls whose input streams in
 	// across multiple ACP tool_call_update messages (kimi does this —
@@ -1573,12 +1587,21 @@ func (c *hermesClient) handleToolCallStart(data json.RawMessage) {
 	// AgentToolWatchdog and is judged by the much shorter AgentIdleWatchdog
 	// instead, so a legitimately long tool call is force-stopped early.
 	//
-	// It is only safe where the content demonstrably IS the invocation, which
-	// ACP does not promise in general — see acpToolCallStartCarriesInvocation.
-	if acpToolCallStartCarriesInvocation(toolName, argsText) {
+	// Only a dialect that will never send input later can do this without
+	// losing the input — see toolStartCarriesFinalInput.
+	if c.toolStartCarriesFinalInput {
+		// The content blocks are display output, not input, so they are used as
+		// Input only for the one shape that demonstrably IS the invocation.
+		// Everything else reports no input rather than passing a rendering
+		// ("Preparing write to <path>") off as the call's arguments.
+		var input map[string]any
+		if acpToolCallStartCarriesInvocation(toolName, argsText) {
+			input = parseToolArgsJSON(argsText)
+		}
 		c.trackTool(msg.ToolCallID, &pendingToolCall{
 			toolName: toolName,
 			argsText: argsText,
+			input:    input,
 			emitted:  true,
 		})
 		if c.onMessage != nil {
@@ -1586,7 +1609,7 @@ func (c *hermesClient) handleToolCallStart(data json.RawMessage) {
 				Type:   MessageToolUse,
 				Tool:   toolName,
 				CallID: msg.ToolCallID,
-				Input:  parseToolArgsJSON(argsText),
+				Input:  input,
 			})
 		}
 		return
@@ -1604,23 +1627,17 @@ func (c *hermesClient) handleToolCallStart(data json.RawMessage) {
 }
 
 // acpToolCallStartCarriesInvocation reports whether a tool_call start frame's
-// content can be treated as the call's input, which is the only case where
-// MessageToolUse may be emitted before the call completes.
+// content can be reported as the call's input rather than as display output.
 //
 // It deliberately recognises exactly one shape: a `terminal` call whose content
 // is the `$ <command>` line. In ACP, `content` is display output produced by the
-// tool call and `rawInput` is the input, and a later update may still supply the
-// real rawInput — so treating arbitrary content as input would both mis-record
-// the invocation and freeze the wrong value before the real one arrives. Hermes
-// suppresses rawInput for its whole "polished" tool set and renders each one
-// differently: `terminal` renders `$ <command>` (the invocation), but
-// `write_file` and `patch` render prose like "Preparing write to <path>", and
-// the browser/web/media tools render their own summaries. Only the terminal
-// rendering is the command itself.
-//
-// Nine ACP backends share this client, so everything else — including Kimi's
-// token-streamed args and any backend whose start frame carries a status line —
-// keeps deferring exactly as before.
+// tool call and `rawInput` is the input, so treating arbitrary content as input
+// mis-records the invocation. Hermes suppresses rawInput for its whole
+// "polished" tool set and renders each one differently: `terminal` renders
+// `$ <command>` (the invocation), but `write_file` and `patch` render prose like
+// "Preparing write to <path>", and the browser/web/media tools render their own
+// summaries. Only the terminal rendering is the command itself; the rest report
+// no input at all.
 func acpToolCallStartCarriesInvocation(toolName, argsText string) bool {
 	if toolName != "terminal" {
 		return false
