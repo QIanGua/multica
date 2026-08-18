@@ -1,4 +1,4 @@
-// @vitest-environment jsdom
+// @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The guest half of the handshake. Sibling surfaces are mutually opaque but
@@ -6,19 +6,38 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // same page can postMessage into this one. What stops it from becoming this
 // surface's "host" is the two checks below — neither is visible from reading a
 // plugin's own code, which is exactly why they are pinned here.
+//
+// Runs on a hand-built window rather than jsdom: the SDK touches exactly
+// `addEventListener` and `parent`, and a package that ships to third parties is
+// better off with no test-only dependency at all.
+
+class FakeWindow extends EventTarget {
+  parent: FakeWindow = this;
+  readonly sent: unknown[] = [];
+  postMessage(message: unknown) {
+    this.sent.push(message);
+  }
+}
+
+let fakeWindow: FakeWindow;
 
 async function loadSdk() {
   vi.resetModules();
+  fakeWindow = new FakeWindow();
+  vi.stubGlobal("window", fakeWindow);
+  // The SDK writes theme tokens to documentElement when a host sends them; no
+  // theme is sent here, so a document is never touched.
+  vi.stubGlobal("document", undefined);
   return import("./index");
 }
 
 function initFrom(source: unknown, port: MessagePort) {
   const event = new MessageEvent("message", {
-    data: { type: "multica:plugin-bridge-init", version: 1, theme: {} },
+    data: { type: "multica:plugin-bridge-init", version: 1 },
   });
   Object.defineProperty(event, "source", { value: source, configurable: true });
   Object.defineProperty(event, "ports", { value: [port], configurable: true });
-  window.dispatchEvent(event);
+  fakeWindow.dispatchEvent(event);
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -39,7 +58,7 @@ describe("surface bridge handshake", () => {
     };
     channel.port2.start();
 
-    initFrom(window.parent, channel.port1);
+    initFrom(fakeWindow.parent, channel.port1);
     await multica.context.get(true);
 
     expect(asked).toHaveLength(1);
@@ -54,7 +73,7 @@ describe("surface bridge handshake", () => {
     hostile.port2.start();
 
     // A sibling plugin frame shouting an init with its own port.
-    initFrom({} as Window, hostile.port1);
+    initFrom(new FakeWindow(), hostile.port1);
     void multica.context.get(true);
     await settle();
 
@@ -72,10 +91,10 @@ describe("surface bridge handshake", () => {
     real.port2.start();
     hijack.port2.start();
 
-    initFrom(window.parent, real.port1);
+    initFrom(fakeWindow.parent, real.port1);
     // Even from the embedder's own window: a hijacker that lost the race must
     // not be able to take the channel over afterwards.
-    initFrom(window.parent, hijack.port1);
+    initFrom(fakeWindow.parent, hijack.port1);
     void multica.context.get(true);
     await settle();
 

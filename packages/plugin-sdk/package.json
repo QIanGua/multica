@@ -21,7 +21,6 @@
   "devDependencies": {
     "@multica/eslint-config": "workspace:*",
     "@multica/tsconfig": "workspace:*",
-    "jsdom": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   }
