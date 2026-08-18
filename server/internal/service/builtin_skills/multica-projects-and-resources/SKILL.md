@@ -65,6 +65,13 @@ Saving `worktree` is also refused (HTTP 422, code `daemon_version_unsupported`) 
 not advertise the capability — the fix is updating the Multica app there, then retrying. Pass an empty value to clear
 it back to the default.
 
+Under `in_place` the runtime writes its own files (`.multica/`, `.agent_context/`, the runtime's skills tree) into the
+user's directory for the length of the task, then removes them. When that directory is a git repository, the daemon
+adds those paths to `.git/info/exclude` while the task runs — never to `.gitignore`, which is tracked — so they stay
+out of `git status` and cannot be swept into a commit by `git add -A`; the entries are removed on cleanup. Runtimes
+that can take the runtime brief inline receive it that way in this mode, so the repository's own `AGENTS.md` /
+`CLAUDE.md` is left untouched instead of carrying a Multica-managed block (GitHub #7114).
+
 For `github_repo`, non-JSON `--ref` sets `resource_ref.ref`, the default checkout branch/tag/SHA for future tasks in that project. JSON `--ref '<json>'` remains the escape hatch for full payloads or resource types not covered by shortcuts.
 
 `--start-date` / `--due-date` are optional calendar days (`YYYY-MM-DD`, like issue dates). On `project update`, pass an empty string (`--start-date ""`) to clear a date; an unset flag leaves it untouched.

@@ -5618,6 +5618,37 @@ func providerNeedsInlineSystemPrompt(provider string) bool {
 	}
 }
 
+// providerSupportsInlineSystemPrompt reports whether the provider's backend
+// forwards agent.ExecOptions.SystemPrompt into the turn at all. It answers a
+// different question from providerNeedsInlineSystemPrompt: "needs" is about
+// CLIs that cannot read their context file, "supports" is about CLIs that can
+// take the brief BOTH ways — and it exists so the in_place local_directory
+// flow can choose the delivery that does not write into the user's repository
+// (GitHub #7114).
+//
+// Membership is a property of this repository's backend code, not of the
+// vendor CLI, so it is verifiable by reading it: each provider below prepends
+// SystemPrompt to the prompt it sends (or passes it as --append-system-prompt)
+// whenever the field is non-empty — see grok.go, kimi.go, kiro.go, qoder.go,
+// qwenpaw.go, traecli.go, openclaw.go and codebuddy.go. Everything else is
+// absent deliberately: claude, pi, opencode, deveco and hermes each document
+// at their own call site why they drop the field, and a backend that ignored
+// it would leave the agent with no brief at all — which is why the default is
+// false and a new runtime has to opt in consciously.
+func providerSupportsInlineSystemPrompt(provider string) bool {
+	// Built-in runtime identities inherit their delivery from the protocol
+	// family they run on, the same resolution runtimeConfigPath does.
+	if desc, ok := agent.BuiltinRuntimeByID(provider); ok {
+		return providerSupportsInlineSystemPrompt(desc.ProtocolFamily)
+	}
+	switch provider {
+	case "codebuddy", "grok", "kimi", "kiro", "openclaw", "qoder", "qoderclicn", "qwenpaw", "traecli":
+		return true
+	default:
+		return false
+	}
+}
+
 // gateResumeToReusedWorkdir clears the task's prior session unless this run
 // can actually reach the store the session lives in, and reports whether that
 // held. CLI backends key their session stores to the cwd (Claude Code looks
@@ -6667,6 +6698,19 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				}
 				d.logger.Warn("execenv: cleanup sidecars failed", "error", cerr)
 			}
+			// Drop the patterns ExcludeSidecarsFromGit added to the user's
+			// .git/info/exclude. In place only, matching where they are
+			// written: leaving them behind would keep hiding those paths from
+			// `git status` after the task is over, in the user's own
+			// repository, which is theirs to see.
+			if env.LocalDirectory {
+				if cerr := execenv.CleanupGitExclude(env.WorkDir); cerr != nil {
+					if cleanupErr == nil {
+						cleanupErr = cerr
+					}
+					d.logger.Warn("execenv: cleanup git exclude failed", "error", cerr)
+				}
+			}
 			// In worktree mode a failed cleanup is NOT survivable: Finalize is
 			// about to `git add -A`, so whatever the cleanup could not remove
 			// gets committed and delivered as the task's branch — a diff whose
@@ -6723,9 +6767,46 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 
 	// Inject runtime-specific config (meta skill) so the agent discovers .agent_context/.
-	runtimeBrief, err := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
-	if err != nil {
-		d.logger.Warn("execenv: inject runtime config failed (non-fatal)", "error", err)
+	//
+	// In place the workdir IS the user's repository, so writing the brief to
+	// CLAUDE.md / AGENTS.md appends a Multica-managed block to a file the
+	// project versions as its own instructions — and any `git add -A` the
+	// agent runs mid-task commits it, which CleanupRuntimeConfig cannot undo
+	// after the fact (GitHub #7114). When the runtime can take the brief
+	// inline instead, take that route and leave the file untouched.
+	inlineBrief := env.LocalDirectory && providerSupportsInlineSystemPrompt(provider)
+	var runtimeBrief string
+	gitExcludePaths := env.SidecarPaths
+	if inlineBrief {
+		runtimeBrief = execenv.BuildRuntimeBrief(provider, taskCtx)
+		taskLog.Debug("execenv: delivering runtime brief inline; leaving the repository's runtime config file untouched",
+			"provider", provider, "work_dir", env.WorkDir)
+	} else {
+		brief, created, briefErr := execenv.InjectRuntimeConfigCreated(env.WorkDir, provider, taskCtx)
+		if briefErr != nil {
+			d.logger.Warn("execenv: inject runtime config failed (non-fatal)", "error", briefErr)
+		}
+		runtimeBrief = brief
+		// A config file WE created is an untracked new file in the user's
+		// repo, so it can be hidden from git alongside the sidecars. One that
+		// pre-existed is the user's own (usually tracked) and no ignore rule
+		// applies to it — only the marker block inside it is ours.
+		if created && env.LocalDirectory {
+			if path := execenv.RuntimeConfigPath(env.WorkDir, provider); path != "" {
+				gitExcludePaths = append(append([]string(nil), gitExcludePaths...), path)
+			}
+		}
+	}
+
+	// Keep the runtime's own files out of the user's `git status` for the
+	// length of the run, so the agent cannot sweep them into a commit. In
+	// place only — worktree mode shares the user's common git dir and removes
+	// the sidecars before Finalize commits instead.
+	if env.LocalDirectory {
+		if err := execenv.ExcludeSidecarsFromGit(env.WorkDir, gitExcludePaths); err != nil {
+			taskLog.Warn("execenv: could not hide runtime files from git; they may show up as untracked changes in your repository",
+				"work_dir", env.WorkDir, "error", err)
+		}
 	}
 	prompt := BuildPrompt(task, provider)
 
@@ -7035,7 +7116,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// as always included, and a real kiro-cli 2.13.0 ACP smoke confirms it.
 	// Prepending the full runtime brief into the ACP user prompt duplicates that
 	// context and bloats every turn.
-	if providerNeedsInlineSystemPrompt(provider) {
+	if providerNeedsInlineSystemPrompt(provider) || inlineBrief {
 		execOpts.SystemPrompt = runtimeBrief
 	}
 
@@ -7114,7 +7195,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		task.PriorSessionResumeUnavailable = true
 		execOpts.ResumeContinuityNotice = ""
 		taskCtx.PriorSessionResumed = false
-		if freshBrief, briefErr := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx); briefErr != nil {
+		// Mirror the delivery chosen for the first attempt: an in_place run on
+		// an inline-capable runtime must not start writing the brief into the
+		// user's repository just because the session was rebuilt.
+		if inlineBrief {
+			runtimeBrief = execenv.BuildRuntimeBrief(provider, taskCtx)
+			execOpts.SystemPrompt = runtimeBrief
+		} else if freshBrief, briefErr := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx); briefErr != nil {
 			taskLog.Warn("execenv: re-inject cold runtime config for fresh retry failed (non-fatal)", "error", briefErr)
 		} else {
 			runtimeBrief = freshBrief
