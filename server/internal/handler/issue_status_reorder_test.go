@@ -149,40 +149,67 @@ func TestReorderIssueStatusesRejectsForeignInputs(t *testing.T) {
 	}
 }
 
-// TestReorderIssueStatusesSerializesAgainstConcurrentArchive is the one that
-// makes "atomic" mean something.
+// TestReorderIssueStatusesSerializesAgainstConcurrentArchive is the sharp
+// counterexample for "atomic".
 //
-// The old shape validated every id, THEN ran the UPDATE — with no lock and no
-// transaction spanning the two. An archive committing in that window left the
-// UPDATE silently skipping the archived row (it is excluded by the statement)
-// while the earlier rows were rewritten, and the caller still got a 200 over a
-// half-applied order.
+// It reproduces the real interleaving rather than a sequential one: the reorder
+// must be IN FLIGHT and parked on the catalog lock when the archive commits.
+// A test that archives first and then calls reorder proves nothing — the
+// active-set check would catch that even with the lock deleted, because the
+// archive is already visible by the time the handler reads anything.
 //
-// Holding the EXCLUSIVE archive-side lock pins that exact interleaving: the
-// reorder cannot even read the catalog until the archive commits, so it sees
-// the archived row and refuses the whole request.
+// Verified by deleting the LockIssueStatusCatalogShared call: the reorder then
+// reads the catalog before the archive commits, sees both rows active, and
+// commits a reorder that includes a row archived underneath it.
 func TestReorderIssueStatusesSerializesAgainstConcurrentArchive(t *testing.T) {
+	ctx := context.Background()
 	suffix := time.Now().UnixNano()
 	first := insertCustomStatus(t, fmt.Sprintf("qa_h_%d", suffix), "in_review", 1, false)
 	second := insertCustomStatus(t, fmt.Sprintf("qa_i_%d", suffix), "in_review", 2, false)
 
 	before := positionsByID(t, first, second)
 
-	release := holdExclusiveCatalogLock(t)
-	archived := make(chan struct{})
-	go func() {
-		// Archive `second` while the reorder is blocked on the lock, then let
-		// the reorder proceed into a catalog that no longer matches its payload.
-		_, _ = testPool.Exec(context.Background(),
-			`UPDATE issue_status SET archived_at = now() WHERE id = $1`, second)
-		close(archived)
-		release()
-	}()
-	<-archived
+	// Hold the archive side first so the reorder is guaranteed to park on the
+	// lock BEFORE it reads the catalog.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':issue_status', 0))`,
+		parseUUID(testWorkspaceID)); err != nil {
+		t.Fatalf("take exclusive lock: %v", err)
+	}
 
-	rec := reorderVia(t, "in_review", []string{second, first})
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("reorder status = %d, want 409: %s", rec.Code, rec.Body.String())
+	done := make(chan int, 1)
+	go func() { done <- reorderVia(t, "in_review", []string{second, first}).Code }()
+
+	select {
+	case code := <-done:
+		t.Fatalf("reorder completed (%d) before the archive released the lock — it never took the shared lock", code)
+	case <-time.After(400 * time.Millisecond):
+		// Parked on the lock, as required.
+	}
+
+	// Archive inside the held lock and commit: from the reorder's point of view
+	// both rows were active when it was called, and one is archived by the time
+	// it can read anything.
+	if _, err := tx.Exec(ctx,
+		`UPDATE issue_status SET archived_at = now() WHERE id = $1`, second); err != nil {
+		t.Fatalf("archive inside the window: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit archive: %v", err)
+	}
+
+	select {
+	case code := <-done:
+		if code != http.StatusConflict {
+			t.Fatalf("reorder status = %d, want 409 against a status archived inside the race window", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("reorder never completed after the archive committed")
 	}
 
 	after := positionsByID(t, first, second)

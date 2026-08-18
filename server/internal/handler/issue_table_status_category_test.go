@@ -8,6 +8,9 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/multica-ai/multica/server/internal/issuestatus"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // Board, list and swimlane columns are CATEGORIES, not status keys (MUL-6243).
@@ -281,49 +284,49 @@ func TestIssueTableStatusCategoryMatchesStatusWithoutCustomStatuses(t *testing.T
 	}
 }
 
-// countCatalogSelects reads pg_stat_statements-free: it uses the table's own
-// sequential/index scan counters from pg_stat_user_tables, which advance once
-// per scan of `issue_status`.
-func catalogScans(t *testing.T) int64 {
+// countingCatalogQuerier wraps the real querier and counts catalog reads. This
+// is the injection point the read-count assertions use: it is deterministic,
+// unlike pg_stat_user_tables, whose counters are flushed asynchronously and so
+// can report zero for a request that really did query — which is exactly why
+// the previous `delta <= 1` assertion was vacuous.
+type countingCatalogQuerier struct {
+	issuestatus.Querier
+	entryReads    int
+	categoryReads int
+}
+
+func (c *countingCatalogQuerier) ListIssueStatusEntries(
+	ctx context.Context, arg db.ListIssueStatusEntriesParams,
+) ([]db.IssueStatus, error) {
+	c.entryReads++
+	return c.Querier.ListIssueStatusEntries(ctx, arg)
+}
+
+func (c *countingCatalogQuerier) ListIssueStatusKeysByCategories(
+	ctx context.Context, arg db.ListIssueStatusKeysByCategoriesParams,
+) ([]string, error) {
+	c.categoryReads++
+	return c.Querier.ListIssueStatusKeysByCategories(ctx, arg)
+}
+
+// withCountingCatalog installs the counter for the duration of a test.
+func withCountingCatalog(t *testing.T) *countingCatalogQuerier {
 	t.Helper()
-	// The stats collector is asynchronous; force this backend's view forward so
-	// two readings around one request are comparable.
-	if _, err := testPool.Exec(context.Background(), `SELECT pg_stat_clear_snapshot()`); err != nil {
-		t.Fatalf("clear stat snapshot: %v", err)
-	}
-	var scans int64
-	if err := testPool.QueryRow(context.Background(), `
-		SELECT COALESCE(seq_scan, 0) + COALESCE(idx_scan, 0)
-		FROM pg_stat_user_tables WHERE relname = 'issue_status'
-	`).Scan(&scans); err != nil {
-		t.Fatalf("read issue_status scan count: %v", err)
-	}
-	return scans
+	counter := &countingCatalogQuerier{Querier: testHandler.Queries}
+	previous := testHandler.IssueStatusCatalog
+	testHandler.IssueStatusCatalog = counter
+	t.Cleanup(func() { testHandler.IssueStatusCatalog = previous })
+	return counter
 }
 
 // A board loads seven column branches as seven separate HTTP requests, so a
 // catalog read that looks cheap per request is multiplied by seven. The first
 // cut ran ExpandCategories AND CustomKeyCategories per resolve — two reads
-// where one suffices, i.e. 14 catalog scans behind one board load instead of 7.
-//
-// This asserts the observable count, not that the derived SQL matches: the
-// point Elon made is that identical SQL says nothing about how many times it
-// ran.
+// where one suffices, i.e. 14 catalog reads behind one board load instead of 7.
 func TestIssueTableStatusCategoryReadsCatalogOncePerRequest(t *testing.T) {
 	projectID, _ := seedStatusCategoryFixture(t)
+	counter := withCountingCatalog(t)
 
-	// Warm any lazily-built state (issue prefix, seeding) so it is not counted.
-	warm := httptest.NewRecorder()
-	testHandler.ListIssueTableGroups(warm, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
-		Query: statusCategoryQuery(projectID),
-		Group: issueTableGroupSpec{Kind: "status_category"},
-		Page:  issueTablePageRequest{Limit: 100},
-	}))
-	if warm.Code != http.StatusOK {
-		t.Fatalf("warm-up status = %d: %s", warm.Code, warm.Body.String())
-	}
-
-	before := catalogScans(t)
 	w := httptest.NewRecorder()
 	testHandler.ListIssueTableGroups(w, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
 		Query: statusCategoryQuery(projectID),
@@ -333,30 +336,51 @@ func TestIssueTableStatusCategoryReadsCatalogOncePerRequest(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("groups status = %d: %s", w.Code, w.Body.String())
 	}
-	after := catalogScans(t)
 
-	if delta := after - before; delta > 1 {
-		t.Fatalf("one category-grouped request scanned issue_status %d times, want at most 1", delta)
+	// Exactly one, not "at most one": a zero would mean the counter never saw
+	// the request and the assertion proved nothing.
+	if counter.entryReads != 1 {
+		t.Fatalf("catalog entry reads = %d, want exactly 1", counter.entryReads)
+	}
+	// Both maps are derived from that single read; the category expansion must
+	// not issue a second query of its own.
+	if counter.categoryReads != 0 {
+		t.Fatalf("category-expansion reads = %d, want 0 (derived from the entry read)", counter.categoryReads)
+	}
+}
+
+func TestIssueTableCompoundStatusCategoryReadsCatalogOncePerRequest(t *testing.T) {
+	projectID, _ := seedStatusCategoryFixture(t)
+	counter := withCountingCatalog(t)
+
+	w := httptest.NewRecorder()
+	testHandler.ListIssueTableGroups(w, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
+		Query: statusCategoryQuery(projectID),
+		Group: issueTableGroupSpec{
+			Kind:      "compound",
+			Primary:   "project",
+			Secondary: "status_category",
+		},
+		Page: issueTablePageRequest{Limit: 100},
+	}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("groups status = %d: %s", w.Code, w.Body.String())
+	}
+	if counter.entryReads != 1 {
+		t.Fatalf("catalog entry reads = %d, want exactly 1", counter.entryReads)
+	}
+	if counter.categoryReads != 0 {
+		t.Fatalf("category-expansion reads = %d, want 0", counter.categoryReads)
 	}
 }
 
 // The common case: no custom statuses means the client never asks for the
-// category contract at all, so a default board pays nothing for this feature.
-// This pins the SERVER half — that `status` grouping still reads no catalog.
+// category contract, so a default board pays nothing for this feature. This
+// pins the SERVER half — plain `status` grouping reads no catalog at all.
 func TestIssueTableStatusGroupingReadsNoCatalog(t *testing.T) {
 	projectID, _ := seedStatusCategoryFixture(t)
+	counter := withCountingCatalog(t)
 
-	warm := httptest.NewRecorder()
-	testHandler.ListIssueTableGroups(warm, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
-		Query: statusCategoryQuery(projectID),
-		Group: issueTableGroupSpec{Kind: "status"},
-		Page:  issueTablePageRequest{Limit: 100},
-	}))
-	if warm.Code != http.StatusOK {
-		t.Fatalf("warm-up status = %d: %s", warm.Code, warm.Body.String())
-	}
-
-	before := catalogScans(t)
 	w := httptest.NewRecorder()
 	testHandler.ListIssueTableGroups(w, newRequest(http.MethodPost, "/api/issues/table/groups", issueTableGroupsRequest{
 		Query: statusCategoryQuery(projectID),
@@ -366,10 +390,9 @@ func TestIssueTableStatusGroupingReadsNoCatalog(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("groups status = %d: %s", w.Code, w.Body.String())
 	}
-	after := catalogScans(t)
-
-	if delta := after - before; delta != 0 {
-		t.Fatalf("plain status grouping scanned issue_status %d times, want 0", delta)
+	if counter.entryReads != 0 || counter.categoryReads != 0 {
+		t.Fatalf("plain status grouping read the catalog (%d entry, %d category), want 0",
+			counter.entryReads, counter.categoryReads)
 	}
 }
 

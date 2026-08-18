@@ -62,31 +62,48 @@ describe("issueBehavesAs", () => {
 
 describe("statusFilterColumns", () => {
   const loaded = buildIssueStatusCatalog([entry("in_review", "in_review", true), entry("qa", "in_review")]);
-  const pending = buildIssueStatusCatalog(undefined);
+  const pending = buildIssueStatusCatalog(undefined, { isPending: true });
+  const failed = buildIssueStatusCatalog(undefined, { isPending: false, isError: true });
+
+  function columns(result: ReturnType<typeof statusFilterColumns>): string[] {
+    if (result.state !== "resolved") throw new Error(`expected resolved, got ${result.state}`);
+    return [...result.columns];
+  }
 
   it("resolves built-ins without waiting for the catalog", () => {
-    expect([...statusFilterColumns(["todo", "done"], pending)]).toEqual(["todo", "done"]);
+    expect(columns(statusFilterColumns(["todo", "done"], pending))).toEqual(["todo", "done"]);
   });
 
   it("maps a custom key to its category once the catalog is loaded", () => {
-    expect([...statusFilterColumns(["qa"], loaded)]).toEqual(["in_review"]);
+    expect(columns(statusFilterColumns(["qa"], loaded))).toEqual(["in_review"]);
   });
 
   // The regression: `categoryOf` answers `todo` for anything it has not loaded,
   // which is indistinguishable from a real `todo`. Routing on that guess paged
   // the todo column for a saved `qa` filter while the query still restricted
-  // `status=qa` — an empty board on every cold load, permanent on a failed
-  // catalog fetch. Contributing NO column is what makes the surface wait.
-  it("contributes no column for a custom key while the catalog is in flight", () => {
-    expect([...statusFilterColumns(["qa"], pending)]).toEqual([]);
+  // `status=qa`.
+  //
+  // Returning an EMPTY column set was equally wrong: the caller could not tell
+  // "narrow to nothing" from "cannot answer yet", so it fetched no branches and
+  // rendered an empty board with no spinner. Hence the explicit pending state.
+  it("reports pending — not an empty result — while the catalog is in flight", () => {
+    expect(statusFilterColumns(["qa"], pending)).toEqual({ state: "pending" });
   });
 
-  it("does not guess a column for a key the loaded catalog has never heard of", () => {
-    expect([...statusFilterColumns(["gone"], loaded)]).toEqual([]);
+  it("reports error when the catalog request failed, so the surface can retry", () => {
+    expect(statusFilterColumns(["qa"], failed)).toEqual({ state: "error" });
   });
 
-  it("keeps built-in columns alongside an unresolved custom key", () => {
-    expect([...statusFilterColumns(["todo", "qa"], pending)]).toEqual(["todo"]);
+  // A LOADED catalog that does not know the key is authoritative: the status was
+  // deleted, or belongs to another workspace. That is a resolved answer.
+  it("resolves to no column for a key the loaded catalog has never heard of", () => {
+    expect(columns(statusFilterColumns(["gone"], loaded))).toEqual([]);
+  });
+
+  // A built-in alongside an unresolved custom key still cannot be routed: the
+  // surface would show the built-in column and silently omit the custom one.
+  it("reports pending when any custom key in the filter is unresolved", () => {
+    expect(statusFilterColumns(["todo", "qa"], pending)).toEqual({ state: "pending" });
   });
 });
 

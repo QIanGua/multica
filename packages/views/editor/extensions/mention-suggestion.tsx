@@ -544,7 +544,11 @@ function MentionRow({
       >
         <span className="flex h-7 w-7 shrink-0 items-center justify-center">
           {item.status ? (
-            <StatusIcon status={item.status} className="h-3.5 w-3.5" />
+            <StatusIcon
+              status={item.status}
+              category={item.statusCategory}
+              className="h-3.5 w-3.5"
+            />
           ) : (
             <ListTodo className="h-3.5 w-3.5 text-muted-foreground" />
           )}

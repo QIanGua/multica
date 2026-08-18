@@ -76,6 +76,12 @@ export interface IssueSurfaceData {
     childProgressMap: Map<string, ChildProgress>;
   }>;
   isLoading: boolean;
+  /**
+   * The catalog request a CUSTOM status filter depends on failed. The filter
+   * cannot be honoured without it, so the surface shows a retryable error
+   * rather than an unexplained empty board. (MUL-6243)
+   */
+  isStatusCatalogError: boolean;
   /** The window's data is being revalidated while the previous snapshot is
    *  shown as a placeholder (sort/date change, or any grouped-board filter
    *  change). Drives the header's deferred refresh indicator — content stays
@@ -95,6 +101,8 @@ export function useIssueSurfaceData({
   ganttShowCompleted,
   statusFilters,
   hiddenStatusCategories,
+  statusFilterPending,
+  statusFilterError,
   priorityFilters,
   assigneeFilters,
   includeNoAssignee,
@@ -120,6 +128,10 @@ export function useIssueSurfaceData({
   ganttShowCompleted: boolean;
   statusFilters: IssueStatus[];
   hiddenStatusCategories: IssueStatusCategory[];
+  /** A custom status filter is waiting on the catalog — hold loading. */
+  statusFilterPending: boolean;
+  /** The catalog failed, so a custom status filter cannot be honoured. */
+  statusFilterError: boolean;
   priorityFilters: IssueFilterState["priorityFilters"];
   assigneeFilters: IssueFilterState["assigneeFilters"];
   includeNoAssignee: boolean;
@@ -331,8 +343,12 @@ export function useIssueSurfaceData({
     // concrete KEYS and so has to be mapped back to the columns those keys land
     // in. Default view shows every category, `cancelled` last (its canonical
     // position in ALL_STATUSES). (MUL-6243)
-    const selected =
+    const resolved =
       statusFilters.length > 0 ? statusFilterColumns(statusFilters, catalog) : null;
+    // Pending/error contribute no narrowing here; the surface's loading and
+    // error states (statusFilterPending / statusFilterError) are what stop it
+    // rendering as though the empty result were the answer.
+    const selected = resolved?.state === "resolved" ? resolved.columns : null;
     return ALL_STATUSES.filter(
       (s) =>
         !hiddenStatusCategories.includes(s) &&
@@ -377,13 +393,19 @@ export function useIssueSurfaceData({
     ],
   );
 
-  const isLoading = serverGroupBranches.enabled
-    ? serverGroupBranches.isLoading
-    : usesGantt
-      ? ganttIssuesQuery.isLoading
-      : serverStatusBranches.enabled
-        ? serverStatusBranches.isLoading
-        : false;
+  // `statusFilterPending` holds the surface in loading while a CUSTOM status
+  // filter waits for the catalog to say which column it belongs to. Without it
+  // the surface reported "loaded, zero results" — an empty board with no
+  // spinner — for the whole cold-load window. (MUL-6243)
+  const isLoading =
+    statusFilterPending ||
+    (serverGroupBranches.enabled
+      ? serverGroupBranches.isLoading
+      : usesGantt
+        ? ganttIssuesQuery.isLoading
+        : serverStatusBranches.enabled
+          ? serverStatusBranches.isLoading
+          : false);
 
   // Placeholder-backed revalidation of the ACTIVE query only. First loads are
   // isLoading (no previous data to place-hold); gantt has no placeholder
@@ -421,6 +443,7 @@ export function useIssueSurfaceData({
     // so this shared legacy surface projection never asserts Table empty.
     isEmpty:
       !isLoading &&
+      !statusFilterError &&
       !usesGantt &&
       !usesTable &&
       (serverStatusBranches.enabled
@@ -429,5 +452,6 @@ export function useIssueSurfaceData({
         : serverGroupBranches.enabled &&
           !serverGroupBranches.isError &&
           serverGroupBranches.total === 0),
+    isStatusCatalogError: statusFilterError,
   };
 }

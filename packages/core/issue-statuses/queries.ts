@@ -61,6 +61,18 @@ export interface IssueStatusCatalog {
   /** True once the catalog has loaded; false while it is still in flight. */
   isLoaded: boolean;
   /**
+   * The catalog is still in flight and nothing has resolved yet.
+   *
+   * A surface that routes on a CUSTOM status key has to hold its loading state
+   * while this is true. `isLoaded === false` alone is not enough to act on:
+   * the difference between "not here yet" and "the request failed" decides
+   * whether the user sees a spinner or a retryable error, and the first cut
+   * showed neither — just a silently empty board. (MUL-6243)
+   */
+  isPending: boolean;
+  /** The catalog request failed. Surfaces that need it must offer a retry. */
+  isError: boolean;
+  /**
    * True when the catalog is LOADED and holds at least one custom status.
    *
    * This is the switch for the category-grouped surface contract. Two reasons
@@ -112,6 +124,7 @@ export function isIssueStatusCategory(value: string): value is IssueStatusCatego
  */
 export function buildIssueStatusCatalog(
   entries: IssueStatusEntry[] | undefined,
+  status: { isPending?: boolean; isError?: boolean } = {},
 ): IssueStatusCatalog {
   const list = entries ?? [];
   const byKey = new Map(list.map((e) => [e.key, e]));
@@ -140,6 +153,10 @@ export function buildIssueStatusCatalog(
     },
     inCategory: (category) => list.filter((e) => e.category === category && !e.archived_at),
     isLoaded: entries !== undefined,
+    // Defaults describe a non-React caller holding a list it already has:
+    // resolved when entries are present, still pending when they are not.
+    isPending: status.isPending ?? entries === undefined,
+    isError: status.isError ?? false,
     hasCustomStatuses:
       entries !== undefined && list.some((e) => e.is_system !== true),
   };

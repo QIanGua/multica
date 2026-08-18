@@ -116,7 +116,7 @@ func (h *Handler) resolveStatusCategoryMaps(
 	ctx context.Context,
 	workspaceID pgtype.UUID,
 ) (customKeys map[string]string, categoryKeys map[string][]string, err error) {
-	customKeys, err = issuestatus.CustomKeyCategories(ctx, h.Queries, workspaceID)
+	customKeys, err = issuestatus.CustomKeyCategories(ctx, h.issueStatusCatalog(), workspaceID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1000,4 +1000,13 @@ func (h *Handler) ListIssueTableGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	committed = true
 	writeJSON(w, http.StatusOK, response)
+}
+
+// issueStatusCatalog is the querier catalog reads go through. Defaults to
+// Queries; tests substitute a counting wrapper.
+func (h *Handler) issueStatusCatalog() issuestatus.Querier {
+	if h.IssueStatusCatalog != nil {
+		return h.IssueStatusCatalog
+	}
+	return h.Queries
 }

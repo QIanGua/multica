@@ -195,7 +195,15 @@ export function useIssueStatusBranches({
   const catalog = useIssueStatuses(wsId);
   const { hasCustomStatuses } = catalog;
   const group = hasCustomStatuses ? CATEGORY_GROUP : STATUS_GROUP;
-  const identity = useMemo(() => JSON.stringify(query), [query]);
+  // The grouping contract is part of the cursor identity, not just the query:
+  // it flips from `status` to `status_category` the moment the catalog lands,
+  // and a cursor minted against the old contract is meaningless to the new one.
+  // Without this, catalog arrival carried stale `status:` cursors into
+  // `status_category:` requests. (MUL-6243)
+  const identity = useMemo(
+    () => JSON.stringify({ query, group: group.kind }),
+    [group.kind, query],
+  );
   const [cursorState, setCursorState] = useState<StatusCursorState>(() =>
     initialCursorState(identity, statuses),
   );

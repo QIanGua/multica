@@ -66,33 +66,50 @@ export function normalizeStatusPatch(patch: Partial<Issue>): Partial<Issue> {
 }
 
 /**
- * The board/list COLUMNS an exact status-key filter narrows to (MUL-6243).
+ * How an exact status-key filter resolves to board/list COLUMNS (MUL-6243).
  *
- * Built-in keys resolve with no catalog at all, because a built-in key IS its
- * own category. A custom key does not — and `categoryOf` answers `todo` for
- * anything it has not loaded, which is indistinguishable from a real `todo`
- * status. Routing on that guess would page the todo column for a saved `qa`
- * filter while the query still restricts `status=qa`: a board that is briefly
- * empty on every cold load, and permanently empty if the catalog request fails.
+ * Three states, not two. Built-in keys resolve with no catalog at all, because
+ * a built-in key IS its own category. A CUSTOM key does not — and `categoryOf`
+ * answers `todo` for anything it has not loaded, which is indistinguishable
+ * from a real `todo`. Routing on that guess paged the todo column for a saved
+ * `qa` filter while the query still restricted `status=qa`.
  *
- * So an unresolved custom key contributes NO column until the catalog is
- * authoritative. The column appears the moment it lands.
+ * Returning an empty column set for that case is equally wrong: the caller
+ * cannot tell "narrow to nothing" from "cannot answer yet", so it fetched no
+ * branches and rendered an empty board with no spinner and no error. Hence the
+ * explicit state:
+ *
+ * - `resolved` — every key answered; `columns` is authoritative.
+ * - `pending`  — a custom key needs a catalog that is still in flight. Hold the
+ *                surface's loading state; do not fetch and do not render empty.
+ * - `error`    — the catalog request failed. Show a retryable error; a custom
+ *                filter cannot be honoured without it.
  */
+export type StatusFilterColumnsResult =
+  | { state: "resolved"; columns: Set<IssueStatusCategory> }
+  | { state: "pending" }
+  | { state: "error" };
+
 export function statusFilterColumns(
   statusFilters: readonly string[],
-  catalog: Pick<IssueStatusCatalog, "entryOf" | "isLoaded">,
-): Set<IssueStatusCategory> {
+  catalog: Pick<IssueStatusCatalog, "entryOf" | "isLoaded" | "isPending" | "isError">,
+): StatusFilterColumnsResult {
   const columns = new Set<IssueStatusCategory>();
   for (const key of statusFilters) {
     if (isIssueStatusCategory(key)) {
       columns.add(key);
       continue;
     }
-    if (!catalog.isLoaded) continue;
+    // A custom key. Without an authoritative catalog there is no honest answer.
+    if (catalog.isError) return { state: "error" };
+    if (!catalog.isLoaded) return { state: "pending" };
     const category = catalog.entryOf(key)?.category;
+    // A LOADED catalog that does not know the key is authoritative too: the
+    // status was deleted, or belongs to another workspace. Contributing no
+    // column is the resolved answer, not a pending one.
     if (category && ALL_STATUSES.includes(category)) columns.add(category);
   }
-  return columns;
+  return { state: "resolved", columns };
 }
 
 /**
