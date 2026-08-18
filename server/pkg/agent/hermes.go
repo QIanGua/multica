@@ -381,7 +381,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		stdin:                      stdin,
 		pending:                    make(map[int]*pendingRPC),
 		pendingTools:               make(map[string]*pendingToolCall),
-		toolStartCarriesFinalInput: true,
+		toolStartCarriesFinalInput: b.cfg.BuiltinRuntime,
 		acceptNotification: func(string) bool {
 			return streamingCurrentTurn.Load()
 		},
@@ -896,15 +896,22 @@ type hermesClient struct {
 	// toolStartCarriesFinalInput marks a dialect whose tool_call start frame is
 	// the only place a call's input ever appears, so MessageToolUse can be
 	// emitted as soon as the call starts instead of being held until it
-	// completes. Hermes sets it: it attaches rawInput on the start frame for
-	// ordinary tools, deliberately omits it for its "polished" tool set, and
-	// never sends rawInput on an update (acp_adapter/tools.py — build_tool_call
-	// passes `raw_input=None if tool_name in _POLISHED_TOOLS else arguments`,
-	// and build_tool_complete passes none at all). Waiting therefore cannot
-	// yield more input, and only costs the run its in-flight visibility.
+	// completes. Waiting cannot yield more input for such a dialect, and only
+	// costs the run its in-flight visibility.
 	//
-	// Other backends leave it false and keep deferring — Kimi streams its args
-	// across updates, so for it the start frame is genuinely incomplete.
+	// It is a vendor-verified compatibility exception, so the hermes backend
+	// scopes it to Config.BuiltinRuntime the same way
+	// acpToleratesOmittedMcpCapabilities does: `protocol_family: hermes` with
+	// `command_name: jcode` reaches this backend as "hermes" while being an
+	// unrelated implementation, and only the real Hermes Agent binary is known
+	// to behave this way — acp_adapter/tools.py's build_tool_call passes
+	// `raw_input=None if tool_name in _POLISHED_TOOLS else arguments`, and
+	// build_tool_complete passes none at all. Unset means deferring, so a
+	// custom hermes-family runtime that supplies rawInput on a later update
+	// still has it recorded.
+	//
+	// Other backends leave it false too — Kimi streams its args across updates,
+	// so for it the start frame is genuinely incomplete.
 	toolStartCarriesFinalInput bool
 
 	// pendingTools buffers the args for tool calls whose input streams in
