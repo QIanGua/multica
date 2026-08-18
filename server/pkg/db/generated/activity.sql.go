@@ -62,7 +62,7 @@ const createActivity = `-- name: CreateActivity :one
 INSERT INTO activity_log (
     workspace_id, issue_id, actor_type, actor_id, action, details
 ) VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at
+RETURNING id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at, via_plugin_id
 `
 
 type CreateActivityParams struct {
@@ -93,12 +93,13 @@ func (q *Queries) CreateActivity(ctx context.Context, arg CreateActivityParams) 
 		&i.Action,
 		&i.Details,
 		&i.CreatedAt,
+		&i.ViaPluginID,
 	)
 	return i, err
 }
 
 const getActivity = `-- name: GetActivity :one
-SELECT id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at FROM activity_log
+SELECT id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at, via_plugin_id FROM activity_log
 WHERE id = $1
 `
 
@@ -114,6 +115,7 @@ func (q *Queries) GetActivity(ctx context.Context, id pgtype.UUID) (ActivityLog,
 		&i.Action,
 		&i.Details,
 		&i.CreatedAt,
+		&i.ViaPluginID,
 	)
 	return i, err
 }
@@ -145,8 +147,8 @@ func (q *Queries) HasSquadLeaderNoActionEvaluationForTask(ctx context.Context, a
 }
 
 const listActivitiesForIssue = `-- name: ListActivitiesForIssue :many
-SELECT id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at FROM (
-    SELECT id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at FROM activity_log
+SELECT id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at, via_plugin_id FROM (
+    SELECT id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at, via_plugin_id FROM activity_log
     WHERE issue_id = $1
     ORDER BY created_at DESC, id DESC
     LIMIT $2
@@ -192,6 +194,7 @@ func (q *Queries) ListActivitiesForIssue(ctx context.Context, arg ListActivities
 			&i.Action,
 			&i.Details,
 			&i.CreatedAt,
+			&i.ViaPluginID,
 		); err != nil {
 			return nil, err
 		}

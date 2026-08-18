@@ -27,7 +27,7 @@ type Capabilities struct {
 // resources land with the agent integration.
 func HostCapabilities() Capabilities {
 	return Capabilities{
-		SurfaceTypes:  map[string]bool{},
+		SurfaceTypes:  map[string]bool{SurfaceIssuePanel: true, SurfaceSidebarPanel: true},
 		HookTriggers:  map[string]bool{},
 		HookTransport: map[string]bool{},
 		ResourceTypes: map[string]bool{},

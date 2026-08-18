@@ -56,6 +56,7 @@ const (
 	PluginErrorInvalid      PluginErrorKind = "invalid"
 	PluginErrorNotFound     PluginErrorKind = "not_found"
 	PluginErrorConflict     PluginErrorKind = "conflict"
+	PluginErrorForbidden    PluginErrorKind = "forbidden"
 	PluginErrorIncompatible PluginErrorKind = "incompatible"
 	PluginErrorQuota        PluginErrorKind = "quota"
 	PluginErrorUnavailable  PluginErrorKind = "unavailable"
@@ -406,6 +407,10 @@ func pruneConfig(raw []byte, manifest plugincontract.Manifest) []byte {
 	}
 	return encoded
 }
+
+func parseUUIDValue(value string) (pgtype.UUID, error) { return util.ParseUUID(value) }
+
+func uuidString(value pgtype.UUID) string { return util.UUIDToString(value) }
 
 // ParseInstallationManifest reads back the consented snapshot. Callers must use
 // this, never a freshly fetched manifest: what the source URL serves today is
