@@ -18,6 +18,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/profiling"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/scheduler"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -447,6 +448,7 @@ func main() {
 		Addr:    ":" + port,
 		Handler: r,
 	}
+	profilingServer := profiling.NewServer()
 
 	// Start background workers.
 	sweepCtx, sweepCancel := context.WithCancel(context.Background())
@@ -548,6 +550,13 @@ func main() {
 	}
 
 	go func() {
+		slog.Info("pprof server starting", "addr", profilingServer.Addr)
+		if err := profilingServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("pprof server disabled after startup error", "error", err)
+		}
+	}()
+
+	go func() {
 		slog.Info("server starting", "port", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "error", err)
@@ -620,5 +629,10 @@ func main() {
 		}
 		metricsShutdownCancel()
 	}
+	profilingShutdownCtx, profilingShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := profilingServer.Shutdown(profilingShutdownCtx); err != nil {
+		slog.Error("pprof server forced to shutdown", "error", err)
+	}
+	profilingShutdownCancel()
 	slog.Info("server stopped")
 }
