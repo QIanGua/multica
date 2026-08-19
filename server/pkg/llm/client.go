@@ -23,7 +23,7 @@ package llm
 import (
 	"context"
 	"errors"
-	"log/slog"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -65,21 +65,20 @@ type Config struct {
 	// MULTICA_LLM_DEFAULT_MODEL. When empty, FallbackModel is used.
 	DefaultModel string
 	// MaxRetries is the transport-level retry budget applied to every request
-	// this client makes. Maps to MULTICA_LLM_MAX_RETRIES.
+	// this client makes. Maps to MULTICA_LLM_MAX_RETRIES. Build one with
+	// Retries; nil means unset, and DefaultMaxRetries applies.
 	//
-	//   - nil  — unset; DefaultMaxRetries applies.
-	//   - 0    — retries disabled; exactly one upstream request per call.
-	//   - N>0  — exactly N retries, so at most N+1 upstream requests.
+	//   - nil            — unset; DefaultMaxRetries applies.
+	//   - Retries(0)     — retries disabled; exactly one upstream request.
+	//   - Retries(N)     — at most N retries, so at most N+1 upstream requests.
 	//
-	// It is a *int rather than an int precisely so "unset" and "explicitly
-	// disabled" stay distinguishable: a bare int made 0 indistinguishable from
-	// the zero value, so asking for no retries silently produced the SDK
-	// default instead (MUL-6364).
-	//
-	// Negative values are invalid. The configuration layer that owns
-	// MULTICA_LLM_MAX_RETRIES rejects them before boot (option.WithMaxRetries
-	// panics on a negative, and New is documented never to fail); New warns and
-	// falls back to DefaultMaxRetries if one arrives anyway.
+	// It is a pointer to a validated type rather than a bare int for two
+	// reasons (MUL-6364). A bare int made 0 indistinguishable from the zero
+	// value, so asking for no retries silently produced the SDK default
+	// instead; and it let a negative — which option.WithMaxRetries panics on —
+	// reach this layer, where the only options were to panic or to quietly
+	// substitute some other budget. Retries is the sole constructor and rejects
+	// negatives, so neither state is representable here at all.
 	//
 	// What this budget retries is decided by the SDK: connection-level failures
 	// (no response at all), HTTP 408, 409, 429 and any 5xx, plus any response
@@ -94,7 +93,7 @@ type Config struct {
 	// caller's own deadline: backoff alone costs ~1.5s at 2 retries and ~21s at
 	// 6, so a budget larger than the caller's timeout only converts a
 	// recoverable failure into a deadline-exceeded one.
-	MaxRetries *int
+	MaxRetries *RetryOverride
 	// HTTPClient, when set, replaces the SDK's default transport. Primarily a
 	// test seam.
 	HTTPClient option.HTTPClient
@@ -105,6 +104,35 @@ type Config struct {
 // it explicitly so the effective policy is ours to report and can never drift
 // silently with an SDK bump.
 const DefaultMaxRetries = 2
+
+// RetryOverride is a validated retry budget for Config.MaxRetries. Its only
+// field is unexported and Retries is its only constructor, so an invalid budget
+// cannot be represented at this boundary — New therefore has no correction
+// branch to take, and needs none. #7154 asked that invalid values fail
+// validation rather than be silently coerced; making them unbuildable is the
+// strongest available form of that.
+type RetryOverride struct{ n int }
+
+// Retries returns an override of at most n retries per call. It rejects a
+// negative n instead of correcting it: option.WithMaxRetries panics on one, and
+// there is no honest correction to make — "fewer than zero retries" is a
+// mistake, not a request to disable them. Retries(0) is how you disable them.
+func Retries(n int) (*RetryOverride, error) {
+	if n < 0 {
+		return nil, fmt.Errorf("llm: max retries must not be negative, got %d (use 0 to disable retries)", n)
+	}
+	return &RetryOverride{n: n}, nil
+}
+
+// Value reports the configured budget. The zero value of RetryOverride reports
+// 0, which is consistent: an override that was never built through Retries
+// carries no retries either.
+func (r *RetryOverride) Value() int {
+	if r == nil {
+		return 0
+	}
+	return r.n
+}
 
 // Retry policy sources, as reported by RetryBudget.Source.
 const (
@@ -121,8 +149,9 @@ const (
 // went unnoticed in the first place. Every field is a scalar or a fixed enum,
 // so logging the whole struct can never leak an API key or a gateway URL.
 type RetryBudget struct {
-	// MaxRetries is the number of retries attempted after a failed request, so
-	// N means at most N+1 upstream requests per call.
+	// MaxRetries is the ceiling on retries after a failed request, so N means
+	// at most N+1 upstream requests per call. Only retryable failures consume
+	// it; a success or the caller's deadline can end the call sooner.
 	MaxRetries int
 	// Source is RetrySourceDefault or RetrySourceConfig.
 	Source string
@@ -159,17 +188,11 @@ func New(cfg Config) *Client {
 		RequestTimeout: defaultRequestTimeout,
 	}
 	if cfg.MaxRetries != nil {
-		if n := *cfg.MaxRetries; n >= 0 {
-			retry.MaxRetries = n
-			retry.Source = RetrySourceConfig
-		} else {
-			// Unreachable through the supported configuration path, which fails
-			// the boot on a negative. Warn rather than clamp: silently turning
-			// an invalid budget into a valid-looking one is the exact failure
-			// mode this field was reworked to remove.
-			slog.Warn("llm: negative MaxRetries is not a supported value, using the default",
-				"value", n, "max_retries", retry.MaxRetries)
-		}
+		// No validation and no clamping here on purpose: RetryOverride can only
+		// hold a value Retries already accepted, so there is no invalid budget
+		// left for this layer to silently correct.
+		retry.MaxRetries = cfg.MaxRetries.Value()
+		retry.Source = RetrySourceConfig
 	}
 	// Always set it explicitly, even for the default, so the budget the SDK
 	// enforces and the one RetryBudget reports are the same number.

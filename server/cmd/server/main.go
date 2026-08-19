@@ -24,6 +24,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
+	"github.com/multica-ai/multica/server/pkg/llm"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -128,15 +129,15 @@ func envNonNegativeInt(name string, def int) int {
 const maxLLMRetriesLimit = 5
 
 // parseLLMMaxRetries turns the raw MULTICA_LLM_MAX_RETRIES value into the
-// tri-state llm.Config.MaxRetries expects: nil for unset (use the default), a
-// pointer to 0 for "disable retries", a pointer to N for exactly N.
+// tri-state llm.Config.MaxRetries expects: nil for unset (use the default),
+// llm.Retries(0) to disable retries, llm.Retries(N) for a ceiling of N.
 //
 // Unlike the envFooInt helpers above it returns an error instead of warning and
 // falling back to a default. A retry budget silently corrected to something the
 // operator did not ask for is the failure this knob exists to remove
-// (MUL-6364): a typo'd "3 " or a negative must stop the boot, not quietly
+// (MUL-6364): a typo'd "3x" or a negative must stop the boot, not quietly
 // restore the default and look configured.
-func parseLLMMaxRetries(raw string) (*int, error) {
+func parseLLMMaxRetries(raw string) (*llm.RetryOverride, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
@@ -145,13 +146,18 @@ func parseLLMMaxRetries(raw string) (*int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("must be an integer, got %q", raw)
 	}
-	if v < 0 {
-		return nil, fmt.Errorf("must not be negative, got %d (use 0 to disable retries)", v)
-	}
 	if v > maxLLMRetriesLimit {
 		return nil, fmt.Errorf("must be at most %d, got %d", maxLLMRetriesLimit, v)
 	}
-	return &v, nil
+	// llm.Retries owns the lower bound. It is the boundary that makes a negative
+	// budget unrepresentable, and this is the only place the server builds one,
+	// so the deployment-specific ceiling above and the type-level floor here
+	// cannot disagree.
+	override, err := llm.Retries(v)
+	if err != nil {
+		return nil, fmt.Errorf("must not be negative, got %d (use 0 to disable retries)", v)
+	}
+	return override, nil
 }
 
 func envPositiveInt64(name string, def int64) int64 {

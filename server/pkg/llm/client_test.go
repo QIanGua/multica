@@ -13,11 +13,18 @@ import (
 	"github.com/openai/openai-go/v3/shared"
 )
 
-// retries builds a Config.MaxRetries value. Tests that assert an exact upstream
-// request count pass retries(0) to take SDK retries out of the picture; before
-// MUL-6364 that required the negative -1, because a plain 0 was indistinguishable
-// from unset and quietly restored the default budget.
-func retries(n int) *int { return &n }
+// retries builds a Config.MaxRetries value, failing loudly on a budget Retries
+// rejects. Tests that assert an exact upstream request count pass retries(0) to
+// take SDK retries out of the picture; before MUL-6364 that required the
+// negative -1, because a plain 0 was indistinguishable from unset and quietly
+// restored the default budget.
+func retries(n int) *RetryOverride {
+	override, err := Retries(n)
+	if err != nil {
+		panic(err)
+	}
+	return override
+}
 
 // stubUpstream returns an httptest server that mimics the OpenAI
 // chat-completions endpoint. handler receives the decoded request body.

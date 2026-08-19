@@ -42,6 +42,7 @@ import (
 	composiosdk "github.com/multica-ai/multica/server/pkg/composio"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
+	"github.com/multica-ai/multica/server/pkg/llm"
 )
 
 var defaultOrigins = []string{
@@ -199,7 +200,7 @@ type RouterOptions struct {
 	// terminating the process from inside a router constructor would also kill
 	// any test that happened to have the variable set. nil means unset, which
 	// is what tests and NewRouter get.
-	LLMMaxRetries *int
+	LLMMaxRetries *llm.RetryOverride
 }
 
 func buildChannelSupervisor(

@@ -8,7 +8,7 @@ import (
 )
 
 // TestParseLLMMaxRetriesAccepted pins the states an operator is allowed to
-// configure. The nil-versus-pointer distinction is the whole point: it is what
+// configure. The nil-versus-override distinction is the whole point: it is what
 // lets pkg/llm tell "unset, use the default" apart from "explicitly disabled".
 func TestParseLLMMaxRetriesAccepted(t *testing.T) {
 	for _, tc := range []struct {
@@ -30,11 +30,11 @@ func TestParseLLMMaxRetriesAccepted(t *testing.T) {
 			}
 			switch {
 			case tc.want == nil && got != nil:
-				t.Fatalf("parseLLMMaxRetries(%q) = %d, want unset (nil)", tc.raw, *got)
+				t.Fatalf("parseLLMMaxRetries(%q) = %d, want unset (nil)", tc.raw, got.Value())
 			case tc.want != nil && got == nil:
 				t.Fatalf("parseLLMMaxRetries(%q) = nil, want %d", tc.raw, *tc.want)
-			case tc.want != nil && *got != *tc.want:
-				t.Fatalf("parseLLMMaxRetries(%q) = %d, want %d", tc.raw, *got, *tc.want)
+			case tc.want != nil && got.Value() != *tc.want:
+				t.Fatalf("parseLLMMaxRetries(%q) = %d, want %d", tc.raw, got.Value(), *tc.want)
 			}
 		})
 	}
@@ -61,7 +61,7 @@ func TestParseLLMMaxRetriesRejected(t *testing.T) {
 				t.Fatalf("parseLLMMaxRetries(%q) accepted the value (= %v), want a validation error", tc.raw, got)
 			}
 			if got != nil {
-				t.Fatalf("parseLLMMaxRetries(%q) returned %d alongside an error; a rejected value must not be usable", tc.raw, *got)
+				t.Fatalf("parseLLMMaxRetries(%q) returned %d alongside an error; a rejected value must not be usable", tc.raw, got.Value())
 			}
 			if !strings.Contains(err.Error(), tc.wantMessage) {
 				t.Fatalf("parseLLMMaxRetries(%q) error = %q, want it to mention %q", tc.raw, err, tc.wantMessage)

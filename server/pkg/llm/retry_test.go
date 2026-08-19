@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	openai "github.com/openai/openai-go/v3"
@@ -24,14 +25,16 @@ func retryingUpstream(t *testing.T, count *int) string {
 	}).URL
 }
 
-// TestMaxRetriesSemantics pins the four supported states of Config.MaxRetries
+// TestMaxRetriesSemantics pins the supported states of Config.MaxRetries
 // against the only thing that matters to an operator: how many times we hit
 // their upstream. Before MUL-6364 an explicit 0 landed in the "unset" row here
-// and a negative was the only way to reach the "disabled" one.
+// and a negative was the only way to reach the "disabled" one. The upstream
+// here fails every time, so the budget is always spent in full — with a
+// recoverable upstream the same configuration would stop at the first success.
 func TestMaxRetriesSemantics(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
-		configured   *int
+		configured   *RetryOverride
 		wantRequests int
 		wantBudget   RetryBudget
 	}{
@@ -48,13 +51,13 @@ func TestMaxRetriesSemantics(t *testing.T) {
 			wantBudget:   RetryBudget{MaxRetries: 0, Source: RetrySourceConfig, RequestTimeout: defaultRequestTimeout},
 		},
 		{
-			name:         "one retries exactly once",
+			name:         "one caps retries at one",
 			configured:   retries(1),
 			wantRequests: 2,
 			wantBudget:   RetryBudget{MaxRetries: 1, Source: RetrySourceConfig, RequestTimeout: defaultRequestTimeout},
 		},
 		{
-			name:         "positive value is honored exactly",
+			name:         "positive value is honored as the ceiling",
 			configured:   retries(5),
 			wantRequests: 6,
 			wantBudget:   RetryBudget{MaxRetries: 5, Source: RetrySourceConfig, RequestTimeout: defaultRequestTimeout},
@@ -77,25 +80,42 @@ func TestMaxRetriesSemantics(t *testing.T) {
 	}
 }
 
-// TestNegativeMaxRetriesFallsBackToDefault covers the guard, not a supported
-// input: cmd/server fails the boot on a negative before it can reach New. The
-// guard exists because option.WithMaxRetries panics on a negative and New is
-// documented never to fail, so the value must not be passed through — and it
-// must not be quietly clamped to 0 either, which would read as "retries
-// disabled" to anyone reading the startup diagnostic.
-func TestNegativeMaxRetriesFallsBackToDefault(t *testing.T) {
-	requests := 0
-	c := New(Config{APIKey: "k", BaseURL: retryingUpstream(t, &requests), MaxRetries: retries(-1)})
+// TestRetriesRejectsNegative is the acceptance criterion from #7154 at the
+// package boundary: an invalid budget fails validation instead of being coerced
+// into a working-looking one. Because Retries is the only constructor, a
+// rejected value cannot go on to configure anything — there is deliberately no
+// fallback here to assert.
+func TestRetriesRejectsNegative(t *testing.T) {
+	for _, n := range []int{-1, -5} {
+		override, err := Retries(n)
+		if err == nil {
+			t.Fatalf("Retries(%d) = %+v, want a validation error", n, override)
+		}
+		if override != nil {
+			t.Fatalf("Retries(%d) returned %+v alongside an error; a rejected budget must not be usable", n, override)
+		}
+		if !strings.Contains(err.Error(), "must not be negative") {
+			t.Fatalf("Retries(%d) error = %q, want it to say the value must not be negative", n, err)
+		}
+	}
+}
 
-	budget := c.RetryBudget()
-	if budget.MaxRetries != DefaultMaxRetries || budget.Source != RetrySourceDefault {
-		t.Fatalf("RetryBudget() = %+v, want the default budget from %q", budget, RetrySourceDefault)
+// TestRetriesAcceptsNonNegative is the other half: 0 and positive values build
+// an override reporting exactly what was asked for.
+func TestRetriesAcceptsNonNegative(t *testing.T) {
+	for _, n := range []int{0, 1, 5, 100} {
+		override, err := Retries(n)
+		if err != nil {
+			t.Fatalf("Retries(%d) failed: %v", n, err)
+		}
+		if got := override.Value(); got != n {
+			t.Fatalf("Retries(%d).Value() = %d, want %d", n, got, n)
+		}
 	}
-	if _, err := c.Chat(context.Background(), openai.ChatCompletionNewParams{}); err == nil {
-		t.Fatal("expected the upstream error to surface")
-	}
-	if want := DefaultMaxRetries + 1; requests != want {
-		t.Fatalf("upstream saw %d requests, want %d (default budget, not 0)", requests, want)
+
+	var missing *RetryOverride
+	if got := missing.Value(); got != 0 {
+		t.Fatalf("nil override Value() = %d, want 0", got)
 	}
 }
 

@@ -126,12 +126,12 @@ type Config struct {
 	LLMAPIKey       string
 	LLMBaseURL      string
 	LLMDefaultModel string
-	// LLMMaxRetries is the parsed, already-validated MULTICA_LLM_MAX_RETRIES.
-	// nil means unset (llm.DefaultMaxRetries applies); 0 means retries are
-	// disabled. It arrives pre-validated because an unparseable or out-of-range
-	// budget fails the boot in cmd/server rather than reaching this struct —
-	// see llm.Config.MaxRetries for the full semantics.
-	LLMMaxRetries *int
+	// LLMMaxRetries is the parsed MULTICA_LLM_MAX_RETRIES budget. nil means
+	// unset (llm.DefaultMaxRetries applies); llm.Retries(0) disables retries.
+	// The type carries the validation: it can only be built through llm.Retries,
+	// and cmd/server additionally fails the boot on an out-of-range value before
+	// one reaches this struct. See llm.Config.MaxRetries for the full semantics.
+	LLMMaxRetries *llm.RetryOverride
 	// ServerVersion is the build version of the running API binary (the same
 	// value main.go stamps via -X main.version and reports on /metrics).
 	// Surfaced through /api/config so self-hosted operators can confirm which
