@@ -116,6 +116,11 @@ type activeRepoCheckoutTask struct {
 	WorkDir     string
 }
 
+// registerActiveRepoCheckoutTask binds checkout identity to the active task.
+// The token prevents unauthenticated localhost callers from choosing another
+// task's identity or workdir. It is not an OS-user isolation boundary: another
+// process that can steal the child's environment token can authenticate as
+// that task and already holds its API credential.
 func (d *Daemon) registerActiveRepoCheckoutTask(token string, task activeRepoCheckoutTask) {
 	d.repoCheckoutTasksMu.Lock()
 	defer d.repoCheckoutTasksMu.Unlock()

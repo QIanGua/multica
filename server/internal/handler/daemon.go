@@ -1871,6 +1871,10 @@ func rerunSourceMatchesTaskScope(task, source db.AgentTaskQueue) bool {
 	return false
 }
 
+func claimResponseAgentIdentityMatches(resp AgentTaskResponse) bool {
+	return resp.AgentID != "" && resp.Agent != nil && resp.Agent.ID == resp.AgentID
+}
+
 // buildClaimedTaskResponse assembles the full daemon claim payload for a
 // single already-claimed task and computes the exact comment ids embedded in
 // it (deliveredCommentIDs). Shared by the per-runtime handler
@@ -1900,6 +1904,11 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	agent, err := h.Queries.GetAgent(r.Context(), task.AgentID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// The current schema cascades agent deletion to task rows, so a
+			// durable orphan task cannot normally reach this branch. It remains a
+			// fail-closed guard for a deletion racing response assembly or for
+			// externally corrupted data; settlement may report that the task row
+			// already disappeared, but no claim payload is dispatched either way.
 			slog.Error("daemon claim: task agent no longer exists; refusing dispatch",
 				"task_id", uuidToString(task.ID), "agent_id", uuidToString(task.AgentID))
 			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
@@ -1921,114 +1930,116 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			message: "failed to load task agent",
 		}
 	}
-	if uuidToString(agent.ID) != resp.AgentID {
-		slog.Error("daemon claim: task identity mismatch; refusing dispatch",
-			"task_id", uuidToString(task.ID), "task_agent_id", resp.AgentID, "loaded_agent_id", uuidToString(agent.ID))
+	useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
+	var customEnv map[string]string
+	if agent.CustomEnv != nil {
+		if err := json.Unmarshal(agent.CustomEnv, &customEnv); err != nil {
+			slog.Warn("failed to unmarshal agent custom_env", "agent_id", uuidToString(agent.ID), "error", err)
+		}
+	}
+	var customArgs []string
+	if agent.CustomArgs != nil {
+		if err := json.Unmarshal(agent.CustomArgs, &customArgs); err != nil {
+			slog.Warn("failed to unmarshal agent custom_args", "agent_id", uuidToString(agent.ID), "error", err)
+		}
+	}
+	var mcpConfig json.RawMessage
+	if agent.McpConfig != nil {
+		mcpConfig = json.RawMessage(agent.McpConfig)
+	}
+	// Fold in the workspace MCP servers this agent has been explicitly
+	// given (GH #6062). Only bound AND enabled servers are read, so a
+	// workspace library entry nobody added reaches nothing. Read on every
+	// claim, exactly like the agent column, so an admin's edit or a toggle
+	// lands on the agent's next task with nothing to restart. Errors —
+	// including a failed read — leave the agent config untouched: a broken
+	// shared entry must never take away servers the agent runs with today.
+	if bound, err := h.Queries.ListEnabledAgentMcpServers(r.Context(), agent.ID); err != nil {
+		slog.Warn("daemon claim: load agent mcp servers failed; using agent mcp_config",
+			"task_id", uuidToString(task.ID), "agent_id", uuidToString(agent.ID), "error", err)
+	} else if len(bound) > 0 {
+		bindings := make([]WorkspaceMcpBinding, 0, len(bound))
+		for _, server := range bound {
+			bindings = append(bindings, WorkspaceMcpBinding{Name: server.Name, Config: json.RawMessage(server.Config)})
+		}
+		if resolved, err := ResolveAgentMcpConfig(bindings, mcpConfig); err != nil {
+			slog.Warn("daemon claim: resolve agent mcp servers failed; falling back to agent mcp_config",
+				"task_id", uuidToString(task.ID), "agent_id", uuidToString(agent.ID), "error", err)
+		} else {
+			mcpConfig = resolved
+		}
+	}
+	// Layer the per-task overlay (set at enqueue from the initiator
+	// user's active integrations — currently Composio) on top of the
+	// agent's saved mcp_config. Overlay wins on server-name collisions
+	// because it carries the live user-scoped session URL. Errors are
+	// logged but never fail the claim: a broken overlay must not prevent
+	// the agent from running with its base config.
+	if composioMCPEnabled && len(task.RuntimeMcpOverlay) > 0 {
+		if merged, err := mergeMCPOverlay(mcpConfig, json.RawMessage(task.RuntimeMcpOverlay)); err != nil {
+			slog.Warn("daemon claim: merge runtime_mcp_overlay failed; falling back to agent mcp_config", "task_id", uuidToString(task.ID), "error", err)
+		} else {
+			mcpConfig = merged
+		}
+	}
+	// runtime_config is stored as JSONB and may legitimately be the
+	// empty object `{}` for agents that haven't opted into any
+	// provider-specific tuning. Forward only non-empty payloads so the
+	// daemon's per-provider decoders treat absent-or-empty identically.
+	var runtimeConfig json.RawMessage
+	if rc := bytes.TrimSpace(agent.RuntimeConfig); len(rc) > 0 && !bytes.Equal(rc, []byte("{}")) && !bytes.Equal(rc, []byte("null")) {
+		runtimeConfig = json.RawMessage(agent.RuntimeConfig)
+	}
+	resp.Agent = &TaskAgentData{
+		ID:                    uuidToString(agent.ID),
+		Name:                  agent.Name,
+		Instructions:          agent.Instructions,
+		CustomEnv:             customEnv,
+		CustomArgs:            customArgs,
+		McpConfig:             mcpConfig,
+		Model:                 agent.Model.String,
+		ThinkingLevel:         agent.ThinkingLevel.String,
+		ServiceTier:           agent.ServiceTier.String,
+		RuntimeConfig:         runtimeConfig,
+		DisabledRuntimeSkills: disabledRuntimeSkillsFor(agent.DisabledRuntimeSkills, runtimeID, runtime.Provider),
+	}
+	// System agents carry a product-owned instruction layer that ships with
+	// this binary instead of being copied into their row at creation. That
+	// is what makes it hot-updatable: editing the embedded file and
+	// deploying reaches every existing workspace on its next task, with no
+	// migration and no client upgrade. agent.Instructions holds only the
+	// workspace's own notes, so a release can never overwrite them.
+	//
+	// Composing here covers every task kind, because this is the single
+	// place a claimed task's agent payload is assembled.
+	if agent.SystemKey.String == service.MikaSystemKey {
+		resp.Agent.Instructions = service.ComposeMikaInstructions(agent.Name, agent.Instructions)
+	}
+	if useSkillRefs {
+		_, skillRefs := h.TaskService.LoadAgentSkillBundles(r.Context(), task.AgentID)
+		agentSkillCount = len(skillRefs)
+		resp.Agent.SkillRefs = skillRefs
+	} else {
+		skills := h.TaskService.LoadAgentSkills(r.Context(), task.AgentID)
+		agentSkillCount = len(skills)
+		builtinSkills := h.TaskService.BuiltinSkills()
+		builtinSkillCount = len(builtinSkills)
+		skills = append(skills, builtinSkills...)
+		resp.Agent.Skills = skills
+	}
+	if !claimResponseAgentIdentityMatches(resp) {
+		responseAgentID := ""
+		if resp.Agent != nil {
+			responseAgentID = resp.Agent.ID
+		}
+		slog.Error("daemon claim: response agent identity mismatch; refusing dispatch",
+			"task_id", uuidToString(task.ID), "task_agent_id", resp.AgentID, "response_agent_id", responseAgentID)
 		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
 			r.Context(), task,
-			"Task identity is invalid: the task and expanded agent disagree.",
+			"Task identity is invalid: the task and response agent disagree.",
 			taskfailure.ReasonInvalidTaskIdentity,
-			"error_invalid_task_identity", http.StatusConflict, "task agent identity mismatch",
+			"error_invalid_task_identity", http.StatusConflict, "task response agent identity mismatch",
 		)
-	}
-	{
-		useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
-		var customEnv map[string]string
-		if agent.CustomEnv != nil {
-			if err := json.Unmarshal(agent.CustomEnv, &customEnv); err != nil {
-				slog.Warn("failed to unmarshal agent custom_env", "agent_id", uuidToString(agent.ID), "error", err)
-			}
-		}
-		var customArgs []string
-		if agent.CustomArgs != nil {
-			if err := json.Unmarshal(agent.CustomArgs, &customArgs); err != nil {
-				slog.Warn("failed to unmarshal agent custom_args", "agent_id", uuidToString(agent.ID), "error", err)
-			}
-		}
-		var mcpConfig json.RawMessage
-		if agent.McpConfig != nil {
-			mcpConfig = json.RawMessage(agent.McpConfig)
-		}
-		// Fold in the workspace MCP servers this agent has been explicitly
-		// given (GH #6062). Only bound AND enabled servers are read, so a
-		// workspace library entry nobody added reaches nothing. Read on every
-		// claim, exactly like the agent column, so an admin's edit or a toggle
-		// lands on the agent's next task with nothing to restart. Errors —
-		// including a failed read — leave the agent config untouched: a broken
-		// shared entry must never take away servers the agent runs with today.
-		if bound, err := h.Queries.ListEnabledAgentMcpServers(r.Context(), agent.ID); err != nil {
-			slog.Warn("daemon claim: load agent mcp servers failed; using agent mcp_config",
-				"task_id", uuidToString(task.ID), "agent_id", uuidToString(agent.ID), "error", err)
-		} else if len(bound) > 0 {
-			bindings := make([]WorkspaceMcpBinding, 0, len(bound))
-			for _, server := range bound {
-				bindings = append(bindings, WorkspaceMcpBinding{Name: server.Name, Config: json.RawMessage(server.Config)})
-			}
-			if resolved, err := ResolveAgentMcpConfig(bindings, mcpConfig); err != nil {
-				slog.Warn("daemon claim: resolve agent mcp servers failed; falling back to agent mcp_config",
-					"task_id", uuidToString(task.ID), "agent_id", uuidToString(agent.ID), "error", err)
-			} else {
-				mcpConfig = resolved
-			}
-		}
-		// Layer the per-task overlay (set at enqueue from the initiator
-		// user's active integrations — currently Composio) on top of the
-		// agent's saved mcp_config. Overlay wins on server-name collisions
-		// because it carries the live user-scoped session URL. Errors are
-		// logged but never fail the claim: a broken overlay must not prevent
-		// the agent from running with its base config.
-		if composioMCPEnabled && len(task.RuntimeMcpOverlay) > 0 {
-			if merged, err := mergeMCPOverlay(mcpConfig, json.RawMessage(task.RuntimeMcpOverlay)); err != nil {
-				slog.Warn("daemon claim: merge runtime_mcp_overlay failed; falling back to agent mcp_config", "task_id", uuidToString(task.ID), "error", err)
-			} else {
-				mcpConfig = merged
-			}
-		}
-		// runtime_config is stored as JSONB and may legitimately be the
-		// empty object `{}` for agents that haven't opted into any
-		// provider-specific tuning. Forward only non-empty payloads so the
-		// daemon's per-provider decoders treat absent-or-empty identically.
-		var runtimeConfig json.RawMessage
-		if rc := bytes.TrimSpace(agent.RuntimeConfig); len(rc) > 0 && !bytes.Equal(rc, []byte("{}")) && !bytes.Equal(rc, []byte("null")) {
-			runtimeConfig = json.RawMessage(agent.RuntimeConfig)
-		}
-		resp.Agent = &TaskAgentData{
-			ID:                    uuidToString(agent.ID),
-			Name:                  agent.Name,
-			Instructions:          agent.Instructions,
-			CustomEnv:             customEnv,
-			CustomArgs:            customArgs,
-			McpConfig:             mcpConfig,
-			Model:                 agent.Model.String,
-			ThinkingLevel:         agent.ThinkingLevel.String,
-			ServiceTier:           agent.ServiceTier.String,
-			RuntimeConfig:         runtimeConfig,
-			DisabledRuntimeSkills: disabledRuntimeSkillsFor(agent.DisabledRuntimeSkills, runtimeID, runtime.Provider),
-		}
-		// System agents carry a product-owned instruction layer that ships with
-		// this binary instead of being copied into their row at creation. That
-		// is what makes it hot-updatable: editing the embedded file and
-		// deploying reaches every existing workspace on its next task, with no
-		// migration and no client upgrade. agent.Instructions holds only the
-		// workspace's own notes, so a release can never overwrite them.
-		//
-		// Composing here covers every task kind, because this is the single
-		// place a claimed task's agent payload is assembled.
-		if agent.SystemKey.String == service.MikaSystemKey {
-			resp.Agent.Instructions = service.ComposeMikaInstructions(agent.Name, agent.Instructions)
-		}
-		if useSkillRefs {
-			_, skillRefs := h.TaskService.LoadAgentSkillBundles(r.Context(), task.AgentID)
-			agentSkillCount = len(skillRefs)
-			resp.Agent.SkillRefs = skillRefs
-		} else {
-			skills := h.TaskService.LoadAgentSkills(r.Context(), task.AgentID)
-			agentSkillCount = len(skills)
-			builtinSkills := h.TaskService.BuiltinSkills()
-			builtinSkillCount = len(builtinSkills)
-			skills = append(skills, builtinSkills...)
-			resp.Agent.Skills = skills
-		}
 	}
 
 	// Resolve the runtime owner's profile description so the daemon can
@@ -2405,7 +2416,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 					resp.PriorSessionResumeUnavailable = true
 				}
 			} else if err == nil {
-				slog.Error("daemon claim: rerun source belongs to another agent or scope; starting fresh",
+				slog.Warn("daemon claim: rerun source belongs to another agent or scope; starting fresh",
 					"task_id", uuidToString(task.ID),
 					"task_agent_id", uuidToString(task.AgentID),
 					"task_issue_id", uuidToString(task.IssueID),

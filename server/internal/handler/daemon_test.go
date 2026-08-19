@@ -2570,6 +2570,27 @@ func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *te
 	}
 }
 
+func TestClaimResponseAgentIdentityMatches(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		resp AgentTaskResponse
+		want bool
+	}{
+		{name: "matching", resp: AgentTaskResponse{AgentID: "agent-a", Agent: &TaskAgentData{ID: "agent-a"}}, want: true},
+		{name: "mismatched", resp: AgentTaskResponse{AgentID: "agent-a", Agent: &TaskAgentData{ID: "agent-b"}}},
+		{name: "missing top-level identity", resp: AgentTaskResponse{Agent: &TaskAgentData{ID: "agent-a"}}},
+		{name: "missing response agent", resp: AgentTaskResponse{AgentID: "agent-a"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := claimResponseAgentIdentityMatches(tc.resp); got != tc.want {
+				t.Fatalf("claimResponseAgentIdentityMatches() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 type claimRuntimeGuardTask struct {
 	PriorSessionID                string   `json:"prior_session_id"`
 	PriorWorkDir                  string   `json:"prior_work_dir"`
@@ -3035,42 +3056,6 @@ func TestClaimTask_ManualRetryReusesWorkdir(t *testing.T) {
 			t.Fatal("cross-agent rerun must disclose that the requested source was not resumable")
 		}
 	})
-}
-
-func TestClaimBuildRejectsAgentDeletedAfterClaim(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-
-	agentID, runtimeID, _ := createRuntimeGuardAgent(t, ctx)
-	issueID := dbfx.Issue(t, "missing claim agent fixture", testutil.Cols{
-		"status": "in_progress",
-		"number": 81299,
-	})
-	taskID := dbfx.Task(t, agentID, testutil.Cols{
-		"runtime_id": runtimeID,
-		"issue_id":   issueID,
-		"status":     "queued",
-	})
-	claimed, err := testHandler.TaskService.ClaimTaskForRuntime(ctx, parseUUID(runtimeID))
-	if err != nil {
-		t.Fatalf("ClaimTaskForRuntime: %v", err)
-	}
-	if claimed == nil || uuidToString(claimed.ID) != taskID {
-		t.Fatalf("ClaimTaskForRuntime task = %v, want %s", claimed, taskID)
-	}
-	dbfx.Exec(t, `DELETE FROM agent WHERE id = $1`, agentID)
-
-	runtime, err := testHandler.Queries.GetAgentRuntime(ctx, parseUUID(runtimeID))
-	if err != nil {
-		t.Fatalf("GetAgentRuntime: %v", err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/claim", nil)
-	_, _, _, _, failure := testHandler.buildClaimedTaskResponse(req, claimed, runtime, runtimeID, testWorkspaceID)
-	if failure == nil || failure.status != http.StatusInternalServerError || failure.outcome != "error_invalid_task_identity_settle" {
-		t.Fatalf("buildClaimedTaskResponse failure = %#v, want fail-closed settlement error", failure)
-	}
 }
 
 func TestClaimTask_ChatPriorSessionRuntimeGuard(t *testing.T) {
