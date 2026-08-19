@@ -120,6 +120,13 @@ func NewSecureHTTPClient(endpoint *url.URL) *http.Client {
 	dialer := &net.Dialer{Timeout: ConnectTimeout, KeepAlive: 30 * time.Second}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
+	if devOrigin {
+		// Trust an extra CA for this origin, never skip verification: a plugin
+		// author's local MCP server still presents a certificate.
+		if config := devTLSConfig(); config != nil {
+			transport.TLSClientConfig = config
+		}
+	}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
@@ -172,6 +179,12 @@ type discoveredTool struct {
 	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
+// SupportedProtocolVersions is the MCP protocol revisions this build speaks,
+// most preferred first. Discover offers the first and accepts any of them.
+func SupportedProtocolVersions() []string {
+	return []string{"2025-03-26", "2024-11-05"}
+}
+
 func Discover(ctx context.Context, rawEndpoint string, allowedHosts, protocolVersions []string, headers http.Header) ([]Tool, string, error) {
 	endpoint, err := ValidatePublicHTTPSEndpoint(ctx, rawEndpoint, allowedHosts, nil)
 	if err != nil {
@@ -179,10 +192,14 @@ func Discover(ctx context.Context, rawEndpoint string, allowedHosts, protocolVer
 	}
 	client := NewSecureHTTPClient(endpoint)
 	sessionID := ""
-	protocolVersion := "2025-03-26"
-	if len(protocolVersions) > 0 {
-		protocolVersion = protocolVersions[0]
+	// An empty list means "whatever this build supports", not "nothing is
+	// acceptable". The response is checked against this same slice further
+	// down, so leaving it empty rejected every server that answered correctly —
+	// which is exactly what it did to the first plugin that used this path.
+	if len(protocolVersions) == 0 {
+		protocolVersions = SupportedProtocolVersions()
 	}
+	protocolVersion := protocolVersions[0]
 	initialize := map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "initialize",
 		"params": map[string]any{
