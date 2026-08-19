@@ -103,14 +103,19 @@ type HookInvocation struct {
 // handler written against v1 should not have to care what else the host learns
 // how to send later.
 type hookRequestBody struct {
-	Version      int              `json:"version"`
-	HookKey      string           `json:"hook_key"`
-	Trigger      string           `json:"trigger"`
-	EventType    string           `json:"event_type,omitempty"`
-	WorkspaceID  string           `json:"workspace_id"`
-	Installation string           `json:"installation_id"`
-	Actor        hookRequestActor `json:"actor"`
-	Input        json.RawMessage  `json:"input,omitempty"`
+	Version      int    `json:"version"`
+	HookKey      string `json:"hook_key"`
+	Trigger      string `json:"trigger"`
+	EventType    string `json:"event_type,omitempty"`
+	WorkspaceID  string `json:"workspace_id"`
+	Installation string `json:"installation_id"`
+	// IssueID is the issue this call is about, as resolved and permission-checked
+	// by the host. Sent because the alternative is every handler reading it out
+	// of client-supplied `input` — unvalidated, and absent entirely for the event
+	// trigger, where no client was involved at all.
+	IssueID string           `json:"issue_id,omitempty"`
+	Actor   hookRequestActor `json:"actor"`
+	Input   json.RawMessage  `json:"input,omitempty"`
 	// CallbackToken lets the handler call the Action API back for the few
 	// minutes it is valid. Narrower than the installation's own token and tied
 	// to this one call, so a handler that leaks it leaks a few minutes of the
@@ -252,6 +257,12 @@ func (s *PluginService) callHookEndpoint(ctx context.Context, invocation HookInv
 	if err != nil {
 		return nil, err
 	}
+	// The grant lives exactly as long as the call it was issued for. Without
+	// this it would stay usable for the rest of its TTL after the handler has
+	// already answered.
+	if s.Callbacks != nil && body.CallbackToken != "" {
+		defer s.Callbacks.Revoke(body.CallbackToken)
+	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return nil, &PluginError{Kind: PluginErrorInvalid, Message: "encode hook request", Err: err}
@@ -310,6 +321,9 @@ func (s *PluginService) buildHookBody(ctx context.Context, invocation HookInvoca
 		WorkspaceID:  uuidString(invocation.Installation.WorkspaceID),
 		Installation: uuidString(invocation.Installation.ID),
 		Actor:        hookRequestActor{Type: invocation.Actor.Type, ID: uuidString(invocation.Actor.ID)},
+	}
+	if invocation.IssueID.Valid {
+		body.IssueID = uuidString(invocation.IssueID)
 	}
 	if invocation.Input != nil {
 		encoded, err := json.Marshal(invocation.Input)

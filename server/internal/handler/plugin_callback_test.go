@@ -124,9 +124,10 @@ func TestCallbackFromAnEventHookWritesAsThePlugin(t *testing.T) {
 	}
 }
 
-// One call, and only one. A handler that leaks its token leaks a few minutes of
-// what it was already doing, not standing access.
-func TestCallbackTokenRedeemsExactlyOnce(t *testing.T) {
+// A grant is good for the whole invocation, not one request. A handler that
+// reads an issue and then comments on it makes two calls, and the single-use
+// version of this refused the second — the failure a live run surfaced.
+func TestCallbackTokenServesTheWholeInvocation(t *testing.T) {
 	withPluginsV1Flag(t, testHandler, true)
 	cleanupPluginInstallations(t)
 	withCallbackTokens(t)
@@ -141,14 +142,23 @@ func TestCallbackTokenRedeemsExactlyOnce(t *testing.T) {
 		t.Fatalf("first use: status=%d body=%s", first.Code, first.Body.String())
 	}
 
+	// The read-then-write shape every non-trivial handler has.
 	second := httptest.NewRecorder()
-	testHandler.GetPluginIssue(second, callbackRequest(token, http.MethodGet,
-		"/api/v1/plugin/issues/"+issueID, nil, map[string]string{"id": issueID}))
-	if second.Code == http.StatusOK {
-		t.Fatal("a callback token was accepted twice")
+	testHandler.CreatePluginComment(second, callbackRequest(token, http.MethodPost,
+		"/api/v1/plugin/issues/"+issueID+"/comments",
+		map[string]any{"content": "and now a comment about what I read"},
+		map[string]string{"id": issueID}))
+	if second.Code != http.StatusCreated {
+		t.Fatalf("a handler must be able to write after reading: status=%d body=%s", second.Code, second.Body.String())
 	}
-	if second.Code != http.StatusForbidden {
-		t.Fatalf("second use: status=%d body=%s, want 403", second.Code, second.Body.String())
+
+	// Revoked once the invocation is over.
+	testHandler.PluginService.Callbacks.Revoke(token)
+	third := httptest.NewRecorder()
+	testHandler.GetPluginIssue(third, callbackRequest(token, http.MethodGet,
+		"/api/v1/plugin/issues/"+issueID, nil, map[string]string{"id": issueID}))
+	if third.Code != http.StatusForbidden {
+		t.Fatalf("a revoked grant must be refused: status=%d body=%s", third.Code, third.Body.String())
 	}
 }
 

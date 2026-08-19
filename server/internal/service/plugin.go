@@ -2,10 +2,13 @@ package service
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -64,13 +67,48 @@ type PluginService struct {
 }
 
 func NewPluginService(queries *db.Queries, txStarter TxStarter) *PluginService {
-	return &PluginService{
+	service := &PluginService{
 		Queries:    queries,
 		TxStarter:  txStarter,
 		LocalDir:   strings.TrimSpace(os.Getenv("MULTICA_PLUGIN_DIR")),
 		DevOrigins: parseDevOrigins(os.Getenv("MULTICA_PLUGIN_DEV_ORIGINS")),
 		Host:       plugincontract.HostCapabilities(),
 	}
+	service.HookClient = devHookClient(service.DevOrigins, os.Getenv("MULTICA_PLUGIN_DEV_CA"))
+	return service
+}
+
+// devHookClient trusts an additional CA for dev-origin hook endpoints only.
+//
+// A hook URL must be HTTPS — the manifest requires it — so an author testing
+// against a local server needs its certificate trusted by something. This adds
+// a named CA file rather than turning verification off: the failure mode of
+// InsecureSkipVerify is that it survives into production behind a config flag
+// somebody forgot, and there is no way to tell from the code whether it is
+// active. A CA that has to be supplied by path cannot silently apply to
+// anything else.
+//
+// Nil unless BOTH an origin allowlist and a CA path are set, and it is only
+// ever consulted for an endpoint already inside that allowlist.
+func devHookClient(devOrigins []string, caPath string) *http.Client {
+	if len(devOrigins) == 0 || strings.TrimSpace(caPath) == "" {
+		return nil
+	}
+	pem, err := os.ReadFile(caPath)
+	if err != nil {
+		slog.Warn("plugins: MULTICA_PLUGIN_DEV_CA could not be read; dev hook endpoints will not be trusted", "path", caPath, "error", err)
+		return nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		slog.Warn("plugins: MULTICA_PLUGIN_DEV_CA contained no certificates", "path", caPath)
+		return nil
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	slog.Info("plugins: dev hook endpoints will trust an additional CA", "path", caPath, "origins", devOrigins)
+	return &http.Client{Timeout: 30 * time.Second, Transport: transport}
 }
 
 type PluginErrorKind string

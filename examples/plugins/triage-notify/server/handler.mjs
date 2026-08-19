@@ -14,8 +14,10 @@
  * rotates the plugin's token in workspace settings.
  */
 
-import { createServer } from "node:http";
+import { createServer as createHTTPServer } from "node:http";
+import { createServer as createHTTPSServer } from "node:https";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const SIGNING_SECRET = process.env.MULTICA_SIGNING_SECRET ?? "";
@@ -75,7 +77,9 @@ function verify(rawBody, headers) {
  * Calls Multica back using the one-shot token that arrived with the request.
  *
  * The token is scoped to this invocation and expires in minutes, so it is worth
- * spending on the work at hand rather than storing. Which identity the writes
+ * spending on the work at hand rather than storing. It is good for as many calls
+ * as the job needs — reading the issue and then commenting on it is two, which
+ * is the floor for a handler that does anything with what it read. Which identity the writes
  * land under was decided when the hook was dispatched: a ui/manual call writes
  * as the person who triggered it, an event call writes as the plugin.
  */
@@ -106,6 +110,15 @@ function triage(issue) {
   return { priority: "medium", owner: "triage" };
 }
 
+// TLS when a cert is supplied. A hook transport URL must be HTTPS — the
+// manifest validator requires it — so a handler that only speaks HTTP cannot be
+// pointed at even in development.
+const tlsCert = process.env.MULTICA_HOOK_TLS_CERT;
+const tlsKey = process.env.MULTICA_HOOK_TLS_KEY;
+const createServer = tlsCert && tlsKey
+  ? (handler) => createHTTPSServer({ cert: readFileSync(tlsCert), key: readFileSync(tlsKey) }, handler)
+  : createHTTPServer;
+
 const server = createServer((request, response) => {
   if (request.method !== "POST" || !request.url?.startsWith("/hooks/triage")) {
     response.writeHead(404).end();
@@ -131,9 +144,11 @@ const server = createServer((request, response) => {
     console.log(`hook ${body.hook_key} via ${body.trigger}${body.event_type ? ` (${body.event_type})` : ""} as ${body.actor?.type}`);
 
     try {
-      // The callback token proves who we are; the issue id came in the event
-      // payload or was named by the person who triggered it.
-      const issueId = body.input?.issue_id ?? body.input?.issue?.id;
+      // The host tells us which issue this is about, having already resolved and
+      // permission-checked it. Preferred over anything in `input`: for an event
+      // trigger there was no client to supply it, and for ui/manual a
+      // client-supplied id is not something a handler should trust.
+      const issueId = body.issue_id ?? body.input?.issue_id ?? body.input?.issue?.id;
       if (!issueId) {
         response.writeHead(200, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ skipped: "no issue in scope" }));
@@ -159,4 +174,4 @@ const server = createServer((request, response) => {
   });
 });
 
-server.listen(PORT, () => console.log(`triage handler listening on :${PORT}`));
+server.listen(PORT, () => console.log(`triage handler listening on ${tlsCert ? "https" : "http"}://127.0.0.1:${PORT}`));

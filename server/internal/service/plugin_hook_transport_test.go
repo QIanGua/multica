@@ -210,8 +210,13 @@ func TestHookRefusesWhenNoNetScopeGranted(t *testing.T) {
 }
 
 // The callback token travels in the body, so a handler can answer without ever
-// being given standing access — and it redeems exactly once.
-func TestHookCarriesAOneShotCallbackToken(t *testing.T) {
+// being given standing access.
+//
+// Deliberately NOT single-use. A real handler reads the issue, decides, then
+// writes — two calls minimum. Making the token single-use looked stricter and
+// only pushed authors toward the installation's standing token, which never
+// expires; this test pins the looser bound as the intended one.
+func TestHookCarriesAnInvocationScopedCallbackToken(t *testing.T) {
 	harness := newHookTestServer(t)
 	service := hookTestService(t, harness)
 	host := hookTestHost(harness)
@@ -246,15 +251,74 @@ func TestHookCarriesAOneShotCallbackToken(t *testing.T) {
 		t.Fatalf("a manual trigger must carry the member actor, got %q", body.Actor.Type)
 	}
 
-	grant, err := service.Callbacks.Redeem(body.CallbackToken)
+	// Re-issued here because callHookEndpoint revokes the grant once the call it
+	// was issued for has returned.
+	token, err := service.Callbacks.Issue(context.Background(), HookInvocation{
+		Installation: installation,
+		Hook:         hook,
+		Trigger:      plugincontract.TriggerManual,
+		Actor:        HookActor{Type: "member", ID: actorID},
+	})
 	if err != nil {
-		t.Fatalf("first redemption must succeed: %v", err)
+		t.Fatalf("issue: %v", err)
+	}
+
+	grant, err := service.Callbacks.Resolve(token)
+	if err != nil {
+		t.Fatalf("first resolve must succeed: %v", err)
 	}
 	if grant.Actor.Type != "member" || uuidString(grant.Actor.ID) != uuidString(actorID) {
 		t.Fatalf("the grant must carry the actor decided at dispatch, got %+v", grant.Actor)
 	}
-	if _, err := service.Callbacks.Redeem(body.CallbackToken); err == nil {
-		t.Fatal("a callback token must not redeem twice")
+	// The second call is the one that used to fail. A handler that read the
+	// issue and then wanted to comment on it got a 403 here.
+	if _, err := service.Callbacks.Resolve(token); err != nil {
+		t.Fatalf("a handler must be able to make more than one call with one grant: %v", err)
+	}
+
+	// Revoked when the invocation is over, so it does not linger for its TTL.
+	service.Callbacks.Revoke(token)
+	if _, err := service.Callbacks.Resolve(token); err == nil {
+		t.Fatal("a revoked grant must stop resolving")
+	}
+}
+
+// The host resolved and permission-checked the issue, so it says which one this
+// call is about. Without it a handler has to read a client-supplied field —
+// unvalidated for ui/manual, and absent entirely for event, where no client was
+// involved.
+func TestHookBodyCarriesTheIssueTheHostResolved(t *testing.T) {
+	harness := newHookTestServer(t)
+	service := hookTestService(t, harness)
+	host := hookTestHost(harness)
+	installation := hookTestInstallation(t, harness.server.URL+"/hooks/summarize", host, []string{plugincontract.TriggerEvent})
+
+	hook, err := FindHook(installation, "summarize")
+	if err != nil {
+		t.Fatalf("find hook: %v", err)
+	}
+	issueID, err := parseUUIDValue("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	if err != nil {
+		t.Fatalf("parse issue id: %v", err)
+	}
+	if _, err := service.callHookEndpoint(context.Background(), HookInvocation{
+		Installation: installation,
+		Hook:         hook,
+		Trigger:      plugincontract.TriggerEvent,
+		EventType:    plugincontract.EventIssueCreated,
+		Actor:        HookActor{Type: "plugin", ID: installation.ID},
+		IssueID:      issueID,
+	}); err != nil {
+		t.Fatalf("hook call: %v", err)
+	}
+
+	received := <-harness.received
+	var body hookRequestBody
+	if err := json.Unmarshal(received.Body, &body); err != nil {
+		t.Fatalf("decode delivered body: %v", err)
+	}
+	if body.IssueID != uuidString(issueID) {
+		t.Fatalf("issue_id = %q, want %q — the handler has no other trustworthy way to know", body.IssueID, uuidString(issueID))
 	}
 }
 

@@ -198,9 +198,19 @@ func TestEventDispatchStampsThePluginActor(t *testing.T) {
 		t.Fatalf("trigger = %q, want event", body.Trigger)
 	}
 
-	grant, err := service.Callbacks.Redeem(body.CallbackToken)
+	// Re-issued: callHookEndpoint revokes the grant once its call has returned.
+	token, err := service.Callbacks.Issue(t.Context(), HookInvocation{
+		Installation: installation,
+		Hook:         hook,
+		Trigger:      plugincontract.TriggerEvent,
+		Actor:        HookActor{Type: "plugin", ID: installation.ID},
+	})
 	if err != nil {
-		t.Fatalf("redeem: %v", err)
+		t.Fatalf("issue: %v", err)
+	}
+	grant, err := service.Callbacks.Resolve(token)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
 	}
 	if grant.Actor.Type != "plugin" {
 		t.Fatalf("the grant must carry the plugin actor, got %q", grant.Actor.Type)

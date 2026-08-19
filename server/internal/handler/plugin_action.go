@@ -110,10 +110,10 @@ func (h *Handler) pluginSessionCaller(w http.ResponseWriter, r *http.Request, sc
 
 // pluginTokenCaller is the hook path: a plugin's own server calling in.
 //
-// A callback token is one call, minutes long, and carries the actor decided
-// when the hook went out — so a ui-triggered hook writes back as the person who
-// pressed the button, and cannot elect to write as anyone else. An install
-// token is standing access and always acts as the plugin.
+// A callback token is scoped to one INVOCATION, lives for minutes, and carries
+// the actor decided when the hook went out — so a ui-triggered hook writes back
+// as the person who pressed the button and cannot elect to write as anyone
+// else. An install token is standing access and always acts as the plugin.
 func (h *Handler) pluginTokenCaller(w http.ResponseWriter, r *http.Request, token, scope string) (service.PluginActionCaller, pluginActor, bool) {
 	var installationID pgtype.UUID
 	actor := pluginActor{Type: "plugin"}
@@ -125,7 +125,7 @@ func (h *Handler) pluginTokenCaller(w http.ResponseWriter, r *http.Request, toke
 			writeError(w, http.StatusForbidden, "callback tokens are not enabled")
 			return service.PluginActionCaller{}, pluginActor{}, false
 		}
-		grant, err := h.PluginService.Callbacks.Redeem(token)
+		grant, err := h.PluginService.Callbacks.Resolve(token)
 		if err != nil {
 			writePluginError(w, err, "failed to authorize the Plugin call")
 			return service.PluginActionCaller{}, pluginActor{}, false

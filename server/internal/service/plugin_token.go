@@ -28,7 +28,7 @@ import (
 //	install token  (mpi_…)  plugin -> host, long-lived, rotatable.
 //	                        The host only ever verifies it, so it is stored
 //	                        hashed and cannot be recovered from the database.
-//	callback token          host -> plugin, minutes, one call.
+//	callback token          host -> plugin, minutes, one INVOCATION.
 //	                        Handed to a hook handler so it can answer using the
 //	                        Action API without being given standing access.
 
@@ -114,15 +114,27 @@ type CallbackGrant struct {
 	ExpiresAt time.Time
 }
 
-// CallbackTokens issues and redeems the per-invocation callback tokens.
+// CallbackTokens issues and resolves the per-invocation callback tokens.
 //
-// One-shot is enforced here, in memory. That is a deliberate bound and worth
-// stating plainly: on a single server a token redeems exactly once; across
-// several instances, or after a restart, a captured token could redeem once per
-// instance until it expires. The short TTL is what makes that acceptable, and a
-// shared store is the fix if Multica ever runs hot-hot. Recording nonces in the
-// database instead would put a row-per-call write on the outbound path to buy
-// strictness the threat model does not need yet.
+// Scoped to one INVOCATION, not one request — and that distinction was found by
+// running a real handler rather than by reasoning about it. A single-use token
+// looked stricter and was: the reference handler reads the issue, decides, then
+// posts a comment, and the second call died on an already-spent token. Two calls
+// is the floor for any handler that does something with what it read.
+//
+// The trade that actually matters is not one-call versus several. It is this
+// token versus the installation's standing token: a handler that cannot finish
+// its job with the callback will simply be written against the install token
+// instead, which never expires and is not scoped to an invocation. A control
+// that pushes authors toward the stronger credential is worse than the slightly
+// looser one they will use.
+//
+// What still bounds it: minutes, this installation's granted scopes, the actor
+// decided at dispatch, and the issue the invocation was about.
+//
+// Held in memory. Across several instances or after a restart a token stops
+// resolving early rather than late, so the failure mode is a handler seeing 403
+// — visible and retriable — not a grant outliving its window.
 type CallbackTokens struct {
 	mu     sync.Mutex
 	issued map[string]CallbackGrant
@@ -158,9 +170,9 @@ func (c *CallbackTokens) Issue(ctx context.Context, invocation HookInvocation) (
 	return token, nil
 }
 
-// Redeem consumes a token. A second attempt with the same token fails, which is
-// what makes it one-shot.
-func (c *CallbackTokens) Redeem(token string) (CallbackGrant, error) {
+// Resolve looks a token up. Valid for as many calls as the handler needs until
+// it expires; see the type comment for why that is the right bound.
+func (c *CallbackTokens) Resolve(token string) (CallbackGrant, error) {
 	token = strings.TrimSpace(token)
 	if !strings.HasPrefix(token, callbackTokenPrefix) {
 		return CallbackGrant{}, pluginErrf(PluginErrorForbidden, "invalid callback token")
@@ -172,13 +184,25 @@ func (c *CallbackTokens) Redeem(token string) (CallbackGrant, error) {
 	c.sweepLocked()
 	grant, ok := c.issued[key]
 	if !ok {
-		return CallbackGrant{}, pluginErrf(PluginErrorForbidden, "callback token is expired or already used")
+		return CallbackGrant{}, pluginErrf(PluginErrorForbidden, "callback token is expired or unknown")
 	}
-	delete(c.issued, key)
 	if time.Now().After(grant.ExpiresAt) {
-		return CallbackGrant{}, pluginErrf(PluginErrorForbidden, "callback token is expired or already used")
+		delete(c.issued, key)
+		return CallbackGrant{}, pluginErrf(PluginErrorForbidden, "callback token is expired or unknown")
 	}
 	return grant, nil
+}
+
+// Revoke drops a grant before its expiry. Called when a hook invocation has
+// finished, so a token stops working the moment the work it was issued for is
+// over rather than lingering for the rest of its window.
+func (c *CallbackTokens) Revoke(token string) {
+	if token == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.issued, hashToken(strings.TrimSpace(token)))
 }
 
 // sweepLocked drops expired grants so the map cannot grow without bound on a
