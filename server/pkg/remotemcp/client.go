@@ -34,6 +34,16 @@ func ValidatePublicHTTPSEndpoint(ctx context.Context, raw string, allowedHosts [
 	if err != nil {
 		return nil, fmt.Errorf("parse endpoint: %w", err)
 	}
+	// An operator-named dev origin skips the public-internet requirement and
+	// nothing else: the net: scope below still applies, so a Plugin still
+	// cannot reach a destination the administrator did not consent to.
+	if isDevOrigin(endpoint) {
+		devHost := strings.ToLower(strings.TrimSuffix(endpoint.Hostname(), "."))
+		if len(allowedHosts) > 0 && !hostAllowed(devHost, allowedHosts) {
+			return nil, errors.New("endpoint host is outside the Plugin endpoint policy")
+		}
+		return endpoint, nil
+	}
 	if endpoint.Scheme != "https" || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.Fragment != "" || endpoint.RawQuery != "" {
 		return nil, errors.New("endpoint must be a public HTTPS URL without userinfo, query, or fragment")
 	}
@@ -102,6 +112,11 @@ func isPublicAddress(address netip.Addr) bool {
 }
 
 func NewSecureHTTPClient(endpoint *url.URL) *http.Client {
+	// Decided once, here, rather than inside the dialer: the endpoint is fixed
+	// for this client's lifetime, so a per-dial lookup could only differ if the
+	// environment changed mid-task, and honouring that would be a way to widen
+	// the guard after the connection was approved.
+	devOrigin := isDevOrigin(endpoint)
 	dialer := &net.Dialer{Timeout: ConnectTimeout, KeepAlive: 30 * time.Second}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
@@ -119,7 +134,10 @@ func NewSecureHTTPClient(endpoint *url.URL) *http.Client {
 		}
 		for _, candidate := range addresses {
 			candidate = candidate.Unmap()
-			if !isPublicAddress(candidate) {
+			// The host pin above still holds for a dev origin, so a redirect
+			// pointing somewhere else is refused either way. What this skips is
+			// only "the address must be on the public internet".
+			if !devOrigin && !isPublicAddress(candidate) {
 				return nil, errors.New("remote MCP endpoint resolved to a non-public address")
 			}
 			connection, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(candidate.String(), port))
