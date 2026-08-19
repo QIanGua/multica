@@ -70,4 +70,18 @@ func TestAutopilotQuotaManualAndWebhookEnforcement(t *testing.T) {
 	if runCount != 0 {
 		t.Fatalf("blocked manual/webhook requests created %d runs, want zero", runCount)
 	}
+
+	usageRecorder := httptest.NewRecorder()
+	usageReq := newRequest("GET", "/api/autopilots/usage", nil)
+	testHandler.GetAutopilotQuotaUsage(usageRecorder, usageReq)
+	if usageRecorder.Code != http.StatusOK {
+		t.Fatalf("usage status = %d body=%s, want 200", usageRecorder.Code, usageRecorder.Body.String())
+	}
+	var usage AutopilotQuotaUsageResponse
+	if err := json.Unmarshal(usageRecorder.Body.Bytes(), &usage); err != nil {
+		t.Fatalf("decode usage response: %v", err)
+	}
+	if usage.BlockedCounts["manual"] != 1 || usage.BlockedCounts["webhook"] != 1 {
+		t.Fatalf("blocked counts = %#v, want one manual and one webhook", usage.BlockedCounts)
+	}
 }

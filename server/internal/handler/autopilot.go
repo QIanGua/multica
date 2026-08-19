@@ -78,13 +78,14 @@ type AutopilotResponse struct {
 }
 
 type AutopilotQuotaUsageResponse struct {
-	Action      string  `json:"action"`
-	Used        *int64  `json:"used"`
-	Reserved    *int64  `json:"reserved"`
-	Limit       *int64  `json:"limit"`
-	PeriodStart *string `json:"period_start"`
-	PeriodEnd   *string `json:"period_end"`
-	ResetAt     *string `json:"reset_at"`
+	Action        string           `json:"action"`
+	Used          *int64           `json:"used"`
+	Reserved      *int64           `json:"reserved"`
+	Limit         *int64           `json:"limit"`
+	PeriodStart   *string          `json:"period_start"`
+	PeriodEnd     *string          `json:"period_end"`
+	ResetAt       *string          `json:"reset_at"`
+	BlockedCounts map[string]int64 `json:"blocked_counts"`
 }
 
 // AutopilotCollaboratorEntry is a member explicitly granted write access to an
@@ -2130,8 +2131,9 @@ func (h *Handler) TriggerAutopilot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// GetAutopilotQuotaUsage exposes only Cloud-provided interval facts. When the
-// gate is off or malformed, the service returns before any quota-table read.
+// GetAutopilotQuotaUsage exposes Cloud-provided interval facts plus durable
+// server-owned blocked counts. When the gate is off or malformed, the service
+// returns before any quota-table read.
 func (h *Handler) GetAutopilotQuotaUsage(w http.ResponseWriter, r *http.Request) {
 	workspaceID, err := util.ParseUUID(h.resolveWorkspaceID(r))
 	if err != nil {
@@ -2147,6 +2149,7 @@ func (h *Handler) GetAutopilotQuotaUsage(w http.ResponseWriter, r *http.Request)
 	if usage.Enabled {
 		resp.Action = usage.Action
 		resp.Used, resp.Reserved, resp.Limit = usage.Used, usage.Reserved, usage.Limit
+		resp.BlockedCounts = usage.BlockedCounts
 		if usage.PeriodStart != nil {
 			v := usage.PeriodStart.UTC().Format(time.RFC3339)
 			resp.PeriodStart = &v

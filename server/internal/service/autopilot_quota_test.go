@@ -38,6 +38,26 @@ type autopilotQuotaFixture struct {
 	createRunArgs db.CreateAutopilotRunParams
 }
 
+type autopilotQuotaMetricsRecorder struct {
+	mu        sync.Mutex
+	decisions map[string]int
+}
+
+func (m *autopilotQuotaMetricsRecorder) RecordAutopilotQuotaDecision(action, source, result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.decisions == nil {
+		m.decisions = make(map[string]int)
+	}
+	m.decisions[action+"\x00"+source+"\x00"+result]++
+}
+
+func (m *autopilotQuotaMetricsRecorder) count(action, source, result string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.decisions[action+"\x00"+source+"\x00"+result]
+}
+
 func newAutopilotQuotaFixture(t *testing.T, action entitlement.Action, limit int) *autopilotQuotaFixture {
 	t.Helper()
 	pool := newResolveOriginatorPool(t)
@@ -174,6 +194,9 @@ func TestAutopilotQuotaEnforcesBoundaryAndFinalizesIdempotently(t *testing.T) {
 	if err != nil || usage.Used == nil || usage.Reserved == nil || *usage.Used != 0 || *usage.Reserved != int64(limit) {
 		t.Fatalf("reserved usage = %+v, %v", usage, err)
 	}
+	if got := usage.BlockedCounts["api"]; got != 1 {
+		t.Fatalf("blocked API count = %d, want 1", got)
+	}
 	if _, err := settleAutopilotQuota(ctx, q, runs[0].QuotaReservationID, true); err != nil {
 		t.Fatalf("consume: %v", err)
 	}
@@ -245,6 +268,8 @@ func TestAutopilotQuotaConcurrentAdmissionNeverExceedsLimit(t *testing.T) {
 
 func TestAutopilotQuotaObserveToEnforceAndOffFinalization(t *testing.T) {
 	fixture := newAutopilotQuotaFixture(t, entitlement.ActionObserve, 1)
+	metrics := &autopilotQuotaMetricsRecorder{}
+	fixture.service.QuotaMetrics = metrics
 	ctx := context.Background()
 	runs := make([]db.AutopilotRun, 0, 2)
 	for i := 0; i < 2; i++ {
@@ -260,15 +285,8 @@ func TestAutopilotQuotaObserveToEnforceAndOffFinalization(t *testing.T) {
 	if err != nil || usage.Action != string(entitlement.ActionObserve) || *usage.Reserved != 2 {
 		t.Fatalf("observe usage = %+v, %v; want two reservations", usage, err)
 	}
-	var wouldBlock map[string]int64
-	if err := fixture.pool.QueryRow(ctx, `
-		SELECT would_block_counts FROM autopilot_quota_period
-		WHERE workspace_id = $1 AND period_start = $2 AND period_end = $3`,
-		fixture.workspaceID, fixture.periodStart, fixture.periodEnd).Scan(&wouldBlock); err != nil {
-		t.Fatalf("read would-block counts: %v", err)
-	}
-	if wouldBlock["api"] != 1 {
-		t.Fatalf("api would-block count = %d, want 1", wouldBlock["api"])
+	if got := metrics.count("observe", "api", "would_block"); got != 1 {
+		t.Fatalf("observed would-block metric = %d, want 1", got)
 	}
 
 	fixture.setPolicy(entitlement.ActionEnforce, fixture.periodStart, fixture.periodEnd, 1)

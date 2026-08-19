@@ -1919,6 +1919,7 @@ export const AutopilotQuotaUsageSchema = z.object({
   period_start: z.string().nullable().default(null),
   period_end: z.string().nullable().default(null),
   reset_at: z.string().nullable().default(null),
+  blocked_counts: z.record(z.string(), z.number().int().nonnegative()).nullable().catch(null).default(null),
 }).loose();
 
 export const FALLBACK_AUTOPILOT_RUN: AutopilotRun = {

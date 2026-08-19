@@ -9,7 +9,6 @@ CREATE TABLE autopilot_quota_period (
     used_count BIGINT NOT NULL DEFAULT 0 CHECK (used_count >= 0),
     reserved_count BIGINT NOT NULL DEFAULT 0 CHECK (reserved_count >= 0),
     blocked_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
-    would_block_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (period_start < period_end)
@@ -22,7 +21,7 @@ CREATE TABLE autopilot_quota_reservation (
     period_end TIMESTAMPTZ NOT NULL,
     policy_revision BIGINT NOT NULL,
     subscription_version BIGINT NOT NULL,
-    source TEXT NOT NULL CHECK (source IN ('schedule', 'manual', 'webhook', 'api')),
+    source TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'reserved'
         CHECK (state IN ('reserved', 'consumed', 'released')),

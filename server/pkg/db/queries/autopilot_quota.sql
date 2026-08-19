@@ -47,20 +47,6 @@ WHERE workspace_id = @workspace_id
   AND period_end = @period_end
 RETURNING *;
 
--- name: IncrementAutopilotQuotaWouldBlock :one
-UPDATE autopilot_quota_period
-SET would_block_counts = jsonb_set(
-        would_block_counts,
-        ARRAY[@source::text],
-        to_jsonb(COALESCE((would_block_counts ->> @source::text)::bigint, 0) + 1),
-        true
-    ),
-    updated_at = now()
-WHERE workspace_id = @workspace_id
-  AND period_start = @period_start
-  AND period_end = @period_end
-RETURNING *;
-
 -- name: ConsumeAutopilotQuotaReservation :one
 -- used_count is monotonic within a period: consuming a reserved slot is the
 -- only write that changes it, and no release path decrements it.

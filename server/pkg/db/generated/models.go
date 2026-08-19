@@ -222,16 +222,14 @@ type AutopilotCollaborator struct {
 }
 
 type AutopilotQuotaPeriod struct {
-	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
-	PeriodStart      pgtype.Timestamptz `json:"period_start"`
-	PeriodEnd        pgtype.Timestamptz `json:"period_end"`
-	UsedCount        int64              `json:"used_count"`
-	ReservedCount    int64              `json:"reserved_count"`
-	BlockedCounts    []byte             `json:"blocked_counts"`
-	WouldBlockCounts []byte             `json:"would_block_counts"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	PeriodStart   pgtype.Timestamptz `json:"period_start"`
+	PeriodEnd     pgtype.Timestamptz `json:"period_end"`
+	UsedCount     int64              `json:"used_count"`
+	ReservedCount int64              `json:"reserved_count"`
+	BlockedCounts []byte             `json:"blocked_counts"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
 type AutopilotQuotaReservation struct {

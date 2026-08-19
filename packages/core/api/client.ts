@@ -3732,6 +3732,7 @@ export class ApiClient {
         period_start: null,
         period_end: null,
         reset_at: null,
+        blocked_counts: null,
       },
       { endpoint: "GET /api/autopilots/usage" },
     );

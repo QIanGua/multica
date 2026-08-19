@@ -143,6 +143,7 @@ export interface AutopilotQuotaUsage {
   period_start: string | null;
   period_end: string | null;
   reset_at: string | null;
+  blocked_counts: Record<string, number> | null;
 }
 
 export interface AutopilotSubscriberInput {

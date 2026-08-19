@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -36,14 +37,15 @@ func (e *AutopilotQuotaExceededError) Error() string {
 // AutopilotQuotaUsage is the workspace-scoped, policy-neutral API model.
 // A disabled/malformed decision returns Enabled=false and leaves all facts nil.
 type AutopilotQuotaUsage struct {
-	Enabled     bool
-	Action      string
-	Used        *int64
-	Reserved    *int64
-	Limit       *int64
-	PeriodStart *time.Time
-	PeriodEnd   *time.Time
-	ResetAt     *time.Time
+	Enabled       bool
+	Action        string
+	Used          *int64
+	Reserved      *int64
+	Limit         *int64
+	PeriodStart   *time.Time
+	PeriodEnd     *time.Time
+	ResetAt       *time.Time
+	BlockedCounts map[string]int64
 }
 
 type autopilotQuotaPolicy struct {
@@ -180,15 +182,8 @@ func (s *AutopilotService) createAutopilotRunWithQuota(
 			Limit: policy.limit, ResetAt: policy.resetAt,
 		}
 	}
-	if wouldBlock {
-		if _, err := qtx.IncrementAutopilotQuotaWouldBlock(ctx, db.IncrementAutopilotQuotaWouldBlockParams{
-			Source: source, WorkspaceID: workspaceID,
-			PeriodStart: periodArgs.PeriodStart, PeriodEnd: periodArgs.PeriodEnd,
-		}); err != nil {
-			return db.AutopilotRun{}, false, fmt.Errorf("record observed quota admission: %w", err)
-		}
-	}
-
+	// Observe-only would-blocks stay in the bounded decision metric. Durable
+	// blocked counts back the usage API only for decisions that reject work.
 	reservation, err := qtx.CreateAutopilotQuotaReservation(ctx, db.CreateAutopilotQuotaReservationParams{
 		WorkspaceID: workspaceID, PeriodStart: periodArgs.PeriodStart, PeriodEnd: periodArgs.PeriodEnd,
 		PolicyRevision: policy.policyRevision, SubscriptionVersion: policy.subscriptionVersion,
@@ -310,10 +305,20 @@ func (s *AutopilotService) AutopilotQuotaUsage(ctx context.Context, workspaceID 
 	} else if err != nil {
 		return AutopilotQuotaUsage{}, fmt.Errorf("load autopilot quota usage: %w", err)
 	}
+	blockedCounts := make(map[string]int64)
+	if len(period.BlockedCounts) > 0 {
+		if err := json.Unmarshal(period.BlockedCounts, &blockedCounts); err != nil {
+			return AutopilotQuotaUsage{}, fmt.Errorf("decode autopilot quota blocked counts: %w", err)
+		}
+		if blockedCounts == nil {
+			blockedCounts = make(map[string]int64)
+		}
+	}
 	return AutopilotQuotaUsage{
 		Enabled: true, Action: string(policy.action),
 		Used: &period.UsedCount, Reserved: &period.ReservedCount, Limit: &policy.limit,
 		PeriodStart: &policy.periodStart, PeriodEnd: &policy.periodEnd, ResetAt: &policy.resetAt,
+		BlockedCounts: blockedCounts,
 	}, nil
 }
 
