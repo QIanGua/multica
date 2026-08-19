@@ -297,11 +297,12 @@ RETURNING *;
 -- a second run for the same (trigger_id, planned_at) pair (MUL-3551).
 INSERT INTO autopilot_run (
     autopilot_id, trigger_id, source, status, trigger_payload, squad_id, planned_at,
-    webhook_delivery_id
+    webhook_delivery_id, quota_reservation_id, reason_code
 ) VALUES (
     $1, sqlc.narg('trigger_id'), $2, $3, sqlc.narg('trigger_payload'),
     sqlc.narg('squad_id'), sqlc.narg('planned_at'),
-    sqlc.narg('webhook_delivery_id')
+    sqlc.narg('webhook_delivery_id'), sqlc.narg('quota_reservation_id'),
+    sqlc.narg('reason_code')
 ) RETURNING *;
 
 -- name: GetAutopilotRunByTriggerAndPlanned :one
@@ -323,6 +324,11 @@ SELECT * FROM autopilot_run
 WHERE webhook_delivery_id = $1
 LIMIT 1;
 
+-- name: GetAutopilotRunByQuotaReservation :one
+SELECT * FROM autopilot_run
+WHERE quota_reservation_id = $1
+LIMIT 1;
+
 -- name: RecoverPartialAutopilotRun :exec
 -- Recovers a partial-state autopilot_run from a crashed first attempt
 -- (the runner wrote the run row but died before creating the downstream
@@ -338,6 +344,7 @@ UPDATE autopilot_run
 SET status = 'failed',
     completed_at = now(),
     failure_reason = 'recovered partial dispatch (crashed before downstream creation)',
+    reason_code = 'internal_error',
     planned_at = NULL
 WHERE id = $1;
 
@@ -371,7 +378,8 @@ RETURNING *;
 
 -- name: UpdateAutopilotRunFailed :one
 UPDATE autopilot_run
-SET status = 'failed', completed_at = now(), failure_reason = $2
+SET status = 'failed', completed_at = now(), failure_reason = $2,
+    reason_code = sqlc.narg('reason_code')
 WHERE id = $1
 RETURNING *;
 
@@ -383,7 +391,8 @@ RETURNING *;
 -- MUL-1899). Recording the skip + reason gives the UI / failure monitor / ops
 -- a paper trail without polluting the failure ratio.
 UPDATE autopilot_run
-SET status = 'skipped', completed_at = now(), failure_reason = $2
+SET status = 'skipped', completed_at = now(), failure_reason = $2,
+    reason_code = sqlc.narg('reason_code')
 WHERE id = $1
 RETURNING *;
 
@@ -484,13 +493,14 @@ SELECT * FROM autopilot_run
 WHERE issue_id = $1 AND status IN ('issue_created', 'running')
 LIMIT 1;
 
--- name: FailAutopilotRunsByIssue :exec
+-- name: FailAutopilotRunsByIssue :many
 -- Fails active autopilot runs linked to a given issue.
 -- Must be called BEFORE issue deletion (ON DELETE SET NULL clears issue_id).
 UPDATE autopilot_run
 SET status = 'failed', completed_at = now(), failure_reason = 'linked issue was deleted'
 WHERE issue_id = $1
-  AND status IN ('issue_created', 'running');
+  AND status IN ('issue_created', 'running')
+RETURNING *;
 
 -- =====================
 -- Failure-rate auto-pause

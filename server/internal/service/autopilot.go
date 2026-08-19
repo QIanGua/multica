@@ -16,6 +16,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/attribution"
 	"github.com/multica-ai/multica/server/internal/dispatch"
+	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/issueguard"
 	"github.com/multica-ai/multica/server/internal/issueposition"
@@ -32,10 +33,12 @@ type TxStarter interface {
 }
 
 type AutopilotService struct {
-	Queries   *db.Queries
-	TxStarter TxStarter
-	Bus       *events.Bus
-	TaskSvc   *TaskService
+	Queries      *db.Queries
+	TxStarter    TxStarter
+	Bus          *events.Bus
+	TaskSvc      *TaskService
+	Entitlements entitlement.Provider
+	QuotaMetrics AutopilotQuotaMetrics
 }
 
 // DefaultAutopilotTriggerTimezone is the timezone used to render Autopilot
@@ -124,7 +127,7 @@ func (s *AutopilotService) DispatchAutopilot(
 	// callers don't surface a per-run reason code to a human, so it is dropped.
 	// webhookDeliveryID is invalid here — durable webhook deliveries admit through
 	// AdmitAutopilotWebhookDelivery instead of this entry point.
-	run, _, err := s.dispatchAutopilot(ctx, autopilot, triggerID, source, payload, pgtype.Timestamptz{}, pgtype.UUID{}, pgtype.UUID{})
+	run, _, err := s.dispatchAutopilot(ctx, autopilot, triggerID, source, payload, pgtype.Timestamptz{}, pgtype.UUID{}, pgtype.UUID{}, source+":"+newAutopilotIdempotencyKey())
 	return run, err
 }
 
@@ -141,10 +144,24 @@ func (s *AutopilotService) DispatchAutopilotManual(
 	payload []byte,
 	actorUserID pgtype.UUID,
 ) (*db.AutopilotRun, dispatch.ReasonCode, error) {
+	return s.DispatchAutopilotManualWithKey(ctx, autopilot, triggerID, payload, actorUserID, newAutopilotIdempotencyKey())
+}
+
+// DispatchAutopilotManualWithKey preserves a caller-supplied request key so
+// retrying the same HTTP request cannot reserve or execute twice.
+func (s *AutopilotService) DispatchAutopilotManualWithKey(
+	ctx context.Context,
+	autopilot db.Autopilot,
+	triggerID pgtype.UUID,
+	payload []byte,
+	actorUserID pgtype.UUID,
+	idempotencyKey string,
+) (*db.AutopilotRun, dispatch.ReasonCode, error) {
 	// The manual path is the one surface that shows a per-run outcome to a human,
 	// so it returns the typed reason code decided at the admission source. No
 	// webhook delivery on the manual path.
-	return s.dispatchAutopilot(ctx, autopilot, triggerID, "manual", payload, pgtype.Timestamptz{}, pgtype.UUID{}, actorUserID)
+	key := "manual:" + util.UUIDToString(autopilot.ID) + ":" + idempotencyKey
+	return s.dispatchAutopilot(ctx, autopilot, triggerID, "manual", payload, pgtype.Timestamptz{}, pgtype.UUID{}, actorUserID, key)
 }
 
 // AdmitAutopilotWebhookDelivery creates or reuses the idempotent run for a
@@ -198,7 +215,7 @@ func (s *AutopilotService) AdmitAutopilotWebhookDelivery(
 	if autopilot.ExecutionMode == "run_only" {
 		initialStatus = "running"
 	}
-	run, err := s.Queries.CreateAutopilotRun(ctx, db.CreateAutopilotRunParams{
+	run, _, err := s.createAutopilotRunWithQuota(ctx, autopilot.WorkspaceID, "webhook", "webhook:"+util.UUIDToString(deliveryID), db.CreateAutopilotRunParams{
 		AutopilotID:       autopilot.ID,
 		TriggerID:         triggerID,
 		Source:            "webhook",
@@ -398,7 +415,7 @@ func (s *AutopilotService) DispatchAutopilotForPlan(
 			"issue_set", existing.IssueID.Valid,
 			"task_set", existing.TaskID.Valid,
 		)
-		if err := s.Queries.RecoverPartialAutopilotRun(ctx, existing.ID); err != nil {
+		if err := s.recoverPartialAutopilotRun(ctx, existing); err != nil {
 			return nil, fmt.Errorf("dispatch for plan: recover partial run: %w", err)
 		}
 		// Fall through to a fresh dispatch below.
@@ -410,7 +427,8 @@ func (s *AutopilotService) DispatchAutopilotForPlan(
 	// Scheduled dispatch has no member actor → rule_owner attribution, and no
 	// human surface for a per-run reason code, so it is dropped. No webhook
 	// delivery on the scheduled-plan path.
-	run, _, err := s.dispatchAutopilot(ctx, autopilot, triggerID, source, payload, plannedTS, pgtype.UUID{}, pgtype.UUID{})
+	key := "schedule:" + util.UUIDToString(triggerID) + ":" + plannedAt.UTC().Format(time.RFC3339Nano)
+	run, _, err := s.dispatchAutopilot(ctx, autopilot, triggerID, source, payload, plannedTS, pgtype.UUID{}, pgtype.UUID{}, key)
 	return run, err
 }
 
@@ -463,6 +481,7 @@ func (s *AutopilotService) dispatchAutopilot(
 	plannedAt pgtype.Timestamptz,
 	webhookDeliveryID pgtype.UUID,
 	actorUserID pgtype.UUID,
+	idempotencyKey string,
 ) (*db.AutopilotRun, dispatch.ReasonCode, error) {
 	if reason, code, skip := s.shouldSkipDispatch(ctx, autopilot, actorUserID); skip {
 		run, err := s.recordSkippedRun(ctx, autopilot, triggerID, source, payload, plannedAt, webhookDeliveryID, reason)
@@ -475,7 +494,7 @@ func (s *AutopilotService) dispatchAutopilot(
 		initialStatus = "running"
 	}
 
-	run, err := s.Queries.CreateAutopilotRun(ctx, db.CreateAutopilotRunParams{
+	run, reused, err := s.createAutopilotRunWithQuota(ctx, autopilot.WorkspaceID, source, idempotencyKey, db.CreateAutopilotRunParams{
 		AutopilotID:       autopilot.ID,
 		TriggerID:         triggerID,
 		Source:            source,
@@ -486,7 +505,15 @@ func (s *AutopilotService) dispatchAutopilot(
 		WebhookDeliveryID: webhookDeliveryID,
 	})
 	if err != nil {
+		var quotaErr *AutopilotQuotaExceededError
+		if errors.As(err, &quotaErr) && source == "schedule" {
+			skipped, skipErr := s.recordSkippedRun(ctx, autopilot, triggerID, source, payload, plannedAt, webhookDeliveryID, quotaErr.Error(), dispatch.ReasonQuotaExceeded)
+			return skipped, dispatch.ReasonQuotaExceeded, skipErr
+		}
 		return nil, dispatch.ReasonInternalError, fmt.Errorf("create run: %w", err)
+	}
+	if reused {
+		return &run, dispatch.ReasonCode(run.ReasonCode.String), nil
 	}
 	s.captureAutopilotRunStarted(autopilot, run, source)
 	return s.dispatchAutopilotRun(ctx, autopilot, triggerID, source, &run, actorUserID)
@@ -676,6 +703,9 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		return fmt.Errorf("link run to issue: %w", err)
 	}
 	*run = updatedRun
+	if err := settleAutopilotQuota(ctx, qtx, run.QuotaReservationID, true); err != nil {
+		return fmt.Errorf("consume quota reservation: %w", err)
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
@@ -983,7 +1013,7 @@ func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue)
 
 	switch effectiveStatus {
 	case "done", "in_review":
-		updatedRun, err := s.Queries.UpdateAutopilotRunCompleted(ctx, db.UpdateAutopilotRunCompletedParams{
+		updatedRun, err := s.completeAutopilotRun(ctx, db.UpdateAutopilotRunCompletedParams{
 			ID: run.ID,
 		})
 		if err != nil {
@@ -994,7 +1024,7 @@ func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue)
 		s.publishRunDone(wsID, updatedRun, "completed")
 	case "cancelled", "blocked":
 		reason := "issue " + issue.Status
-		updatedRun, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
+		updatedRun, err := s.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
 			ID:            run.ID,
 			FailureReason: pgtype.Text{String: reason, Valid: true},
 		})
@@ -1026,7 +1056,7 @@ func (s *AutopilotService) SyncRunFromTask(ctx context.Context, task db.AgentTas
 
 	switch task.Status {
 	case "completed":
-		updatedRun, err := s.Queries.UpdateAutopilotRunCompleted(ctx, db.UpdateAutopilotRunCompletedParams{
+		updatedRun, err := s.completeAutopilotRun(ctx, db.UpdateAutopilotRunCompletedParams{
 			ID:     run.ID,
 			Result: task.Result,
 		})
@@ -1041,7 +1071,7 @@ func (s *AutopilotService) SyncRunFromTask(ctx context.Context, task db.AgentTas
 		if task.Error.Valid {
 			reason = task.Error.String
 		}
-		updatedRun, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
+		updatedRun, err := s.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
 			ID:            run.ID,
 			FailureReason: pgtype.Text{String: reason, Valid: true},
 		})
@@ -1100,7 +1130,7 @@ func (s *AutopilotService) SyncRunFromLinkedIssueTask(ctx context.Context, task 
 	}
 
 	reason := taskFailureReasonForAutopilotRun(task)
-	updatedRun, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
+	updatedRun, err := s.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
 		ID:            run.ID,
 		FailureReason: pgtype.Text{String: reason, Valid: reason != ""},
 	})
@@ -1141,9 +1171,10 @@ func (s *AutopilotService) handleDispatchSkip(ctx context.Context, ap db.Autopil
 	if !errors.As(err, &skipErr) {
 		return nil, ""
 	}
-	updated, uerr := s.Queries.UpdateAutopilotRunSkipped(ctx, db.UpdateAutopilotRunSkippedParams{
+	updated, uerr := s.skipAutopilotRun(ctx, db.UpdateAutopilotRunSkippedParams{
 		ID:            run.ID,
 		FailureReason: pgtype.Text{String: skipErr.reason, Valid: true},
+		ReasonCode:    pgtype.Text{String: string(skipErr.code), Valid: skipErr.code != ""},
 	})
 	if uerr != nil {
 		slog.Warn("failed to mark dispatch as skipped",
@@ -1169,9 +1200,10 @@ func (s *AutopilotService) handleDispatchSkip(ctx context.Context, ap db.Autopil
 }
 
 func (s *AutopilotService) failRun(ctx context.Context, runID pgtype.UUID, reason string) {
-	if _, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
+	if _, err := s.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
 		ID:            runID,
 		FailureReason: pgtype.Text{String: reason, Valid: true},
+		ReasonCode:    pgtype.Text{String: string(dispatch.ReasonInternalError), Valid: true},
 	}); err != nil {
 		slog.Warn("failed to mark autopilot run as failed", "run_id", util.UUIDToString(runID), "error", err)
 	}
@@ -1369,7 +1401,12 @@ func (s *AutopilotService) recordSkippedRun(
 	plannedAt pgtype.Timestamptz,
 	webhookDeliveryID pgtype.UUID,
 	reason string,
+	reasonCode ...dispatch.ReasonCode,
 ) (*db.AutopilotRun, error) {
+	code := pgtype.Text{}
+	if len(reasonCode) > 0 && reasonCode[0] != "" {
+		code = pgtype.Text{String: string(reasonCode[0]), Valid: true}
+	}
 	run, err := s.Queries.CreateAutopilotRun(ctx, db.CreateAutopilotRunParams{
 		AutopilotID:       autopilot.ID,
 		TriggerID:         triggerID,
@@ -1379,6 +1416,7 @@ func (s *AutopilotService) recordSkippedRun(
 		SquadID:           autopilotSquadAttribution(autopilot),
 		PlannedAt:         plannedAt,
 		WebhookDeliveryID: webhookDeliveryID,
+		ReasonCode:        code,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create skipped run: %w", err)
@@ -1387,6 +1425,7 @@ func (s *AutopilotService) recordSkippedRun(
 	updated, err := s.Queries.UpdateAutopilotRunSkipped(ctx, db.UpdateAutopilotRunSkippedParams{
 		ID:            run.ID,
 		FailureReason: pgtype.Text{String: reason, Valid: true},
+		ReasonCode:    code,
 	})
 	if err == nil {
 		run = updated

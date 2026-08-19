@@ -3667,7 +3667,7 @@ func (h *Handler) DeleteIssue(w http.ResponseWriter, r *http.Request) {
 
 	h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
 	// Fail any linked autopilot runs before delete (ON DELETE SET NULL clears issue_id).
-	h.Queries.FailAutopilotRunsByIssue(r.Context(), issue.ID)
+	_ = h.AutopilotService.FailAutopilotRunsByIssue(r.Context(), issue.ID)
 
 	attachmentURLs, err := h.deleteIssueAndCollectAttachmentURLs(r.Context(), issue)
 	if err != nil {
@@ -4133,7 +4133,7 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
-		h.Queries.FailAutopilotRunsByIssue(r.Context(), issue.ID)
+		_ = h.AutopilotService.FailAutopilotRunsByIssue(r.Context(), issue.ID)
 
 		attachmentURLs, err := h.deleteIssueAndCollectAttachmentURLs(r.Context(), issue)
 		if err != nil {

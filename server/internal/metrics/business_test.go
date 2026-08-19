@@ -176,6 +176,11 @@ func TestBusinessMetricsRegistryExposesAllFamilies(t *testing.T) {
 	m.RecordCloudRuntimeRequest("provision", "ok", 0.5)
 	m.RecordDaemonWSMessageReceived("heartbeat")
 	m.RecordChatOutputLocalPath("file_url")
+	m.RecordEntitlementCache("hit")
+	m.RecordEntitlementRefresh("success", 0.01)
+	m.RecordEntitlementDecision("autopilot_runs", "observe", "cache_fresh")
+	m.RecordEntitlementVersionRegression("refresh")
+	m.RecordAutopilotQuotaDecision("observe", "manual", "admitted")
 
 	families, err := registry.Gather()
 	if err != nil {
