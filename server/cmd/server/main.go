@@ -61,6 +61,13 @@ func channelLeaseRedisURLFromEnv() string {
 	return strings.TrimSpace(os.Getenv("REDIS_URL"))
 }
 
+func realtimeRelayRedisURLFromEnv() string {
+	if dedicated := strings.TrimSpace(os.Getenv("REALTIME_RELAY_REDIS_URL")); dedicated != "" {
+		return dedicated
+	}
+	return strings.TrimSpace(os.Getenv("REDIS_URL"))
+}
+
 func closeRedisClient(label string, client *redis.Client) {
 	if client == nil {
 		return
@@ -77,7 +84,14 @@ func shardedRelayConfigFromEnv() realtime.ShardedStreamRelayConfig {
 	cfg.ReadCount = envPositiveInt64("REALTIME_RELAY_XREAD_COUNT", cfg.ReadCount)
 	cfg.ReadBlock = envDuration("REALTIME_RELAY_XREAD_BLOCK", cfg.ReadBlock)
 	cfg.ReplayGrace = envDuration("REALTIME_RELAY_REPLAY_GRACE", cfg.ReplayGrace)
-	return cfg
+	cfg.TrimHorizon = envDuration("REALTIME_RELAY_TRIM_HORIZON", 2*cfg.ReplayGrace)
+	cfg.StreamTTL = envDuration("REALTIME_RELAY_STREAM_TTL", cfg.TrimHorizon+cfg.ReplayGrace)
+	cfg.TTLRefreshInterval = envDuration("REALTIME_RELAY_TTL_REFRESH_INTERVAL", cfg.TTLRefreshInterval)
+	cfg.MaintenanceInterval = envDuration("REALTIME_RELAY_MAINTENANCE_INTERVAL", cfg.MaintenanceInterval)
+	if err := cfg.Validate(); err != nil {
+		slog.Warn("invalid realtime relay retention config; normalizing to safe values", "error", err)
+	}
+	return cfg.Normalized()
 }
 
 func realtimeRelayModeFromEnv() string {
@@ -338,15 +352,23 @@ func main() {
 		closeRedisClient("channel-lease", channelLeaseRedis)
 		closeRedisClient("store", storeRedis)
 	}()
-	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
-		opts, err := redis.ParseURL(redisURL)
-		if err != nil {
-			slog.Error("invalid REDIS_URL — falling back to in-memory hub", "error", err)
+	sharedRedisURL := strings.TrimSpace(os.Getenv("REDIS_URL"))
+	relayRedisURL := realtimeRelayRedisURLFromEnv()
+	if (sharedRedisURL != "" || relayRedisURL != "") && envBool("REDIS_DISABLE_CLIENT_NAME", false) {
+		slog.Info("redis: CLIENT SETNAME disabled (REDIS_DISABLE_CLIENT_NAME=true) for managed Redis compatibility")
+	}
+	if sharedRedisURL != "" {
+		if opts, err := redis.ParseURL(sharedRedisURL); err != nil {
+			slog.Error("invalid REDIS_URL — request-path Redis features disabled", "error", err)
 		} else {
-			if envBool("REDIS_DISABLE_CLIENT_NAME", false) {
-				slog.Info("redis: CLIENT SETNAME disabled (REDIS_DISABLE_CLIENT_NAME=true) for managed Redis compatibility")
-			}
 			storeRedis = newNamedRedisClient(opts, "store")
+		}
+	}
+	if relayRedisURL != "" {
+		opts, err := redis.ParseURL(relayRedisURL)
+		if err != nil {
+			slog.Error("invalid realtime relay Redis URL — falling back to in-memory hub", "error", err)
+		} else {
 			relayWriteRedis = newNamedRedisClient(opts, "realtime-write")
 
 			relayMode := realtimeRelayModeFromEnv()
@@ -373,21 +395,29 @@ func main() {
 			}
 			relay.Start(relayCtx)
 			broadcaster = realtime.NewDualWriteBroadcaster(hub, relay)
+			storePoolSize := 0
+			if storeRedis != nil {
+				storePoolSize = storeRedis.Options().PoolSize
+			}
 			slog.Info(
 				"realtime: Redis relay enabled",
 				"node_id", relay.NodeID(),
 				"mode", relayMode,
+				"dedicated_instance", strings.TrimSpace(os.Getenv("REALTIME_RELAY_REDIS_URL")) != "",
 				"shards", relayConfig.Shards,
 				"stream_max_len", relayConfig.StreamMaxLen,
+				"replay_grace", relayConfig.ReplayGrace.String(),
+				"trim_horizon", relayConfig.TrimHorizon.String(),
+				"stream_ttl", relayConfig.StreamTTL.String(),
 				"xread_count", relayConfig.ReadCount,
 				"xread_block", relayConfig.ReadBlock.String(),
-				"store_pool_size", opts.PoolSize,
+				"store_pool_size", storePoolSize,
 				"realtime_write_pool_size", opts.PoolSize,
 				"realtime_read_pool_size", opts.PoolSize,
 			)
 		}
 	} else {
-		slog.Info("realtime: REDIS_URL not set — using in-memory hub (single-node mode)")
+		slog.Info("realtime: REDIS_URL and REALTIME_RELAY_REDIS_URL are unset — using in-memory hub (single-node mode)")
 	}
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_BACKEND")), "redis") {
 		leaseRedisURL := channelLeaseRedisURLFromEnv()

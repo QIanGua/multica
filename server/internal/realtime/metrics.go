@@ -37,15 +37,25 @@ type Metrics struct {
 	scopeRooms           sync.Map
 
 	// Redis relay counters. Zero unless the Redis broadcaster is enabled.
-	RedisXAddTotal             atomic.Int64
-	RedisXAddErrors            atomic.Int64
-	RedisXReadTotal            atomic.Int64
-	RedisXReadErrors           atomic.Int64
-	RedisAckTotal              atomic.Int64
-	RedisLastXAddLagMicros     atomic.Int64
-	RedisMirrorPrimaryErrors   atomic.Int64
-	RedisMirrorSecondaryErrors atomic.Int64
-	RedisMirrorDivergenceTotal atomic.Int64
+	RedisXAddTotal               atomic.Int64
+	RedisXAddErrors              atomic.Int64
+	RedisXReadTotal              atomic.Int64
+	RedisXReadErrors             atomic.Int64
+	RedisAckTotal                atomic.Int64
+	RedisLastXAddLagMicros       atomic.Int64
+	RedisMirrorPrimaryErrors     atomic.Int64
+	RedisMirrorSecondaryErrors   atomic.Int64
+	RedisMirrorDivergenceTotal   atomic.Int64
+	RedisRelayStreamTrimmedTotal atomic.Int64
+	RedisRelayStreamMissingTotal atomic.Int64
+	RedisRelayRetentionErrors    atomic.Int64
+	RedisRelayStreamsWithoutTTL  atomic.Int64
+	RedisUsedMemoryBytes         atomic.Int64
+	RedisMaxMemoryBytes          atomic.Int64
+	RedisEvictedKeys             atomic.Int64
+
+	redisStreamsMu sync.RWMutex
+	redisStreams   map[string]RedisStreamObservation
 
 	// RedisConnected is set by the relay on startup / reconnect.
 	RedisConnected atomic.Bool
@@ -55,6 +65,15 @@ type Metrics struct {
 
 	// NodeID is set once at boot by the relay (or empty in single-node mode).
 	NodeID atomic.Value // string
+}
+
+// RedisStreamObservation is the latest low-frequency retention sample for one
+// relay stream. PTTLMillis uses Redis sentinel values: -1 means no expiry and
+// -2 means the key does not exist.
+type RedisStreamObservation struct {
+	Entries     int64 `json:"entries"`
+	MemoryBytes int64 `json:"memory_bytes"`
+	PTTLMillis  int64 `json:"pttl_millis"`
 }
 
 // M is the package-level metrics singleton.
@@ -112,6 +131,31 @@ func (m *Metrics) lastRedisErr() string {
 	return m.redisLastErr
 }
 
+// ObserveRedisStream replaces the latest sampled statistics for stream.
+func (m *Metrics) ObserveRedisStream(stream string, entries, memoryBytes, pttlMillis int64) {
+	m.redisStreamsMu.Lock()
+	defer m.redisStreamsMu.Unlock()
+	if m.redisStreams == nil {
+		m.redisStreams = make(map[string]RedisStreamObservation)
+	}
+	m.redisStreams[stream] = RedisStreamObservation{
+		Entries:     entries,
+		MemoryBytes: memoryBytes,
+		PTTLMillis:  pttlMillis,
+	}
+}
+
+// RedisStreamObservations returns a copy safe for metrics collection.
+func (m *Metrics) RedisStreamObservations() map[string]RedisStreamObservation {
+	m.redisStreamsMu.RLock()
+	defer m.redisStreamsMu.RUnlock()
+	out := make(map[string]RedisStreamObservation, len(m.redisStreams))
+	for stream, observation := range m.redisStreams {
+		out[stream] = observation
+	}
+	return out
+}
+
 func snapshotCounters(s *sync.Map) map[string]int64 {
 	out := map[string]int64{}
 	s.Range(func(k, v any) bool {
@@ -161,6 +205,14 @@ func (m *Metrics) Snapshot() map[string]any {
 			"mirror_primary_errors":   m.RedisMirrorPrimaryErrors.Load(),
 			"mirror_secondary_errors": m.RedisMirrorSecondaryErrors.Load(),
 			"mirror_divergence_total": m.RedisMirrorDivergenceTotal.Load(),
+			"stream_trimmed_total":    m.RedisRelayStreamTrimmedTotal.Load(),
+			"stream_missing_total":    m.RedisRelayStreamMissingTotal.Load(),
+			"retention_errors":        m.RedisRelayRetentionErrors.Load(),
+			"streams_without_ttl":     m.RedisRelayStreamsWithoutTTL.Load(),
+			"used_memory_bytes":       m.RedisUsedMemoryBytes.Load(),
+			"max_memory_bytes":        m.RedisMaxMemoryBytes.Load(),
+			"evicted_keys":            m.RedisEvictedKeys.Load(),
+			"streams":                 m.RedisStreamObservations(),
 			"last_error":              m.lastRedisErr(),
 		},
 	}
@@ -189,6 +241,16 @@ func (m *Metrics) Reset() {
 	m.RedisMirrorPrimaryErrors.Store(0)
 	m.RedisMirrorSecondaryErrors.Store(0)
 	m.RedisMirrorDivergenceTotal.Store(0)
+	m.RedisRelayStreamTrimmedTotal.Store(0)
+	m.RedisRelayStreamMissingTotal.Store(0)
+	m.RedisRelayRetentionErrors.Store(0)
+	m.RedisRelayStreamsWithoutTTL.Store(0)
+	m.RedisUsedMemoryBytes.Store(0)
+	m.RedisMaxMemoryBytes.Store(0)
+	m.RedisEvictedKeys.Store(0)
+	m.redisStreamsMu.Lock()
+	m.redisStreams = nil
+	m.redisStreamsMu.Unlock()
 	m.RedisConnected.Store(false)
 	m.SetRedisLastError("")
 }

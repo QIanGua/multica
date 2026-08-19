@@ -29,6 +29,35 @@ func TestShardedStreamRelayConfigDefaults(t *testing.T) {
 	if relay.config.ReplayGrace != defaultShardedRelayReplayGrace {
 		t.Fatalf("expected default replay grace %s, got %s", defaultShardedRelayReplayGrace, relay.config.ReplayGrace)
 	}
+	if relay.config.TrimHorizon != defaultRelayStreamTrimHorizon {
+		t.Fatalf("expected default trim horizon %s, got %s", defaultRelayStreamTrimHorizon, relay.config.TrimHorizon)
+	}
+	if relay.config.StreamTTL != defaultRelayStreamTTL {
+		t.Fatalf("expected default stream TTL %s, got %s", defaultRelayStreamTTL, relay.config.StreamTTL)
+	}
+	if err := relay.config.Validate(); err != nil {
+		t.Fatalf("default config is invalid: %v", err)
+	}
+}
+
+func TestShardedStreamRelayConfigNormalizesRetentionInvariants(t *testing.T) {
+	cfg := ShardedStreamRelayConfig{
+		ReplayGrace:         20 * time.Minute,
+		TrimHorizon:         10 * time.Minute,
+		StreamTTL:           15 * time.Minute,
+		TTLRefreshInterval:  time.Hour,
+		MaintenanceInterval: time.Hour,
+	}.Normalized()
+
+	if cfg.TrimHorizon != 40*time.Minute {
+		t.Fatalf("trim horizon = %s, want 40m", cfg.TrimHorizon)
+	}
+	if cfg.StreamTTL != 60*time.Minute {
+		t.Fatalf("stream TTL = %s, want 60m", cfg.StreamTTL)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("normalized config is invalid: %v", err)
+	}
 }
 
 func TestShardedStreamRelayShardForScopeIsStableAndBounded(t *testing.T) {
@@ -164,5 +193,72 @@ func TestShardedStreamRelayReadShardOnceReplaysRetainedMessages(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestShardedStreamRelayMaintenanceTrimsExactlyAndRepairsTTL(t *testing.T) {
+	M.Reset()
+	t.Cleanup(M.Reset)
+	rdb, mock := redismock.NewClientMock()
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	now := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	relay := NewShardedStreamRelay(NewHub(), rdb, rdb, ShardedStreamRelayConfig{
+		Shards:      1,
+		ReplayGrace: 5 * time.Minute,
+		TrimHorizon: 10 * time.Minute,
+		StreamTTL:   15 * time.Minute,
+	})
+	relay.now = func() time.Time { return now }
+	relay.ttl.now = relay.now
+	stream := ShardedStreamKey(0)
+	minID := streamMinID(now, 10*time.Minute)
+
+	mock.ExpectExists(stream).SetVal(1)
+	mock.ExpectXTrimMinID(stream, minID).SetVal(17)
+	mock.ExpectPTTL(stream).SetVal(-1)
+	mock.ExpectPExpire(stream, 15*time.Minute).SetVal(true)
+	mock.ExpectXLen(stream).SetVal(23)
+	mock.ExpectMemoryUsage(stream).SetVal(4096)
+	mock.ExpectInfo("memory").SetVal("used_memory:8192\r\nmaxmemory:65536\r\n")
+	mock.ExpectInfo("stats").SetVal("evicted_keys:3\r\n")
+
+	relay.maintainStreams(context.Background())
+
+	if got := M.RedisRelayStreamTrimmedTotal.Load(); got != 17 {
+		t.Fatalf("trimmed total = %d, want 17", got)
+	}
+	observation := M.RedisStreamObservations()[stream]
+	if observation.Entries != 23 || observation.MemoryBytes != 4096 || observation.PTTLMillis != (15*time.Minute).Milliseconds() {
+		t.Fatalf("unexpected observation: %+v", observation)
+	}
+	if got := M.RedisUsedMemoryBytes.Load(); got != 8192 {
+		t.Fatalf("used memory = %d, want 8192", got)
+	}
+	if got := M.RedisMaxMemoryBytes.Load(); got != 65536 {
+		t.Fatalf("max memory = %d, want 65536", got)
+	}
+	if got := M.RedisEvictedKeys.Load(); got != 3 {
+		t.Fatalf("evicted keys = %d, want 3", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShardedStreamRelayMissingTransitionResetsGenerationOnce(t *testing.T) {
+	M.Reset()
+	t.Cleanup(M.Reset)
+	relay := NewShardedStreamRelay(NewHub(), nil, nil, ShardedStreamRelayConfig{Shards: 1})
+
+	relay.updateStreamPresence(0, true)
+	relay.updateStreamPresence(0, false)
+	relay.updateStreamPresence(0, false)
+
+	if got := relay.streamGeneration[0].Load(); got != 1 {
+		t.Fatalf("generation = %d, want 1", got)
+	}
+	if got := M.RedisRelayStreamMissingTotal.Load(); got != 1 {
+		t.Fatalf("missing total = %d, want 1", got)
 	}
 }

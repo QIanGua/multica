@@ -55,6 +55,56 @@ func TestChannelLeaseRedisURLFromEnvFallsBackToSharedRedis(t *testing.T) {
 	}
 }
 
+func TestRealtimeRelayRedisURLFromEnvPrefersDedicatedInstance(t *testing.T) {
+	t.Setenv("REDIS_URL", "redis://shared:6379/0")
+	t.Setenv("REALTIME_RELAY_REDIS_URL", " redis://relay:6379/0 ")
+	if got := realtimeRelayRedisURLFromEnv(); got != "redis://relay:6379/0" {
+		t.Fatalf("realtime relay Redis URL = %q", got)
+	}
+}
+
+func TestRealtimeRelayRedisURLFromEnvFallsBackToSharedRedis(t *testing.T) {
+	t.Setenv("REDIS_URL", " redis://shared:6379/0 ")
+	t.Setenv("REALTIME_RELAY_REDIS_URL", "")
+	if got := realtimeRelayRedisURLFromEnv(); got != "redis://shared:6379/0" {
+		t.Fatalf("realtime relay Redis URL = %q", got)
+	}
+}
+
+func TestShardedRelayConfigFromEnvDerivesSafeRetention(t *testing.T) {
+	t.Setenv("REALTIME_RELAY_REPLAY_GRACE", "20m")
+	t.Setenv("REALTIME_RELAY_TRIM_HORIZON", "")
+	t.Setenv("REALTIME_RELAY_STREAM_TTL", "")
+
+	cfg := shardedRelayConfigFromEnv()
+	if cfg.TrimHorizon != 40*time.Minute {
+		t.Fatalf("trim horizon = %s, want 40m", cfg.TrimHorizon)
+	}
+	if cfg.StreamTTL != 60*time.Minute {
+		t.Fatalf("stream TTL = %s, want 60m", cfg.StreamTTL)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("derived retention config is invalid: %v", err)
+	}
+}
+
+func TestShardedRelayConfigFromEnvNormalizesUnsafeOverrides(t *testing.T) {
+	t.Setenv("REALTIME_RELAY_REPLAY_GRACE", "5m")
+	t.Setenv("REALTIME_RELAY_TRIM_HORIZON", "4m")
+	t.Setenv("REALTIME_RELAY_STREAM_TTL", "3m")
+
+	cfg := shardedRelayConfigFromEnv()
+	if cfg.TrimHorizon != 10*time.Minute {
+		t.Fatalf("trim horizon = %s, want 10m", cfg.TrimHorizon)
+	}
+	if cfg.StreamTTL != 15*time.Minute {
+		t.Fatalf("stream TTL = %s, want 15m", cfg.StreamTTL)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("normalized retention config is invalid: %v", err)
+	}
+}
+
 func TestNewNamedRedisClient_SetsClientName(t *testing.T) {
 	t.Setenv("REDIS_DISABLE_CLIENT_NAME", "")
 	base := &redis.Options{Addr: "localhost:6379"}
