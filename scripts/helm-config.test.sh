@@ -22,6 +22,8 @@ default_config="$(
     --show-only templates/configmap.yaml
 )"
 require_rendered_value "$default_config" 'MULTICA_VCS_INTEGRATION_ENABLED: "true"'
+require_rendered_value "$default_config" 'MULTICA_ENTITLEMENT_POLICY_ENABLED: "false"'
+require_rendered_value "$default_config" 'MULTICA_ENTITLEMENT_POLICY_URL: ""'
 
 disabled_config="$(
   helm template multica "$CHART_DIR" \
@@ -29,5 +31,20 @@ disabled_config="$(
     --set backend.config.vcsIntegrationEnabled=false
 )"
 require_rendered_value "$disabled_config" 'MULTICA_VCS_INTEGRATION_ENABLED: "false"'
+
+entitlement_config="$(
+  helm template multica "$CHART_DIR" \
+    --show-only templates/configmap.yaml \
+    --set backend.config.entitlementPolicy.enabled=true \
+    --set-string backend.config.entitlementPolicy.url=http://multica-cloud.internal:8080 \
+    --set-string backend.config.entitlementPolicy.timeout=2s \
+    --set-string backend.config.entitlementPolicy.staleGrace=10m \
+    --set backend.config.entitlementPolicy.emergencyDisabled=false
+)"
+require_rendered_value "$entitlement_config" 'MULTICA_ENTITLEMENT_POLICY_ENABLED: "true"'
+require_rendered_value "$entitlement_config" 'MULTICA_ENTITLEMENT_POLICY_URL: "http://multica-cloud.internal:8080"'
+require_rendered_value "$entitlement_config" 'MULTICA_ENTITLEMENT_POLICY_TIMEOUT: "2s"'
+require_rendered_value "$entitlement_config" 'MULTICA_ENTITLEMENT_STALE_GRACE: "10m"'
+require_rendered_value "$entitlement_config" 'MULTICA_ENTITLEMENT_EMERGENCY_DISABLED: "false"'
 
 echo "helm config rendering ok"
