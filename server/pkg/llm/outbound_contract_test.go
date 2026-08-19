@@ -3,11 +3,13 @@ package llm
 import (
 	"context"
 	"errors"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -31,13 +33,15 @@ func (c *countingHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	return nil, errors.New("upstream must not be contacted by a disabled client")
 }
 
-// TestUnconfiguredClientMakesZeroUpstreamRequests pins the privacy contract a
+// TestUnconfiguredClientMakesZeroUpstreamRequests pins the contract a
 // deployment relies on when it leaves MULTICA_LLM_API_KEY and
-// MULTICA_LLM_BASE_URL empty: no chat content leaves the server, at all.
+// MULTICA_LLM_BASE_URL empty: this layer sends nothing, to anyone. (Only this
+// layer — agent runs reach a model by their own path, which no variable here
+// governs. See the package doc.)
 //
 // Both consumers of this package send private chat content upstream — the
 // first message of a chat session (auto-titling) and the tail of a conversation
-// (follow-up suggestions). "Leave the LLM variables empty" is the documented
+// (follow-up questions). "Leave the LLM variables empty" is the documented
 // answer for an operator whose policy forbids that (.env.example, the docs
 // environment-variables pages, and GitHub issue #7162), so the behaviour has to
 // be a tested guarantee rather than something that happens to be true today.
@@ -107,34 +111,131 @@ func TestUnconfiguredClientMakesZeroUpstreamRequests(t *testing.T) {
 	}
 }
 
-// llmPackageDir is this package's path relative to the server module root, used
-// to exempt it from the import scan below.
+// llmPackageDir is this package's path relative to the server module root. The
+// two source scans below exempt it: it is the layer they are guarding, not a
+// caller of it.
 const llmPackageDir = "pkg/llm"
 
 const openAISDKImportPrefix = "github.com/openai/openai-go"
 
-// TestOutboundLLMTrafficGoesThroughThisPackage enforces the single-entry-point
-// rule stated in this package's doc comment: nothing outside pkg/llm imports
-// the OpenAI SDK.
+// documentedConsumers is the inventory this package's doc comment,
+// .env.example and the environment-variables docs pages all publish to
+// operators: these files, and only these, ask this layer to send something
+// upstream. The value is the summary each one is documented with.
+var documentedConsumers = map[string]string{
+	"internal/handler/chat_title.go":                  "chat auto-titling: the first user message of a new chat session",
+	"internal/service/chat_quick_actions_generate.go": "chat follow-up questions: the tail of the conversation",
+}
+
+// clientCallSurface is every method on Client that can produce an upstream
+// request. Enabled and DefaultModel are deliberately absent: asking whether the
+// layer is on sends nothing, and consumers are expected to call it.
+var clientCallSurface = map[string]bool{
+	"Chat":         true,
+	"ChatStream":   true,
+	"GenerateText": true,
+	"GenerateJSON": true,
+}
+
+// TestDocumentedConsumersAreTheOnlyCallers keeps the published consumer
+// inventory from going quietly stale.
 //
-// The rule is what makes the operator-facing disclosure maintainable. The
-// consumer list in the package doc, .env.example and the docs pages all claim
-// that MULTICA_LLM_API_KEY / MULTICA_LLM_BASE_URL govern every server-side call
-// to an external model. That claim is only checkable by reading one package as
-// long as it is the only door to the SDK; a second caller elsewhere would make
-// the documentation quietly wrong rather than obviously so, which is exactly
-// the failure #7162 reported.
+// The operator-facing copy does not merely say this layer can be turned off; it
+// enumerates what is sent, feature by feature, so an admin can decide whether
+// to turn it on. That list is a promise about the whole server, and a third
+// feature calling GenerateText would break it silently: nothing in the build
+// notices, the docs keep naming two consumers, and the deployment starts
+// sending something no one disclosed.
 //
-// This asserts on source rather than behaviour because the regression is the
+// The import guard below cannot catch that case — a new consumer goes through
+// this package exactly as the existing two do, importing no SDK. So this test
+// scans production call sites instead and requires the set to match the
+// inventory in both directions: an undocumented caller fails, and so does a
+// documented one that stopped calling.
+func TestDocumentedConsumersAreTheOnlyCallers(t *testing.T) {
+	found := map[string][]string{}
+	scanServerModule(t, skipTestFiles, func(rel string, file *ast.File) {
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && clientCallSurface[sel.Sel.Name] {
+				found[rel] = append(found[rel], sel.Sel.Name)
+			}
+			return true
+		})
+	})
+
+	for rel, methods := range found {
+		if _, documented := documentedConsumers[rel]; !documented {
+			t.Errorf("undocumented consumer of this layer: %s calls %v.\n"+
+				"If it sends content upstream, it must be disclosed before it ships: add it to "+
+				"documentedConsumers, to this package's doc comment, and to the operator copy in "+
+				".env.example and apps/docs/content/docs/environment-variables*.mdx (all four locales).\n"+
+				"If it is an unrelated type that happens to share a method name, add it to "+
+				"documentedConsumers with a note saying so, or rename the method.", rel, methods)
+		}
+	}
+	for rel, summary := range documentedConsumers {
+		if _, still := found[rel]; !still {
+			t.Errorf("%s no longer calls this layer, but is still published as a consumer (%q).\n"+
+				"Drop it from documentedConsumers, this package's doc comment, and the operator copy — "+
+				"an inventory that overstates what is sent is as misleading as one that understates it.",
+				rel, summary)
+		}
+	}
+}
+
+// TestOpenAISDKIsImportedOnlyByThisPackage enforces the import half of the
+// single-entry-point rule: nothing outside pkg/llm reaches the OpenAI SDK.
+//
+// This is narrower than it sounds, and deliberately paired with the inventory
+// test above. On its own it proves only that the SDK has one door; it says
+// nothing about how many callers walk through it. Together the two mean the
+// package doc's consumer list can be trusted: no one can bypass this layer, and
+// no one can join it unannounced.
+//
+// It asserts on source rather than behaviour because the regression is the
 // existence of a call site, and no runtime assertion can observe a request the
 // test never triggers.
-func TestOutboundLLMTrafficGoesThroughThisPackage(t *testing.T) {
+func TestOpenAISDKIsImportedOnlyByThisPackage(t *testing.T) {
+	var offenders []string
+	scanServerModule(t, includeTestFiles, func(rel string, file *ast.File) {
+		for _, imp := range file.Imports {
+			if strings.HasPrefix(strings.Trim(imp.Path.Value, `"`), openAISDKImportPrefix) {
+				offenders = append(offenders, rel)
+				return
+			}
+		}
+	})
+
+	if len(offenders) > 0 {
+		sort.Strings(offenders)
+		t.Fatalf("these files import the OpenAI SDK directly, bypassing pkg/llm:\n  %s\n"+
+			"Call this package instead (add a helper here if it lacks what you need), so what this "+
+			"deployment's assist layer sends to a third party stays answerable by reading one package.",
+			strings.Join(offenders, "\n  "))
+	}
+}
+
+const (
+	skipTestFiles    = false
+	includeTestFiles = true
+)
+
+// scanServerModule parses every Go file in the server module except this
+// package's own, calling visit with the file's module-relative path. Test files
+// are included only when withTests is set: a stub in a _test.go is not a
+// product feature sending chat content anywhere.
+func scanServerModule(t *testing.T, withTests bool, visit func(rel string, file *ast.File)) {
+	t.Helper()
+
 	// Tests run in their package directory, so the server module root is two
 	// levels up from pkg/llm.
 	moduleRoot := filepath.Join("..", "..")
 	exempt := filepath.Join(moduleRoot, filepath.FromSlash(llmPackageDir))
 
-	var offenders []string
 	err := filepath.WalkDir(moduleRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -152,28 +253,22 @@ func TestOutboundLLMTrafficGoesThroughThisPackage(t *testing.T) {
 		if !strings.HasSuffix(d.Name(), ".go") {
 			return nil
 		}
+		if !withTests && strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
 
-		file, parseErr := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		file, parseErr := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
 		if parseErr != nil {
 			return parseErr
 		}
-		for _, imp := range file.Imports {
-			if strings.HasPrefix(strings.Trim(imp.Path.Value, `"`), openAISDKImportPrefix) {
-				offenders = append(offenders, filepath.ToSlash(path))
-				return nil
-			}
+		rel, relErr := filepath.Rel(moduleRoot, path)
+		if relErr != nil {
+			return relErr
 		}
+		visit(filepath.ToSlash(rel), file)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("scan server module for OpenAI SDK imports: %v", err)
-	}
-
-	if len(offenders) > 0 {
-		t.Fatalf("these files import the OpenAI SDK directly, bypassing pkg/llm:\n  %s\n"+
-			"Call this package instead (add a helper here if it lacks what you need), so the "+
-			"consumer list in its doc comment and in .env.example stays the whole truth about "+
-			"what this deployment sends to an external model.",
-			strings.Join(offenders, "\n  "))
+		t.Fatalf("scan server module: %v", err)
 	}
 }

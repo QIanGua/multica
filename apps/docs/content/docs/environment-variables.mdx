@@ -192,7 +192,11 @@ Two features use this layer, and each one sends chat content to the endpoint you
 - **Chat auto-titling** — the first user message of a new chat session, sent verbatim. Attachments are never included.
 - **Follow-up questions** (the suggestion buttons under an agent reply) — the tail of the conversation: up to 6 messages, with the reply being answered capped at 3000 characters and each older message at 800.
 
-When both the API key and the base URL are empty, this layer is disabled and the server sends nothing to any model provider. That is the supported configuration when your policy does not allow chat content to leave your deployment: chat sessions keep the title the client derives from the first message, the follow-up question buttons do not appear, and everything else is unaffected.
+When both the API key and the base URL are empty, this layer is disabled and makes no upstream request at all — neither feature above sends anything. That is the supported configuration when your policy does not allow this layer to send chat content off the deployment: chat sessions keep the title the client derives from the first message, the follow-up question buttons do not appear, and everything else is unaffected.
+
+<Callout type="info">
+This covers the assist layer only. Running an agent is a separate data path: when an agent answers a chat, your daemon executes that agent's AI coding tool using the tool's own credentials, and `MULTICA_*` variables are dropped from the agent's environment rather than passed to it. Emptying the variables above does not affect it — govern that path through the agent's runtime configuration.
+</Callout>
 
 ## Daemon configuration
 

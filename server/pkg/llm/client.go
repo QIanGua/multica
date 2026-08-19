@@ -1,24 +1,37 @@
 // Package llm is a thin, reusable wrapper around the official OpenAI Go SDK
 // (github.com/openai/openai-go). It exists so the rest of the server has a
 // single, well-typed entry point for "just call an LLM" needs that do NOT
-// require the full agent runtime — e.g. generating a chat title or drafting a
-// quick-create issue (MUL-4238).
+// require the full agent runtime — currently chat auto-titling and chat
+// follow-up questions (MUL-4238).
+//
+// # Scope: the assist layer, not every model call in the product
+//
+// This package covers the LLM calls the API process makes on its own behalf.
+// Running an agent is a different data path entirely: the daemon executes an
+// AI coding tool as a subprocess under that tool's own credentials, and the
+// MULTICA_* environment is stripped rather than handed to it. Nothing here
+// governs that path, and operator-facing copy about this layer must not imply
+// otherwise — an admin who reads "empty means nothing is sent" as covering the
+// whole product has been misled about where their chat content goes.
 //
 // # The single-entry-point rule
 //
-// Every server-side LLM call in this repository goes through this package, and
-// nothing outside it imports the OpenAI SDK directly. That is a constraint to
-// keep, not a coincidence: it is what makes "does this deployment send chat
-// content to a third party, and what exactly does it send?" answerable by
-// reading one config block instead of auditing the tree. A new feature that
-// wants a model calls this package. TestOutboundLLMTrafficGoesThroughThisPackage
-// enforces the import half of that rule.
+// Every LLM call the server process makes on its own behalf goes through this
+// package, and nothing outside it imports the OpenAI SDK directly. That is a
+// constraint to keep, not a coincidence: it is what makes "what does this
+// deployment's assist layer send to a third party?" answerable by reading one
+// package instead of auditing the tree. A new feature that wants a model calls
+// this package. Two tests hold the halves of that rule:
+// TestOpenAISDKIsImportedOnlyByThisPackage (nothing else reaches the SDK) and
+// TestDocumentedConsumersAreTheOnlyCallers (nothing else reaches this client).
 //
 // # Consumers, and what they send upstream
 //
 // Keep this list current when a consumer is added, removed, or changes what it
 // sends — it is the source the operator-facing copy is written from
-// (.env.example and apps/docs/content/docs/environment-variables*.mdx).
+// (.env.example and apps/docs/content/docs/environment-variables*.mdx), and
+// TestDocumentedConsumersAreTheOnlyCallers fails until a new call site is
+// reflected here.
 //
 //   - Chat auto-titling — server/internal/handler/chat_title.go. Sends the
 //     first user message of a new chat session, verbatim and uncapped.
@@ -30,13 +43,13 @@
 //     message at 800.
 //
 // Both consumers send private chat content, which is why an unconfigured
-// deployment making zero upstream requests is a contract rather than a
-// side effect: New with no API key and no base URL returns a disabled client
-// whose every call fails with ErrNotConfigured before an HTTP request is ever
-// built, and both consumers check Enabled() before doing any work.
-// TestUnconfiguredClientMakesZeroUpstreamRequests holds this layer's half.
-// Operators who must not send chat content anywhere leave MULTICA_LLM_API_KEY
-// and MULTICA_LLM_BASE_URL empty; the product stays whole (client-derived chat
+// deployment making zero upstream requests is a contract rather than a side
+// effect: New with no API key and no base URL returns a disabled client whose
+// every call fails with ErrNotConfigured before an HTTP request is ever built,
+// and both consumers check Enabled() before doing any work
+// (TestUnconfiguredClientMakesZeroUpstreamRequests). An operator who must not
+// let THIS layer send chat content leaves MULTICA_LLM_API_KEY and
+// MULTICA_LLM_BASE_URL empty; the product stays whole (client-derived chat
 // titles, no follow-up question buttons).
 //
 // The wrapper is intentionally small:
