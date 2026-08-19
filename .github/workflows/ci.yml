@@ -76,20 +76,28 @@ jobs:
               - 'docker-compose.selfhost.build.yml'
               - 'Makefile'
             # Everything the backend jobs (backend-tests,
-            # go-vulnerability-scan, windows-execenv) read. The Go test
-            # binaries resolve every fixture they load from runtime.Caller,
-            # so nothing outside server/ reaches them; the extra entries are
-            # the shell entry points those jobs run and the Helm chart
-            # scripts/helm-config.test.sh renders. Same bias as the frontend
+            # go-vulnerability-scan, windows-execenv) read, which is NOT the
+            # same thing as server/**: three Go tests reach out of the module
+            # to pin a contract against a file the other side owns, and each
+            # one has to be listed here or the PR that breaks the contract is
+            # exactly the PR that skips the test. Same bias as the frontend
             # filter: over-match rather than silently skip validation.
             backend:
               - 'server/**'
               - 'deploy/helm/**'
+              # pkg/agent/worktree_capability_contract_test.go reads this file
+              # and compares LOCAL_WORKTREE_CAPABILITY against the daemon's
+              # protocol constant. A typo on either side disables worktree
+              # mode for everyone with no error anywhere, so a change to the
+              # frontend half must run the backend suite.
+              - 'packages/core/runtimes/cli-version.ts'
+              # internal/daemon/agent_command_names_test.go reads both of
+              # these; they are also the entry points scripts/test-go.sh runs.
+              - 'scripts/agent-cli-command-names.txt'
+              - 'scripts/go-test-with-agent-cli-guard.sh'
               - 'scripts/helm-config.test.sh'
               - 'scripts/test-go.sh'
               - 'scripts/test-go.test.sh'
-              - 'scripts/go-test-with-agent-cli-guard.sh'
-              - 'scripts/agent-cli-command-names.txt'
               - 'Makefile'
               - '.github/workflows/ci.yml'
             sqlc:
