@@ -85,23 +85,43 @@ func NewPluginEventDispatcher(service *PluginService) *PluginEventDispatcher {
 //
 // Runs on the dispatcher's own lifecycle because it is the same concern:
 // bounded resources for something a third party's behaviour drives.
+//
+// The first sweep waits for the first tick rather than firing at construction.
+// An earlier version swept immediately, on the theory that a deployment down for
+// a week should not wait an hour — and it panicked in cmd/server's router test,
+// where the dispatcher is built over a Queries whose pool was never opened. The
+// benefit was one hour of retention on a cold start against a 7-day TTL; the
+// cost was a goroutine touching the database before the process is known to have
+// one.
 func (d *PluginEventDispatcher) sweepInvocations() {
 	defer d.wg.Done()
 	ticker := time.NewTicker(invocationSweepEvery)
 	defer ticker.Stop()
 	for {
-		// Swept once at startup as well: a deployment that was down for a week
-		// should not wait an hour to drop what expired while it was off.
-		d.sweepOnce()
 		select {
 		case <-d.stop:
 			return
 		case <-ticker.C:
+			d.sweepOnce()
 		}
 	}
 }
 
+// sweepOnce deletes what has aged out.
+//
+// Panics are contained for the same reason runGuarded exists: this runs on a
+// bare goroutine, where an unrecovered panic is not a failed sweep but a dead
+// process. A nil check on Queries is NOT enough to prevent one — sqlc's Queries
+// wraps an executor, so a non-nil Queries over an unopened pool passes every
+// check available here and then dereferences inside pgxpool. That is exactly how
+// this took down cmd/server's test, and it is why the guard is a recover rather
+// than one more nil comparison.
 func (d *PluginEventDispatcher) sweepOnce() {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error("plugins: panic while sweeping hook invocations", "recovered", recovered)
+		}
+	}()
 	if d.service == nil || d.service.Queries == nil {
 		return
 	}

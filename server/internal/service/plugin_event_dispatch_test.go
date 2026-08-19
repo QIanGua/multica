@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -222,3 +223,24 @@ func TestEventDispatchStampsThePluginActor(t *testing.T) {
 type recordingSink func(eventType string)
 
 func (r recordingSink) Dispatch(eventType, _ string, _ pgtype.UUID, _ any) { r(eventType) }
+
+// The shape that took down cmd/server's router test: a dispatcher built over a
+// Queries whose pool was never opened.
+//
+// A nil check on Queries does not catch it — sqlc wraps an executor, so the
+// value is non-nil and the nil pool is only reached inside pgxpool. Constructing
+// a dispatcher must therefore never touch the database on its own, and a sweep
+// that does must not be able to kill the process.
+func TestNewDispatcherDoesNotTouchTheDatabase(t *testing.T) {
+	// A Queries over a nil pool: exactly what NewRouter holds in a test that
+	// never opens one.
+	dispatcher := NewPluginEventDispatcher(&PluginService{Queries: db.New(nil)})
+	t.Cleanup(dispatcher.Close)
+
+	// Long enough that a construction-time sweep would already have panicked and
+	// taken the process with it.
+	time.Sleep(150 * time.Millisecond)
+
+	// And the sweep itself, called directly, must survive the same pool.
+	dispatcher.sweepOnce()
+}
