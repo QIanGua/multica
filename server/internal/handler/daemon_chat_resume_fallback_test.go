@@ -2,15 +2,37 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+type failChatInputQueryDB struct {
+	delegate db.DBTX
+}
+
+func (f *failChatInputQueryDB) Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
+	return f.delegate.Exec(ctx, query, args...)
+}
+
+func (f *failChatInputQueryDB) Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error) {
+	if strings.Contains(query, "-- name: ListChatInputMessages") {
+		return nil, errors.New("injected chat input load failure")
+	}
+	return f.delegate.Query(ctx, query, args...)
+}
+
+func (f *failChatInputQueryDB) QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row {
+	return f.delegate.QueryRow(ctx, query, args...)
+}
 
 func TestChatSessionResumeFallbackNeeded(t *testing.T) {
 	tests := []struct {
@@ -42,52 +64,35 @@ func TestClaimTaskChatCompletePointerSkipsSessionFallbackQuery(t *testing.T) {
 	ctx := context.Background()
 	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
 
-	var chatSessionID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO chat_session (
-			workspace_id, agent_id, creator_id, title,
-			session_id, work_dir, runtime_id
-		)
-		VALUES ($1, $2, $3, 'complete resume pointer', 'pointer-session', '/pointer-workdir', $4)
-		RETURNING id
-	`, testWorkspaceID, agentID, testUserID, runtimeID).Scan(&chatSessionID); err != nil {
-		t.Fatalf("setup: create chat session: %v", err)
-	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM chat_session WHERE id = $1`, chatSessionID) })
-
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO chat_message (chat_session_id, role, content)
-		VALUES ($1, 'user', 'keep the direct pointer')
-	`, chatSessionID); err != nil {
-		t.Fatalf("setup: create chat input: %v", err)
-	}
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, chat_session_id, status, priority)
-		VALUES ($1, $2, $3, 'queued', 1000)
-	`, agentID, runtimeID, chatSessionID); err != nil {
-		t.Fatalf("setup: create chat task: %v", err)
-	}
+	chatSessionID := dbfx.ChatSession(t, agentID, testutil.Cols{
+		"title":      "complete resume pointer",
+		"session_id": "pointer-session",
+		"work_dir":   "/pointer-workdir",
+		"runtime_id": runtimeID,
+	})
+	dbfx.Insert(t, "chat_message", testutil.Cols{
+		"chat_session_id": chatSessionID,
+		"role":            "user",
+		"content":         "keep the direct pointer",
+	})
+	dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":      runtimeID,
+		"chat_session_id": chatSessionID,
+		"priority":        1000,
+	})
 
 	claimMetrics := obsmetrics.NewBusinessMetrics()
 	h := *testHandler
 	h.Metrics = claimMetrics
 
-	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, daemonID)
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("runtimeId", runtimeID)
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
-	h.ClaimTaskByRuntime(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("ClaimTaskByRuntime: expected 200, got %d: %s", w.Code, w.Body.String())
-	}
+	req = testutil.WithURLParams(req, "runtimeId", runtimeID)
+	w := testutil.Call(t, h.ClaimTaskByRuntime, req).Want(http.StatusOK)
 	var resp struct {
 		Task *claimRuntimeGuardTask `json:"task"`
 	}
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
+	w.JSON(&resp)
 	if resp.Task == nil {
 		t.Fatal("expected a claimed task")
 	}
@@ -128,5 +133,65 @@ func TestClaimTaskChatCompletePointerSkipsSessionFallbackQuery(t *testing.T) {
 	}
 	if !seenRolloutQuery {
 		t.Fatal("independent rollout-missing query was not observed")
+	}
+}
+
+func TestClaimTaskChatInputLoadFailureSkipsResumeQueries(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
+	chatSessionID := dbfx.ChatSession(t, agentID, testutil.Cols{
+		"title":      "input failure skips resume history",
+		"runtime_id": runtimeID,
+	})
+	taskID := dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":      runtimeID,
+		"chat_session_id": chatSessionID,
+		"priority":        1000,
+	})
+	dbfx.Exec(t, `UPDATE agent_task_queue SET chat_input_task_id = id WHERE id = $1`, taskID)
+	dbfx.Insert(t, "chat_message", testutil.Cols{
+		"chat_session_id": chatSessionID,
+		"role":            "user",
+		"content":         "input query should fail before resume history",
+		"task_id":         taskID,
+	})
+
+	claimMetrics := obsmetrics.NewBusinessMetrics()
+	h := *testHandler
+	h.Metrics = claimMetrics
+	h.Queries = db.New(&failChatInputQueryDB{delegate: testPool})
+
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
+		testWorkspaceID, daemonID)
+	req = testutil.WithURLParams(req, "runtimeId", runtimeID)
+	testutil.Call(t, h.ClaimTaskByRuntime, req).Want(http.StatusInternalServerError)
+
+	var status string
+	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status)
+	if status != "dispatched" {
+		t.Fatalf("task status after input load failure = %q, want dispatched for redelivery", status)
+	}
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(claimMetrics.Collectors()...)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather claim metrics: %v", err)
+	}
+	for _, family := range families {
+		switch family.GetName() {
+		case "multica_chat_claim_session_fallback_needed_total":
+			if len(family.Metric) != 1 || family.Metric[0].GetCounter().GetValue() != 0 {
+				t.Fatalf("input load failure unexpectedly needed session fallback: %v", family)
+			}
+		case "multica_chat_claim_session_fallback_result_total":
+			t.Fatalf("input load failure unexpectedly emitted a session fallback result: %v", family)
+		case "multica_chat_claim_resume_query_duration_seconds":
+			t.Fatalf("input load failure unexpectedly ran a resume-history query: %v", family)
+		}
 	}
 }

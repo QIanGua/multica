@@ -2587,7 +2587,11 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 						if prior.WorkDir.Valid && resp.PriorWorkDir == "" {
 							resp.PriorWorkDir = prior.WorkDir.String
 						}
-					case errors.Is(err, pgx.ErrNoRows), err == nil:
+					case errors.Is(err, pgx.ErrNoRows):
+						h.Metrics.RecordChatClaimSessionFallbackMiss()
+					case err == nil:
+						// Defensive only: the SQL excludes NULL session ids, but
+						// preserve miss semantics if that contract ever changes.
 						h.Metrics.RecordChatClaimSessionFallbackMiss()
 					default:
 						h.Metrics.RecordChatClaimSessionFallbackError()
