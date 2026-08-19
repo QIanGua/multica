@@ -49,8 +49,9 @@ func TestWorkspaceScopeGuard(t *testing.T) {
 		id := seedComment(t, ctx, issueID)
 		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM comment WHERE id = $1`, util.UUIDToString(id)) })
 
-		if err := queries.DeleteComment(ctx, db.DeleteCommentParams{ID: id, WorkspaceID: wsB}); err != nil {
-			t.Fatalf("cross-workspace DeleteComment: expected nil error (no-op), got %v", err)
+		deleted, err := queries.DeleteComment(ctx, db.DeleteCommentParams{ID: id, WorkspaceID: wsB})
+		if err != nil || deleted != 0 {
+			t.Fatalf("cross-workspace DeleteComment = (%d, %v), want (0, nil)", deleted, err)
 		}
 		assertRowExists(t, ctx, "comment", id)
 	})

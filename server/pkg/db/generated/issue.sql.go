@@ -1426,6 +1426,8 @@ type MaterializeIssueChannelMediaMarkdownParams struct {
 // with the fully composed Markdown so rich-text ordering survives. If a user
 // edited concurrently (or the adapter has no inline layout), append instead;
 // preserving user-authored bytes takes precedence over layout fidelity.
+// This is asynchronous system materialization, not a new user action, so it
+// intentionally preserves last_activity_at while still advancing revision.
 func (q *Queries) MaterializeIssueChannelMediaMarkdown(ctx context.Context, arg MaterializeIssueChannelMediaMarkdownParams) (Issue, error) {
 	row := q.db.QueryRow(ctx, materializeIssueChannelMediaMarkdown,
 		arg.BaseDescription,

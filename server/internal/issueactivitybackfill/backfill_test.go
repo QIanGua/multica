@@ -62,21 +62,21 @@ INSERT INTO %s (id, updated_at, last_activity_at) VALUES
 		t.Fatalf("seed fixture: %v", err)
 	}
 
-	rows, err := Batch(ctx, pool, Options{BatchSize: 1, Table: table})
-	if err != nil || rows != 1 {
-		t.Fatalf("first Batch = (%d, %v), want (1, nil)", rows, err)
+	first, err := Batch(ctx, pool, Options{BatchSize: 1, Table: table})
+	if err != nil || first.Rows != 1 || first.LastID != "00000000-0000-0000-0000-000000000001" {
+		t.Fatalf("first Batch = (%+v, %v), want one row ending at id 1", first, err)
 	}
 	remaining, err := CountRemaining(ctx, pool, table)
 	if err != nil || remaining != 1 {
 		t.Fatalf("CountRemaining = (%d, %v), want (1, nil)", remaining, err)
 	}
-	rows, err = Batch(ctx, pool, Options{BatchSize: 10, Table: table})
-	if err != nil || rows != 1 {
-		t.Fatalf("second Batch = (%d, %v), want (1, nil)", rows, err)
+	second, err := Batch(ctx, pool, Options{BatchSize: 10, AfterID: &first.LastID, Table: table})
+	if err != nil || second.Rows != 1 || second.LastID != "00000000-0000-0000-0000-000000000002" {
+		t.Fatalf("second Batch = (%+v, %v), want one row ending at id 2", second, err)
 	}
-	rows, err = Batch(ctx, pool, Options{BatchSize: 10, Table: table})
-	if err != nil || rows != 0 {
-		t.Fatalf("idempotent Batch = (%d, %v), want (0, nil)", rows, err)
+	idempotent, err := Batch(ctx, pool, Options{BatchSize: 10, AfterID: &second.LastID, Table: table})
+	if err != nil || idempotent.Rows != 0 || idempotent.LastID != "" {
+		t.Fatalf("idempotent Batch = (%+v, %v), want empty result", idempotent, err)
 	}
 
 	var preserved time.Time
@@ -86,5 +86,51 @@ SELECT last_activity_at FROM %s WHERE id = '00000000-0000-0000-0000-000000000003
 	}
 	if want := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC); !preserved.Equal(want) {
 		t.Fatalf("pre-populated activity changed to %s, want %s", preserved, want)
+	}
+}
+
+func TestBatchWrapsToRecoverRowsSkippedByLock(t *testing.T) {
+	pool := testPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	table := fixture(t, pool)
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+INSERT INTO %s (id, updated_at, last_activity_at) VALUES
+('00000000-0000-0000-0000-000000000001', '2026-01-01T00:00:00Z', NULL),
+('00000000-0000-0000-0000-000000000002', '2026-01-02T00:00:00Z', NULL),
+('00000000-0000-0000-0000-000000000003', '2026-01-03T00:00:00Z', NULL)`, table)); err != nil {
+		t.Fatalf("seed fixture: %v", err)
+	}
+
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock transaction: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx, fmt.Sprintf(`
+SELECT id FROM %s WHERE id = '00000000-0000-0000-0000-000000000001' FOR UPDATE`, table)); err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatalf("lock first row: %v", err)
+	}
+
+	first, err := Batch(ctx, pool, Options{BatchSize: 2, Table: table})
+	if err != nil || first.Rows != 2 || first.LastID != "00000000-0000-0000-0000-000000000003" {
+		_ = lockTx.Rollback(ctx)
+		t.Fatalf("locked-row Batch = (%+v, %v), want ids 2-3", first, err)
+	}
+	if err := lockTx.Rollback(ctx); err != nil {
+		t.Fatalf("release first row: %v", err)
+	}
+
+	endOfPass, err := Batch(ctx, pool, Options{BatchSize: 2, AfterID: &first.LastID, Table: table})
+	if err != nil || endOfPass.Rows != 0 {
+		t.Fatalf("end-of-pass Batch = (%+v, %v), want empty result", endOfPass, err)
+	}
+	remaining, err := CountRemaining(ctx, pool, table)
+	if err != nil || remaining != 1 {
+		t.Fatalf("CountRemaining = (%d, %v), want skipped row", remaining, err)
+	}
+	recovered, err := Batch(ctx, pool, Options{BatchSize: 2, Table: table})
+	if err != nil || recovered.Rows != 1 || recovered.LastID != "00000000-0000-0000-0000-000000000001" {
+		t.Fatalf("wrapped Batch = (%+v, %v), want recovered id 1", recovered, err)
 	}
 }

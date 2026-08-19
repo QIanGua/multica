@@ -3482,10 +3482,17 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	issue, err := h.Queries.GetIssue(r.Context(), comment.IssueID)
-	if err != nil {
+	hasIssue := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("load issue for delete post-processing failed", "issue_id", uuidToString(comment.IssueID), "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to load issue")
 		return
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The issue delete may have won the race after GetCommentInWorkspace.
+		// Continue so DeleteComment can report whether the comment itself still
+		// existed; touching issue activity is intentionally best effort.
+		slog.Info("comment parent issue no longer exists", "issue_id", uuidToString(comment.IssueID), "comment_id", commentId)
 	}
 
 	// Collect attachment URLs before CASCADE delete removes them.
@@ -3500,16 +3507,23 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("cancel tasks for deleted trigger comment failed", append(logger.RequestAttrs(r), "error", cancelErr, "comment_id", commentId)...)
 	}
 
-	if err := h.Queries.DeleteComment(r.Context(), db.DeleteCommentParams{
+	deleted, err := h.Queries.DeleteComment(r.Context(), db.DeleteCommentParams{
 		ID:          comment.ID,
 		WorkspaceID: comment.WorkspaceID,
-	}); err != nil {
-		slog.Warn("delete comment failed", append(logger.RequestAttrs(r), "error", err, "comment_id", commentId)...)
-		// Cancellation already committed but deletion did not. The comment is
-		// still valid, so rebuild the complete cancelled batch (including this
-		// trigger) before returning the storage error.
-		h.retriggerCancelledTaskSurvivors(r.Context(), issue, cancelled, pgtype.UUID{})
-		writeError(w, http.StatusInternalServerError, "failed to delete comment")
+	})
+	if err != nil || deleted != 1 {
+		slog.Warn("delete comment failed", append(logger.RequestAttrs(r), "error", err, "rows", deleted, "comment_id", commentId)...)
+		// Cancellation already committed but deletion did not. If the parent
+		// issue still exists, rebuild the complete cancelled batch (including
+		// this trigger) before reporting the storage error or concurrent no-op.
+		if hasIssue {
+			h.retriggerCancelledTaskSurvivors(r.Context(), issue, cancelled, pgtype.UUID{})
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to delete comment")
+		} else {
+			writeError(w, http.StatusNotFound, "comment not found")
+		}
 		return
 	}
 
@@ -3519,7 +3533,9 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 		"comment_id": uuidToString(comment.ID),
 		"issue_id":   uuidToString(comment.IssueID),
 	})
-	h.retriggerCancelledTaskSurvivors(r.Context(), issue, cancelled, comment.ID)
+	if hasIssue {
+		h.retriggerCancelledTaskSurvivors(r.Context(), issue, cancelled, comment.ID)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

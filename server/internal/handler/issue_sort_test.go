@@ -58,12 +58,14 @@ func TestListIssuesSortsByStatusAndUpdatedAt(t *testing.T) {
 	listTitles := func(sort, direction string) []string {
 		t.Helper()
 		path := fmt.Sprintf(
-			"/api/issues?workspace_id=%s&project_id=%s&limit=50&sort=%s&direction=%s",
+			"/api/issues?workspace_id=%s&project_id=%s&limit=50&sort=%s",
 			testWorkspaceID,
 			projectID,
 			sort,
-			direction,
 		)
+		if direction != "" {
+			path += "&direction=" + direction
+		}
 		w := httptest.NewRecorder()
 		testHandler.ListIssues(w, newRequest("GET", path, nil))
 		if w.Code != http.StatusOK {
@@ -77,6 +79,35 @@ func TestListIssuesSortsByStatusAndUpdatedAt(t *testing.T) {
 		}
 		titles := make([]string, 0, len(response.Issues))
 		for _, issue := range response.Issues {
+			titles = append(titles, issue.Title)
+		}
+		return titles
+	}
+	groupedTitles := func(sort, direction string) []string {
+		t.Helper()
+		path := fmt.Sprintf(
+			"/api/issues/grouped?workspace_id=%s&project_id=%s&limit=50&sort=%s",
+			testWorkspaceID,
+			projectID,
+			sort,
+		)
+		if direction != "" {
+			path += "&direction=" + direction
+		}
+		w := httptest.NewRecorder()
+		testHandler.ListGroupedIssues(w, newRequest("GET", path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("ListGroupedIssues: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var response GroupedIssuesResponse
+		if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+			t.Fatalf("decode grouped response: %v", err)
+		}
+		if len(response.Groups) != 1 {
+			t.Fatalf("ListGroupedIssues groups = %d, want 1", len(response.Groups))
+		}
+		titles := make([]string, 0, len(response.Groups[0].Issues))
+		for _, issue := range response.Groups[0].Issues {
 			titles = append(titles, issue.Title)
 		}
 		return titles
@@ -115,6 +146,21 @@ func TestListIssuesSortsByStatusAndUpdatedAt(t *testing.T) {
 		"sort-backlog",
 	})
 	assertTitles(listTitles("last_activity", "desc"), []string{
+		"sort-backlog",
+		"sort-progress",
+		"sort-done",
+	})
+	assertTitles(listTitles("last_activity", ""), []string{
+		"sort-backlog",
+		"sort-progress",
+		"sort-done",
+	})
+	assertTitles(groupedTitles("last_activity", "asc"), []string{
+		"sort-done",
+		"sort-progress",
+		"sort-backlog",
+	})
+	assertTitles(groupedTitles("last_activity", ""), []string{
 		"sort-backlog",
 		"sort-progress",
 		"sort-done",

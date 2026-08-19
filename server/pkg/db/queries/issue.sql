@@ -104,6 +104,8 @@ FOR UPDATE;
 -- with the fully composed Markdown so rich-text ordering survives. If a user
 -- edited concurrently (or the adapter has no inline layout), append instead;
 -- preserving user-authored bytes takes precedence over layout fidelity.
+-- This is asynchronous system materialization, not a new user action, so it
+-- intentionally preserves last_activity_at while still advancing revision.
 UPDATE issue
 SET description = CASE
         WHEN sqlc.narg('base_description')::text IS NOT NULL

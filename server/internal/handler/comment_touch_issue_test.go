@@ -157,11 +157,12 @@ func TestUpdateAndDeleteCommentBumpIssueActivity(t *testing.T) {
 	}
 
 	setBase()
-	if err := testHandler.Queries.DeleteComment(ctx, db.DeleteCommentParams{
+	deleted, err := testHandler.Queries.DeleteComment(ctx, db.DeleteCommentParams{
 		ID:          comment.ID,
 		WorkspaceID: parseUUID(testWorkspaceID),
-	}); err != nil {
-		t.Fatalf("DeleteComment: %v", err)
+	})
+	if err != nil || deleted != 1 {
+		t.Fatalf("DeleteComment = (%d, %v), want (1, nil)", deleted, err)
 	}
 	if got := readActivity(); !got.After(base) {
 		t.Fatalf("comment delete did not advance activity: base=%s got=%s", base, got)

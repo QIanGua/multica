@@ -6,8 +6,10 @@
 //
 // Each batch commits independently. SIGINT/SIGTERM, a database error, or
 // --max-batches can stop the walk, and a later invocation resumes from rows
-// whose last_activity_at is still NULL. A session advisory lock serializes
-// operators while SKIP LOCKED avoids waiting behind unrelated hot rows.
+// whose last_activity_at is still NULL. Each pass advances by an id keyset
+// watermark instead of rescanning its completed prefix. A session advisory lock
+// serializes operators while SKIP LOCKED avoids waiting behind unrelated hot
+// rows; later passes wrap around to recover rows skipped while locked.
 package main
 
 import (
@@ -84,19 +86,29 @@ func run() error {
 	slog.Info("issue last-activity backfill started", "remaining", remaining, "batch_size", *batchSize, "delay", delay.String())
 
 	var total int64
+	var afterID *string
+	pass := 1
 	for batch := 1; *maxBatches == 0 || batch <= *maxBatches; batch++ {
-		rows, err := issueactivitybackfill.Batch(ctx, pool, issueactivitybackfill.Options{BatchSize: *batchSize})
+		result, err := issueactivitybackfill.Batch(ctx, pool, issueactivitybackfill.Options{
+			BatchSize: *batchSize,
+			AfterID:   afterID,
+		})
 		if err != nil {
 			return err
 		}
-		total += rows
-		if rows > 0 {
-			slog.Info("issue last-activity batch committed", "batch", batch, "rows", rows, "total", total)
+		if result.Rows > 0 && result.LastID == "" {
+			return fmt.Errorf("issue last-activity backfill batch returned %d rows without a keyset watermark", result.Rows)
 		}
-		// A short/empty SKIP LOCKED batch does not prove completion: all
-		// remaining rows may simply be hot. Count before declaring success and
-		// keep retrying until they unlock or the operator interrupts the run.
-		if rows < int64(*batchSize) {
+		total += result.Rows
+		if result.Rows > 0 {
+			slog.Info("issue last-activity batch committed", "batch", batch, "pass", pass, "rows", result.Rows, "total", total, "last_id", result.LastID)
+			next := result.LastID
+			afterID = &next
+		}
+		// A short/empty keyset batch marks the end of this pass, not necessarily
+		// completion: SKIP LOCKED may have left hot rows below the watermark.
+		// Count once per pass, then wrap to the start until those rows unlock.
+		if result.Rows < int64(*batchSize) {
 			remaining, err = issueactivitybackfill.CountRemaining(ctx, pool, "")
 			if err != nil {
 				return err
@@ -105,7 +117,9 @@ func run() error {
 				slog.Info("issue last-activity backfill complete", "rows_backfilled", total, "remaining", 0)
 				return nil
 			}
-			slog.Info("issue last-activity rows remain locked or pending", "remaining", remaining)
+			pass++
+			afterID = nil
+			slog.Info("issue last-activity pass complete; rows remain locked or pending", "pass", pass-1, "remaining", remaining)
 		}
 		if *delay > 0 {
 			select {

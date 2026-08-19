@@ -108,7 +108,7 @@ func TestIssueDecorationActivityOnlyAdvancesOnChange(t *testing.T) {
 	}
 
 	reset()
-	if err := testHandler.Queries.AttachLabelToIssue(ctx, db.AttachLabelToIssueParams{
+	if _, err := testHandler.Queries.AttachLabelToIssue(ctx, db.AttachLabelToIssueParams{
 		IssueID: issueID, LabelID: labelID, WorkspaceID: workspaceID,
 	}); err != nil {
 		t.Fatalf("AttachLabelToIssue: %v", err)
@@ -117,7 +117,7 @@ func TestIssueDecorationActivityOnlyAdvancesOnChange(t *testing.T) {
 		t.Fatalf("label attach did not advance activity: base=%s got=%s", base, got)
 	}
 	reset()
-	if err := testHandler.Queries.AttachLabelToIssue(ctx, db.AttachLabelToIssueParams{
+	if _, err := testHandler.Queries.AttachLabelToIssue(ctx, db.AttachLabelToIssueParams{
 		IssueID: issueID, LabelID: labelID, WorkspaceID: workspaceID,
 	}); err != nil {
 		t.Fatalf("duplicate AttachLabelToIssue: %v", err)
