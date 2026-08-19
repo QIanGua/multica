@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   portal: vi.fn(),
   reconcile: vi.fn(),
   refetch: vi.fn(),
+  refetchSummary: vi.fn(),
+  refetchUsage: vi.fn(),
   refetchPrices: vi.fn(),
   openExternal: vi.fn(),
   role: "owner" as "owner" | "admin" | "member",
@@ -33,16 +35,43 @@ const mocks = vi.hoisted(() => ({
   pricesLoading: false,
   pricesFetching: false,
   pricesError: false,
+  summaryPending: false,
+  summaryFetching: false,
+  summaryError: false,
+  summaryMalformed: false,
+  usagePending: false,
+  usageFetching: false,
+  usageError: false,
   entitlements: {
     workspaceId: "workspace-1",
     plan: "free",
     status: "inactive",
     seats: 3,
-    issueWindow: 1000,
-    autopilotRuns: 100,
+    issueWindow: 17,
+    autopilotRuns: 7,
     currentPeriodEnd: null as string | null,
     snapshotExpiresAt: null as string | null,
     version: 0,
+  },
+  summary: {
+    entitlement: null as never,
+    billingInterval: null as "month" | "year" | null,
+    actualSeats: 3,
+    billedSeats: null as number | null,
+    pendingSeatQuantity: null as number | null,
+    cancelAtPeriodEnd: false,
+    graceUntil: null as string | null,
+    hasStripeCustomer: false,
+  },
+  usage: {
+    action: "enforce" as "off" | "observe" | "enforce",
+    used: 3 as number | null,
+    reserved: 2 as number | null,
+    limit: 7 as number | null,
+    period_start: "2030-01-01T00:00:00Z" as string | null,
+    period_end: "2030-02-01T00:00:00Z" as string | null,
+    reset_at: "2030-02-01T00:00:00Z" as string | null,
+    blocked_counts: {} as Record<string, number> | null,
   },
 }));
 
@@ -57,6 +86,9 @@ vi.mock("@multica/core/billing", () => ({
   workspaceSubscriptionPricesOptions: (wsId: string) => ({
     queryKey: ["workspace-subscriptions", wsId, "prices"],
   }),
+  workspaceSubscriptionSummaryOptions: (wsId: string) => ({
+    queryKey: ["workspace-subscriptions", wsId, "summary"],
+  }),
   useCreateWorkspaceSubscriptionCheckout: () => ({
     mutateAsync: mocks.checkout,
     isPending: false,
@@ -68,6 +100,12 @@ vi.mock("@multica/core/billing", () => ({
   useReconcileWorkspaceSubscriptionSeats: () => ({
     mutateAsync: mocks.reconcile,
     isPending: false,
+  }),
+}));
+
+vi.mock("@multica/core/autopilots", () => ({
+  autopilotQuotaUsageOptions: (wsId: string) => ({
+    queryKey: ["autopilots", wsId, "usage"],
   }),
 }));
 
@@ -125,15 +163,42 @@ describe("BillingTab", () => {
     mocks.pricesLoading = false;
     mocks.pricesFetching = false;
     mocks.pricesError = false;
+    mocks.summaryPending = false;
+    mocks.summaryFetching = false;
+    mocks.summaryError = false;
+    mocks.summaryMalformed = false;
+    mocks.usagePending = false;
+    mocks.usageFetching = false;
+    mocks.usageError = false;
     Object.assign(mocks.entitlements, {
       plan: "free",
       status: "inactive",
       seats: 3,
-      issueWindow: 1000,
-      autopilotRuns: 100,
+      issueWindow: 17,
+      autopilotRuns: 7,
       currentPeriodEnd: null,
       snapshotExpiresAt: null,
       version: 0,
+    });
+    Object.assign(mocks.summary, {
+      entitlement: mocks.entitlements,
+      billingInterval: null,
+      actualSeats: 3,
+      billedSeats: null,
+      pendingSeatQuantity: null,
+      cancelAtPeriodEnd: false,
+      graceUntil: null,
+      hasStripeCustomer: false,
+    });
+    Object.assign(mocks.usage, {
+      action: "enforce",
+      used: 3,
+      reserved: 2,
+      limit: 7,
+      period_start: "2030-01-01T00:00:00Z",
+      period_end: "2030-02-01T00:00:00Z",
+      reset_at: "2030-02-01T00:00:00Z",
+      blocked_counts: {},
     });
     mocks.useQuery.mockImplementation((options: unknown) => {
       const queryKey = (options as { queryKey?: readonly unknown[] }).queryKey;
@@ -144,6 +209,28 @@ describe("BillingTab", () => {
           isFetching: mocks.pricesFetching,
           isError: mocks.pricesError,
           refetch: mocks.refetchPrices,
+        };
+      }
+      if (queryKey?.[queryKey.length - 1] === "summary") {
+        return {
+          data: mocks.summaryError
+            ? undefined
+            : mocks.summaryMalformed
+              ? null
+              : mocks.summary,
+          isPending: mocks.summaryPending,
+          isFetching: mocks.summaryFetching,
+          isError: mocks.summaryError,
+          refetch: mocks.refetchSummary,
+        };
+      }
+      if (queryKey?.[queryKey.length - 1] === "usage") {
+        return {
+          data: mocks.usageError ? undefined : mocks.usage,
+          isPending: mocks.usagePending,
+          isFetching: mocks.usageFetching,
+          isError: mocks.usageError,
+          refetch: mocks.refetchUsage,
         };
       }
       return {
@@ -186,8 +273,9 @@ describe("BillingTab", () => {
     renderWithI18n(<BillingTab />);
 
     expect(screen.getByRole("heading", { name: "Billing" })).toBeInTheDocument();
-    expect(screen.getByText("1,000")).toBeInTheDocument();
-    expect(screen.getByText("100 / month")).toBeInTheDocument();
+    expect(screen.getByText("17")).toBeInTheDocument();
+    expect(screen.getByText("5 / 7")).toBeInTheDocument();
+    expect(screen.getByText("3 completed · 2 in progress")).toBeInTheDocument();
     expect(screen.getByText("$10.00 per human seat")).toBeInTheDocument();
     expect(
       screen.getByText("Estimated monthly total: $30.00"),
@@ -297,10 +385,21 @@ describe("BillingTab", () => {
         queryKey: ["workspace-subscriptions", "workspace-2", "prices"],
       }),
     );
+    expect(mocks.useQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        queryKey: ["workspace-subscriptions", "workspace-2", "summary"],
+      }),
+    );
+    expect(mocks.useQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        queryKey: ["autopilots", "workspace-2", "usage"],
+      }),
+    );
   });
 
   it("shows the unit price without a zero estimated total when seats are unavailable", () => {
     mocks.entitlements.seats = 0;
+    mocks.summary.actualSeats = 0;
 
     renderWithI18n(<BillingTab />);
 
@@ -471,6 +570,127 @@ describe("BillingTab", () => {
     expect(
       screen.queryByRole("button", { name: "Refresh seats" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("renders authoritative subscription seat facts", () => {
+    Object.assign(mocks.entitlements, {
+      currentPeriodEnd: "2030-02-01T00:00:00Z",
+    });
+    Object.assign(mocks.summary, {
+      billingInterval: "month",
+      actualSeats: 4,
+      billedSeats: 5,
+      pendingSeatQuantity: 4,
+      hasStripeCustomer: true,
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("Monthly")).toBeInTheDocument();
+    expect(screen.getByText("5 seats")).toBeInTheDocument();
+    expect(screen.getByText(/4 seats from Feb 1, 2030/)).toBeInTheDocument();
+    expect(screen.getAllByText("4 members")).toHaveLength(2);
+  });
+
+  it("uses completed and reserved runs for the quota decision", () => {
+    Object.assign(mocks.usage, { used: 5, reserved: 2, limit: 7 });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("Limit reached")).toBeInTheDocument();
+    expect(screen.getByText("7 / 7")).toBeInTheDocument();
+    expect(screen.getByText("5 completed · 2 in progress")).toBeInTheDocument();
+  });
+
+  it("does not render missing limited usage as zero or unlimited", async () => {
+    const user = userEvent.setup();
+    Object.assign(mocks.usage, {
+      action: "off",
+      used: null,
+      reserved: null,
+      limit: null,
+      reset_at: null,
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(
+      screen.getByText("Usage is temporarily unavailable"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("7 / month")).toBeInTheDocument();
+    expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 \/ 7/)).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "Retry automation usage" }),
+    );
+    expect(mocks.refetchUsage).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["request fails", true, false],
+    ["response is malformed", false, true],
+  ])(
+    "keeps plan facts visible when the subscription summary %s",
+    (_case, isError, isMalformed) => {
+      mocks.summaryError = isError;
+      mocks.summaryMalformed = isMalformed;
+
+      renderWithI18n(<BillingTab />);
+
+      expect(screen.getByText("Free")).toBeInTheDocument();
+      expect(
+        screen.getByText("Some seat details are unavailable"),
+      ).toBeInTheDocument();
+      expect(screen.getAllByText("Unavailable")).toHaveLength(2);
+    },
+  );
+
+  it.each([
+    ["incomplete", "Subscription setup is incomplete"],
+    ["incomplete_expired", "Subscription setup expired"],
+    ["paused", "Subscription is paused"],
+    ["unpaid", "Subscription is unpaid"],
+    ["canceled", "Subscription is canceled"],
+  ])("renders a recovery notice for %s", (status, title) => {
+    mocks.entitlements.status = status;
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText(title)).toBeInTheDocument();
+  });
+
+  it("warns when the trusted entitlement snapshot has expired", () => {
+    mocks.entitlements.snapshotExpiresAt = "2000-01-01T00:00:00Z";
+
+    renderWithI18n(<BillingTab />);
+
+    expect(
+      screen.getByText("Subscription data may be out of date"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Snapshot stale")).toBeInTheDocument();
+    expect(screen.queryByText("Inactive")).not.toBeInTheDocument();
+  });
+
+  it("shows grace and scheduled-cancellation dates from subscription facts", () => {
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "past_due",
+      currentPeriodEnd: "2030-03-01T00:00:00Z",
+    });
+    Object.assign(mocks.summary, {
+      graceUntil: "2030-02-15T00:00:00Z",
+      cancelAtPeriodEnd: true,
+      hasStripeCustomer: true,
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(
+      screen.getByText(/Update your payment method by Feb 15, 2030/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Cancellation is scheduled")).toBeInTheDocument();
+    expect(screen.getByText(/Pro remains available through Mar 1, 2030/)).toBeInTheDocument();
   });
 
   it("shows Pro management and unlimited limits without a second Checkout", () => {
