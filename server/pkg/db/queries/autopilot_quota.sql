@@ -62,6 +62,8 @@ WHERE workspace_id = @workspace_id
 RETURNING *;
 
 -- name: ConsumeAutopilotQuotaReservation :one
+-- used_count is monotonic within a period: consuming a reserved slot is the
+-- only write that changes it, and no release path decrements it.
 WITH locked AS (
     SELECT qr.* FROM autopilot_quota_reservation qr
     WHERE qr.id = @reservation_id AND qr.state = 'reserved'
@@ -90,6 +92,8 @@ WHERE p.workspace_id = changed.workspace_id
 RETURNING p.*;
 
 -- name: ReleaseAutopilotQuotaReservation :one
+-- Release is intentionally limited to still-reserved work. A consumed
+-- create_issue slot remains counted after cancellation, blocking, or deletion.
 WITH locked AS (
     SELECT qr.* FROM autopilot_quota_reservation qr
     WHERE qr.id = @reservation_id AND qr.state = 'reserved'
@@ -121,10 +125,29 @@ SELECT r.*
 FROM autopilot_quota_reservation r
 LEFT JOIN autopilot_run ar ON ar.quota_reservation_id = r.id
 WHERE r.state = 'reserved'
-  AND r.created_at < @created_before
   AND (
-      ar.id IS NULL
-      OR ar.status IN ('completed', 'failed', 'skipped')
+      (
+          r.created_at < @terminal_created_before
+          AND (ar.id IS NULL OR ar.status IN ('completed', 'failed', 'skipped'))
+      )
+      OR (
+          -- Manual/API requests have no durable retry owner. Reclaim only an
+          -- hours-old partial run with neither a linked side effect nor even
+          -- an unlinked task row; schedule and webhook retries repair their
+          -- own partial state and are deliberately excluded.
+          r.created_at < @partial_created_before
+          AND ar.source IN ('manual', 'api')
+          AND (
+              ar.status = 'pending'
+              OR (ar.status = 'issue_created' AND ar.issue_id IS NULL)
+              OR (ar.status = 'running' AND ar.task_id IS NULL)
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM agent_task_queue task
+              WHERE task.autopilot_run_id = ar.id
+          )
+      )
   )
 ORDER BY r.created_at
 LIMIT @row_limit;

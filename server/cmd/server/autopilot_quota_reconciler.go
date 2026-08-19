@@ -9,16 +9,26 @@ import (
 )
 
 const (
-	autopilotQuotaReconcileInterval = time.Minute
-	autopilotQuotaRecoveryAge       = 10 * time.Minute
-	autopilotQuotaReconcileBatch    = 100
+	autopilotQuotaReconcileInterval   = time.Minute
+	autopilotQuotaTerminalRecoveryAge = 10 * time.Minute
+	// Manual/API dispatches have no durable retry owner. Six hours is far
+	// beyond normal dispatch latency while still releasing a genuinely
+	// abandoned slot before the entitlement period rolls over.
+	autopilotQuotaPartialRecoveryAge = 6 * time.Hour
+	autopilotQuotaReconcileBatch     = 100
 )
 
 func runAutopilotQuotaReconciler(ctx context.Context, svc *service.AutopilotService) {
 	ticker := time.NewTicker(autopilotQuotaReconcileInterval)
 	defer ticker.Stop()
 	for {
-		if settled, err := svc.ReconcileAutopilotQuotaReservations(ctx, time.Now().Add(-autopilotQuotaRecoveryAge), autopilotQuotaReconcileBatch); err != nil {
+		now := time.Now()
+		if settled, err := svc.ReconcileAutopilotQuotaReservations(
+			ctx,
+			now.Add(-autopilotQuotaTerminalRecoveryAge),
+			now.Add(-autopilotQuotaPartialRecoveryAge),
+			autopilotQuotaReconcileBatch,
+		); err != nil {
 			if ctx.Err() == nil {
 				slog.Warn("autopilot quota reconciler failed", "error", err)
 			}

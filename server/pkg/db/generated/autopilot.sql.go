@@ -1585,7 +1585,7 @@ func (q *Queries) PauseAutopilotsByUnrunnableSquad(ctx context.Context, squadID 
 	return items, nil
 }
 
-const recoverPartialAutopilotRun = `-- name: RecoverPartialAutopilotRun :exec
+const recoverPartialAutopilotRun = `-- name: RecoverPartialAutopilotRun :one
 WITH updated_run AS (
     UPDATE autopilot_run AS ar
     SET status = 'failed',
@@ -1594,6 +1594,16 @@ WITH updated_run AS (
         reason_code = 'internal_error',
         planned_at = NULL
     WHERE ar.id = $1
+      AND (
+          ar.status = 'pending'
+          OR (ar.status = 'issue_created' AND ar.issue_id IS NULL)
+          OR (ar.status = 'running' AND ar.task_id IS NULL)
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM agent_task_queue task
+          WHERE task.autopilot_run_id = ar.id
+      )
     RETURNING ar.quota_reservation_id
 ), locked_reservation AS MATERIALIZED (
     SELECT qr.id, qr.workspace_id, qr.period_start, qr.period_end, qr.policy_revision, qr.subscription_version, qr.source, qr.idempotency_key, qr.state, qr.created_at, qr.finalized_at
@@ -1613,14 +1623,17 @@ WITH updated_run AS (
             AND p.period_end = locked.period_end
       )
     RETURNING locked.workspace_id, locked.period_start, locked.period_end
+), settled_period AS (
+    UPDATE autopilot_quota_period AS p
+    SET reserved_count = reserved_count - 1,
+        updated_at = now()
+    FROM released_reservation AS released
+    WHERE p.workspace_id = released.workspace_id
+      AND p.period_start = released.period_start
+      AND p.period_end = released.period_end
+    RETURNING p.workspace_id
 )
-UPDATE autopilot_quota_period AS p
-SET reserved_count = reserved_count - 1,
-    updated_at = now()
-FROM released_reservation AS released
-WHERE p.workspace_id = released.workspace_id
-  AND p.period_start = released.period_start
-  AND p.period_end = released.period_end
+SELECT count(*)::bigint FROM updated_run
 `
 
 // Recovers a partial-state autopilot_run from a crashed first attempt
@@ -1633,9 +1646,11 @@ WHERE p.workspace_id = released.workspace_id
 // The row stays in autopilot_run as a FAILED record (with a recovery
 // reason) so ops still see the abandoned attempt in the run history —
 // it is not silently deleted.
-func (q *Queries) RecoverPartialAutopilotRun(ctx context.Context, id pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, recoverPartialAutopilotRun, id)
-	return err
+func (q *Queries) RecoverPartialAutopilotRun(ctx context.Context, id pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, recoverPartialAutopilotRun, id)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const rotateAutopilotTriggerWebhookToken = `-- name: RotateAutopilotTriggerWebhookToken :one
@@ -2029,6 +2044,8 @@ type UpdateAutopilotRunCompletedParams struct {
 	Result []byte      `json:"result"`
 }
 
+// Quota safety: only use for a run known to have no reservation. Normal
+// terminal paths must call UpdateAutopilotRunTerminalWithQuota instead.
 func (q *Queries) UpdateAutopilotRunCompleted(ctx context.Context, arg UpdateAutopilotRunCompletedParams) (AutopilotRun, error) {
 	row := q.db.QueryRow(ctx, updateAutopilotRunCompleted, arg.ID, arg.Result)
 	var i AutopilotRun
@@ -2069,6 +2086,8 @@ type UpdateAutopilotRunFailedParams struct {
 	ReasonCode    pgtype.Text `json:"reason_code"`
 }
 
+// Quota safety: only use for a run known to have no reservation. Normal
+// terminal paths must call UpdateAutopilotRunTerminalWithQuota instead.
 func (q *Queries) UpdateAutopilotRunFailed(ctx context.Context, arg UpdateAutopilotRunFailedParams) (AutopilotRun, error) {
 	row := q.db.QueryRow(ctx, updateAutopilotRunFailed, arg.ID, arg.FailureReason, arg.ReasonCode)
 	var i AutopilotRun
@@ -2185,6 +2204,8 @@ type UpdateAutopilotRunSkippedParams struct {
 	ReasonCode    pgtype.Text `json:"reason_code"`
 }
 
+// Quota safety: this is only for pre-admission skipped rows, which never have
+// reservations. Post-admission skips use UpdateAutopilotRunTerminalWithQuota.
 // Marks an autopilot_run as skipped without enqueueing any task. Used by the
 // pre-flight admission check when the assignee agent's runtime is offline:
 // creating an issue / task in that state would just pile a doomed job onto
@@ -2233,6 +2254,8 @@ type UpdateAutopilotRunSkippedWithResultParams struct {
 	Result        []byte      `json:"result"`
 }
 
+// Quota safety: legacy no-reservation helper. New terminal paths must call
+// UpdateAutopilotRunTerminalWithQuota instead.
 func (q *Queries) UpdateAutopilotRunSkippedWithResult(ctx context.Context, arg UpdateAutopilotRunSkippedWithResultParams) (AutopilotRun, error) {
 	row := q.db.QueryRow(ctx, updateAutopilotRunSkippedWithResult, arg.ID, arg.FailureReason, arg.Result)
 	var i AutopilotRun
@@ -2346,6 +2369,9 @@ type UpdateAutopilotRunTerminalWithQuotaRow struct {
 // the quota CTEs become empty without an extra BEGIN/COMMIT round trip.
 // Consumed slots are deliberately immutable: create_issue is chargeable once
 // the issue exists, even if that issue is later blocked, cancelled, or deleted.
+// The CTE sequence is: update the run, lock a still-reserved slot, finalize
+// that slot exactly once, then move one unit from reserved_count to either
+// used_count (consume) or nowhere (release). used_count never decreases.
 func (q *Queries) UpdateAutopilotRunTerminalWithQuota(ctx context.Context, arg UpdateAutopilotRunTerminalWithQuotaParams) (UpdateAutopilotRunTerminalWithQuotaRow, error) {
 	row := q.db.QueryRow(ctx, updateAutopilotRunTerminalWithQuota,
 		arg.TerminalStatus,

@@ -285,20 +285,12 @@ func (s *AutopilotService) DispatchAutopilotForWebhookDelivery(
 	// while linking task_id back to the run. Repair that linkage and wake the
 	// daemon; otherwise continue the same partial run below.
 	if autopilot.ExecutionMode == "run_only" && !run.TaskID.Valid {
-		task, taskErr := s.Queries.GetAutopilotTaskByRun(ctx, run.ID)
-		switch {
-		case taskErr == nil:
-			updated, updateErr := s.Queries.UpdateAutopilotRunRunning(ctx, db.UpdateAutopilotRunRunningParams{
-				ID:     run.ID,
-				TaskID: task.ID,
-			})
-			if updateErr != nil {
-				return run, fmt.Errorf("dispatch for webhook delivery: repair task linkage: %w", updateErr)
-			}
-			s.TaskSvc.NotifyTaskEnqueued(ctx, task)
-			return &updated, nil
-		case !errors.Is(taskErr, pgx.ErrNoRows):
-			return run, fmt.Errorf("dispatch for webhook delivery: lookup linked task: %w", taskErr)
+		repaired, found, repairErr := s.repairAutopilotRunTaskLink(ctx, *run)
+		if repairErr != nil {
+			return run, fmt.Errorf("dispatch for webhook delivery: %w", repairErr)
+		}
+		if found {
+			return repaired, nil
 		}
 	}
 	// Webhook worker dispatch has no member actor and no human reason-code
@@ -341,6 +333,38 @@ func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, aut
 		return fmt.Errorf("dispatch for webhook delivery: repair issue task: %w", err)
 	}
 	return nil
+}
+
+// repairAutopilotRunTaskLink closes the run_only crash window where task
+// creation committed but autopilot_run.task_id did not. Finding any task is
+// proof that downstream ownership already moved; active work is re-woken and
+// terminal work is replayed through the normal finalizer instead of duplicated.
+func (s *AutopilotService) repairAutopilotRunTaskLink(ctx context.Context, run db.AutopilotRun) (*db.AutopilotRun, bool, error) {
+	task, err := s.Queries.GetAutopilotTaskByRun(ctx, run.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("lookup linked task: %w", err)
+	}
+	updated, err := s.Queries.UpdateAutopilotRunRunning(ctx, db.UpdateAutopilotRunRunningParams{
+		ID:     run.ID,
+		TaskID: task.ID,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("repair task linkage: %w", err)
+	}
+	switch task.Status {
+	case "completed", "failed", "cancelled":
+		s.SyncRunFromTask(ctx, task)
+		updated, err = s.Queries.GetAutopilotRun(ctx, run.ID)
+		if err != nil {
+			return nil, false, fmt.Errorf("reload terminal repaired run: %w", err)
+		}
+	default:
+		s.TaskSvc.NotifyTaskEnqueued(ctx, task)
+	}
+	return &updated, true, nil
 }
 
 // DispatchAutopilotForPlan is the entry point for scheduled triggers that
@@ -404,6 +428,15 @@ func (s *AutopilotService) DispatchAutopilotForPlan(
 		return &existing, nil
 
 	case err == nil:
+		if autopilot.ExecutionMode == "run_only" && !existing.TaskID.Valid {
+			repaired, found, repairErr := s.repairAutopilotRunTaskLink(ctx, existing)
+			if repairErr != nil {
+				return nil, fmt.Errorf("dispatch for plan: %w", repairErr)
+			}
+			if found {
+				return repaired, nil
+			}
+		}
 		// Partial-state run from a crashed attempt. Mark it failed
 		// (with a recovery reason) and release its partial-unique
 		// slot so the fresh dispatch below can create a new row.
@@ -415,8 +448,12 @@ func (s *AutopilotService) DispatchAutopilotForPlan(
 			"issue_set", existing.IssueID.Valid,
 			"task_set", existing.TaskID.Valid,
 		)
-		if err := s.recoverPartialAutopilotRun(ctx, existing); err != nil {
+		recovered, err := s.recoverPartialAutopilotRun(ctx, existing)
+		if err != nil {
 			return nil, fmt.Errorf("dispatch for plan: recover partial run: %w", err)
+		}
+		if !recovered {
+			return nil, fmt.Errorf("dispatch for plan: partial run changed concurrently; retry")
 		}
 		// Fall through to a fresh dispatch below.
 

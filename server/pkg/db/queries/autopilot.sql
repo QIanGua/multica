@@ -329,7 +329,7 @@ SELECT * FROM autopilot_run
 WHERE quota_reservation_id = $1
 LIMIT 1;
 
--- name: RecoverPartialAutopilotRun :exec
+-- name: RecoverPartialAutopilotRun :one
 -- Recovers a partial-state autopilot_run from a crashed first attempt
 -- (the runner wrote the run row but died before creating the downstream
 -- issue/task) so that a subsequent DispatchAutopilotForPlan call can
@@ -348,6 +348,16 @@ WITH updated_run AS (
         reason_code = 'internal_error',
         planned_at = NULL
     WHERE ar.id = $1
+      AND (
+          ar.status = 'pending'
+          OR (ar.status = 'issue_created' AND ar.issue_id IS NULL)
+          OR (ar.status = 'running' AND ar.task_id IS NULL)
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM agent_task_queue task
+          WHERE task.autopilot_run_id = ar.id
+      )
     RETURNING ar.quota_reservation_id
 ), locked_reservation AS MATERIALIZED (
     SELECT qr.*
@@ -367,14 +377,17 @@ WITH updated_run AS (
             AND p.period_end = locked.period_end
       )
     RETURNING locked.workspace_id, locked.period_start, locked.period_end
+), settled_period AS (
+    UPDATE autopilot_quota_period AS p
+    SET reserved_count = reserved_count - 1,
+        updated_at = now()
+    FROM released_reservation AS released
+    WHERE p.workspace_id = released.workspace_id
+      AND p.period_start = released.period_start
+      AND p.period_end = released.period_end
+    RETURNING p.workspace_id
 )
-UPDATE autopilot_quota_period AS p
-SET reserved_count = reserved_count - 1,
-    updated_at = now()
-FROM released_reservation AS released
-WHERE p.workspace_id = released.workspace_id
-  AND p.period_start = released.period_start
-  AND p.period_end = released.period_end;
+SELECT count(*)::bigint FROM updated_run;
 
 -- name: GetAutopilotRun :one
 SELECT * FROM autopilot_run
@@ -399,12 +412,16 @@ WHERE id = $1
 RETURNING *;
 
 -- name: UpdateAutopilotRunCompleted :one
+-- Quota safety: only use for a run known to have no reservation. Normal
+-- terminal paths must call UpdateAutopilotRunTerminalWithQuota instead.
 UPDATE autopilot_run
 SET status = 'completed', completed_at = now(), result = sqlc.narg('result')
 WHERE id = $1
 RETURNING *;
 
 -- name: UpdateAutopilotRunFailed :one
+-- Quota safety: only use for a run known to have no reservation. Normal
+-- terminal paths must call UpdateAutopilotRunTerminalWithQuota instead.
 UPDATE autopilot_run
 SET status = 'failed', completed_at = now(), failure_reason = $2,
     reason_code = sqlc.narg('reason_code')
@@ -412,6 +429,8 @@ WHERE id = $1
 RETURNING *;
 
 -- name: UpdateAutopilotRunSkipped :one
+-- Quota safety: this is only for pre-admission skipped rows, which never have
+-- reservations. Post-admission skips use UpdateAutopilotRunTerminalWithQuota.
 -- Marks an autopilot_run as skipped without enqueueing any task. Used by the
 -- pre-flight admission check when the assignee agent's runtime is offline:
 -- creating an issue / task in that state would just pile a doomed job onto
@@ -430,6 +449,9 @@ RETURNING *;
 -- the quota CTEs become empty without an extra BEGIN/COMMIT round trip.
 -- Consumed slots are deliberately immutable: create_issue is chargeable once
 -- the issue exists, even if that issue is later blocked, cancelled, or deleted.
+-- The CTE sequence is: update the run, lock a still-reserved slot, finalize
+-- that slot exactly once, then move one unit from reserved_count to either
+-- used_count (consume) or nowhere (release). used_count never decreases.
 WITH updated_run AS (
     UPDATE autopilot_run AS ar
     SET status = @terminal_status::text,
@@ -481,6 +503,8 @@ WITH updated_run AS (
 SELECT * FROM updated_run;
 
 -- name: UpdateAutopilotRunSkippedWithResult :one
+-- Quota safety: legacy no-reservation helper. New terminal paths must call
+-- UpdateAutopilotRunTerminalWithQuota instead.
 UPDATE autopilot_run
 SET status = 'skipped',
     completed_at = now(),

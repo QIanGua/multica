@@ -62,6 +62,15 @@ func newAutopilotIdempotencyKey() string { return uuid.NewString() }
 // the generated value scopes idempotency to that single request.
 func NewRequestIdempotencyKey() string { return newAutopilotIdempotencyKey() }
 
+func validAutopilotExecutionSource(source string) bool {
+	switch source {
+	case "schedule", "manual", "webhook", "api":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *AutopilotService) quotaPolicy(ctx context.Context, workspaceID pgtype.UUID) (autopilotQuotaPolicy, bool) {
 	if s.Entitlements == nil || !workspaceID.Valid {
 		return autopilotQuotaPolicy{}, false
@@ -98,6 +107,9 @@ func (s *AutopilotService) createAutopilotRunWithQuota(
 	source, idempotencyKey string,
 	params db.CreateAutopilotRunParams,
 ) (db.AutopilotRun, bool, error) {
+	if !validAutopilotExecutionSource(source) {
+		return db.AutopilotRun{}, false, fmt.Errorf("invalid autopilot execution source %q", source)
+	}
 	policy, enabled := s.quotaPolicy(ctx, workspaceID)
 	if !enabled {
 		run, err := s.Queries.CreateAutopilotRun(ctx, params)
@@ -270,8 +282,9 @@ func autopilotRunFromTerminalRow(row db.UpdateAutopilotRunTerminalWithQuotaRow) 
 	}
 }
 
-func (s *AutopilotService) recoverPartialAutopilotRun(ctx context.Context, run db.AutopilotRun) error {
-	return s.Queries.RecoverPartialAutopilotRun(ctx, run.ID)
+func (s *AutopilotService) recoverPartialAutopilotRun(ctx context.Context, run db.AutopilotRun) (bool, error) {
+	rows, err := s.Queries.RecoverPartialAutopilotRun(ctx, run.ID)
+	return rows > 0, err
 }
 
 // FailAutopilotRunsByIssue keeps create_issue consumption immutable while
@@ -310,13 +323,19 @@ func (s *AutopilotService) QuotaEnabled() bool { return s.Entitlements != nil }
 // reservation/run transaction but before the downstream side effect or normal
 // finalizer. The reservation transition remains CAS-based, so replicas may run
 // this concurrently without double-adjusting counters.
-func (s *AutopilotService) ReconcileAutopilotQuotaReservations(ctx context.Context, createdBefore time.Time, limit int32) (int, error) {
+func (s *AutopilotService) ReconcileAutopilotQuotaReservations(
+	ctx context.Context,
+	terminalCreatedBefore time.Time,
+	partialCreatedBefore time.Time,
+	limit int32,
+) (int, error) {
 	if !s.QuotaEnabled() || limit <= 0 {
 		return 0, nil
 	}
 	reservations, err := s.Queries.ListRecoverableAutopilotQuotaReservations(ctx, db.ListRecoverableAutopilotQuotaReservationsParams{
-		CreatedBefore: pgtype.Timestamptz{Time: createdBefore.UTC(), Valid: true},
-		RowLimit:      limit,
+		TerminalCreatedBefore: pgtype.Timestamptz{Time: terminalCreatedBefore.UTC(), Valid: true},
+		PartialCreatedBefore:  pgtype.Timestamptz{Time: partialCreatedBefore.UTC(), Valid: true},
+		RowLimit:              limit,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("list recoverable quota reservations: %w", err)
@@ -351,11 +370,19 @@ func (s *AutopilotService) ReconcileAutopilotQuotaReservations(ctx context.Conte
 			if !changed {
 				continue
 			}
+		case (run.Source == "manual" || run.Source == "api") &&
+			!run.IssueID.Valid && !run.TaskID.Valid &&
+			(run.Status == "pending" || run.Status == "issue_created" || run.Status == "running"):
+			changed, err := s.recoverPartialAutopilotRun(ctx, run)
+			if err != nil {
+				return settled, fmt.Errorf("recover abandoned quota run: %w", err)
+			}
+			if !changed {
+				continue
+			}
 		default:
-			// Admission retries own recovery for live partial runs: schedule
-			// clears its planned slot, webhook resumes from durable delivery,
-			// and manual/API reuse the idempotency key. A time-based sweeper
-			// must never race those paths and force a still-live run to failed.
+			// Schedule and webhook retries own their partial-state recovery. The
+			// query excludes them so this branch is only a defensive guard.
 			continue
 		}
 		settled++

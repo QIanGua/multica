@@ -37,14 +37,15 @@ FROM changed
 WHERE p.workspace_id = changed.workspace_id
   AND p.period_start = changed.period_start
   AND p.period_end = changed.period_end
-RETURNING p.id, p.workspace_id, p.period_start, p.period_end, p.used_count, p.reserved_count, p.blocked_counts, p.would_block_counts, p.created_at, p.updated_at
+RETURNING p.workspace_id, p.period_start, p.period_end, p.used_count, p.reserved_count, p.blocked_counts, p.would_block_counts, p.created_at, p.updated_at, p.id
 `
 
+// used_count is monotonic within a period: consuming a reserved slot is the
+// only write that changes it, and no release path decrements it.
 func (q *Queries) ConsumeAutopilotQuotaReservation(ctx context.Context, reservationID pgtype.UUID) (AutopilotQuotaPeriod, error) {
 	row := q.db.QueryRow(ctx, consumeAutopilotQuotaReservation, reservationID)
 	var i AutopilotQuotaPeriod
 	err := row.Scan(
-		&i.ID,
 		&i.WorkspaceID,
 		&i.PeriodStart,
 		&i.PeriodEnd,
@@ -54,6 +55,7 @@ func (q *Queries) ConsumeAutopilotQuotaReservation(ctx context.Context, reservat
 		&i.WouldBlockCounts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ID,
 	)
 	return i, err
 }
@@ -108,7 +110,7 @@ INSERT INTO autopilot_quota_period (workspace_id, period_start, period_end)
 VALUES ($1, $2, $3)
 ON CONFLICT (workspace_id, period_start, period_end) DO UPDATE
 SET updated_at = autopilot_quota_period.updated_at
-RETURNING id, workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at
+RETURNING workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at, id
 `
 
 type EnsureAutopilotQuotaPeriodParams struct {
@@ -123,7 +125,6 @@ func (q *Queries) EnsureAutopilotQuotaPeriod(ctx context.Context, arg EnsureAuto
 	row := q.db.QueryRow(ctx, ensureAutopilotQuotaPeriod, arg.WorkspaceID, arg.PeriodStart, arg.PeriodEnd)
 	var i AutopilotQuotaPeriod
 	err := row.Scan(
-		&i.ID,
 		&i.WorkspaceID,
 		&i.PeriodStart,
 		&i.PeriodEnd,
@@ -133,12 +134,13 @@ func (q *Queries) EnsureAutopilotQuotaPeriod(ctx context.Context, arg EnsureAuto
 		&i.WouldBlockCounts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ID,
 	)
 	return i, err
 }
 
 const getAutopilotQuotaPeriod = `-- name: GetAutopilotQuotaPeriod :one
-SELECT id, workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at FROM autopilot_quota_period
+SELECT workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at, id FROM autopilot_quota_period
 WHERE workspace_id = $1 AND period_start = $2 AND period_end = $3
 `
 
@@ -152,7 +154,6 @@ func (q *Queries) GetAutopilotQuotaPeriod(ctx context.Context, arg GetAutopilotQ
 	row := q.db.QueryRow(ctx, getAutopilotQuotaPeriod, arg.WorkspaceID, arg.PeriodStart, arg.PeriodEnd)
 	var i AutopilotQuotaPeriod
 	err := row.Scan(
-		&i.ID,
 		&i.WorkspaceID,
 		&i.PeriodStart,
 		&i.PeriodEnd,
@@ -162,6 +163,7 @@ func (q *Queries) GetAutopilotQuotaPeriod(ctx context.Context, arg GetAutopilotQ
 		&i.WouldBlockCounts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ID,
 	)
 	return i, err
 }
@@ -218,7 +220,7 @@ SET blocked_counts = jsonb_set(
 WHERE workspace_id = $2
   AND period_start = $3
   AND period_end = $4
-RETURNING id, workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at
+RETURNING workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at, id
 `
 
 type IncrementAutopilotQuotaBlockedParams struct {
@@ -237,7 +239,6 @@ func (q *Queries) IncrementAutopilotQuotaBlocked(ctx context.Context, arg Increm
 	)
 	var i AutopilotQuotaPeriod
 	err := row.Scan(
-		&i.ID,
 		&i.WorkspaceID,
 		&i.PeriodStart,
 		&i.PeriodEnd,
@@ -247,6 +248,7 @@ func (q *Queries) IncrementAutopilotQuotaBlocked(ctx context.Context, arg Increm
 		&i.WouldBlockCounts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ID,
 	)
 	return i, err
 }
@@ -256,7 +258,7 @@ UPDATE autopilot_quota_period
 SET reserved_count = reserved_count + 1,
     updated_at = now()
 WHERE workspace_id = $1 AND period_start = $2 AND period_end = $3
-RETURNING id, workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at
+RETURNING workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at, id
 `
 
 type IncrementAutopilotQuotaReservedParams struct {
@@ -269,7 +271,6 @@ func (q *Queries) IncrementAutopilotQuotaReserved(ctx context.Context, arg Incre
 	row := q.db.QueryRow(ctx, incrementAutopilotQuotaReserved, arg.WorkspaceID, arg.PeriodStart, arg.PeriodEnd)
 	var i AutopilotQuotaPeriod
 	err := row.Scan(
-		&i.ID,
 		&i.WorkspaceID,
 		&i.PeriodStart,
 		&i.PeriodEnd,
@@ -279,6 +280,7 @@ func (q *Queries) IncrementAutopilotQuotaReserved(ctx context.Context, arg Incre
 		&i.WouldBlockCounts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ID,
 	)
 	return i, err
 }
@@ -295,7 +297,7 @@ SET would_block_counts = jsonb_set(
 WHERE workspace_id = $2
   AND period_start = $3
   AND period_end = $4
-RETURNING id, workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at
+RETURNING workspace_id, period_start, period_end, used_count, reserved_count, blocked_counts, would_block_counts, created_at, updated_at, id
 `
 
 type IncrementAutopilotQuotaWouldBlockParams struct {
@@ -314,7 +316,6 @@ func (q *Queries) IncrementAutopilotQuotaWouldBlock(ctx context.Context, arg Inc
 	)
 	var i AutopilotQuotaPeriod
 	err := row.Scan(
-		&i.ID,
 		&i.WorkspaceID,
 		&i.PeriodStart,
 		&i.PeriodEnd,
@@ -324,6 +325,7 @@ func (q *Queries) IncrementAutopilotQuotaWouldBlock(ctx context.Context, arg Inc
 		&i.WouldBlockCounts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ID,
 	)
 	return i, err
 }
@@ -333,22 +335,42 @@ SELECT r.id, r.workspace_id, r.period_start, r.period_end, r.policy_revision, r.
 FROM autopilot_quota_reservation r
 LEFT JOIN autopilot_run ar ON ar.quota_reservation_id = r.id
 WHERE r.state = 'reserved'
-  AND r.created_at < $1
   AND (
-      ar.id IS NULL
-      OR ar.status IN ('completed', 'failed', 'skipped')
+      (
+          r.created_at < $1
+          AND (ar.id IS NULL OR ar.status IN ('completed', 'failed', 'skipped'))
+      )
+      OR (
+          -- Manual/API requests have no durable retry owner. Reclaim only an
+          -- hours-old partial run with neither a linked side effect nor even
+          -- an unlinked task row; schedule and webhook retries repair their
+          -- own partial state and are deliberately excluded.
+          r.created_at < $2
+          AND ar.source IN ('manual', 'api')
+          AND (
+              ar.status = 'pending'
+              OR (ar.status = 'issue_created' AND ar.issue_id IS NULL)
+              OR (ar.status = 'running' AND ar.task_id IS NULL)
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM agent_task_queue task
+              WHERE task.autopilot_run_id = ar.id
+          )
+      )
   )
 ORDER BY r.created_at
-LIMIT $2
+LIMIT $3
 `
 
 type ListRecoverableAutopilotQuotaReservationsParams struct {
-	CreatedBefore pgtype.Timestamptz `json:"created_before"`
-	RowLimit      int32              `json:"row_limit"`
+	TerminalCreatedBefore pgtype.Timestamptz `json:"terminal_created_before"`
+	PartialCreatedBefore  pgtype.Timestamptz `json:"partial_created_before"`
+	RowLimit              int32              `json:"row_limit"`
 }
 
 func (q *Queries) ListRecoverableAutopilotQuotaReservations(ctx context.Context, arg ListRecoverableAutopilotQuotaReservationsParams) ([]AutopilotQuotaReservation, error) {
-	rows, err := q.db.Query(ctx, listRecoverableAutopilotQuotaReservations, arg.CreatedBefore, arg.RowLimit)
+	rows, err := q.db.Query(ctx, listRecoverableAutopilotQuotaReservations, arg.TerminalCreatedBefore, arg.PartialCreatedBefore, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -404,14 +426,15 @@ FROM changed
 WHERE p.workspace_id = changed.workspace_id
   AND p.period_start = changed.period_start
   AND p.period_end = changed.period_end
-RETURNING p.id, p.workspace_id, p.period_start, p.period_end, p.used_count, p.reserved_count, p.blocked_counts, p.would_block_counts, p.created_at, p.updated_at
+RETURNING p.workspace_id, p.period_start, p.period_end, p.used_count, p.reserved_count, p.blocked_counts, p.would_block_counts, p.created_at, p.updated_at, p.id
 `
 
+// Release is intentionally limited to still-reserved work. A consumed
+// create_issue slot remains counted after cancellation, blocking, or deletion.
 func (q *Queries) ReleaseAutopilotQuotaReservation(ctx context.Context, reservationID pgtype.UUID) (AutopilotQuotaPeriod, error) {
 	row := q.db.QueryRow(ctx, releaseAutopilotQuotaReservation, reservationID)
 	var i AutopilotQuotaPeriod
 	err := row.Scan(
-		&i.ID,
 		&i.WorkspaceID,
 		&i.PeriodStart,
 		&i.PeriodEnd,
@@ -421,6 +444,7 @@ func (q *Queries) ReleaseAutopilotQuotaReservation(ctx context.Context, reservat
 		&i.WouldBlockCounts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ID,
 	)
 	return i, err
 }
