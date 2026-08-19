@@ -1895,6 +1895,16 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	// not — because its absence is what tells an upgraded daemon it is talking
 	// to a server too old to have answered the question (MUL-5811).
 	resp.LeaderRoleResolved = true
+	// Agent-trigger plugin hooks, as tools. A failure here degrades to no
+	// tools rather than failing the claim: a plugin that cannot be listed must
+	// not stop an agent from working on the issue.
+	if h.PluginService != nil && h.pluginsV1Enabled(r.Context()) {
+		if tools, toolErr := h.PluginService.AgentHookTools(r.Context(), parseUUID(runtimeWorkspaceID)); toolErr != nil {
+			slog.Warn("plugins: could not list agent hook tools", "workspace_id", runtimeWorkspaceID, "error", toolErr)
+		} else {
+			resp.PluginHookTools = tools
+		}
+	}
 	supportsCoalescedComments := requestHasClientCapability(r, protocol.DaemonCapabilityCoalescedCommentsV1)
 	// Empty-but-non-nil so pgx persists '{}' rather than NULL for tasks without
 	// comment input. Comment tasks replace this with the ids actually embedded

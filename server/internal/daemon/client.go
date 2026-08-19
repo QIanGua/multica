@@ -1095,3 +1095,69 @@ func (c *Client) getJSONWithToken(ctx context.Context, path, token string, respB
 	}
 	return json.NewDecoder(resp.Body).Decode(respBody)
 }
+
+// postJSONWithToken is getJSONWithToken's write counterpart, for the daemon's
+// task-scoped calls that carry a body.
+func (c *Client) postJSONWithToken(ctx context.Context, path, token string, reqBody, respBody any) error {
+	encoded, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(encoded))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	c.setIdentityHeaders(req)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &requestError{Method: http.MethodPost, Path: path, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(data))}
+	}
+	if respBody == nil {
+		io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(respBody)
+}
+
+// InvokeAgentPluginHook asks the server to make one agent-triggered hook call.
+//
+// The daemon deliberately does not call the plugin itself: the signing secret
+// is derived from the deployment key and stays on the server, and routing
+// through it keeps the rate limit, circuit breaker, `net:` destination check
+// and invocation record on one code path for every trigger.
+func (c *Client) InvokeAgentPluginHook(ctx context.Context, daemonToken, taskID, installationID, hookKey string, input json.RawMessage) (json.RawMessage, error) {
+	var response struct {
+		Status string          `json:"status"`
+		Output json.RawMessage `json:"output,omitempty"`
+		Error  string          `json:"error,omitempty"`
+	}
+	path := fmt.Sprintf("/api/daemon/tasks/%s/plugin-hooks", url.PathEscape(taskID))
+	body := map[string]any{"installation_id": installationID, "hook_key": hookKey}
+	if len(input) > 0 {
+		body["input"] = input
+	}
+	if err := c.postJSONWithToken(ctx, path, daemonToken, body, &response); err != nil {
+		return nil, err
+	}
+	// A refused or failed hook comes back as a 200 with a status, so that the
+	// caller can render it as a TOOL error rather than a broken transport —
+	// an unreachable plugin endpoint must not fail the agent's task.
+	if response.Status != "ok" {
+		if response.Error != "" {
+			return nil, errors.New(response.Error)
+		}
+		return nil, errors.New("the plugin hook did not succeed")
+	}
+	return response.Output, nil
+}

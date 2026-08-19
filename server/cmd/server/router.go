@@ -1258,6 +1258,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Get("/workspaces/{workspaceId}/repos", h.GetDaemonWorkspaceRepos)
 		r.Get("/workspaces/{workspaceId}/runtime-profiles", h.DaemonListRuntimeProfiles)
 
+		// Agent-triggered plugin hooks. The daemon's local MCP server calls
+		// this when an agent picks one of its tools; the server makes the
+		// signed request so the daemon never holds the signing secret.
+		r.Post("/tasks/{id}/plugin-hooks", h.InvokeAgentPluginHook)
+
 		r.Post("/runtimes/{runtimeId}/tasks/claim", h.ClaimTaskByRuntime)
 		// Canonical machine-level batch claim (MUL-4257). `/claim` is a
 		// transitional alias; the daemon coordinator targets the canonical

@@ -6337,6 +6337,33 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	for _, diagnostic := range remoteMCPDiagnostics {
 		taskLog.Warn("Remote MCP degraded", "reason", diagnostic)
 	}
+
+	// Agent-trigger plugin hooks, as a second local MCP server beside the
+	// broker. A failure to start it degrades to no plugin tools rather than
+	// failing the task: an agent that cannot reach a plugin should still work
+	// on the issue, which is the same rule that makes a failing tool call a
+	// tool error rather than a task error.
+	pluginHookConfig, pluginHookServer, pluginHookErr := startTaskPluginHookMCP(
+		ctx, task.ID, task.PluginHookTools,
+		func(callCtx context.Context, taskID, installationID, hookKey string, input json.RawMessage) (json.RawMessage, error) {
+			return d.client.InvokeAgentPluginHook(callCtx, task.RemoteMCPDaemonToken, taskID, installationID, hookKey, input)
+		},
+		taskLog,
+	)
+	if pluginHookErr != nil {
+		taskLog.Warn("plugin hook tools unavailable", "error", pluginHookErr)
+	}
+	if pluginHookServer != nil {
+		defer pluginHookServer.Close()
+	}
+	if len(pluginHookConfig) > 0 {
+		merged, mergeErr := mergeTaskRemoteMCPConfig(remoteMCPConfig, pluginHookConfig)
+		if mergeErr != nil {
+			taskLog.Warn("could not merge plugin hook MCP config", "error", mergeErr)
+		} else {
+			remoteMCPConfig = merged
+		}
+	}
 	if task.Agent != nil {
 		agentMcpConfig = task.Agent.McpConfig
 		effectiveMcpConfig = agentMcpConfig

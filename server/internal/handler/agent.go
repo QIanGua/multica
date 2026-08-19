@@ -315,6 +315,11 @@ type AgentTaskResponse struct {
 	IssueID              string                 `json:"issue_id"`
 	WorkspaceID          string                 `json:"workspace_id"`
 	RemoteMCPConnections []remotemcp.Connection `json:"remote_mcp_connections,omitempty"`
+	// PluginHookTools are the workspace's agent-trigger plugin hooks, which the
+	// daemon renders as MCP tools for this task. Resolved at claim time so
+	// disabling or uninstalling a plugin takes effect on the next task rather
+	// than whenever a daemon happens to restart.
+	PluginHookTools []service.PluginHookTool `json:"plugin_hook_tools,omitempty"`
 	// RemoteMCPDaemonToken is a short-lived, workspace-and-daemon scoped
 	// credential used only by the local daemon's write-only Remote MCP broker.
 	// It is never injected into the agent process.

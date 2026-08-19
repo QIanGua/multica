@@ -305,16 +305,15 @@ func TestShippedHostCapabilitiesRunTheSurfacesTheHostMounts(t *testing.T) {
 	}
 
 	// handler.InvokePluginHook serves ui and manual; service.PluginEventDispatcher
-	// serves event off the internal bus.
-	for _, trigger := range []string{plugincontract.TriggerUI, plugincontract.TriggerManual, plugincontract.TriggerEvent} {
+	// serves event off the internal bus; daemon/plugin_hook_mcp.go renders
+	// agent-trigger hooks as MCP tools.
+	for _, trigger := range []string{
+		plugincontract.TriggerUI, plugincontract.TriggerManual,
+		plugincontract.TriggerEvent, plugincontract.TriggerAgent,
+	} {
 		if !shipped.HookTriggers[trigger] {
 			t.Fatalf("hook trigger %q has a host call site and must be shipped", trigger)
 		}
-	}
-	// The agent trigger is not a call site the host drives — it is a hook
-	// exposed to an agent as an MCP tool, which needs the daemon-side server.
-	if shipped.HookTriggers[plugincontract.TriggerAgent] {
-		t.Fatal("the agent trigger needs the daemon-side MCP server, which has not landed")
 	}
 
 	// service.callHookEndpoint speaks http and nothing else.

@@ -80,6 +80,10 @@ type Task struct {
 	// RemoteMCPDaemonToken stays inside the daemon and authenticates the local
 	// broker's credential-resolution calls. It must never enter agent env/config.
 	RemoteMCPDaemonToken string `json:"remote_mcp_daemon_token,omitempty"`
+	// PluginHookTools are this workspace's agent-trigger plugin hooks, which
+	// the local MCP server presents to the agent as tools. Resolved by the
+	// server at claim time; the daemon never reads plugin state itself.
+	PluginHookTools []PluginHookTool `json:"plugin_hook_tools,omitempty"`
 	// WorkspaceContext mirrors workspace.context (the per-workspace system
 	// prompt set in Settings → General). Server populates this on every claim
 	// regardless of task kind so the daemon can inject `## Workspace Context`
@@ -293,4 +297,17 @@ type TaskResult struct {
 	// precisely when the abandoned id would otherwise stay selectable.
 	RetiredSessionID string           `json:"-"`
 	Usage            []TaskUsageEntry `json:"usage,omitempty"` // per-model token usage
+}
+
+// PluginHookTool is one agent-trigger plugin hook, as the agent will see it.
+//
+// Mirrors service.PluginHookTool on the wire. Declared here rather than
+// imported so the daemon does not depend on the server's service package —
+// same reason Task itself is a daemon-side type.
+type PluginHookTool struct {
+	InstallationID string          `json:"installation_id"`
+	HookKey        string          `json:"hook_key"`
+	Name           string          `json:"name"`
+	Description    string          `json:"description"`
+	InputSchema    json.RawMessage `json:"input_schema,omitempty"`
 }
