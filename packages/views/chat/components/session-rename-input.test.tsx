@@ -8,7 +8,6 @@ const TEST_RESOURCES = { en: { chat: enChat } };
 const RENAME_LABEL = enChat.session_history.row_rename_aria;
 const onSubmit = vi.fn();
 const onCancel = vi.fn();
-const onCompositionChange = vi.fn();
 
 function renderInput(): HTMLInputElement {
   render(
@@ -17,7 +16,6 @@ function renderInput(): HTMLInputElement {
         initialValue="Original title"
         onSubmit={onSubmit}
         onCancel={onCancel}
-        onCompositionChange={onCompositionChange}
       />
     </I18nProvider>,
   );
@@ -28,7 +26,6 @@ describe("SessionRenameInput", () => {
   beforeEach(() => {
     onSubmit.mockReset();
     onCancel.mockReset();
-    onCompositionChange.mockReset();
   });
 
   it.each([
@@ -44,20 +41,11 @@ describe("SessionRenameInput", () => {
     expect(input).toHaveValue("yanjiu");
   });
 
-  it("blocks outside pointerdown until composition ends, then submits", () => {
+  it("submits the latest value on outside pointerdown", () => {
     const input = renderInput();
-    fireEvent.change(input, { target: { value: "yanjiu" } });
-    fireEvent.compositionStart(input);
-
-    expect(fireEvent.pointerDown(document.body)).toBe(false);
-    expect(onSubmit).not.toHaveBeenCalled();
-    expect(onCompositionChange).toHaveBeenLastCalledWith(true);
-
     fireEvent.change(input, { target: { value: "研究" } });
-    fireEvent.compositionEnd(input);
     fireEvent.pointerDown(document.body);
 
-    expect(onCompositionChange).toHaveBeenLastCalledWith(false);
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith("研究");
   });

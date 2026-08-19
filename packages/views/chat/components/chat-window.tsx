@@ -1167,9 +1167,6 @@ function SessionDropdown({
   // session id (not the full session) so a stale closure can't overwrite a
   // newer rename pulled in via WS.
   const [renamingId, setRenamingId] = useState<string | null>(null);
-  // Keep the controlled popover open even if its outside-press listener runs
-  // before SessionRenameInput's document listener for the same pointerdown.
-  const renameComposingRef = useRef(false);
   const setArchived = useSetChatSessionArchived();
   const updateSession = useUpdateChatSession();
   const setActiveSession = useChatStore((s) => s.setActiveSession);
@@ -1264,7 +1261,6 @@ function SessionDropdown({
   };
 
   const handleSubmitRename = (sessionId: string, raw: string) => {
-    renameComposingRef.current = false;
     const trimmed = raw.trim();
     const current = sessions.find((s) => s.id === sessionId);
     setRenamingId(null);
@@ -1359,10 +1355,7 @@ function SessionDropdown({
             key: "rename",
             icon: <Pencil className="size-3.5" />,
             label: t(($) => $.session_history.row_rename_aria),
-            onSelect: () => {
-              renameComposingRef.current = false;
-              setRenamingId(session.id);
-            },
+            onSelect: () => setRenamingId(session.id),
           },
           {
             key: "archive",
@@ -1408,13 +1401,7 @@ function SessionDropdown({
             <SessionRenameInput
               initialValue={session.title ?? ""}
               onSubmit={(value) => handleSubmitRename(session.id, value)}
-              onCancel={() => {
-                renameComposingRef.current = false;
-                setRenamingId(null);
-              }}
-              onCompositionChange={(isComposing) => {
-                renameComposingRef.current = isComposing;
-              }}
+              onCancel={() => setRenamingId(null)}
             />
           ) : isConfirmingStop ? (
             <div className="truncate text-body font-medium text-destructive">
@@ -1526,13 +1513,7 @@ function SessionDropdown({
 
   return (
     <>
-      <Popover
-        open={isHistoryOpen}
-        onOpenChange={(open) => {
-          if (!open && renameComposingRef.current) return;
-          setIsHistoryOpen(open);
-        }}
-      >
+      <Popover open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
         <div className="flex min-w-0 items-center gap-1">
           <PopoverTrigger className="flex max-w-96 min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1 transition-colors hover:bg-accent data-[popup-open]:bg-accent data-open:bg-accent">
             {triggerAgent && (

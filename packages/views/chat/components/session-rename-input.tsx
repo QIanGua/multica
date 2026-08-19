@@ -19,17 +19,14 @@ export function SessionRenameInput({
   initialValue,
   onSubmit,
   onCancel,
-  onCompositionChange,
 }: {
   initialValue: string;
   onSubmit: (value: string) => void;
   onCancel: () => void;
-  onCompositionChange?: (isComposing: boolean) => void;
 }) {
   const { t } = useT("chat");
   const [value, setValue] = useState(initialValue);
   const inputRef = useRef<HTMLInputElement>(null);
-  const isComposingRef = useRef(false);
   // Hold the latest value + callback in refs so the mount-only effect's
   // listener always sees fresh state without re-subscribing on every
   // keystroke (which would briefly leave a window where pointerdown isn't
@@ -47,13 +44,6 @@ export function SessionRenameInput({
       const input = inputRef.current;
       if (!input) return;
       if (input.contains(e.target as Node)) return;
-      if (isComposingRef.current) {
-        // Do not let the same pointerdown dismiss the controlled popover and
-        // discard the draft while the IME still owns the input.
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        return;
-      }
       onSubmitRef.current(valueRef.current);
     };
     // Capture phase — commit before outside-click handling can close the
@@ -72,14 +62,6 @@ export function SessionRenameInput({
       maxLength={200}
       aria-label={t(($) => $.session_history.row_rename_aria)}
       onChange={(e) => setValue(e.target.value)}
-      onCompositionStart={() => {
-        isComposingRef.current = true;
-        onCompositionChange?.(true);
-      }}
-      onCompositionEnd={() => {
-        isComposingRef.current = false;
-        onCompositionChange?.(false);
-      }}
       onClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
       onKeyDown={(e) => {
