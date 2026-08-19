@@ -77,11 +77,12 @@ jobs:
               - 'Makefile'
             # Everything the backend jobs (backend-tests,
             # go-vulnerability-scan, windows-execenv) read, which is NOT the
-            # same thing as server/**: three Go tests reach out of the module
-            # to pin a contract against a file the other side owns, and each
-            # one has to be listed here or the PR that breaks the contract is
-            # exactly the PR that skips the test. Same bias as the frontend
-            # filter: over-match rather than silently skip validation.
+            # same thing as server/**: four Go tests reach out of the module
+            # to pin a contract against a file the other side owns, across
+            # three cross-module file dependencies. Each of those files has
+            # to be listed here or the PR that breaks the contract is exactly
+            # the PR that skips the test. Same bias as the frontend filter:
+            # over-match rather than silently skip validation.
             backend:
               - 'server/**'
               - 'deploy/helm/**'
@@ -92,7 +93,9 @@ jobs:
               # frontend half must run the backend suite.
               - 'packages/core/runtimes/cli-version.ts'
               # internal/daemon/agent_command_names_test.go reads both of
-              # these; they are also the entry points scripts/test-go.sh runs.
+              # these as test inputs; the guard script is additionally the
+              # entry point scripts/test-go.sh runs, and the names file is
+              # the data that guard consumes.
               - 'scripts/agent-cli-command-names.txt'
               - 'scripts/go-test-with-agent-cli-guard.sh'
               - 'scripts/helm-config.test.sh'
