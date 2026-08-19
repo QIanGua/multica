@@ -1858,6 +1858,19 @@ func chatSessionResumeFallbackNeeded(priorSessionID, priorWorkDir string) bool {
 	return priorSessionID == "" || priorWorkDir == ""
 }
 
+func rerunSourceMatchesTaskScope(task, source db.AgentTaskQueue) bool {
+	if task.AgentID != source.AgentID {
+		return false
+	}
+	if task.IssueID.Valid {
+		return source.IssueID.Valid && task.IssueID == source.IssueID
+	}
+	if task.ChatSessionID.Valid {
+		return source.ChatSessionID.Valid && task.ChatSessionID == source.ChatSessionID
+	}
+	return false
+}
+
 // buildClaimedTaskResponse assembles the full daemon claim payload for a
 // single already-claimed task and computes the exact comment ids embedded in
 // it (deliveredCommentIDs). Shared by the per-runtime handler
@@ -1884,7 +1897,41 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	if composioMCPEnabled {
 		resp.ConnectedApps = parseRuntimeConnectedAppsForClaim(task.RuntimeConnectedApps, task.ID)
 	}
-	if agent, err := h.Queries.GetAgent(r.Context(), task.AgentID); err == nil {
+	agent, err := h.Queries.GetAgent(r.Context(), task.AgentID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("daemon claim: task agent no longer exists; refusing dispatch",
+				"task_id", uuidToString(task.ID), "agent_id", uuidToString(task.AgentID))
+			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+				r.Context(), task,
+				"Task identity is invalid: the assigned agent no longer exists.",
+				taskfailure.ReasonInvalidTaskIdentity,
+				"error_invalid_task_identity", http.StatusConflict, "task agent no longer exists",
+			)
+		}
+		slog.Error("daemon claim: load task agent failed; requeueing claim",
+			"task_id", uuidToString(task.ID), "agent_id", uuidToString(task.AgentID), "error", err)
+		if _, requeueErr := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); requeueErr != nil {
+			slog.Error("daemon claim: requeue after agent load failure failed; stale reclaim will recover it",
+				"task_id", uuidToString(task.ID), "error", requeueErr)
+		}
+		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, &claimBuildFailure{
+			outcome: "error_load_task_agent",
+			status:  http.StatusInternalServerError,
+			message: "failed to load task agent",
+		}
+	}
+	if uuidToString(agent.ID) != resp.AgentID {
+		slog.Error("daemon claim: task identity mismatch; refusing dispatch",
+			"task_id", uuidToString(task.ID), "task_agent_id", resp.AgentID, "loaded_agent_id", uuidToString(agent.ID))
+		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+			r.Context(), task,
+			"Task identity is invalid: the task and expanded agent disagree.",
+			taskfailure.ReasonInvalidTaskIdentity,
+			"error_invalid_task_identity", http.StatusConflict, "task agent identity mismatch",
+		)
+	}
+	{
 		useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
 		var customEnv map[string]string
 		if agent.CustomEnv != nil {
@@ -2343,7 +2390,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			// directory. PriorWorkDir is offered regardless of runtime (a shared
 			// mount may still resolve it); only the per-cwd session is
 			// runtime-gated.
-			if src, err := h.Queries.GetAgentTask(r.Context(), task.RerunOfTaskID); err == nil {
+			if src, err := h.Queries.GetAgentTask(r.Context(), task.RerunOfTaskID); err == nil && rerunSourceMatchesTaskScope(*task, src) {
 				if src.WorkDir.Valid {
 					resp.PriorWorkDir = src.WorkDir.String
 				}
@@ -2357,6 +2404,16 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				if src.SessionRolloutMissing {
 					resp.PriorSessionResumeUnavailable = true
 				}
+			} else if err == nil {
+				slog.Error("daemon claim: rerun source belongs to another agent or scope; starting fresh",
+					"task_id", uuidToString(task.ID),
+					"task_agent_id", uuidToString(task.AgentID),
+					"task_issue_id", uuidToString(task.IssueID),
+					"source_task_id", uuidToString(src.ID),
+					"source_agent_id", uuidToString(src.AgentID),
+					"source_issue_id", uuidToString(src.IssueID),
+				)
+				resp.PriorSessionResumeUnavailable = true
 			}
 		} else if !task.ForceFreshSession {
 			// Non-rerun follow-up on the same issue: resume the most recent

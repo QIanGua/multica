@@ -2571,15 +2571,16 @@ func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *te
 }
 
 type claimRuntimeGuardTask struct {
-	PriorSessionID           string   `json:"prior_session_id"`
-	PriorWorkDir             string   `json:"prior_work_dir"`
-	ChatMessage              string   `json:"chat_message"`
-	ThreadName               string   `json:"thread_name"`
-	QuickCreateAttachmentIDs []string `json:"quick_create_attachment_ids"`
-	QuickCreatePriority      string   `json:"quick_create_priority"`
-	QuickCreateDueDate       string   `json:"quick_create_due_date"`
-	ProjectID                string   `json:"project_id"`
-	ProjectDescription       string   `json:"project_description"`
+	PriorSessionID                string   `json:"prior_session_id"`
+	PriorWorkDir                  string   `json:"prior_work_dir"`
+	PriorSessionResumeUnavailable bool     `json:"prior_session_resume_unavailable"`
+	ChatMessage                   string   `json:"chat_message"`
+	ThreadName                    string   `json:"thread_name"`
+	QuickCreateAttachmentIDs      []string `json:"quick_create_attachment_ids"`
+	QuickCreatePriority           string   `json:"quick_create_priority"`
+	QuickCreateDueDate            string   `json:"quick_create_due_date"`
+	ProjectID                     string   `json:"project_id"`
+	ProjectDescription            string   `json:"project_description"`
 }
 
 func claimTaskForRuntimeGuard(t *testing.T, runtimeID, daemonID string) *claimRuntimeGuardTask {
@@ -3003,6 +3004,73 @@ func TestClaimTask_ManualRetryReusesWorkdir(t *testing.T) {
 			t.Fatalf("PriorSessionID = %q, want empty (cross-runtime session cannot resolve)", task.PriorSessionID)
 		}
 	})
+
+	t.Run("different_agent_source_starts_fresh", func(t *testing.T) {
+		issueNum++
+		issueID := dbfx.Issue(t, "manual-retry-cross-agent fixture", testutil.Cols{
+			"status": "in_progress",
+			"number": issueNum,
+		})
+		otherAgentID := dbfx.Agent(t, "Rerun Source Other Agent", runtimeID, testutil.Cols{})
+		sourceID := dbfx.Task(t, otherAgentID, testutil.Cols{
+			"runtime_id": runtimeID,
+			"issue_id":   issueID,
+			"status":     "failed",
+			"session_id": "other-agent-session",
+			"work_dir":   "/tmp/other-agent-workdir",
+		})
+		dbfx.Exec(t, `
+			INSERT INTO agent_task_queue (
+				agent_id, runtime_id, issue_id, status, priority,
+				rerun_of_task_id, force_fresh_session
+			)
+			VALUES ($1, $2, $3, 'queued', 0, $4, TRUE)
+		`, agentID, runtimeID, issueID, sourceID)
+
+		task := claimTaskForRuntimeGuard(t, runtimeID, daemonID)
+		if task.PriorWorkDir != "" || task.PriorSessionID != "" {
+			t.Fatalf("cross-agent rerun inherited source pointers: session=%q workdir=%q", task.PriorSessionID, task.PriorWorkDir)
+		}
+		if !task.PriorSessionResumeUnavailable {
+			t.Fatal("cross-agent rerun must disclose that the requested source was not resumable")
+		}
+	})
+}
+
+func TestClaimBuildRejectsAgentDeletedAfterClaim(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	agentID, runtimeID, _ := createRuntimeGuardAgent(t, ctx)
+	issueID := dbfx.Issue(t, "missing claim agent fixture", testutil.Cols{
+		"status": "in_progress",
+		"number": 81299,
+	})
+	taskID := dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id": runtimeID,
+		"issue_id":   issueID,
+		"status":     "queued",
+	})
+	claimed, err := testHandler.TaskService.ClaimTaskForRuntime(ctx, parseUUID(runtimeID))
+	if err != nil {
+		t.Fatalf("ClaimTaskForRuntime: %v", err)
+	}
+	if claimed == nil || uuidToString(claimed.ID) != taskID {
+		t.Fatalf("ClaimTaskForRuntime task = %v, want %s", claimed, taskID)
+	}
+	dbfx.Exec(t, `DELETE FROM agent WHERE id = $1`, agentID)
+
+	runtime, err := testHandler.Queries.GetAgentRuntime(ctx, parseUUID(runtimeID))
+	if err != nil {
+		t.Fatalf("GetAgentRuntime: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/claim", nil)
+	_, _, _, _, failure := testHandler.buildClaimedTaskResponse(req, claimed, runtime, runtimeID, testWorkspaceID)
+	if failure == nil || failure.status != http.StatusInternalServerError || failure.outcome != "error_invalid_task_identity_settle" {
+		t.Fatalf("buildClaimedTaskResponse failure = %#v, want fail-closed settlement error", failure)
+	}
 }
 
 func TestClaimTask_ChatPriorSessionRuntimeGuard(t *testing.T) {
