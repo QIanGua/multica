@@ -141,6 +141,9 @@ If the frontend and backend are served from different hostnames, `COOKIE_DOMAIN`
 | `PORT` | `8080` | Backend port — the one to edit. It is the port the backend process listens on for a local/bare run, and the host port the Compose self-host stack publishes. In Compose the container always listens on `8080` internally, so changing this needs no rebuild. |
 | `BACKEND_PORT` | Value of `PORT` | Optional alias that overrides `PORT` for the backend. `API_PORT` and `SERVER_PORT` are further aliases; the **alias order** is `BACKEND_PORT` → `API_PORT` → `SERVER_PORT` → `PORT` → `8080`, and it is the same in `Makefile`, `scripts/local-env.sh` and `docker-compose.selfhost.yml`. Leave them unset unless the host port must differ from the port the process listens on. |
 | `METRICS_ADDR` | empty | Optional Prometheus metrics listener, for example `127.0.0.1:9090` |
+| `PPROF_ADDR` | empty | Optional Go runtime profiling listener, for example `127.0.0.1:6060`; keep it loopback-only unless access is otherwise restricted. |
+| `PPROF_BLOCK_PROFILE_RATE` | `0` | Average one block-profile sample per this many nanoseconds spent blocked; `0` disables block profiling. Use `1` to capture every blocking event during a debugging session. |
+| `PPROF_MUTEX_PROFILE_FRACTION` | `0` | Mutex contention sampling denominator; `0` disables mutex profiling, `1` captures every event, and `5` captures about one in five. |
 | `FRONTEND_PORT` | `3000` | Frontend port. Host port in Compose; the container always listens on `3000` internally. |
 | `CORS_ALLOWED_ORIGINS` | Value of `FRONTEND_ORIGIN` | Comma-separated list of allowed origins. Governs **both** the HTTP CORS allowlist **and** the WebSocket `Origin` check. A browser origin that isn't listed here (and isn't `localhost`) has its real-time WebSocket upgrade rejected with `403`, so live updates stop working until a manual refresh. |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
@@ -580,6 +583,44 @@ networking, allowlists, NetworkPolicy, or proxy authentication. If you bind
 `METRICS_ADDR=0.0.0.0:9090` inside a container, only publish that port to a
 trusted network, for example a host-local mapping such as
 `127.0.0.1:9090:9090`.
+
+## Go Runtime Profiling
+
+The backend can expose Go CPU, heap, goroutine, block, mutex, and other runtime
+profiles on a separate management listener:
+
+```bash
+PPROF_ADDR=127.0.0.1:6060 ./server/bin/server
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+```
+
+`PPROF_ADDR` is empty by default, so no profiling listener is started. The
+public API port does not serve `/debug/pprof/`. Profiles can reveal process
+internals and some captures add CPU or memory pressure, so keep the listener on
+loopback or protect it with the same private-network controls as metrics.
+
+Block and mutex endpoints are available whenever pprof is enabled, but their
+sampling is off by default to avoid steady-state runtime overhead. Enable them
+only for a debugging session, then return both values to `0`:
+
+```bash
+PPROF_ADDR=127.0.0.1:6060 \
+PPROF_BLOCK_PROFILE_RATE=1 \
+PPROF_MUTEX_PROFILE_FRACTION=1 \
+./server/bin/server
+```
+
+A loopback listener inside a container belongs to that container's network
+namespace and is not reachable directly from the host. With the Compose stack,
+capture the profile inside the backend container and copy it out:
+
+```bash
+docker compose -f docker-compose.selfhost.yml exec backend \
+  wget -qO /tmp/heap.pprof http://127.0.0.1:6060/debug/pprof/heap
+docker compose -f docker-compose.selfhost.yml cp backend:/tmp/heap.pprof ./heap.pprof
+go tool pprof ./heap.pprof
+```
 
 ## Upgrading
 
