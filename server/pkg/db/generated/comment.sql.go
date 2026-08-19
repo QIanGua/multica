@@ -314,6 +314,9 @@ WITH locked_issue AS MATERIALIZED (
     WHERE comment.id = $1 AND comment.workspace_id = $2
     FOR UPDATE OF issue
 ), issue_fence AS MATERIALIZED (
+    -- The consumed locked_count below is the ordering fence: the issue lock is
+    -- acquired before DELETE can lock the comment. MATERIALIZED only prevents
+    -- folding/re-evaluation and is not, by itself, a lock-order guarantee.
     SELECT count(*) AS locked_count FROM locked_issue
 ), deleted_comment AS (
     DELETE FROM comment
@@ -1637,6 +1640,10 @@ WITH locked_issue AS MATERIALIZED (
     WHERE comment.id = $1
     FOR UPDATE OF issue
 ), issue_fence AS MATERIALIZED (
+    -- The aggregate always emits one row. Consuming locked_count in target's
+    -- tautological predicate creates a real data dependency: locked_issue must
+    -- acquire the owner lock before target can lock the comment. MATERIALIZED
+    -- prevents folding/re-evaluation; it does not itself establish lock order.
     SELECT count(*) AS locked_count FROM locked_issue
 ), target AS MATERIALIZED (
     SELECT comment.id, comment.issue_id, comment.author_type, comment.author_id, comment.content, comment.type, comment.created_at, comment.updated_at, comment.parent_id, comment.workspace_id, comment.resolved_at, comment.resolved_by_type, comment.resolved_by_id, comment.source_task_id, comment.quick_action_id, comment.via_plugin_id, comment.revision,

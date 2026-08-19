@@ -27,7 +27,31 @@ import (
 	"github.com/multica-ai/multica/server/internal/logger"
 )
 
-const advisoryLockName = "issue_last_activity_backfill"
+const (
+	advisoryLockName        = "issue_last_activity_backfill"
+	defaultMaxStalledPasses = 10
+)
+
+type stalledPassGuard struct {
+	max         int
+	consecutive int
+}
+
+func (g *stalledPassGuard) observe(passRows, remaining int64) error {
+	if passRows > 0 {
+		g.consecutive = 0
+		return nil
+	}
+	g.consecutive++
+	if g.max > 0 && g.consecutive >= g.max {
+		return fmt.Errorf(
+			"issue last-activity backfill stalled: %d consecutive passes made no progress with %d rows remaining; release long-held row locks and rerun, or increase --max-stalled-passes",
+			g.consecutive,
+			remaining,
+		)
+	}
+	return nil
+}
 
 func main() {
 	logger.Init()
@@ -41,6 +65,7 @@ func run() error {
 	batchSize := flag.Int("batch-size", issueactivitybackfill.DefaultBatchSize, "maximum issue rows updated per transaction")
 	delay := flag.Duration("sleep-between-batches", 100*time.Millisecond, "delay between committed batches")
 	maxBatches := flag.Int("max-batches", 0, "stop after N batches (0 = finish all remaining rows)")
+	maxStalledPasses := flag.Int("max-stalled-passes", defaultMaxStalledPasses, "fail after N consecutive no-progress passes (0 = disable the guard)")
 	flag.Parse()
 	if *batchSize < 1 {
 		return fmt.Errorf("--batch-size must be at least 1")
@@ -50,6 +75,9 @@ func run() error {
 	}
 	if *maxBatches < 0 {
 		return fmt.Errorf("--max-batches must not be negative")
+	}
+	if *maxStalledPasses < 0 {
+		return fmt.Errorf("--max-stalled-passes must not be negative")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -86,8 +114,10 @@ func run() error {
 	slog.Info("issue last-activity backfill started", "remaining", remaining, "batch_size", *batchSize, "delay", delay.String())
 
 	var total int64
+	var passRows int64
 	var afterID *string
 	pass := 1
+	stallGuard := stalledPassGuard{max: *maxStalledPasses}
 	for batch := 1; *maxBatches == 0 || batch <= *maxBatches; batch++ {
 		result, err := issueactivitybackfill.Batch(ctx, pool, issueactivitybackfill.Options{
 			BatchSize: *batchSize,
@@ -100,6 +130,7 @@ func run() error {
 			return fmt.Errorf("issue last-activity backfill batch returned %d rows without a keyset watermark", result.Rows)
 		}
 		total += result.Rows
+		passRows += result.Rows
 		if result.Rows > 0 {
 			slog.Info("issue last-activity batch committed", "batch", batch, "pass", pass, "rows", result.Rows, "total", total, "last_id", result.LastID)
 			next := result.LastID
@@ -117,9 +148,13 @@ func run() error {
 				slog.Info("issue last-activity backfill complete", "rows_backfilled", total, "remaining", 0)
 				return nil
 			}
+			if err := stallGuard.observe(passRows, remaining); err != nil {
+				return err
+			}
 			pass++
 			afterID = nil
-			slog.Info("issue last-activity pass complete; rows remain locked or pending", "pass", pass-1, "remaining", remaining)
+			slog.Info("issue last-activity pass complete; rows remain locked or pending", "pass", pass-1, "rows", passRows, "remaining", remaining, "stalled_passes", stallGuard.consecutive)
+			passRows = 0
 		}
 		if *delay > 0 {
 			select {

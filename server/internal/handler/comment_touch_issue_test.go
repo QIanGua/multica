@@ -351,6 +351,105 @@ func TestDeleteCommentLosingRaceDoesNotTouchIssue(t *testing.T) {
 	assertIssueActivityState(t, issueID, 11, time.Date(2020, time.January, 2, 0, 0, 0, 0, time.UTC))
 }
 
+// Issue teardown locks the owner and then cascades into comments. A comment
+// mutation must wait for that owner lock before taking the child lock; taking
+// them in the opposite order would deadlock when teardown reaches the cascade.
+func TestCommentMutationsFollowIssueTeardownLockOrder(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	tests := []struct {
+		name      string
+		queryName string
+		mutate    func(context.Context, string) error
+	}{
+		{
+			name:      "update",
+			queryName: "UpdateComment",
+			mutate: func(ctx context.Context, commentID string) error {
+				_, err := testHandler.Queries.UpdateComment(ctx, db.UpdateCommentParams{
+					ID:      parseUUID(commentID),
+					Content: "concurrent edit",
+				})
+				if errors.Is(err, pgx.ErrNoRows) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				return errors.New("comment update succeeded after its issue was deleted")
+			},
+		},
+		{
+			name:      "delete",
+			queryName: "DeleteComment",
+			mutate: func(ctx context.Context, commentID string) error {
+				result, err := testHandler.Queries.DeleteComment(ctx, db.DeleteCommentParams{
+					ID:          parseUUID(commentID),
+					WorkspaceID: parseUUID(testWorkspaceID),
+				})
+				if err != nil {
+					return err
+				}
+				if result.Changed {
+					return errors.New("comment delete changed a row after its issue was deleted")
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			issueID := dbfx.Issue(t, "comment mutation vs issue teardown "+tt.name)
+			commentID := dbfx.Comment(t, issueID, "before")
+
+			teardown, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin issue teardown: %v", err)
+			}
+			defer teardown.Rollback(context.Background())
+			qtx := testHandler.Queries.WithTx(teardown)
+			if _, err := qtx.LockIssueForDelete(ctx, db.LockIssueForDeleteParams{
+				ID:          parseUUID(issueID),
+				WorkspaceID: parseUUID(testWorkspaceID),
+			}); err != nil {
+				t.Fatalf("lock issue for teardown: %v", err)
+			}
+
+			mutationDone := make(chan error, 1)
+			go func() {
+				mutationDone <- tt.mutate(ctx, commentID)
+			}()
+			waitForCommentMutationLock(t, tt.queryName, mutationDone)
+
+			// This is the delete phase of deleteIssueAndCollectAttachmentURLs.
+			// If the mutation took the comment before waiting for the issue, the
+			// ON DELETE CASCADE below closes a real issue/comment deadlock cycle.
+			deleteErr := qtx.DeleteIssue(ctx, db.DeleteIssueParams{
+				ID:          parseUUID(issueID),
+				WorkspaceID: parseUUID(testWorkspaceID),
+			})
+			if deleteErr == nil {
+				deleteErr = teardown.Commit(ctx)
+			} else {
+				_ = teardown.Rollback(context.Background())
+			}
+			mutationErr := <-mutationDone
+			if deleteErr != nil {
+				t.Fatalf("issue teardown deadlocked or failed: %v", deleteErr)
+			}
+			if mutationErr != nil {
+				t.Fatalf("comment mutation deadlocked or returned an unexpected result: %v", mutationErr)
+			}
+		})
+	}
+}
+
 func waitForCommentMutationLock(t *testing.T, queryName string, done <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
