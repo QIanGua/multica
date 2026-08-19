@@ -1904,6 +1904,15 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		} else {
 			resp.PluginHookTools = tools
 		}
+		// mcp-transport hooks ride the EXISTING broker: the connection shape is
+		// what validatePinnedRemoteMCPTools already reads, so an approved tool
+		// that went missing or whose schema drifted refuses at startup without
+		// any new enforcement code.
+		if connections, connErr := h.PluginService.AgentMCPConnections(r.Context(), parseUUID(runtimeWorkspaceID)); connErr != nil {
+			slog.Warn("plugins: could not list agent MCP connections", "workspace_id", runtimeWorkspaceID, "error", connErr)
+		} else if len(connections) > 0 {
+			resp.RemoteMCPConnections = append(resp.RemoteMCPConnections, connections...)
+		}
 	}
 	supportsCoalescedComments := requestHasClientCapability(r, protocol.DaemonCapabilityCoalescedCommentsV1)
 	// Empty-but-non-nil so pgx persists '{}' rather than NULL for tasks without

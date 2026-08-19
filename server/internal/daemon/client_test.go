@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/multica-ai/multica/server/pkg/remotemcp"
 	"time"
 
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -110,6 +112,38 @@ func TestClient_ResolveRemoteMCPCredentialUsesExplicitDaemonToken(t *testing.T) 
 	}
 	if got := c.Token(); got != "mul_owner_pat" {
 		t.Fatalf("client PAT was mutated to %q", got)
+	}
+}
+
+// A Plugin's mcp hook shares this resolver and this broker with a workspace's
+// own Remote MCP connections, but its credential lives in the Plugin's secret
+// storage and a different route serves it. The contribution id is all the
+// broker hands back at dial time, so the id carries the marker — and a
+// connection without it must keep going to the original route.
+func TestClient_ResolveRemoteMCPCredentialRoutesPluginContributions(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential_header":"Authorization","credential":"Bearer upstream"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	for _, contribution := range []string{"contribution-1", remotemcp.PluginContributionPrefix + "install-1:toolbox"} {
+		if _, err := c.ResolveRemoteMCPCredential(context.Background(), "mdt_task_broker", "task-1", contribution); err != nil {
+			t.Fatalf("resolve %q: %v", contribution, err)
+		}
+	}
+
+	want := []string{
+		"/api/daemon/tasks/task-1/remote-mcp/contribution-1/credential",
+		"/api/daemon/tasks/task-1/plugin-mcp/plugin:install-1:toolbox/credential",
+	}
+	for i, path := range want {
+		if seen[i] != path {
+			t.Fatalf("request %d went to %q, want %q", i, seen[i], path)
+		}
 	}
 }
 

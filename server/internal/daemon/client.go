@@ -16,6 +16,7 @@ import (
 
 	"github.com/multica-ai/multica/server/pkg/agent"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"github.com/multica-ai/multica/server/pkg/remotemcp"
 )
 
 // requestError is returned by postJSON/getJSON when the server responds with an error status.
@@ -222,7 +223,15 @@ func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, ta
 		CredentialHeader string `json:"credential_header"`
 		Credential       string `json:"credential"`
 	}
-	path := fmt.Sprintf("/api/daemon/tasks/%s/remote-mcp/%s/credential", url.PathEscape(taskID), url.PathEscape(contributionID))
+	// A Plugin-contributed connection keeps its credential in the Plugin's own
+	// secret storage, which a different route serves. The marker travels on the
+	// contribution id because that is all the broker hands back at dial time.
+	route := "remote-mcp"
+	if strings.HasPrefix(contributionID, remotemcp.PluginContributionPrefix) {
+		route = "plugin-mcp"
+	}
+	path := fmt.Sprintf("/api/daemon/tasks/%s/%s/%s/credential",
+		url.PathEscape(taskID), route, url.PathEscape(contributionID))
 	if err := c.getJSONWithToken(ctx, path, daemonToken, &response); err != nil {
 		return nil, err
 	}

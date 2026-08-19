@@ -199,6 +199,25 @@ export const PluginTokenIssueSchema = z.object({
   signing_secret: z.string().default(""),
 }).loose();
 
+/**
+ * Discovered tools for one `mcp`-transport hook.
+ *
+ * Defaults matter here in the usual direction: an unparseable response yields
+ * an EMPTY list and nothing approved, so a drifted backend cannot make the UI
+ * render a tool as already-approved.
+ */
+export const PluginMCPToolSchema = z.object({
+  name: z.string().default(""),
+  description: z.string().default(""),
+  schema_digest: z.string().default(""),
+  approved: z.boolean().default(false),
+  drifted: z.boolean().default(false),
+}).loose();
+
+export const PluginMCPToolListSchema = z.object({
+  tools: z.array(PluginMCPToolSchema).default([]),
+}).loose();
+
 export const PluginManifestSummarySchema = z.object({
   key: z.string().default(""),
   name: z.string().default(""),

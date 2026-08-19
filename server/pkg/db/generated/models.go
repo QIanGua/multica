@@ -954,6 +954,7 @@ type PluginInstallation struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	TokenHash      pgtype.Text        `json:"token_hash"`
 	TokenRotatedAt pgtype.Timestamptz `json:"token_rotated_at"`
+	McpApprovals   []byte             `json:"mcp_approvals"`
 }
 
 type PluginInvocation struct {

@@ -176,3 +176,9 @@ DELETE FROM skill WHERE plugin_installation_id = $1;
 -- declares must go, or a renamed skill leaves its predecessor behind forever.
 DELETE FROM skill
 WHERE plugin_installation_id = $1 AND name <> ALL(@keep_names::text[]);
+
+-- name: SetPluginMCPApprovals :one
+UPDATE plugin_installation
+SET mcp_approvals = $2, updated_at = now()
+WHERE id = $1
+RETURNING *;

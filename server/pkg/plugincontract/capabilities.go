@@ -44,10 +44,11 @@ func HostCapabilities() Capabilities {
 			TriggerEvent:  true,
 			TriggerAgent:  true,
 		},
-		// http only. The mcp transport adopts an external MCP server's tools as
-		// hooks, which needs an admin approval step with a pinned schema — the
-		// approval is the whole point, so it does not ship without one.
-		HookTransport: map[string]bool{TransportHTTP: true},
+		// http calls one declared endpoint; mcp adopts an external MCP server's
+		// tools, which is why it ships with an approval step that pins them by
+		// schema digest — see service/plugin_mcp_transport.go. Installing the
+		// plugin is not the grant there; approving the tools is.
+		HookTransport: map[string]bool{TransportHTTP: true, TransportMCP: true},
 		// A skill resource is not a call in either direction — it is a SKILL.md
 		// written into the existing skill table at install and removed at
 		// uninstall. service.InstallSkillResources does that.

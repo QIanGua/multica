@@ -55,7 +55,7 @@ const createPluginInstallation = `-- name: CreatePluginInstallation :one
 INSERT INTO plugin_installation (
     workspace_id, plugin_key, source_url, version, manifest, granted_scopes, installed_by
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at
+RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals
 `
 
 type CreatePluginInstallationParams struct {
@@ -94,6 +94,7 @@ func (q *Queries) CreatePluginInstallation(ctx context.Context, arg CreatePlugin
 		&i.UpdatedAt,
 		&i.TokenHash,
 		&i.TokenRotatedAt,
+		&i.McpApprovals,
 	)
 	return i, err
 }
@@ -264,7 +265,7 @@ func (q *Queries) DeletePluginStorageValue(ctx context.Context, arg DeletePlugin
 }
 
 const getPluginInstallation = `-- name: GetPluginInstallation :one
-SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at FROM plugin_installation WHERE id = $1
+SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals FROM plugin_installation WHERE id = $1
 `
 
 func (q *Queries) GetPluginInstallation(ctx context.Context, id pgtype.UUID) (PluginInstallation, error) {
@@ -285,12 +286,13 @@ func (q *Queries) GetPluginInstallation(ctx context.Context, id pgtype.UUID) (Pl
 		&i.UpdatedAt,
 		&i.TokenHash,
 		&i.TokenRotatedAt,
+		&i.McpApprovals,
 	)
 	return i, err
 }
 
 const getPluginInstallationByTokenHash = `-- name: GetPluginInstallationByTokenHash :one
-SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at FROM plugin_installation WHERE token_hash = $1
+SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals FROM plugin_installation WHERE token_hash = $1
 `
 
 // Looked up by hash, so the plaintext token exists only in the caller's request.
@@ -312,6 +314,7 @@ func (q *Queries) GetPluginInstallationByTokenHash(ctx context.Context, tokenHas
 		&i.UpdatedAt,
 		&i.TokenHash,
 		&i.TokenRotatedAt,
+		&i.McpApprovals,
 	)
 	return i, err
 }
@@ -409,7 +412,7 @@ func (q *Queries) GetPluginStorageValue(ctx context.Context, arg GetPluginStorag
 }
 
 const getWorkspacePluginInstallation = `-- name: GetWorkspacePluginInstallation :one
-SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at FROM plugin_installation
+SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals FROM plugin_installation
 WHERE workspace_id = $1 AND id = $2
 `
 
@@ -436,12 +439,13 @@ func (q *Queries) GetWorkspacePluginInstallation(ctx context.Context, arg GetWor
 		&i.UpdatedAt,
 		&i.TokenHash,
 		&i.TokenRotatedAt,
+		&i.McpApprovals,
 	)
 	return i, err
 }
 
 const getWorkspacePluginInstallationByKey = `-- name: GetWorkspacePluginInstallationByKey :one
-SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at FROM plugin_installation
+SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals FROM plugin_installation
 WHERE workspace_id = $1 AND plugin_key = $2
 `
 
@@ -468,6 +472,7 @@ func (q *Queries) GetWorkspacePluginInstallationByKey(ctx context.Context, arg G
 		&i.UpdatedAt,
 		&i.TokenHash,
 		&i.TokenRotatedAt,
+		&i.McpApprovals,
 	)
 	return i, err
 }
@@ -624,7 +629,7 @@ func (q *Queries) ListPluginStorageKeys(ctx context.Context, arg ListPluginStora
 }
 
 const listWorkspacePluginInstallations = `-- name: ListWorkspacePluginInstallations :many
-SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at FROM plugin_installation
+SELECT id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals FROM plugin_installation
 WHERE workspace_id = $1
 ORDER BY created_at ASC
 `
@@ -653,6 +658,7 @@ func (q *Queries) ListWorkspacePluginInstallations(ctx context.Context, workspac
 			&i.UpdatedAt,
 			&i.TokenHash,
 			&i.TokenRotatedAt,
+			&i.McpApprovals,
 		); err != nil {
 			return nil, err
 		}
@@ -669,7 +675,7 @@ UPDATE plugin_installation
 SET enabled = $2,
     updated_at = now()
 WHERE id = $1
-RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at
+RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals
 `
 
 type SetPluginInstallationEnabledParams struct {
@@ -695,6 +701,7 @@ func (q *Queries) SetPluginInstallationEnabled(ctx context.Context, arg SetPlugi
 		&i.UpdatedAt,
 		&i.TokenHash,
 		&i.TokenRotatedAt,
+		&i.McpApprovals,
 	)
 	return i, err
 }
@@ -715,12 +722,47 @@ func (q *Queries) SetPluginInstallationToken(ctx context.Context, arg SetPluginI
 	return err
 }
 
+const setPluginMCPApprovals = `-- name: SetPluginMCPApprovals :one
+UPDATE plugin_installation
+SET mcp_approvals = $2, updated_at = now()
+WHERE id = $1
+RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals
+`
+
+type SetPluginMCPApprovalsParams struct {
+	ID           pgtype.UUID `json:"id"`
+	McpApprovals []byte      `json:"mcp_approvals"`
+}
+
+func (q *Queries) SetPluginMCPApprovals(ctx context.Context, arg SetPluginMCPApprovalsParams) (PluginInstallation, error) {
+	row := q.db.QueryRow(ctx, setPluginMCPApprovals, arg.ID, arg.McpApprovals)
+	var i PluginInstallation
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.PluginKey,
+		&i.SourceUrl,
+		&i.Version,
+		&i.Manifest,
+		&i.GrantedScopes,
+		&i.Config,
+		&i.Enabled,
+		&i.InstalledBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.TokenHash,
+		&i.TokenRotatedAt,
+		&i.McpApprovals,
+	)
+	return i, err
+}
+
 const updatePluginInstallationConfig = `-- name: UpdatePluginInstallationConfig :one
 UPDATE plugin_installation
 SET config = $2,
     updated_at = now()
 WHERE id = $1
-RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at
+RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals
 `
 
 type UpdatePluginInstallationConfigParams struct {
@@ -746,6 +788,7 @@ func (q *Queries) UpdatePluginInstallationConfig(ctx context.Context, arg Update
 		&i.UpdatedAt,
 		&i.TokenHash,
 		&i.TokenRotatedAt,
+		&i.McpApprovals,
 	)
 	return i, err
 }
@@ -759,7 +802,7 @@ SET source_url = $2,
     config = $6,
     updated_at = now()
 WHERE id = $1
-RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at
+RETURNING id, workspace_id, plugin_key, source_url, version, manifest, granted_scopes, config, enabled, installed_by, created_at, updated_at, token_hash, token_rotated_at, mcp_approvals
 `
 
 type UpdatePluginInstallationManifestParams struct {
@@ -799,6 +842,7 @@ func (q *Queries) UpdatePluginInstallationManifest(ctx context.Context, arg Upda
 		&i.UpdatedAt,
 		&i.TokenHash,
 		&i.TokenRotatedAt,
+		&i.McpApprovals,
 	)
 	return i, err
 }

@@ -316,12 +316,12 @@ func TestShippedHostCapabilitiesRunTheSurfacesTheHostMounts(t *testing.T) {
 		}
 	}
 
-	// service.callHookEndpoint speaks http and nothing else.
-	if !shipped.HookTransport[plugincontract.TransportHTTP] {
-		t.Fatal("the http transport is implemented by callHookEndpoint and must be shipped")
-	}
-	if shipped.HookTransport[plugincontract.TransportMCP] {
-		t.Fatal("the mcp transport has no implementation yet")
+	// service.callHookEndpoint speaks http; service.AgentMCPConnections turns an
+	// approved mcp hook into a broker connection.
+	for _, transport := range []string{plugincontract.TransportHTTP, plugincontract.TransportMCP} {
+		if !shipped.HookTransport[transport] {
+			t.Fatalf("hook transport %q has an implementation and must be shipped", transport)
+		}
 	}
 
 	// service.InstallSkillResources writes these into the skill table, and
