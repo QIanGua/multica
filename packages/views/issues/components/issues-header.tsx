@@ -709,7 +709,7 @@ function PropertyFilterOptions({
   // property is unset, the inverse of picking one of the options below.
   const noValueOption = {
     id: NO_PROPERTY_VALUE,
-    name: t(($) => $.pickers.custom_property.no_value_label),
+    name: t(($) => $.pickers.custom_property.none),
     color: undefined as string | undefined,
     actorType: undefined as string | undefined,
     actorId: undefined as string | undefined,

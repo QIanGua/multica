@@ -459,7 +459,7 @@ function useFilterChips(
     const actorValues = actorProperty ? actorFilterValues(selected) : [];
     const optionName = (optionId: string): string | undefined => {
       if (optionId === NO_PROPERTY_VALUE) {
-        return t(($) => $.pickers.custom_property.no_value_label);
+        return t(($) => $.pickers.custom_property.none);
       }
       if (actorProperty) {
         const ref = parseActorRef(optionId);
