@@ -186,6 +186,9 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `MULTICA_LLM_API_KEY` | 空 | OpenAI 兼容 API key |
 | `MULTICA_LLM_BASE_URL` | 空 | OpenAI 兼容 endpoint |
 | `MULTICA_LLM_DEFAULT_MODEL` | `gpt-5.6-luna` | 请求未指定模型时使用 |
+| `MULTICA_LLM_MAX_RETRIES` | `2` | 单次上游请求的重试次数；`0` 表示禁用重试，`1`–`5` 表示精确次数 |
+
+`MULTICA_LLM_MAX_RETRIES` 是重试策略的唯一配置源。不设置时使用默认的 2 次；设为 `0` 表示每次调用只发一个请求；设为 1–5 表示精确的重试次数。其它取值（负数、非数字、大于 5）会让服务启动失败，而不是被静默纠正。上限是一个延迟预算：退避从 0.5s 开始翻倍，上限 8s，更大的预算会超出调用方自身的超时，把可重试的失败变成超时失败。重试覆盖连接失败以及 HTTP 408、409、429 和 5xx；其余 4xx 直接返回。服务启动时会以 `llm retry policy` 打印生效策略，其中不包含任何凭据。
 
 API key 与 base URL 都为空时，服务端 LLM 生成关闭，调用方会使用本地回退逻辑。
 

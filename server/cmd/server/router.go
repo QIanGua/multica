@@ -193,6 +193,13 @@ type RouterOptions struct {
 	// BatchedHeartbeatScheduler here so the caller can also drive Run/Stop;
 	// tests leave this nil and get the legacy synchronous behavior.
 	HeartbeatScheduler handler.HeartbeatScheduler
+	// LLMMaxRetries carries the parsed MULTICA_LLM_MAX_RETRIES budget. Unlike
+	// its three MULTICA_LLM_* siblings it is injected rather than read here,
+	// because an invalid value must fail the boot and only main() can exit —
+	// terminating the process from inside a router constructor would also kill
+	// any test that happened to have the variable set. nil means unset, which
+	// is what tests and NewRouter get.
+	LLMMaxRetries *int
 }
 
 func buildChannelSupervisor(
@@ -343,6 +350,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		LLMAPIKey:                strings.TrimSpace(os.Getenv("MULTICA_LLM_API_KEY")),
 		LLMBaseURL:               strings.TrimSpace(os.Getenv("MULTICA_LLM_BASE_URL")),
 		LLMDefaultModel:          strings.TrimSpace(os.Getenv("MULTICA_LLM_DEFAULT_MODEL")),
+		LLMMaxRetries:            opts.LLMMaxRetries,
 		ServerVersion:            normalizeServerVersion(version),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
