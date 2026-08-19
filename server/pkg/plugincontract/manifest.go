@@ -116,6 +116,27 @@ var fixedScopes = map[string]bool{
 	ScopeStorageWorkspace: true,
 }
 
+func hasScope(scopes []string, want string) bool {
+	for _, scope := range scopes {
+		if scope == want {
+			return true
+		}
+	}
+	return false
+}
+
+// eventReadScope maps each event onto the scope a plugin would have needed to
+// read the same content through the Action API.
+var eventReadScope = map[string]string{
+	EventIssueCreated:       ScopeIssuesRead,
+	EventIssueUpdated:       ScopeIssuesRead,
+	EventIssueStatusChanged: ScopeIssuesRead,
+	EventCommentCreated:     ScopeCommentsRead,
+	EventTaskStarted:        ScopeTasksRead,
+	EventTaskCompleted:      ScopeTasksRead,
+	EventTaskFailed:         ScopeTasksRead,
+}
+
 var knownEvents = map[string]bool{
 	EventIssueCreated:       true,
 	EventIssueUpdated:       true,
@@ -606,6 +627,15 @@ func (m Manifest) validateContributions() error {
 					return fmt.Errorf("%s.events contains duplicate event %q", field, event)
 				}
 				eventSeen[event] = true
+				// An event PUSHES the same content the Action API would have
+				// required a scope to pull: issue.* carries the description,
+				// comment.created carries the body. Without this, subscribing is
+				// a way to receive what reading was not granted — one dataset
+				// with two standards. Enforced at install, so the consent screen
+				// shows the read scope the subscription actually implies.
+				if required := eventReadScope[event]; required != "" && !hasScope(m.Scopes, required) {
+					return fmt.Errorf("%s.events subscribes to %q, which delivers content requiring the %s scope", field, event, required)
+				}
 			}
 		} else if len(hook.Events) > 0 {
 			return fmt.Errorf("%s.events requires the event trigger", field)

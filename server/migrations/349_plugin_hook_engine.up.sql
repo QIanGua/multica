@@ -49,8 +49,16 @@ ALTER TABLE plugin_installation ADD COLUMN IF NOT EXISTS token_rotated_at TIMEST
 -- via_plugin_id naming the plugin), while an event hook has no person behind it
 -- and must not borrow one. author_id then holds the installation id.
 --
--- Same shape as migration 107, which added 'system' for the same reason: a row
--- the platform produced that would be a lie attributed to any member.
+-- Same reason as migration 107, which added 'system': a row the platform
+-- produced that would be a lie attributed to any member. NOT the same shape,
+-- though — 107 revalidated the whole table under ACCESS EXCLUSIVE, which was
+-- cheap on the comment table of that era and is not on today's. NOT VALID adds
+-- the constraint without a scan; migration 352 validates it under a lock that
+-- readers and writers can share.
+--
+-- New rows are checked from the moment this lands. NOT VALID only means "do not
+-- re-check the rows already here", and the widened set is a superset of the old
+-- one, so there is nothing here that could violate it.
 ALTER TABLE comment DROP CONSTRAINT IF EXISTS comment_author_type_check;
 ALTER TABLE comment ADD CONSTRAINT comment_author_type_check
-    CHECK (author_type IN ('member', 'agent', 'system', 'plugin'));
+    CHECK (author_type IN ('member', 'agent', 'system', 'plugin')) NOT VALID;

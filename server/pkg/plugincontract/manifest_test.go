@@ -479,3 +479,55 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+// An event subscription delivers the same content the Action API would have
+// required a scope to read: issue.* carries the description, comment.created
+// carries the body. Without this check, subscribing was a way to receive what
+// reading was never granted.
+func TestEventSubscriptionRequiresTheMatchingReadScope(t *testing.T) {
+	manifest := func(scopes, events string) []byte {
+		return []byte(`{
+			"manifest_version": 1,
+			"key": "com.example.events",
+			"name": "Events",
+			"description": "d",
+			"version": "1.0.0",
+			"author": {"name": "example"},
+			"scopes": ` + scopes + `,
+			"contributes": {"hooks": [{
+				"key": "watch",
+				"name": "Watch",
+				"description": "Watch things happen.",
+				"triggers": ["event"],
+				"events": ` + events + `,
+				"transport": {"type": "http", "url": "https://example.com/hooks/watch"}
+			}]}
+		}`)
+	}
+
+	for name, tc := range map[string]struct {
+		scopes  string
+		events  string
+		wantErr bool
+	}{
+		"issue event without issues:read":     {`["net:example.com"]`, `["issue.created"]`, true},
+		"issue event with issues:read":        {`["issues:read", "net:example.com"]`, `["issue.created"]`, false},
+		"comment event without comments:read": {`["issues:read", "net:example.com"]`, `["comment.created"]`, true},
+		"comment event with comments:read":    {`["comments:read", "net:example.com"]`, `["comment.created"]`, false},
+		"task event without tasks:read":       {`["net:example.com"]`, `["task.failed"]`, true},
+		"task event with tasks:read":          {`["tasks:read", "net:example.com"]`, `["task.failed"]`, false},
+		"one of several events unscoped": {
+			`["issues:read", "net:example.com"]`, `["issue.created", "comment.created"]`, true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := ParseManifest(manifest(tc.scopes, tc.events))
+			if tc.wantErr && err == nil {
+				t.Fatal("subscribing to content the manifest may not read must be refused at install")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("a properly scoped subscription must parse: %v", err)
+			}
+		})
+	}
+}

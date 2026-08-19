@@ -108,7 +108,17 @@ func devHookClient(devOrigins []string, caPath string) *http.Client {
 	transport.Proxy = nil
 	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	slog.Info("plugins: dev hook endpoints will trust an additional CA", "path", caPath, "origins", devOrigins)
-	return &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+		// Refuse redirects, matching the secure client. A 302 from a dev
+		// endpoint would replay the SIGNED body and the callback token to
+		// wherever it pointed — the one destination check this path skipped is
+		// exactly the one a redirect would need.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("hook endpoints must not redirect")
+		},
+	}
 }
 
 type PluginErrorKind string

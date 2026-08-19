@@ -31,6 +31,14 @@ const (
 	// because an unbounded queue turns a slow plugin into a memory leak.
 	dispatchQueueDepth = 512
 	dispatchWorkers    = 4
+
+	// How long a hook call stays on record. This table is operational telemetry,
+	// not history: it answers "why is this endpoint failing right now", and the
+	// circuit breaker and rate limiter only ever look minutes back. Keeping it
+	// forever would grow an append-only table at the rate of the per-hook limit
+	// — 120/minute/hook — for no reader.
+	invocationRetention  = 7 * 24 * time.Hour
+	invocationSweepEvery = time.Hour
 )
 
 // PluginEventDispatcher fans domain events out to the hooks that asked for them.
@@ -64,7 +72,50 @@ func NewPluginEventDispatcher(service *PluginService) *PluginEventDispatcher {
 		dispatcher.wg.Add(1)
 		go dispatcher.work()
 	}
+	dispatcher.wg.Add(1)
+	go dispatcher.sweepInvocations()
 	return dispatcher
+}
+
+// sweepInvocations makes the table's "TTL-swept" description true.
+//
+// Nothing reads a row older than the breaker and rate-limit windows, both of
+// which look minutes back, so without this the table only grows — at up to the
+// per-hook limit of 120 rows a minute, per hook, forever.
+//
+// Runs on the dispatcher's own lifecycle because it is the same concern:
+// bounded resources for something a third party's behaviour drives.
+func (d *PluginEventDispatcher) sweepInvocations() {
+	defer d.wg.Done()
+	ticker := time.NewTicker(invocationSweepEvery)
+	defer ticker.Stop()
+	for {
+		// Swept once at startup as well: a deployment that was down for a week
+		// should not wait an hour to drop what expired while it was off.
+		d.sweepOnce()
+		select {
+		case <-d.stop:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (d *PluginEventDispatcher) sweepOnce() {
+	if d.service == nil || d.service.Queries == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-invocationRetention), Valid: true}
+	removed, err := d.service.Queries.DeleteExpiredPluginInvocations(ctx, cutoff)
+	if err != nil {
+		slog.Warn("plugins: invocation sweep failed", "error", err)
+		return
+	}
+	if removed > 0 {
+		slog.Info("plugins: swept expired hook invocations", "removed", removed)
+	}
 }
 
 // Dispatch is what the bus listener calls. It must return promptly: the caller

@@ -118,6 +118,7 @@ func (h *Handler) pluginTokenCaller(w http.ResponseWriter, r *http.Request, toke
 	var installationID pgtype.UUID
 	actor := pluginActor{Type: "plugin"}
 	var memberUserID pgtype.UUID
+	var issueScope pgtype.UUID
 
 	switch {
 	case strings.HasPrefix(token, "mpc_"):
@@ -131,6 +132,7 @@ func (h *Handler) pluginTokenCaller(w http.ResponseWriter, r *http.Request, toke
 			return service.PluginActionCaller{}, pluginActor{}, false
 		}
 		installationID = grant.InstallationID
+		issueScope = grant.IssueID
 		if grant.Actor.Type == "member" {
 			memberUserID = grant.Actor.ID
 		}
@@ -148,6 +150,10 @@ func (h *Handler) pluginTokenCaller(w http.ResponseWriter, r *http.Request, toke
 		writePluginError(w, err, "failed to authorize the Plugin call")
 		return service.PluginActionCaller{}, pluginActor{}, false
 	}
+
+	// The grant said which issue it was about. Carrying it here is what turns
+	// that from a comment into a check — see pluginIssueForUser.
+	caller.IssueScope = issueScope
 
 	// A callback token that stands for a person is only as good as that
 	// person's membership TODAY. Re-checking here means revoking someone's
@@ -174,13 +180,37 @@ func (h *Handler) pluginIssueForUser(w http.ResponseWriter, r *http.Request, cal
 		writeError(w, http.StatusNotFound, "issue not found")
 		return db.Issue{}, false
 	}
+	// Resolve first, then compare ids: a caller may name an issue by identifier
+	// (PLUG-12) or by uuid, and comparing raw strings would let the same issue
+	// pass under one spelling and fail under the other.
+	issue, ok := h.resolvePluginIssue(r, caller, issueID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "issue not found")
+		return db.Issue{}, false
+	}
+	// A callback grant issued about one issue reaches only that issue. Without
+	// this the grant is worth every issue in the workspace its actor can see,
+	// for the whole five minutes it lives.
+	//
+	// 404 rather than 403: the caller may well be able to see this issue by
+	// other means, and "you are scoped elsewhere" would confirm the id exists.
+	if caller.IssueScope.Valid && uuidToString(issue.ID) != uuidToString(caller.IssueScope) {
+		writeError(w, http.StatusNotFound, "issue not found")
+		return db.Issue{}, false
+	}
+	return issue, true
+}
+
+// resolvePluginIssue finds an issue inside the caller's workspace, by
+// identifier or by uuid. Membership in that workspace was established by
+// pluginCaller, so this is exactly the reach the caller already has.
+func (h *Handler) resolvePluginIssue(r *http.Request, caller service.PluginActionCaller, issueID string) (db.Issue, bool) {
 	workspaceID := uuidToString(caller.WorkspaceID)
 	if issue, ok := h.resolveIssueByIdentifier(r.Context(), issueID, workspaceID); ok {
 		return issue, true
 	}
 	parsed, err := util.ParseUUID(issueID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "issue not found")
 		return db.Issue{}, false
 	}
 	issue, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
@@ -188,7 +218,6 @@ func (h *Handler) pluginIssueForUser(w http.ResponseWriter, r *http.Request, cal
 		WorkspaceID: caller.WorkspaceID,
 	})
 	if err != nil {
-		writeError(w, http.StatusNotFound, "issue not found")
 		return db.Issue{}, false
 	}
 	return issue, true

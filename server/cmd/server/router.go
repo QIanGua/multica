@@ -1022,7 +1022,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// put an outside server on the critical path of creating an issue.
 	if h.PluginService != nil {
 		h.PluginService.Callbacks = service.NewCallbackTokens()
-		h.PluginService.CallbackBaseURL = strings.TrimSuffix(os.Getenv("MULTICA_PUBLIC_URL"), "/") + "/api/v1/plugin"
+		// Omitted rather than sent relative: a handler receiving
+		// "/api/v1/plugin" cannot call anything with it, and a broken absolute
+		// URL is harder to diagnose than an absent one.
+		if publicURL := strings.TrimSpace(os.Getenv("MULTICA_PUBLIC_URL")); publicURL != "" {
+			h.PluginService.CallbackBaseURL = strings.TrimSuffix(publicURL, "/") + "/api/v1/plugin"
+		} else {
+			slog.Warn("plugins: MULTICA_PUBLIC_URL is not set; hook callbacks will carry no callback_url")
+		}
 		pluginEvents := service.NewPluginEventDispatcher(h.PluginService)
 		service.SubscribePluginEvents(bus, pluginEvents)
 	}

@@ -25,6 +25,15 @@ type PluginActionCaller struct {
 	// Scopes is the consented set, read from the installation row rather than
 	// from the manifest the source URL serves today.
 	Scopes []string
+	// IssueScope, when set, is the ONLY issue this caller may touch.
+	//
+	// Set for a callback token issued against a specific issue. A hook called
+	// about one issue has no business reaching another: without this the grant
+	// is worth every issue in the workspace that its actor can see, for the
+	// whole five minutes it lives. Zero means unrestricted — a session caller,
+	// or an invocation that had no issue — and the ordinary workspace and
+	// membership checks still apply on top.
+	IssueScope pgtype.UUID
 }
 
 // AuthorizePluginAction performs the two checks that belong to the plugin: the
