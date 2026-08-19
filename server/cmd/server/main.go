@@ -426,23 +426,6 @@ func main() {
 		defer samplerPool.Close()
 	}
 
-	profilingConfig := profiling.ConfigFromEnv()
-	var profilingServer *http.Server
-	var blockProfileRate int
-	var mutexProfileFraction int
-	if profilingConfig.Enabled() {
-		blockProfileRate = envNonNegativeInt("PPROF_BLOCK_PROFILE_RATE", 0)
-		mutexProfileFraction = envNonNegativeInt("PPROF_MUTEX_PROFILE_FRACTION", 0)
-		profiling.ConfigureRuntime(blockProfileRate, mutexProfileFraction)
-		profilingServer = profiling.NewServer(profilingConfig.Addr)
-		if !obsmetrics.IsLoopbackAddr(profilingConfig.Addr) {
-			slog.Warn(
-				"pprof listener is not loopback-only; restrict access with private networking, allowlists, or proxy auth",
-				"addr", profilingConfig.Addr,
-			)
-		}
-	}
-
 	// Construct the BatchedHeartbeatScheduler before the router so it can
 	// be injected into the Handler. The Run goroutine starts below
 	// alongside the sweeper, and Stop is called explicitly during graceful
@@ -465,6 +448,7 @@ func main() {
 		Addr:    ":" + port,
 		Handler: r,
 	}
+	profilingServer := profiling.NewServer()
 
 	// Start background workers.
 	sweepCtx, sweepCancel := context.WithCancel(context.Background())
@@ -565,20 +549,12 @@ func main() {
 		}()
 	}
 
-	if profilingServer != nil {
-		go func() {
-			slog.Info(
-				"pprof server starting",
-				"addr", profilingConfig.Addr,
-				"block_profile_rate", blockProfileRate,
-				"mutex_profile_fraction", mutexProfileFraction,
-			)
-			if err := profilingServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				profiling.ConfigureRuntime(0, 0)
-				slog.Error("pprof server disabled after startup error", "error", err)
-			}
-		}()
-	}
+	go func() {
+		slog.Info("pprof server starting", "addr", profilingServer.Addr)
+		if err := profilingServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("pprof server disabled after startup error", "error", err)
+		}
+	}()
 
 	go func() {
 		slog.Info("server starting", "port", port)
@@ -653,12 +629,10 @@ func main() {
 		}
 		metricsShutdownCancel()
 	}
-	if profilingServer != nil {
-		profilingShutdownCtx, profilingShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := profilingServer.Shutdown(profilingShutdownCtx); err != nil {
-			slog.Error("pprof server forced to shutdown", "error", err)
-		}
-		profilingShutdownCancel()
+	profilingShutdownCtx, profilingShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := profilingServer.Shutdown(profilingShutdownCtx); err != nil {
+		slog.Error("pprof server forced to shutdown", "error", err)
 	}
+	profilingShutdownCancel()
 	slog.Info("server stopped")
 }

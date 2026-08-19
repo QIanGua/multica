@@ -3,28 +3,10 @@ package profiling
 import (
 	"net/http"
 	httppprof "net/http/pprof"
-	"os"
-	"runtime"
-	"strings"
 	"time"
 )
 
-type Config struct {
-	Addr string
-}
-
-func ConfigFromEnv() Config {
-	return Config{Addr: strings.TrimSpace(os.Getenv("PPROF_ADDR"))}
-}
-
-func (c Config) Enabled() bool {
-	return strings.TrimSpace(c.Addr) != ""
-}
-
-func ConfigureRuntime(blockProfileRate, mutexProfileFraction int) {
-	runtime.SetBlockProfileRate(blockProfileRate)
-	runtime.SetMutexProfileFraction(mutexProfileFraction)
-}
+const Addr = "127.0.0.1:6060"
 
 func NewHandler() http.Handler {
 	mux := http.NewServeMux()
@@ -37,9 +19,9 @@ func NewHandler() http.Handler {
 	return mux
 }
 
-func NewServer(addr string) *http.Server {
+func NewServer() *http.Server {
 	return &http.Server{
-		Addr:              addr,
+		Addr:              Addr,
 		Handler:           NewHandler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       30 * time.Second,
