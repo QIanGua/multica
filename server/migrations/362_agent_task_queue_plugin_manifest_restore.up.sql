@@ -1,0 +1,21 @@
+-- Restore agent_task_queue.plugin_execution_manifest_id for one release.
+--
+-- Migration 344 dropped this column together with the V1 plugin schema. The
+-- column itself is dead — nothing in this tree reads or writes it — but the
+-- previous release's sqlc-generated queries still name it explicitly in every
+-- agent_task_queue column list (ClaimAgentTask, CreateAgentTask, the
+-- CancelAgentTask* family, FailStaleTasks, ExpireStaleQueuedTasks, ...),
+-- because those queries are written as RETURNING * and expanded at generation
+-- time. Migrations only ever run forward here, so redeploying the previous
+-- image is the only rollback we have, and that needs a schema the previous
+-- binary can still read. Dropping this column in the same release as the code
+-- that stopped using it takes that option away.
+--
+-- Nullable, no default: metadata-only and instant on a hot table. Migration
+-- 299's partial index went away with the column and is deliberately not
+-- restored — it only served plugin queries, which no longer exist.
+--
+-- Contract step: drop this column again one release after v0.4.30 ships, once
+-- rolling back to v0.4.29 is no longer on the table.
+ALTER TABLE agent_task_queue
+    ADD COLUMN IF NOT EXISTS plugin_execution_manifest_id UUID;
