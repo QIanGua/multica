@@ -25,14 +25,15 @@ func TestListIssuesSortsByStatusAndUpdatedAt(t *testing.T) {
 	})
 
 	type fixture struct {
-		title     string
-		status    string
-		updatedAt time.Time
+		title      string
+		status     string
+		updatedAt  time.Time
+		activityAt time.Time
 	}
 	fixtures := []fixture{
-		{"sort-done", "done", time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)},
-		{"sort-backlog", "backlog", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
-		{"sort-progress", "in_progress", time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{"sort-done", "done", time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC), time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)},
+		{"sort-backlog", "backlog", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 2, 3, 0, 0, 0, 0, time.UTC)},
+		{"sort-progress", "in_progress", time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), time.Date(2026, 2, 2, 0, 0, 0, 0, time.UTC)},
 	}
 	for index, item := range fixtures {
 		var number int
@@ -46,10 +47,10 @@ func TestListIssuesSortsByStatusAndUpdatedAt(t *testing.T) {
 		if _, err := testPool.Exec(ctx, `
 			INSERT INTO issue (
 				workspace_id, title, status, priority, creator_type, creator_id,
-				position, number, project_id, created_at, updated_at
+				position, number, project_id, created_at, updated_at, last_activity_at
 			)
-			VALUES ($1, $2, $3, 'none', 'member', $4, $5, $6, $7, $8, $8)
-		`, testWorkspaceID, item.title, item.status, testUserID, index, number, projectID, item.updatedAt); err != nil {
+			VALUES ($1, $2, $3, 'none', 'member', $4, $5, $6, $7, $8, $8, $9)
+		`, testWorkspaceID, item.title, item.status, testUserID, index, number, projectID, item.updatedAt, item.activityAt); err != nil {
 			t.Fatalf("create issue %q: %v", item.title, err)
 		}
 	}
@@ -107,5 +108,15 @@ func TestListIssuesSortsByStatusAndUpdatedAt(t *testing.T) {
 		"sort-done",
 		"sort-progress",
 		"sort-backlog",
+	})
+	assertTitles(listTitles("last_activity", "asc"), []string{
+		"sort-done",
+		"sort-progress",
+		"sort-backlog",
+	})
+	assertTitles(listTitles("last_activity", "desc"), []string{
+		"sort-backlog",
+		"sort-progress",
+		"sort-done",
 	})
 }

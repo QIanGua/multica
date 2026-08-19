@@ -13,11 +13,10 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// TestCreateComment_BumpsIssueUpdatedAt pins MUL-5009: a new comment counts as
-// activity on the issue, so updated_at advances. This is what lets the
-// "Updated date" Kanban/list sort surface recently-discussed cards, not only
-// cards whose status changed.
-func TestCreateComment_BumpsIssueUpdatedAt(t *testing.T) {
+// TestCreateComment_BumpsIssueActivity pins MUL-5009 and MUL-6343: a new
+// comment advances both the legacy updated_at clock and the semantic activity
+// clock in the same statement.
+func TestCreateComment_BumpsIssueActivity(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -25,9 +24,9 @@ func TestCreateComment_BumpsIssueUpdatedAt(t *testing.T) {
 
 	issueID := createCommentTriggerPreviewIssue(t, "comment bumps updated_at", "", "")
 
-	var before time.Time
-	if err := testPool.QueryRow(ctx, `SELECT updated_at FROM issue WHERE id = $1`, issueID).Scan(&before); err != nil {
-		t.Fatalf("read updated_at before: %v", err)
+	var before, activityBefore time.Time
+	if err := testPool.QueryRow(ctx, `SELECT updated_at, last_activity_at FROM issue WHERE id = $1`, issueID).Scan(&before, &activityBefore); err != nil {
+		t.Fatalf("read issue clocks before: %v", err)
 	}
 
 	// Guarantee a measurable wall-clock gap so the bump is unambiguous; now() is
@@ -44,13 +43,16 @@ func TestCreateComment_BumpsIssueUpdatedAt(t *testing.T) {
 		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var after time.Time
-	if err := testPool.QueryRow(ctx, `SELECT updated_at FROM issue WHERE id = $1`, issueID).Scan(&after); err != nil {
-		t.Fatalf("read updated_at after: %v", err)
+	var after, activityAfter time.Time
+	if err := testPool.QueryRow(ctx, `SELECT updated_at, last_activity_at FROM issue WHERE id = $1`, issueID).Scan(&after, &activityAfter); err != nil {
+		t.Fatalf("read issue clocks after: %v", err)
 	}
 
 	if !after.After(before) {
 		t.Fatalf("issue updated_at was not bumped by a new comment: before=%s after=%s", before, after)
+	}
+	if !activityAfter.After(activityBefore) {
+		t.Fatalf("issue last_activity_at was not bumped by a new comment: before=%s after=%s", activityBefore, activityAfter)
 	}
 }
 
@@ -69,9 +71,9 @@ func TestCreateComment_WorkspaceMismatchPersistsNothing(t *testing.T) {
 
 	issueID := createCommentTriggerPreviewIssue(t, "comment workspace guard", "", "")
 
-	var before time.Time
-	if err := testPool.QueryRow(ctx, `SELECT updated_at FROM issue WHERE id = $1`, issueID).Scan(&before); err != nil {
-		t.Fatalf("read updated_at before: %v", err)
+	var before, activityBefore time.Time
+	if err := testPool.QueryRow(ctx, `SELECT updated_at, last_activity_at FROM issue WHERE id = $1`, issueID).Scan(&before, &activityBefore); err != nil {
+		t.Fatalf("read issue clocks before: %v", err)
 	}
 
 	// A workspace that is NOT the issue's workspace: the issue exists, but the
@@ -97,11 +99,71 @@ func TestCreateComment_WorkspaceMismatchPersistsNothing(t *testing.T) {
 		t.Fatalf("workspace mismatch must persist no comment, found %d", commentCount)
 	}
 
-	var after time.Time
-	if err := testPool.QueryRow(ctx, `SELECT updated_at FROM issue WHERE id = $1`, issueID).Scan(&after); err != nil {
-		t.Fatalf("read updated_at after: %v", err)
+	var after, activityAfter time.Time
+	if err := testPool.QueryRow(ctx, `SELECT updated_at, last_activity_at FROM issue WHERE id = $1`, issueID).Scan(&after, &activityAfter); err != nil {
+		t.Fatalf("read issue clocks after: %v", err)
 	}
 	if !after.Equal(before) {
 		t.Fatalf("workspace mismatch must not bump updated_at: before=%s after=%s", before, after)
+	}
+	if !activityAfter.Equal(activityBefore) {
+		t.Fatalf("workspace mismatch must not bump last_activity_at: before=%s after=%s", activityBefore, activityAfter)
+	}
+}
+
+func TestUpdateAndDeleteCommentBumpIssueActivity(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	issueID := createCommentTriggerPreviewIssue(t, "comment mutations bump activity", "", "")
+	comment, err := testHandler.Queries.CreateComment(ctx, db.CreateCommentParams{
+		IssueID:     parseUUID(issueID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+		AuthorType:  "member",
+		AuthorID:    parseUUID(testUserID),
+		Content:     "before",
+		Type:        "comment",
+	})
+	if err != nil {
+		t.Fatalf("CreateComment: %v", err)
+	}
+
+	base := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+	setBase := func() {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, `UPDATE issue SET last_activity_at = $2 WHERE id = $1`, issueID, base); err != nil {
+			t.Fatalf("reset last_activity_at: %v", err)
+		}
+	}
+	readActivity := func() time.Time {
+		t.Helper()
+		var got time.Time
+		if err := testPool.QueryRow(ctx, `SELECT last_activity_at FROM issue WHERE id = $1`, issueID).Scan(&got); err != nil {
+			t.Fatalf("read last_activity_at: %v", err)
+		}
+		return got
+	}
+
+	setBase()
+	if _, err := testHandler.Queries.UpdateComment(ctx, db.UpdateCommentParams{
+		ID:      comment.ID,
+		Content: "after",
+	}); err != nil {
+		t.Fatalf("UpdateComment: %v", err)
+	}
+	if got := readActivity(); !got.After(base) {
+		t.Fatalf("comment edit did not advance activity: base=%s got=%s", base, got)
+	}
+
+	setBase()
+	if err := testHandler.Queries.DeleteComment(ctx, db.DeleteCommentParams{
+		ID:          comment.ID,
+		WorkspaceID: parseUUID(testWorkspaceID),
+	}); err != nil {
+		t.Fatalf("DeleteComment: %v", err)
+	}
+	if got := readActivity(); !got.After(base) {
+		t.Fatalf("comment delete did not advance activity: base=%s got=%s", base, got)
 	}
 }

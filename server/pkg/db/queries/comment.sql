@@ -423,7 +423,7 @@ WHERE c.id = (SELECT id FROM root_of WHERE parent_id IS NULL LIMIT 1);
 
 -- name: CreateComment :one
 -- A new comment counts as activity on its issue, so the same statement bumps
--- the parent issue's updated_at. The touch is a leading data-modifying CTE and
+-- the parent issue's updated_at and last_activity_at. The touch is a leading data-modifying CTE and
 -- the INSERT selects the issue/workspace back out of it, which makes the two
 -- inseparable and gives two query-level guarantees:
 --   * atomicity — the insert and the timestamp bump commit or roll back
@@ -438,7 +438,10 @@ WHERE c.id = (SELECT id FROM root_of WHERE parent_id IS NULL LIMIT 1);
 -- guarantees regardless of what a caller passes. The "Updated date" sort and
 -- the daemon GC TTL both read updated_at, so this consistency is load-bearing.
 WITH touched_issue AS (
-    UPDATE issue SET updated_at = now(), revision = revision + 1
+    UPDATE issue SET
+        updated_at = now(),
+        revision = revision + 1,
+        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
     WHERE issue.id = sqlc.arg(issue_id) AND issue.workspace_id = sqlc.arg(workspace_id)
     RETURNING issue.id, issue.workspace_id, issue.revision
 ), inserted_comment AS (
@@ -480,17 +483,36 @@ ORDER BY created_at ASC, id ASC
 LIMIT 1;
 
 -- name: UpdateComment :one
+WITH target AS (
+    SELECT issue_id, workspace_id
+    FROM comment
+    WHERE comment.id = $1
+      AND (sqlc.narg('expected_revision')::bigint IS NULL OR revision = sqlc.narg('expected_revision')::bigint)
+      AND (
+        sqlc.narg('content_base')::text IS NULL
+        OR content IS NOT DISTINCT FROM sqlc.narg('content_base')::text
+        OR content IS NOT DISTINCT FROM $2
+      )
+      AND (comment.content IS DISTINCT FROM $2 OR comment.source_task_id IS DISTINCT FROM sqlc.narg(source_task_id))
+), touched_issue AS (
+    UPDATE issue
+    SET revision = revision + 1,
+        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
+    FROM target
+    WHERE issue.id = target.issue_id AND issue.workspace_id = target.workspace_id
+    RETURNING issue.id
+)
 UPDATE comment SET
     content = $2,
     source_task_id = sqlc.narg(source_task_id),
     revision = revision + CASE WHEN ROW(content, source_task_id) IS DISTINCT FROM ROW($2, sqlc.narg(source_task_id)) THEN 1 ELSE 0 END,
     updated_at = CASE WHEN ROW(content, source_task_id) IS DISTINCT FROM ROW($2, sqlc.narg(source_task_id)) THEN now() ELSE updated_at END
-WHERE id = $1
-  AND (sqlc.narg('expected_revision')::bigint IS NULL OR revision = sqlc.narg('expected_revision')::bigint)
+WHERE comment.id = $1
+  AND (sqlc.narg('expected_revision')::bigint IS NULL OR comment.revision = sqlc.narg('expected_revision')::bigint)
   AND (
     sqlc.narg('content_base')::text IS NULL
-    OR content IS NOT DISTINCT FROM sqlc.narg('content_base')::text
-    OR content IS NOT DISTINCT FROM $2
+    OR comment.content IS NOT DISTINCT FROM sqlc.narg('content_base')::text
+    OR comment.content IS NOT DISTINCT FROM $2
   )
 RETURNING *;
 
@@ -518,9 +540,22 @@ SELECT EXISTS (
 SELECT count(*) > 0 AS has_replied FROM comment
 WHERE parent_id = @parent_id AND author_type = 'agent' AND author_id = @agent_id;
 
--- name: DeleteComment :exec
+-- name: DeleteComment :execrows
 -- Defense-in-depth: workspace_id is a SQL-layer tenant guard. See DeleteIssue.
-DELETE FROM comment WHERE id = $1 AND workspace_id = $2;
+WITH target AS (
+    SELECT issue_id, workspace_id
+    FROM comment
+    WHERE comment.id = $1 AND comment.workspace_id = $2
+), touched_issue AS (
+    UPDATE issue
+    SET revision = revision + 1,
+        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
+    FROM target
+    WHERE issue.id = target.issue_id AND issue.workspace_id = target.workspace_id
+    RETURNING issue.id
+)
+DELETE FROM comment
+WHERE comment.id = $1 AND comment.workspace_id = $2;
 
 -- name: ResolveComment :one
 -- Idempotent: re-resolving keeps the original resolved_at + resolver. Always

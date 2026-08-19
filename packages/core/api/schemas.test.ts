@@ -88,6 +88,20 @@ const baseIssue = {
 };
 
 describe("IssueSchema (via ListIssuesResponseSchema)", () => {
+  it("accepts null activity during backfill and rejects malformed activity", () => {
+    const parsed = ListIssuesResponseSchema.parse({
+      issues: [{ ...baseIssue, last_activity_at: null }],
+      total: 1,
+    });
+    expect(parsed.issues[0]?.last_activity_at).toBeNull();
+    expect(() =>
+      ListIssuesResponseSchema.parse({
+        issues: [{ ...baseIssue, last_activity_at: 42 }],
+        total: 1,
+      }),
+    ).toThrow();
+  });
+
   it("accepts a primitive metadata KV map", () => {
     const payload = {
       issues: [

@@ -199,7 +199,10 @@ func (q *Queries) CountNewCommentsSince(ctx context.Context, arg CountNewComment
 
 const createComment = `-- name: CreateComment :one
 WITH touched_issue AS (
-    UPDATE issue SET updated_at = now(), revision = revision + 1
+    UPDATE issue SET
+        updated_at = now(),
+        revision = revision + 1,
+        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
     WHERE issue.id = $1 AND issue.workspace_id = $2
     RETURNING issue.id, issue.workspace_id, issue.revision
 ), inserted_comment AS (
@@ -248,7 +251,7 @@ type CreateCommentRow struct {
 }
 
 // A new comment counts as activity on its issue, so the same statement bumps
-// the parent issue's updated_at. The touch is a leading data-modifying CTE and
+// the parent issue's updated_at and last_activity_at. The touch is a leading data-modifying CTE and
 // the INSERT selects the issue/workspace back out of it, which makes the two
 // inseparable and gives two query-level guarantees:
 //   - atomicity — the insert and the timestamp bump commit or roll back
@@ -300,8 +303,21 @@ func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (C
 	return i, err
 }
 
-const deleteComment = `-- name: DeleteComment :exec
-DELETE FROM comment WHERE id = $1 AND workspace_id = $2
+const deleteComment = `-- name: DeleteComment :execrows
+WITH target AS (
+    SELECT issue_id, workspace_id
+    FROM comment
+    WHERE comment.id = $1 AND comment.workspace_id = $2
+), touched_issue AS (
+    UPDATE issue
+    SET revision = revision + 1,
+        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
+    FROM target
+    WHERE issue.id = target.issue_id AND issue.workspace_id = target.workspace_id
+    RETURNING issue.id
+)
+DELETE FROM comment
+WHERE comment.id = $1 AND comment.workspace_id = $2
 `
 
 type DeleteCommentParams struct {
@@ -310,9 +326,12 @@ type DeleteCommentParams struct {
 }
 
 // Defense-in-depth: workspace_id is a SQL-layer tenant guard. See DeleteIssue.
-func (q *Queries) DeleteComment(ctx context.Context, arg DeleteCommentParams) error {
-	_, err := q.db.Exec(ctx, deleteComment, arg.ID, arg.WorkspaceID)
-	return err
+func (q *Queries) DeleteComment(ctx context.Context, arg DeleteCommentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteComment, arg.ID, arg.WorkspaceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getComment = `-- name: GetComment :one
@@ -1589,17 +1608,36 @@ func (q *Queries) UnresolveComment(ctx context.Context, id pgtype.UUID) (Comment
 }
 
 const updateComment = `-- name: UpdateComment :one
+WITH target AS (
+    SELECT issue_id, workspace_id
+    FROM comment
+    WHERE comment.id = $1
+      AND ($4::bigint IS NULL OR revision = $4::bigint)
+      AND (
+        $5::text IS NULL
+        OR content IS NOT DISTINCT FROM $5::text
+        OR content IS NOT DISTINCT FROM $2
+      )
+      AND (comment.content IS DISTINCT FROM $2 OR comment.source_task_id IS DISTINCT FROM $3)
+), touched_issue AS (
+    UPDATE issue
+    SET revision = revision + 1,
+        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
+    FROM target
+    WHERE issue.id = target.issue_id AND issue.workspace_id = target.workspace_id
+    RETURNING issue.id
+)
 UPDATE comment SET
     content = $2,
     source_task_id = $3,
     revision = revision + CASE WHEN ROW(content, source_task_id) IS DISTINCT FROM ROW($2, $3) THEN 1 ELSE 0 END,
     updated_at = CASE WHEN ROW(content, source_task_id) IS DISTINCT FROM ROW($2, $3) THEN now() ELSE updated_at END
-WHERE id = $1
-  AND ($4::bigint IS NULL OR revision = $4::bigint)
+WHERE comment.id = $1
+  AND ($4::bigint IS NULL OR comment.revision = $4::bigint)
   AND (
     $5::text IS NULL
-    OR content IS NOT DISTINCT FROM $5::text
-    OR content IS NOT DISTINCT FROM $2
+    OR comment.content IS NOT DISTINCT FROM $5::text
+    OR comment.content IS NOT DISTINCT FROM $2
   )
 RETURNING id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision
 `
