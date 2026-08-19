@@ -99,7 +99,7 @@ func (b *mcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		return nil
 	}
 	cmd.WaitDelay = mcodeReaderDrainGrace
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	b.cfg.logAgentCommand(cmd)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}

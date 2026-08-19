@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+const redactedAgentCommandArg = "<redacted>"
+
 // Command is the identity of a runtime CLI: the executable Multica spawns plus
 // the argv prefix that belongs to the command itself rather than to any single
 // invocation.
@@ -140,6 +142,57 @@ func (c Command) String() string {
 // Config.ExecutablePath.
 func (c Config) commandAt(path string) Command {
 	return Command{Path: path, Prefix: c.LaunchPrefix, logger: c.Logger}
+}
+
+// logAgentCommand is the only boundary allowed to record runtime process
+// arguments. It works from the final exec.Cmd so launch prefixes and
+// platform-specific rewrites are represented, but never records argument
+// values: flag names remain useful for diagnostics, inline values are removed,
+// and every positional/value token is replaced with a marker. The only
+// optional diagnostic is a typed prompt byte count, so callers cannot append
+// arbitrary secret-bearing fields through this helper.
+func (c Config) logAgentCommand(cmd *exec.Cmd, promptBytes ...int) {
+	logger := c.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if cmd == nil {
+		return
+	}
+
+	args := []string{}
+	if len(cmd.Args) > 1 {
+		args = cmd.Args[1:]
+	}
+	fields := []any{
+		"provider", c.provider,
+		"exec", cmd.Path,
+		"args", redactAgentCommandArgs(args),
+		"arg_count", len(args),
+	}
+	if len(promptBytes) > 0 {
+		fields = append(fields, "prompt_bytes", promptBytes[0])
+	}
+	logger.Info("agent command", fields...)
+}
+
+// redactAgentCommandArgs preserves flag names while removing every value.
+// Unknown flags receive the same treatment as known ones, so a new provider or
+// option cannot require a secret-name list to stay safe. For --flag=value the
+// output is --flag; all non-flag tokens become <redacted>.
+func redactAgentCommandArgs(args []string) []string {
+	redacted := make([]string, len(args))
+	for i, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			if equals := strings.IndexByte(arg, '='); equals > 0 {
+				arg = arg[:equals]
+			}
+			redacted[i] = arg
+			continue
+		}
+		redacted[i] = redactedAgentCommandArg
+	}
+	return redacted
 }
 
 // launchPrefixBlockedArgs maps a protocol family to the flags a launch prefix
