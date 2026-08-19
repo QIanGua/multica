@@ -187,7 +187,12 @@ This group configures server-side assist generation, such as conversation titles
 | `MULTICA_LLM_BASE_URL` | empty | OpenAI-compatible endpoint |
 | `MULTICA_LLM_DEFAULT_MODEL` | `gpt-5.6-luna` | Used when a request does not specify a model |
 
-When both the API key and base URL are empty, server-side LLM generation is off and callers use local fallback logic.
+Two features use this layer, and each one sends chat content to the endpoint you configure:
+
+- **Chat auto-titling** — the first user message of a new chat session, sent verbatim. Attachments are never included.
+- **Follow-up questions** (the suggestion buttons under an agent reply) — the tail of the conversation: up to 6 messages, with the reply being answered capped at 3000 characters and each older message at 800.
+
+When both the API key and the base URL are empty, this layer is disabled and the server sends nothing to any model provider. That is the supported configuration when your policy does not allow chat content to leave your deployment: chat sessions keep the title the client derives from the first message, the follow-up question buttons do not appear, and everything else is unaffected.
 
 ## Daemon configuration
 

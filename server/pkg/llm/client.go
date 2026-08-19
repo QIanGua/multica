@@ -4,6 +4,41 @@
 // require the full agent runtime — e.g. generating a chat title or drafting a
 // quick-create issue (MUL-4238).
 //
+// # The single-entry-point rule
+//
+// Every server-side LLM call in this repository goes through this package, and
+// nothing outside it imports the OpenAI SDK directly. That is a constraint to
+// keep, not a coincidence: it is what makes "does this deployment send chat
+// content to a third party, and what exactly does it send?" answerable by
+// reading one config block instead of auditing the tree. A new feature that
+// wants a model calls this package. TestOutboundLLMTrafficGoesThroughThisPackage
+// enforces the import half of that rule.
+//
+// # Consumers, and what they send upstream
+//
+// Keep this list current when a consumer is added, removed, or changes what it
+// sends — it is the source the operator-facing copy is written from
+// (.env.example and apps/docs/content/docs/environment-variables*.mdx).
+//
+//   - Chat auto-titling — server/internal/handler/chat_title.go. Sends the
+//     first user message of a new chat session, verbatim and uncapped.
+//     Attachments are never included.
+//   - Chat follow-up questions, a.k.a. quick actions —
+//     server/internal/service/chat_quick_actions_generate.go.
+//     Sends the tail of the conversation: up to 6 messages, the reply being
+//     answered capped at 3000 runes (2000 head + 1000 tail) and each older
+//     message at 800.
+//
+// Both consumers send private chat content, which is why an unconfigured
+// deployment making zero upstream requests is a contract rather than a
+// side effect: New with no API key and no base URL returns a disabled client
+// whose every call fails with ErrNotConfigured before an HTTP request is ever
+// built, and both consumers check Enabled() before doing any work.
+// TestUnconfiguredClientMakesZeroUpstreamRequests holds this layer's half.
+// Operators who must not send chat content anywhere leave MULTICA_LLM_API_KEY
+// and MULTICA_LLM_BASE_URL empty; the product stays whole (client-derived chat
+// titles, no follow-up question buttons).
+//
 // The wrapper is intentionally small:
 //
 //   - It owns the SDK client construction (base URL + API key + retry/timeout
