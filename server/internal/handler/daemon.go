@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -4554,6 +4555,31 @@ func taskMessageToPayload(m db.TaskMessage, taskID, issueID string) protocol.Tas
 	}
 }
 
+// taskMessageBroadcastClipEnv gates the clipping below. It is OFF by default,
+// and must stay off until clients that understand `truncated` have saturated.
+//
+// Clipping is not an additive field a client can ignore: it changes the meaning
+// of `input` / `output`, which every existing client already consumes. A client
+// built before this PR writes the clipped copy into a `staleTime: Infinity`
+// cache and never refetches, so its execution log would stay incomplete until
+// the window is reloaded. The client half of this change (the `truncated`
+// reader) ships first; flipping this env var is the second step, once installed
+// builds have caught up.
+//
+// Routing by connection capability instead would be the principled fix, but the
+// hub does not retain the `client_version` it is handed at upgrade, and frames
+// cross nodes through the Redis relay as already-serialized bytes — so it needs
+// the same protocol work that per-task scope routing is waiting on
+// (server/cmd/server/listeners.go). Deliberately one env var, not that.
+const taskMessageBroadcastClipEnv = "MULTICA_CLIP_TASK_MESSAGE_BROADCAST"
+
+// taskMessageBroadcastClipEnabled reports whether oversized tool input/output
+// should be clipped out of the realtime copy of a task message.
+func taskMessageBroadcastClipEnabled() bool {
+	v := strings.TrimSpace(os.Getenv(taskMessageBroadcastClipEnv))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
 // Byte budgets for the realtime fanout of a task message (MUL-6396).
 //
 // A `task:message` frame is broadcast to EVERY client in the workspace, and a
@@ -4645,6 +4671,10 @@ func clipJSONValue(v any) (any, bool) {
 // returned payload is a copy; the caller's row and the REST responses built
 // from it are untouched.
 func truncateTaskMessageForBroadcast(p protocol.TaskMessagePayload) protocol.TaskMessagePayload {
+	if !taskMessageBroadcastClipEnabled() {
+		return p
+	}
+
 	truncated := false
 
 	if len(p.Output) > broadcastOutputLimit {

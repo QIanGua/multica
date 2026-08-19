@@ -332,6 +332,14 @@ export function appendTaskMessage(
   // only in the DB, and `taskMessagesOptions` is staleTime:Infinity — without
   // this the clipped text would be pinned forever. Invalidating refetches for
   // whoever is mounted and is a no-op otherwise.
+  //
+  // Not reachable today, and kept deliberately: `use-chat-session-realtime`
+  // gates `task:message` on `chat_session_id`, which the server's
+  // TaskMessagePayload does not carry, so mobile currently appends nothing at
+  // all (a pre-existing delivery gap, tracked separately). Whichever side of
+  // that is fixed first, this branch must already be here — the clipping is
+  // exactly what a client learning to receive these frames would otherwise
+  // cache permanently.
   if (payload.truncated) {
     qc.invalidateQueries({ queryKey: chatKeys.taskMessages(payload.task_id) });
   }

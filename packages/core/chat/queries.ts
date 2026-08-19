@@ -201,6 +201,15 @@ export function taskMessagesOptions(taskId: string) {
     queryFn: () => api.listTaskMessages(taskId),
     enabled: isTaskMessageTaskId(taskId),
     staleTime: Infinity,
+    // Every write to this cache — this fetch, a backfill, or a realtime batch —
+    // folds into what is already there instead of replacing it. Without this a
+    // response that resolves after a live frame was written would drop that
+    // seq, and staleTime:Infinity means nothing would ever fetch it again.
+    structuralSharing: (prev, next) =>
+      unionTaskMessagesBySeq(
+        prev as TaskMessagePayload[] | undefined,
+        next as TaskMessagePayload[],
+      ),
   });
 }
 
@@ -228,6 +237,47 @@ export function mergeTaskMessagesBySeq(
 }
 
 /**
+ * Union two task-message lists by seq, with `authoritative` winning on conflict.
+ *
+ * This is the rule every write to the `["task-messages", taskId]` cache goes
+ * through, wired in as `structuralSharing` on the query itself so a fetch
+ * result cannot replace the array wholesale.
+ *
+ * That matters because a normal query response and the realtime stream race:
+ * the timeline is fetched on first open, and any frame that arrives while that
+ * request is in flight is written to the cache before the response lands. A
+ * plain replace would drop those seqs, and `staleTime: Infinity` means nothing
+ * would ever refetch them — the gap would survive until a reload.
+ *
+ * Server data wins on conflict because the persisted row is the authority: a
+ * broadcast copy may have been clipped for the fanout, and the fetched row
+ * never is. Rows the response did not mention are kept rather than deleted —
+ * a response snapshotted before a seq was persisted must not erase it.
+ *
+ * The `base` reference is returned unchanged when nothing differs, so an event
+ * that adds nothing does not re-render every subscriber.
+ */
+export function unionTaskMessagesBySeq(
+  base: readonly TaskMessagePayload[] | undefined,
+  authoritative: readonly TaskMessagePayload[],
+): TaskMessagePayload[] {
+  if (!base || base.length === 0) {
+    return [...authoritative].sort((a, b) => a.seq - b.seq);
+  }
+
+  const bySeq = new Map(base.map((m) => [m.seq, m]));
+  let changed = false;
+  for (const msg of authoritative) {
+    if (bySeq.get(msg.seq) !== msg) {
+      bySeq.set(msg.seq, msg);
+      changed = true;
+    }
+  }
+  if (!changed) return base as TaskMessagePayload[];
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+}
+
+/**
  * True when this client already holds (or is actively loading) the message
  * timeline for `taskId` — i.e. some mounted view is rendering it.
  *
@@ -250,18 +300,13 @@ export function isTaskMessageTimelineHeld(
 }
 
 /**
- * Refetch a task's full timeline and swap the clipped rows for the real ones.
+ * Refetch a task's full timeline and fold it into the cache.
  *
  * Used when a broadcast frame arrived `truncated`: the live copy carries
- * clipped tool input/output and the full text exists only in the DB.
- *
- * `mergeTaskMessagesBySeq` deliberately lets the entry already in the cache win
- * on conflict, so a plain merge would leave the clipped copy in place forever.
- * A truncated row is therefore dropped first — but only when the fetch actually
- * returned a replacement for that seq. That keeps two backfills racing (a run
- * writing large files back to back schedules one per flush) from deleting a row
- * the older response simply hadn't seen yet: it stays clipped and the newer
- * backfill fixes it.
+ * clipped tool input/output and the full text exists only in the DB. Writing
+ * the fetched rows straight in is enough — `unionTaskMessagesBySeq`, installed
+ * as the query's `structuralSharing`, is what makes the fetched row replace the
+ * clipped one while keeping any seq the response had not yet seen.
  */
 export async function backfillTaskMessages(
   qc: QueryClient,
@@ -269,15 +314,7 @@ export async function backfillTaskMessages(
 ): Promise<void> {
   if (!isTaskMessageTaskId(taskId)) return;
   const msgs = await api.listTaskMessages(taskId);
-  const replaced = new Set(msgs.map((m) => m.seq));
-  qc.setQueryData<TaskMessagePayload[]>(
-    chatKeys.taskMessages(taskId),
-    (old = []) =>
-      mergeTaskMessagesBySeq(
-        old.filter((m) => !(m.truncated && replaced.has(m.seq))),
-        msgs,
-      ),
-  );
+  qc.setQueryData<TaskMessagePayload[]>(chatKeys.taskMessages(taskId), msgs);
 }
 
 /**

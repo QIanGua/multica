@@ -15,6 +15,7 @@ import (
 // persisted row it was built from is never touched (MUL-6396).
 
 func TestTruncateTaskMessageForBroadcast_LeavesSmallPayloadsAlone(t *testing.T) {
+	enableBroadcastClipping(t)
 	p := protocol.TaskMessagePayload{
 		TaskID: "t1",
 		Type:   "tool_use",
@@ -37,6 +38,7 @@ func TestTruncateTaskMessageForBroadcast_LeavesSmallPayloadsAlone(t *testing.T) 
 }
 
 func TestTruncateTaskMessageForBroadcast_ClipsOversizedOutput(t *testing.T) {
+	enableBroadcastClipping(t)
 	p := protocol.TaskMessagePayload{Output: strings.Repeat("a", broadcastOutputLimit*2)}
 
 	got := truncateTaskMessageForBroadcast(p)
@@ -50,6 +52,7 @@ func TestTruncateTaskMessageForBroadcast_ClipsOversizedOutput(t *testing.T) {
 }
 
 func TestTruncateTaskMessageForBroadcast_ClipsLargeStringsKeepsSmallOnes(t *testing.T) {
+	enableBroadcastClipping(t)
 	// The shape of a Write of a large file: the path must survive so the
 	// transcript can still say what was written.
 	p := protocol.TaskMessagePayload{
@@ -74,6 +77,7 @@ func TestTruncateTaskMessageForBroadcast_ClipsLargeStringsKeepsSmallOnes(t *test
 }
 
 func TestTruncateTaskMessageForBroadcast_ClipsNestedStrings(t *testing.T) {
+	enableBroadcastClipping(t)
 	// MultiEdit: the large strings sit inside an array of objects.
 	p := protocol.TaskMessagePayload{
 		Input: map[string]any{
@@ -104,6 +108,7 @@ func TestTruncateTaskMessageForBroadcast_ClipsNestedStrings(t *testing.T) {
 }
 
 func TestTruncateTaskMessageForBroadcast_DropsInputThatIsStillTooLargeInAggregate(t *testing.T) {
+	enableBroadcastClipping(t)
 	// Per-string clipping bounds each value, not the total: a map of many
 	// modest strings can still blow the budget.
 	input := map[string]any{}
@@ -124,6 +129,7 @@ func TestTruncateTaskMessageForBroadcast_DropsInputThatIsStillTooLargeInAggregat
 }
 
 func TestTruncateTaskMessageForBroadcast_DoesNotSplitRunes(t *testing.T) {
+	enableBroadcastClipping(t)
 	// A clip at a raw byte offset would leave a partial rune, which JSON
 	// encoding then rewrites to U+FFFD.
 	p := protocol.TaskMessagePayload{Output: strings.Repeat("世", broadcastOutputLimit)}
@@ -139,6 +145,7 @@ func TestTruncateTaskMessageForBroadcast_DoesNotSplitRunes(t *testing.T) {
 }
 
 func TestTruncateTaskMessageForBroadcast_LeavesTheSourcePayloadIntact(t *testing.T) {
+	enableBroadcastClipping(t)
 	// The same payload value feeds the REST list responses, which must keep
 	// serving the full persisted content.
 	big := strings.Repeat("z", broadcastStringLimit*2)
@@ -157,5 +164,48 @@ func TestTruncateTaskMessageForBroadcast_LeavesTheSourcePayloadIntact(t *testing
 	}
 	if len(p.Output) != broadcastOutputLimit*2 {
 		t.Fatalf("source payload output was mutated")
+	}
+}
+
+// enableBroadcastClipping opts a case into the clipping path. It is off by
+// default in production until clients that understand `truncated` saturate.
+func enableBroadcastClipping(t *testing.T) {
+	t.Helper()
+	t.Setenv(taskMessageBroadcastClipEnv, "1")
+}
+
+func TestTruncateTaskMessageForBroadcast_DisabledByDefault(t *testing.T) {
+	// The guarantee old clients depend on: with the flag unset, the realtime
+	// copy is byte-for-byte what it was before this change. A client that does
+	// not understand `truncated` caches the broadcast payload under
+	// staleTime:Infinity, so a clipped field would stay clipped until reload.
+	big := strings.Repeat("z", broadcastStringLimit*4)
+	p := protocol.TaskMessagePayload{
+		Input:  map[string]any{"content": big},
+		Output: strings.Repeat("a", broadcastOutputLimit*4),
+	}
+
+	got := truncateTaskMessageForBroadcast(p)
+
+	if got.Truncated {
+		t.Fatalf("clipping applied while disabled")
+	}
+	if content, _ := got.Input["content"].(string); len(content) != len(big) {
+		t.Fatalf("input clipped while disabled: %d bytes", len(content))
+	}
+	if len(got.Output) != broadcastOutputLimit*4 {
+		t.Fatalf("output clipped while disabled: %d bytes", len(got.Output))
+	}
+}
+
+func TestTruncateTaskMessageForBroadcast_EnabledByExplicitValuesOnly(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{{"1", true}, {"true", true}, {"TRUE", true}, {"", false}, {"0", false}, {"yes", false}} {
+		t.Setenv(taskMessageBroadcastClipEnv, tc.value)
+		if got := taskMessageBroadcastClipEnabled(); got != tc.want {
+			t.Errorf("%q: enabled=%v, want %v", tc.value, got, tc.want)
+		}
 	}
 }

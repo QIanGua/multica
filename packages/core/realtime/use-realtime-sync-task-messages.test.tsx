@@ -7,7 +7,7 @@ import type { ReactNode } from "react";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { setApiInstance } from "../api";
 import type { ApiClient } from "../api/client";
-import { chatKeys, taskMessagesOptions } from "../chat/queries";
+import { backfillTaskMessages, chatKeys, taskMessagesOptions } from "../chat/queries";
 import type { TaskMessagePayload } from "../types/events";
 import type { WSClient } from "../api/ws-client";
 import { useRealtimeSync, type RealtimeSyncStores } from "./use-realtime-sync";
@@ -217,6 +217,54 @@ describe("useRealtimeSync — task:message fanout guards (MUL-6396)", () => {
     // seq 2 survives, still clipped, waiting for the next backfill.
     expect(cached(qc, HELD_TASK)?.map((m) => m.seq)).toEqual([1, 2]);
     expect(cached(qc, HELD_TASK)?.[1]?.input).toEqual({ content: "clip 2" });
+    release();
+  });
+
+  it("keeps live frames that landed while the first fetch was still in flight", async () => {
+    // The regression P0-a newly exposes. Before it, the cache was pre-seeded by
+    // the WS handler, so opening a live task found fresh data (staleTime:
+    // Infinity) and never fetched. Now first open DOES fetch, and a response
+    // that resolves after a live frame was written must not drop that seq —
+    // nothing would ever refetch it.
+    let resolveFetch: (msgs: TaskMessagePayload[]) => void = () => {};
+    listTaskMessages.mockImplementation(
+      () => new Promise<TaskMessagePayload[]>((resolve) => { resolveFetch = resolve; }),
+    );
+
+    const handler = mount();
+    const release = holdTimeline(HELD_TASK);
+    await vi.waitFor(() => expect(listTaskMessages).toHaveBeenCalled());
+
+    // Live frame arrives and flushes while the request is still open.
+    handler(msg(HELD_TASK, 2, { content: "live" }));
+    vi.advanceTimersByTime(FLUSH_MS);
+    expect(cached(qc, HELD_TASK)?.map((m) => m.seq)).toEqual([2]);
+
+    // The response was snapshotted before seq 2 was persisted.
+    resolveFetch([msg(HELD_TASK, 1, { content: "persisted" })]);
+
+    await vi.waitFor(() => {
+      expect(cached(qc, HELD_TASK)?.map((m) => m.seq)).toEqual([1, 2]);
+    });
+    expect(cached(qc, HELD_TASK)?.[1]?.content).toBe("live");
+    release();
+  });
+
+  it("lets the fetched row win over a clipped one for the same seq", async () => {
+    const handler = mount();
+    const release = holdTimeline(HELD_TASK);
+    await vi.waitFor(() => expect(cached(qc, HELD_TASK)).toEqual([]));
+
+    handler(msg(HELD_TASK, 1, { input: { content: "clip" }, truncated: true }));
+    vi.advanceTimersByTime(FLUSH_MS);
+    // Server data is authoritative: the clipped copy must not survive.
+    expect(cached(qc, HELD_TASK)?.[0]?.truncated).toBe(true);
+
+    listTaskMessages.mockResolvedValue([msg(HELD_TASK, 1, { input: { content: "full" } })]);
+    await backfillTaskMessages(qc, HELD_TASK);
+
+    expect(cached(qc, HELD_TASK)?.[0]?.input).toEqual({ content: "full" });
+    expect(cached(qc, HELD_TASK)?.[0]?.truncated).toBeUndefined();
     release();
   });
 
