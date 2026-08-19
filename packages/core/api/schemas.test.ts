@@ -7,6 +7,12 @@ import {
   EMPTY_WECOM_INSTALLATION,
   EMPTY_LIST_WECOM_INSTALLATIONS_RESPONSE,
   EMPTY_REDEEM_WECOM_BINDING_TOKEN_RESPONSE,
+  TelegramInstallationSchema,
+  ListTelegramInstallationsResponseSchema,
+  RedeemTelegramBindingTokenResponseSchema,
+  EMPTY_TELEGRAM_INSTALLATION,
+  EMPTY_LIST_TELEGRAM_INSTALLATIONS_RESPONSE,
+  EMPTY_REDEEM_TELEGRAM_BINDING_TOKEN_RESPONSE,
   AgentTaskListSchema,
   AutopilotQuotaUsageSchema,
   AutopilotRunSchema,
@@ -400,6 +406,43 @@ describe("AgentTaskListSchema", () => {
       "comment-2",
       "comment-3",
     ]);
+  });
+
+  it("accepts durable workdir metadata from newer backends", () => {
+    const parsed = AgentTaskListSchema.parse([
+      {
+        ...task,
+        status: "completed",
+        work_dir: "/managed/task/worktree",
+        durable_work_dir: "/Users/dev/project",
+        relative_durable_work_dir: "project",
+        branch_name: "agent/j/abc12345",
+      },
+    ]);
+
+    expect(parsed[0]).toMatchObject({
+      durable_work_dir: "/Users/dev/project",
+      relative_durable_work_dir: "project",
+      branch_name: "agent/j/abc12345",
+    });
+  });
+
+  it("degrades malformed optional path metadata without dropping task rows", () => {
+    const parsed = AgentTaskListSchema.parse([
+      {
+        ...task,
+        work_dir: 1,
+        durable_work_dir: { path: "/project" },
+        relative_durable_work_dir: false,
+        branch_name: ["agent/j/abc12345"],
+      },
+    ]);
+
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.work_dir).toBeUndefined();
+    expect(parsed[0]?.durable_work_dir).toBeUndefined();
+    expect(parsed[0]?.relative_durable_work_dir).toBeUndefined();
+    expect(parsed[0]?.branch_name).toBeUndefined();
   });
 });
 
@@ -1448,6 +1491,66 @@ describe("WeCom installation schemas", () => {
       { endpoint: "POST /api/wecom/binding/redeem" },
     );
     expect(redeem).toEqual(EMPTY_REDEEM_WECOM_BINDING_TOKEN_RESPONSE);
+  });
+});
+
+// Telegram drives the same connect/disabled/revoked UI decisions as WeCom.
+// Keep its wire-contract fallbacks explicit so malformed or older responses
+// cannot render a bot as connected or report a binding success.
+describe("Telegram installation schemas", () => {
+  it("parses a well-formed installation", () => {
+    const parsed = TelegramInstallationSchema.parse({
+      id: "i1",
+      workspace_id: "w1",
+      agent_id: "a1",
+      bot_id: "12345",
+      bot_username: "multica_test_bot",
+      installer_user_id: "u1",
+      status: "active",
+    });
+    expect(parsed.bot_username).toBe("multica_test_bot");
+    expect(parsed.status).toBe("active");
+  });
+
+  it("defaults incomplete data to the disconnected state", () => {
+    const parsed = TelegramInstallationSchema.parse({ id: "i1" });
+    expect(parsed.status).toBe("revoked");
+    expect(parsed.bot_id).toBe("");
+    expect(parsed.bot_username).toBe("");
+
+    const list = ListTelegramInstallationsResponseSchema.parse({});
+    expect(list).toEqual({ installations: [], configured: false });
+  });
+
+  it("keeps unknown forward-compatible installation fields", () => {
+    const parsed = TelegramInstallationSchema.parse({ id: "i1", future_field: "keep" });
+    expect((parsed as unknown as { future_field?: string }).future_field).toBe("keep");
+  });
+
+  it("falls back safely for malformed list, install, and redeem responses", () => {
+    expect(
+      parseWithFallback(
+        "not json",
+        ListTelegramInstallationsResponseSchema,
+        EMPTY_LIST_TELEGRAM_INSTALLATIONS_RESPONSE,
+        { endpoint: "GET /api/workspaces/:id/telegram/installations" },
+      ),
+    ).toEqual(EMPTY_LIST_TELEGRAM_INSTALLATIONS_RESPONSE);
+
+    expect(
+      parseWithFallback(42, TelegramInstallationSchema, EMPTY_TELEGRAM_INSTALLATION, {
+        endpoint: "POST /api/workspaces/:id/telegram/install",
+      }),
+    ).toEqual(EMPTY_TELEGRAM_INSTALLATION);
+
+    expect(
+      parseWithFallback(
+        null,
+        RedeemTelegramBindingTokenResponseSchema,
+        EMPTY_REDEEM_TELEGRAM_BINDING_TOKEN_RESPONSE,
+        { endpoint: "POST /api/telegram/binding/redeem" },
+      ),
+    ).toEqual(EMPTY_REDEEM_TELEGRAM_BINDING_TOKEN_RESPONSE);
   });
 });
 
