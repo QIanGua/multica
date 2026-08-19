@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { I18nProvider } from "@multica/core/i18n/react";
 import type { ChatSession } from "@multica/core/types";
 import enChat from "../../locales/en/chat.json";
@@ -102,7 +102,9 @@ describe("ChatSessionHeader rename keyboard behavior", () => {
     fireEvent.change(input, { target: { value: "yanjiu" } });
     fireEvent.compositionStart(input);
 
-    outside.focus();
+    act(() => {
+      outside.focus();
+    });
 
     expect(updateMutate).not.toHaveBeenCalled();
     expect(input).toBeInTheDocument();
@@ -119,22 +121,21 @@ describe("ChatSessionHeader rename keyboard behavior", () => {
     expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
   });
 
-  it("falls back to the current value when compositionend does not arrive", async () => {
+  it("closes without saving a partial value when compositionend does not arrive", async () => {
     const input = startRename();
     const outside = screen.getByRole("button", { name: OUTSIDE_LABEL });
-    fireEvent.change(input, { target: { value: "研究" } });
+    fireEvent.change(input, { target: { value: "yanjiu" } });
     fireEvent.compositionStart(input);
 
-    outside.focus();
+    act(() => {
+      outside.focus();
+    });
 
     await waitFor(() => {
-      expect(updateMutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
     });
-    expect(updateMutate).toHaveBeenCalledWith({
-      sessionId: "session-1",
-      title: "研究",
-    });
-    expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(screen.getByText("Original title")).toBeInTheDocument();
   });
 
   it("still submits the current value when focus moves outside", () => {
@@ -142,7 +143,9 @@ describe("ChatSessionHeader rename keyboard behavior", () => {
     const outside = screen.getByRole("button", { name: OUTSIDE_LABEL });
     fireEvent.change(input, { target: { value: "Blurred title" } });
 
-    outside.focus();
+    act(() => {
+      outside.focus();
+    });
 
     expect(updateMutate).toHaveBeenCalledTimes(1);
     expect(updateMutate).toHaveBeenCalledWith({

@@ -158,6 +158,16 @@ export function ChatSessionHeader({
                 clearPendingBlurCommit();
                 blurCommitTimeoutRef.current = setTimeout(() => {
                   if (!commitAfterCompositionRef.current) return;
+                  // Without compositionend, the current DOM value is not
+                  // known to be final. Close without persisting a partial
+                  // composition instead of recreating the original bug.
+                  if (isComposingRef.current) {
+                    clearPendingBlurCommit();
+                    isComposingRef.current = false;
+                    commitAfterCompositionRef.current = false;
+                    setEditing(false);
+                    return;
+                  }
                   commitRename(input.value);
                 }, 0);
                 return;
