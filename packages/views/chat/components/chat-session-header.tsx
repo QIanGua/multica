@@ -28,6 +28,7 @@ import {
 } from "@multica/core/chat/mutations";
 import { useChatStore } from "@multica/core/chat";
 import type { Agent, ChatSession } from "@multica/core/types";
+import { isImeComposing } from "@multica/core/utils";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { AppLink } from "../../navigation";
 import { useT } from "../../i18n";
@@ -116,6 +117,7 @@ export function ChatSessionHeader({
             onBlur={commitRename}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
+                if (isImeComposing(e)) return;
                 e.preventDefault();
                 commitRename();
               } else if (e.key === "Escape") {

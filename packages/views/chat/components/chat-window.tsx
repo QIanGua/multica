@@ -15,6 +15,7 @@ import {
 import { toast } from "sonner";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useAuthStore } from "@multica/core/auth";
+import { isImeComposing } from "@multica/core/utils";
 import { agentListOptions, memberListOptions } from "@multica/core/workspace/queries";
 import { projectListOptions } from "@multica/core/projects/queries";
 import { canAssignAgent } from "@multica/views/issues/components";
@@ -1641,6 +1642,7 @@ function SessionRenameInput({
         // selection keyboard handler consume them.
         e.stopPropagation();
         if (e.key === "Enter") {
+          if (isImeComposing(e)) return;
           e.preventDefault();
           onSubmit(value);
         } else if (e.key === "Escape") {

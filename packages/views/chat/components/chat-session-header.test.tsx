@@ -1,0 +1,105 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { I18nProvider } from "@multica/core/i18n/react";
+import type { ChatSession } from "@multica/core/types";
+import enChat from "../../locales/en/chat.json";
+
+const updateMutate = vi.hoisted(() => vi.fn());
+
+vi.mock("@multica/core/paths", () => ({
+  useWorkspacePaths: () => ({ agentDetail: (id: string) => `/agents/${id}` }),
+}));
+
+vi.mock("@multica/core/chat/mutations", () => ({
+  useUpdateChatSession: () => ({ mutate: updateMutate }),
+  useDeleteChatSession: () => ({ mutate: vi.fn() }),
+  useSetChatSessionArchived: () => ({ mutate: vi.fn() }),
+}));
+
+vi.mock("@multica/core/chat", () => ({
+  useChatStore: (selector: (state: { setActiveSession: () => void }) => unknown) =>
+    selector({ setActiveSession: vi.fn() }),
+}));
+
+vi.mock("../../common/actor-avatar", () => ({
+  ActorAvatar: () => null,
+}));
+
+vi.mock("../../navigation", () => ({
+  AppLink: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
+}));
+
+import { ChatSessionHeader } from "./chat-session-header";
+
+const TEST_RESOURCES = { en: { chat: enChat } };
+const RENAME_LABEL = enChat.header.rename;
+
+const session: ChatSession = {
+  id: "session-1",
+  workspace_id: "ws-1",
+  agent_id: "agent-1",
+  creator_id: "user-1",
+  title: "Original title",
+  status: "active",
+  has_unread: false,
+  unread_count: 0,
+  last_message: null,
+  pinned: false,
+  created_at: new Date(0).toISOString(),
+  updated_at: new Date(0).toISOString(),
+};
+
+function startRename(): HTMLInputElement {
+  render(
+    <I18nProvider locale="en" resources={TEST_RESOURCES}>
+      <ChatSessionHeader session={session} agent={null} />
+    </I18nProvider>,
+  );
+  fireEvent.click(screen.getByTitle(RENAME_LABEL));
+  return screen.getByRole("textbox", { name: RENAME_LABEL });
+}
+
+describe("ChatSessionHeader rename keyboard behavior", () => {
+  beforeEach(() => {
+    updateMutate.mockReset();
+  });
+
+  it.each([
+    ["standard composition signal", { isComposing: true, keyCode: 13 }],
+    ["Safari composition signal", { isComposing: false, keyCode: 229 }],
+  ])("keeps editing when Enter carries the %s", (_name, eventInit) => {
+    const input = startRename();
+    fireEvent.change(input, { target: { value: "yanjiu" } });
+
+    fireEvent.keyDown(input, { key: "Enter", ...eventInit });
+
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(input).toBeInTheDocument();
+    expect(input).toHaveValue("yanjiu");
+  });
+
+  it("submits once on a normal Enter", () => {
+    const input = startRename();
+    fireEvent.change(input, { target: { value: "Renamed chat" } });
+
+    fireEvent.keyDown(input, { key: "Enter", isComposing: false, keyCode: 13 });
+
+    expect(updateMutate).toHaveBeenCalledTimes(1);
+    expect(updateMutate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      title: "Renamed chat",
+    });
+    expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("still cancels the edit on Escape", () => {
+    const input = startRename();
+    fireEvent.change(input, { target: { value: "Discard me" } });
+
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
+    expect(screen.getByText("Original title")).toBeInTheDocument();
+  });
+});
