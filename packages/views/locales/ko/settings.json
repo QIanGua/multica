@@ -1,13 +1,12 @@
 {
   "issue_statuses": {
-    "title": "이슈 상태",
-    "description": "기본 제공되는 7개 상태에 더해 직접 상태를 추가할 수 있습니다. 모든 상태는 카테고리에 속하며, 동작은 카테고리가 결정합니다.",
+    "title": "태스크 상태",
+    "description": "태스크가 거치는 워크플로를 정의합니다. 각 상태의 동작은 속한 카테고리가 결정합니다.",
     "loading": "상태를 불러오는 중…",
     "add": "상태 추가",
     "show_archived": "보관됨 표시 ({{count}})",
     "archived_badge": "보관됨",
-    "archived_hint": "새로 지정할 수 없습니다. 이미 이 상태인 이슈는 그대로 유지됩니다.",
-    "built_in_locked": "기본 제공 상태입니다. 이름, 색상, 카테고리를 바꿀 수 없습니다.",
+    "archived_hint": "새로 지정할 수 없습니다. 이미 이 상태인 태스크는 그대로 유지됩니다.",
     "flag_off": "이 배포에서는 사용자 지정 상태가 아직 활성화되지 않았습니다. 아래 기본 상태는 평소대로 동작합니다.",
     "reorder_failed": "새 순서를 저장하지 못했습니다.",
     "actions": {
@@ -22,8 +21,9 @@
       "behavior_hint": "이 상태는 \"{{category}}\"와 정확히 같게 동작합니다.",
       "name": "이름",
       "name_placeholder": "예: Code Review",
+      "key_hint": "API와 CLI에서는 {{key}}로 참조합니다.",
       "category": "카테고리",
-      "category_locked": "카테고리는 변경할 수 없습니다. 이미 이 상태인 이슈가 이에 의존합니다.",
+      "category_locked": "카테고리는 변경할 수 없습니다. 이미 이 상태인 태스크가 이에 의존합니다.",
       "description": "설명",
       "description_placeholder": "팀에게 이 상태가 의미하는 것",
       "color": "색상",
@@ -34,7 +34,7 @@
     },
     "archive_dialog": {
       "title": "이 상태를 보관할까요?",
-      "description": "\"{{name}}\"은(는) 새 이슈에 지정할 수 없게 됩니다. 이미 이 상태인 이슈는 그대로 유지되며 동작도 달라지지 않습니다.",
+      "description": "\"{{name}}\"은(는) 새 태스크에 지정할 수 없게 됩니다. 이미 이 상태인 태스크는 그대로 유지되며 동작도 달라지지 않습니다.",
       "cancel": "취소",
       "confirm": "보관",
       "failed": "보관하지 못했습니다."

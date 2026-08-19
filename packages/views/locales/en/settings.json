@@ -1,13 +1,12 @@
 {
   "issue_statuses": {
     "title": "Issue Statuses",
-    "description": "Add statuses of your own on top of the seven built-in ones. Every status belongs to a category, and the category is what determines its behavior.",
+    "description": "Define the workflow your issues move through. Each status inherits its behavior from its category.",
     "loading": "Loading statuses…",
     "add": "Add status",
     "show_archived": "Show archived ({{count}})",
     "archived_badge": "Archived",
     "archived_hint": "Retired from new assignments. Issues already on it keep it.",
-    "built_in_locked": "Built-in status. Name, color and category are fixed.",
     "flag_off": "Custom statuses are not enabled for this deployment yet. The built-in statuses below work as usual.",
     "reorder_failed": "Could not save the new order.",
     "actions": {
@@ -22,6 +21,7 @@
       "behavior_hint": "This status behaves exactly like {{category}}.",
       "name": "Name",
       "name_placeholder": "e.g. Code Review",
+      "key_hint": "Referred to as {{key}} by the API and the CLI.",
       "category": "Category",
       "category_locked": "Category cannot be changed — issues already on this status depend on it.",
       "description": "Description",
