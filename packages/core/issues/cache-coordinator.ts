@@ -194,6 +194,37 @@ function patchChangesAnyIssueField(
   );
 }
 
+// Fields whose direct mutation is part of the issue's semantic activity
+// contract. Position-only moves deliberately stay out: they are layout edits,
+// not user-visible activity. Full server snapshots carry last_activity_at, so
+// prefer that authoritative clock when present; the field list is the
+// mixed-version/optimistic fallback for patches that do not carry it yet.
+const issueActivityFields = [
+  "title",
+  "description",
+  "status",
+  "priority",
+  "assignee_type",
+  "assignee_id",
+  "start_date",
+  "due_date",
+  "parent_issue_id",
+  "project_id",
+  "stage",
+] as const satisfies readonly (keyof Issue)[];
+
+function patchChangesIssueActivity(
+  patch: Partial<Issue>,
+  base: Issue | undefined,
+): boolean {
+  if (Object.prototype.hasOwnProperty.call(patch, "last_activity_at")) {
+    return patchFieldChanged(patch, base, "last_activity_at");
+  }
+  return issueActivityFields.some((field) =>
+    patchFieldChanged(patch, base, field),
+  );
+}
+
 /** Whether a patch can change a flat window's membership or ordering. A
  * loaded row is always patched optimistically; only windows whose server
  * contract depends on the changed field need the follow-up refetch. */
@@ -248,6 +279,8 @@ function flatWindowNeedsReconcile(
       // Every persisted issue edit advances updated_at even though the
       // optimistic request payload does not carry the server timestamp.
       return anyIssueFieldChanged;
+    case "last_activity":
+      return patchChangesIssueActivity(patch, base);
     case "start_date":
       return patchFieldChanged(patch, base, "start_date");
     case "due_date":
@@ -306,6 +339,12 @@ export function applyIssueChange(
     if (
       sort.sort_by === "updated_at" &&
       patchChangesAnyIssueField(patch, loc?.issue ?? baseIssue)
+    ) {
+      staleKeys.push(key);
+    }
+    if (
+      sort.sort_by === "last_activity" &&
+      patchChangesIssueActivity(patch, loc?.issue ?? baseIssue)
     ) {
       staleKeys.push(key);
     }
@@ -536,18 +575,23 @@ export function invalidateIssueDerivatives(
   }
 }
 
-/** True when any object part of a query key encodes an "Updated date" ordering
- *  (`sort_by: "updated_at"`). Bucketed status boards and flat tables keep the
- *  sort in a standalone bag; assignee-grouped boards merge it into their filter
- *  bag (see `issueAssigneeGroupsOptions`). Scanning every object part matches
- *  all of those surfaces — workspace and My Issues — with one rule. */
-function queryKeyHasUpdatedAtSort(key: QueryKey): boolean {
+/** True when any object part of a query key encodes the requested ordering.
+ * Bucketed, flat and grouped surfaces use `sort_by`; server Table queries use
+ * the nested `sort.field` contract. */
+function queryKeyHasSort(key: QueryKey, field: string): boolean {
   return key.some(
-    (part) =>
-      !!part &&
-      typeof part === "object" &&
-      !Array.isArray(part) &&
-      (part as Record<string, unknown>).sort_by === "updated_at",
+    (part) => {
+      if (!part || typeof part !== "object" || Array.isArray(part)) return false;
+      const record = part as Record<string, unknown>;
+      if (record.sort_by === field) return true;
+      const sort = record.sort;
+      return (
+        !!sort &&
+        typeof sort === "object" &&
+        !Array.isArray(sort) &&
+        (sort as Record<string, unknown>).field === field
+      );
+    },
   );
 }
 
@@ -568,7 +612,20 @@ export function invalidateUpdatedAtSortedIssueLists(
 ): void {
   qc.invalidateQueries({
     queryKey: issueKeys.all(wsId),
-    predicate: (query) => queryKeyHasUpdatedAtSort(query.queryKey),
+    predicate: (query) => queryKeyHasSort(query.queryKey, "updated_at"),
+  });
+}
+
+/** Refetch only issue surfaces ordered by semantic activity. Auxiliary
+ * mutations carry no full Issue snapshot or sortable timestamp, so an
+ * authoritative refetch is the only safe way to restore their order. */
+export function invalidateLastActivitySortedIssueLists(
+  qc: QueryClient,
+  wsId: string,
+): void {
+  qc.invalidateQueries({
+    queryKey: issueKeys.all(wsId),
+    predicate: (query) => queryKeyHasSort(query.queryKey, "last_activity"),
   });
 }
 

@@ -1,4 +1,4 @@
--- Validates the constraint migration 352 added NOT VALID.
+-- Validates the constraint migration 362 added NOT VALID.
 --
 -- Split out because VALIDATE CONSTRAINT takes SHARE UPDATE EXCLUSIVE — readers
 -- and writers continue — while doing the scan that ADD CONSTRAINT would have

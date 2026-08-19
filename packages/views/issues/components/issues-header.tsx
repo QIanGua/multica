@@ -1313,44 +1313,54 @@ export function IssueFilterMenu({
                     only once a category holds more than one status, so a
                     workspace that never customized anything sees the same flat
                     7-row list. (MUL-6243) */}
-                {statusGroups.map((group) => (
-                  <Fragment key={group.category}>
-                    {showStatusGroupLabels && (
+                {statusGroups.map((group) => {
+                  const items = group.options.map((option) => {
+                    const checked = statusFilters.includes(option.key);
+                    const count = counts.status.get(option.key) ?? 0;
+                    const fixed = viewBaseline?.status.has(option.key) === true;
+                    return (
+                      <DropdownMenuCheckboxItem
+                        key={option.key}
+                        checked={checked}
+                        disabled={fixed}
+                        title={fixed ? fixedTitle : undefined}
+                        onCheckedChange={() => act.toggleStatusFilter(option.key)}
+                        className={FILTER_ITEM_CLASS}
+                      >
+                        <HoverCheck checked={checked} />
+                        <StatusIcon
+                          status={option.key}
+                          category={group.category}
+                          color={option.color}
+                          className="h-3.5 w-3.5"
+                        />
+                        {option.label}
+                        {count > 0 && (
+                          <span className="ml-auto text-caption text-muted-foreground">
+                            {t(($) => $.filters.issue_count, { count })}
+                          </span>
+                        )}
+                      </DropdownMenuCheckboxItem>
+                    );
+                  });
+                  // A heading MUST be wrapped in DropdownMenuGroup: it renders
+                  // Base UI's Menu.GroupLabel, which reads a Menu.Group context
+                  // and THROWS without one, taking the whole app down — no error
+                  // boundary sits above the issues surface (MUL-4819, MUL-6393).
+                  // Without a heading the group would only add an unnamed
+                  // role="group" around a single row, so the un-customized
+                  // workspace keeps the flat 7-row list it always had.
+                  return showStatusGroupLabels ? (
+                    <DropdownMenuGroup key={group.category}>
                       <DropdownMenuLabel className="text-caption text-muted-foreground">
                         {t(($) => $.status[group.category])}
                       </DropdownMenuLabel>
-                    )}
-                    {group.options.map((option) => {
-                      const checked = statusFilters.includes(option.key);
-                      const count = counts.status.get(option.key) ?? 0;
-                      const fixed = viewBaseline?.status.has(option.key) === true;
-                      return (
-                        <DropdownMenuCheckboxItem
-                          key={option.key}
-                          checked={checked}
-                          disabled={fixed}
-                          title={fixed ? fixedTitle : undefined}
-                          onCheckedChange={() => act.toggleStatusFilter(option.key)}
-                          className={FILTER_ITEM_CLASS}
-                        >
-                          <HoverCheck checked={checked} />
-                          <StatusIcon
-                            status={option.key}
-                            category={group.category}
-                            color={option.color}
-                            className="h-3.5 w-3.5"
-                          />
-                          {option.label}
-                          {count > 0 && (
-                            <span className="ml-auto text-caption text-muted-foreground">
-                              {t(($) => $.filters.issue_count, { count })}
-                            </span>
-                          )}
-                        </DropdownMenuCheckboxItem>
-                      );
-                    })}
-                  </Fragment>
-                ))}
+                      {items}
+                    </DropdownMenuGroup>
+                  ) : (
+                    <Fragment key={group.category}>{items}</Fragment>
+                  );
+                })}
               </DropdownMenuSubContent>
             </DropdownMenuSub>
 
