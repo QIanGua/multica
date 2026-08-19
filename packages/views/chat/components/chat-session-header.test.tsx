@@ -92,6 +92,40 @@ describe("ChatSessionHeader rename keyboard behavior", () => {
     expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
   });
 
+  it("defers blur submission until an active composition ends", () => {
+    const input = startRename();
+    fireEvent.change(input, { target: { value: "yanjiu" } });
+    fireEvent.compositionStart(input);
+
+    fireEvent.blur(input);
+
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(input).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: "研究" } });
+    fireEvent.compositionEnd(input);
+
+    expect(updateMutate).toHaveBeenCalledTimes(1);
+    expect(updateMutate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      title: "研究",
+    });
+    expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("still submits the current value on an ordinary blur", () => {
+    const input = startRename();
+    fireEvent.change(input, { target: { value: "Blurred title" } });
+
+    fireEvent.blur(input);
+
+    expect(updateMutate).toHaveBeenCalledTimes(1);
+    expect(updateMutate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      title: "Blurred title",
+    });
+  });
+
   it("still cancels the edit on Escape", () => {
     const input = startRename();
     fireEvent.change(input, { target: { value: "Discard me" } });

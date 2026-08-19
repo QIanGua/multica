@@ -15,7 +15,6 @@ import {
 import { toast } from "sonner";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useAuthStore } from "@multica/core/auth";
-import { isImeComposing } from "@multica/core/utils";
 import { agentListOptions, memberListOptions } from "@multica/core/workspace/queries";
 import { projectListOptions } from "@multica/core/projects/queries";
 import { canAssignAgent } from "@multica/views/issues/components";
@@ -72,6 +71,7 @@ import { useChatInputFocus } from "./use-chat-input-focus";
 import { ChatMessageList, ChatMessageSkeleton } from "./chat-message-list";
 import { ChatInput } from "./chat-input";
 import { ChatQueue } from "./chat-queue";
+import { SessionRenameInput } from "./session-rename-input";
 import { ChatResizeHandles } from "./chat-resize-handles";
 import { useChatContextItems } from "./use-chat-context-items";
 import { useChatResize } from "./use-chat-resize";
@@ -1167,6 +1167,9 @@ function SessionDropdown({
   // session id (not the full session) so a stale closure can't overwrite a
   // newer rename pulled in via WS.
   const [renamingId, setRenamingId] = useState<string | null>(null);
+  // Keep the controlled popover open even if its outside-press listener runs
+  // before SessionRenameInput's document listener for the same pointerdown.
+  const renameComposingRef = useRef(false);
   const setArchived = useSetChatSessionArchived();
   const updateSession = useUpdateChatSession();
   const setActiveSession = useChatStore((s) => s.setActiveSession);
@@ -1261,6 +1264,7 @@ function SessionDropdown({
   };
 
   const handleSubmitRename = (sessionId: string, raw: string) => {
+    renameComposingRef.current = false;
     const trimmed = raw.trim();
     const current = sessions.find((s) => s.id === sessionId);
     setRenamingId(null);
@@ -1355,7 +1359,10 @@ function SessionDropdown({
             key: "rename",
             icon: <Pencil className="size-3.5" />,
             label: t(($) => $.session_history.row_rename_aria),
-            onSelect: () => setRenamingId(session.id),
+            onSelect: () => {
+              renameComposingRef.current = false;
+              setRenamingId(session.id);
+            },
           },
           {
             key: "archive",
@@ -1401,7 +1408,13 @@ function SessionDropdown({
             <SessionRenameInput
               initialValue={session.title ?? ""}
               onSubmit={(value) => handleSubmitRename(session.id, value)}
-              onCancel={() => setRenamingId(null)}
+              onCancel={() => {
+                renameComposingRef.current = false;
+                setRenamingId(null);
+              }}
+              onCompositionChange={(isComposing) => {
+                renameComposingRef.current = isComposing;
+              }}
             />
           ) : isConfirmingStop ? (
             <div className="truncate text-body font-medium text-destructive">
@@ -1513,7 +1526,13 @@ function SessionDropdown({
 
   return (
     <>
-      <Popover open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
+      <Popover
+        open={isHistoryOpen}
+        onOpenChange={(open) => {
+          if (!open && renameComposingRef.current) return;
+          setIsHistoryOpen(open);
+        }}
+      >
         <div className="flex min-w-0 items-center gap-1">
           <PopoverTrigger className="flex max-w-96 min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1 transition-colors hover:bg-accent data-[popup-open]:bg-accent data-open:bg-accent">
             {triggerAgent && (
@@ -1574,84 +1593,6 @@ function SessionDropdown({
         </PopoverContent>
       </Popover>
     </>
-  );
-}
-
-/**
- * Inline editor for a session title. Mounts focused with the existing
- * title pre-selected so the user can either replace it outright or arrow
- * into the existing text. Enter commits, Escape cancels, a real click
- * outside the input also commits.
- *
- * We do NOT commit on the input's `blur` event: the history popover can
- * move focus to sibling rows and nested actions while the user is still
- * interacting with the panel. Instead a document-level `pointerdown`
- * listener commits only when the user actually clicks outside the input.
- */
-function SessionRenameInput({
-  initialValue,
-  onSubmit,
-  onCancel,
-}: {
-  initialValue: string;
-  onSubmit: (value: string) => void;
-  onCancel: () => void;
-}) {
-  const { t } = useT("chat");
-  const [value, setValue] = useState(initialValue);
-  const inputRef = useRef<HTMLInputElement>(null);
-  // Hold the latest value + callback in refs so the mount-only effect's
-  // listener always sees fresh state without re-subscribing on every
-  // keystroke (which would briefly leave a window where pointerdown isn't
-  // observed).
-  const valueRef = useRef(value);
-  valueRef.current = value;
-  const onSubmitRef = useRef(onSubmit);
-  onSubmitRef.current = onSubmit;
-
-  useEffect(() => {
-    inputRef.current?.focus();
-    inputRef.current?.select();
-
-    const handlePointerDown = (e: PointerEvent) => {
-      const input = inputRef.current;
-      if (!input) return;
-      if (input.contains(e.target as Node)) return;
-      onSubmitRef.current(valueRef.current);
-    };
-    // Capture phase — commit before outside-click handling can close the
-    // popover and unmount this component.
-    document.addEventListener("pointerdown", handlePointerDown, true);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown, true);
-    };
-  }, []);
-
-  return (
-    <input
-      ref={inputRef}
-      type="text"
-      value={value}
-      maxLength={200}
-      aria-label={t(($) => $.session_history.row_rename_aria)}
-      onChange={(e) => setValue(e.target.value)}
-      onClick={(e) => e.stopPropagation()}
-      onPointerDown={(e) => e.stopPropagation()}
-      onKeyDown={(e) => {
-        // Keep editing keys inside the input instead of letting the row
-        // selection keyboard handler consume them.
-        e.stopPropagation();
-        if (e.key === "Enter") {
-          if (isImeComposing(e)) return;
-          e.preventDefault();
-          onSubmit(value);
-        } else if (e.key === "Escape") {
-          e.preventDefault();
-          onCancel();
-        }
-      }}
-      className="w-full rounded-sm bg-background px-1 py-0.5 text-body outline-none ring-1 ring-border focus-visible:ring-brand"
-    />
   );
 }
 

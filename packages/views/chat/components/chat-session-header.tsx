@@ -64,6 +64,10 @@ export function ChatSessionHeader({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [draft, setDraft] = useState(session.title ?? "");
   const inputRef = useRef<HTMLInputElement>(null);
+  const isComposingRef = useRef(false);
+  // A browser can blur the input before it emits compositionend. Remember
+  // that intent so the final composed value is committed, not the draft.
+  const commitAfterCompositionRef = useRef(false);
 
   const title = session.title?.trim() || t(($) => $.window.untitled);
 
@@ -75,13 +79,17 @@ export function ChatSessionHeader({
   }, [editing]);
 
   const startRename = () => {
+    isComposingRef.current = false;
+    commitAfterCompositionRef.current = false;
     setDraft(session.title ?? "");
     setEditing(true);
   };
 
-  const commitRename = () => {
+  const commitRename = (raw = draft) => {
+    isComposingRef.current = false;
+    commitAfterCompositionRef.current = false;
     setEditing(false);
-    const trimmed = draft.trim();
+    const trimmed = raw.trim();
     if (!trimmed || trimmed === session.title) return;
     updateSession.mutate({ sessionId: session.id, title: trimmed });
   };
@@ -114,7 +122,21 @@ export function ChatSessionHeader({
             maxLength={200}
             aria-label={t(($) => $.header.rename)}
             onChange={(e) => setDraft(e.target.value)}
-            onBlur={commitRename}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={(e) => {
+              isComposingRef.current = false;
+              if (!commitAfterCompositionRef.current) return;
+              commitRename(e.currentTarget.value);
+            }}
+            onBlur={(e) => {
+              if (isComposingRef.current) {
+                commitAfterCompositionRef.current = true;
+                return;
+              }
+              commitRename(e.currentTarget.value);
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
                 if (isImeComposing(e)) return;
@@ -122,6 +144,8 @@ export function ChatSessionHeader({
                 commitRename();
               } else if (e.key === "Escape") {
                 e.preventDefault();
+                isComposingRef.current = false;
+                commitAfterCompositionRef.current = false;
                 setEditing(false);
               }
             }}
