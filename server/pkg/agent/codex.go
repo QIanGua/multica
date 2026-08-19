@@ -1041,7 +1041,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// open pipe held by a grandchild) can't hang cmd.Wait() forever. Matches
 	// the other long-lived backends (claude, copilot, cursor, …).
 	cmd.WaitDelay = codexProcessWaitDelay()
-	b.cfg.logAgentCommand(cmd)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(codexArgs, trustAgentCommandPositional(0, "app-server")))
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}

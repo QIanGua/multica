@@ -124,7 +124,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	// signalled. Returning nil here keeps os/exec from racing us with its own
 	// kill; WaitDelay remains the hard backstop.
 	cmd.Cancel = func() error { return nil }
-	b.cfg.logAgentCommand(cmd, len(prompt))
+	b.cfg.logAgentCommandWithPrompt(cmd, newAgentCommandLogArgs(args, trustAgentCommandPositional(0, "run")), len(prompt))
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd

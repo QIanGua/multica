@@ -232,7 +232,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	args := buildPiArgs(sessionPath, opts, b.cfg.Logger)
 	cmd, _, _ := b.cfg.commandAt(execName).execVia(runCtx, choosePiInvocation, lookedUp, args, b.cfg.Logger)
 	hideAgentWindow(cmd)
-	b.cfg.logAgentCommand(cmd)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd

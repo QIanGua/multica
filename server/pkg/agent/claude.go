@@ -89,7 +89,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	// only after the tree has been signalled. Returning nil keeps os/exec from
 	// racing us with its own kill; WaitDelay remains the hard backstop.
 	cmd.Cancel = func() error { return nil }
-	b.cfg.logAgentCommand(cmd)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd

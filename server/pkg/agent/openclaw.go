@@ -76,7 +76,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
-	b.cfg.logAgentCommand(cmd)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args, trustAgentCommandPositional(0, "agent")))
 	// 500ms, matching cursor-agent — the other backend whose CLI can deliver a
 	// terminal result while keeping a process alive.
 	//

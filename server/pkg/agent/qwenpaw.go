@@ -88,7 +88,7 @@ func (b *qwenpawBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, qwenpawArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.logAgentCommand(cmd)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(qwenpawArgs, trustAgentCommandPositional(0, "acp")))
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}

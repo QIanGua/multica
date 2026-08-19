@@ -350,7 +350,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 	args := buildCopilotArgs(prompt, opts, b.cfg.Logger)
 	cmd, _, _ := b.cfg.commandAt(execName).execVia(runCtx, chooseCopilotInvocation, lookedUp, args, b.cfg.Logger)
 	hideAgentWindow(cmd)
-	b.cfg.logAgentCommand(cmd)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd

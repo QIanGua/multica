@@ -181,31 +181,62 @@ func TestCommandArgvNeverAliasesItsInputs(t *testing.T) {
 	}
 }
 
-func TestRedactAgentCommandArgsPreservesOnlyFlagNames(t *testing.T) {
+func TestRedactAgentCommandArgsPreservesOnlySafeFlagNames(t *testing.T) {
 	t.Parallel()
 
+	overlongFlag := "--" + strings.Repeat("a", maxLoggedAgentCommandFlagLen)
 	args := []string{
 		"--api-key", "api-key-secret",
+		"--dash-prefixed-secret", "-sTk9xQZ-secretvalue",
 		"--token=token-secret",
 		"--header", "Authorization: Bearer header-secret",
 		"-c", `model_providers.example.api_key="config-secret"`,
 		"--future-secret", "future-value-secret",
 		"prompt-secret",
 		"--verbose",
+		"-not-a-short-flag",
+		overlongFlag,
 	}
 	want := []string{
 		"--api-key", redactedAgentCommandArg,
+		"--dash-prefixed-secret", redactedAgentCommandArg,
 		"--token",
 		"--header", redactedAgentCommandArg,
 		"-c", redactedAgentCommandArg,
 		"--future-secret", redactedAgentCommandArg,
 		redactedAgentCommandArg,
 		"--verbose",
+		redactedAgentCommandArg,
+		redactedAgentCommandArg,
 	}
 
-	got := redactAgentCommandArgs(args)
+	got := redactAgentCommandArgs(args, nil)
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("redactAgentCommandArgs = %v, want %v", got, want)
+	}
+}
+
+func TestTrustedAgentCommandPositionalsFollowSourceIndexes(t *testing.T) {
+	t.Parallel()
+
+	invocationArgs := []string{"acp", "--api-key", "-sTk9xQZ-secretvalue", "acp"}
+	finalArgs := []string{
+		"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "wrapper.ps1",
+		"start", "q36",
+		"acp", "--api-key", "-sTk9xQZ-secretvalue", "acp",
+	}
+	cfg := Config{LaunchPrefix: []string{"start", "q36"}}
+	trusted := cfg.trustedAgentCommandPositionals(finalArgs,
+		newAgentCommandLogArgs(invocationArgs, trustAgentCommandPositional(0, "acp")))
+
+	got := redactAgentCommandArgs(finalArgs, trusted)
+	want := []string{
+		redactedAgentCommandArg, redactedAgentCommandArg, redactedAgentCommandArg, redactedAgentCommandArg, redactedAgentCommandArg,
+		redactedAgentCommandArg, redactedAgentCommandArg,
+		"acp", "--api-key", redactedAgentCommandArg, redactedAgentCommandArg,
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("source-aware redaction = %v, want %v", got, want)
 	}
 }
 
@@ -214,6 +245,7 @@ func TestLogAgentCommandRedactsTextAndJSON(t *testing.T) {
 
 	args := []string{
 		"--api-key", "api-key-secret",
+		"--dash-prefixed-secret", "-sTk9xQZ-secretvalue",
 		"--token=token-secret",
 		"--header", "Authorization: Bearer header-secret",
 		"-c", `model_providers.example.api_key="config-secret"`,
@@ -222,6 +254,7 @@ func TestLogAgentCommandRedactsTextAndJSON(t *testing.T) {
 	}
 	secrets := []string{
 		"api-key-secret",
+		"-sTk9xQZ-secretvalue",
 		"token-secret",
 		"Authorization: Bearer header-secret",
 		"config-secret",
@@ -242,7 +275,7 @@ func TestLogAgentCommandRedactsTextAndJSON(t *testing.T) {
 			var buf bytes.Buffer
 			cfg := Config{Logger: slog.New(tc.handler(&buf)), provider: "codex"}
 			cmd := &exec.Cmd{Path: "/opt/multica/bin/codex", Args: append([]string{"codex"}, args...)}
-			cfg.logAgentCommand(cmd, 123)
+			cfg.logAgentCommandWithPrompt(cmd, newAgentCommandLogArgs(args), 123)
 
 			output := buf.String()
 			for _, secret := range secrets {
@@ -351,9 +384,33 @@ func TestOnlyLaunchGoSpawnsRuntimeProcesses(t *testing.T) {
 	}
 }
 
+func containsRuntimeArgReference(expr ast.Expr) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.SelectorExpr:
+			if node.Sel.Name == "Args" {
+				found = true
+				return false
+			}
+		case *ast.Ident:
+			switch strings.ToLower(node.Name) {
+			case "args", "cmdargs", "argv":
+				found = true
+				return false
+			}
+		}
+		return !found
+	})
+	return found
+}
+
 // TestOnlyLaunchGoLogsAgentCommandArgs keeps raw argv out of adapter-local log
 // calls. Every runtime process log must flow through Config.logAgentCommand in
 // launch.go, where values are redacted consistently for text and JSON handlers.
+// The guard checks both common field labels and the expressions themselves, so
+// renaming an "args" field to "argv" cannot bypass it while still passing
+// cmd.Args, args, cmdArgs, or argv to a logger.
 func TestOnlyLaunchGoLogsAgentCommandArgs(t *testing.T) {
 	t.Parallel()
 
@@ -394,7 +451,11 @@ func TestOnlyLaunchGoLogsAgentCommandArgs(t *testing.T) {
 			for _, arg := range call.Args {
 				literal, ok := arg.(*ast.BasicLit)
 				if ok && literal.Kind == token.STRING &&
-					(literal.Value == `"args"` || literal.Value == `"agent command"`) {
+					(literal.Value == `"args"` || literal.Value == `"argv"` || literal.Value == `"agent command"`) {
+					offenders = append(offenders, fset.Position(call.Pos()).String())
+					break
+				}
+				if containsRuntimeArgReference(arg) {
 					offenders = append(offenders, fset.Position(call.Pos()).String())
 					break
 				}
