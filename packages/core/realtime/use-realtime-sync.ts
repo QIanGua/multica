@@ -1307,15 +1307,19 @@ export function useRealtimeSync(
 
     // Two guards stand between the workspace-wide message firehose and the
     // renderer (MUL-6396). `task:message` is broadcast to EVERY client for
-    // EVERY run in the workspace, but only the handful of runs on screen are
-    // ever rendered:
+    // EVERY run in the workspace, but only the handful of runs a user actually
+    // opens is ever rendered:
     //
-    // 1. Frames for a task no mounted view holds are dropped. The old
-    //    `(old = [])` default built a cache entry on first sight, so each
-    //    client accumulated the full transcript of every run it would never
-    //    open — unbounded tool input included — for the life of the run.
+    // 1. Frames are kept only for a task this client already holds a timeline
+    //    entry for — opened at some point, and not yet garbage-collected. The
+    //    old `(old = [])` default built that entry on first sight instead, so
+    //    every client accumulated the transcript of every run its user would
+    //    never open, unbounded tool input included.
     // 2. Frames that survive that gate are coalesced into one cache write per
     //    window, so a burst costs one merge and one render instead of N.
+    //
+    // The entry can be collected between the two, which is why the flush
+    // re-checks rather than trusting the gate — see flushTaskMessages.
     const taskMessageBatches = new Map<string, TaskMessagePayload[]>();
     const truncatedTaskIds = new Set<string>();
     let taskMessageFlushTimer: ReturnType<typeof setTimeout> | null = null;
