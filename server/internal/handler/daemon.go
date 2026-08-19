@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
@@ -4381,7 +4382,18 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for _, msg := range req.Messages {
+	messageIDs := make([]pgtype.UUID, len(req.Messages))
+	for i := range messageIDs {
+		id, err := uuid.NewV7()
+		if err != nil {
+			slog.Error("failed to generate task message id", "task_id", taskID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to persist task message")
+			return
+		}
+		messageIDs[i] = pgtype.UUID{Bytes: [16]byte(id), Valid: true}
+	}
+
+	for i, msg := range req.Messages {
 		// Redact sensitive information before persisting or broadcasting.
 		msg.Content = redact.Text(msg.Content)
 		msg.Output = redact.Text(msg.Output)
@@ -4409,6 +4421,7 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 			inputJSON, _ = json.Marshal(msg.Input)
 		}
 		created, createErr := h.Queries.CreateTaskMessage(r.Context(), db.CreateTaskMessageParams{
+			ID:      messageIDs[i],
 			TaskID:  parseUUID(taskID),
 			Seq:     int32(msg.Seq),
 			Type:    msg.Type,
