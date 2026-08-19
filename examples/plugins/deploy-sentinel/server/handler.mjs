@@ -9,8 +9,30 @@
 // Env: MULTICA_SIGNING_SECRET (the whsec_… shown once when the token was issued)
 //      PORT (default 8788)
 
-import { createServer } from "node:http";
+import { createServer } from "node:https";
+import { readFileSync } from "node:fs";
 import { createHmac, timingSafeEqual } from "node:crypto";
+
+// HTTPS, not HTTP. A hook's transport URL must be an https:// URL or the
+// manifest will not install, and MULTICA_PLUGIN_DEV_CA only changes WHICH
+// certificate Multica trusts — it never turns verification off. Generate one:
+//
+//   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+//     -keyout dev-key.pem -out dev-cert.pem \
+//     -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+//
+// then point MULTICA_PLUGIN_DEV_CA at dev-cert.pem.
+function tlsOptions() {
+  const cert = process.env.TLS_CERT ?? "dev-cert.pem";
+  const key = process.env.TLS_KEY ?? "dev-key.pem";
+  try {
+    return { cert: readFileSync(cert), key: readFileSync(key) };
+  } catch (error) {
+    console.error(`Could not read ${cert} / ${key}: ${error.message}`);
+    console.error("See the README for the openssl one-liner that generates them.");
+    process.exit(1);
+  }
+}
 
 const PORT = Number(process.env.PORT ?? 8788);
 const SIGNING_SECRET = process.env.MULTICA_SIGNING_SECRET ?? "";
@@ -129,7 +151,7 @@ function requestRollback(input, config) {
   };
 }
 
-const server = createServer(async (req, res) => {
+const server = createServer(tlsOptions(), async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks).toString("utf8");
@@ -198,7 +220,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Deploy Sentinel listening on http://127.0.0.1:${PORT}`);
+  console.log(`Deploy Sentinel listening on https://127.0.0.1:${PORT}`);
   if (!SIGNING_SECRET) {
     console.warn("MULTICA_SIGNING_SECRET is not set — every request will be refused.");
   }

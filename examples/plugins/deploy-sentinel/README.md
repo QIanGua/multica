@@ -43,6 +43,15 @@ says what order to use them in. Neither half works as well alone.
 
 Two servers, both the plugin author's own. Multica never runs either.
 
+Both serve HTTPS, because a hook's transport URL must be an `https://` URL or
+the manifest will not install. Make a certificate once:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout dev-key.pem -out dev-cert.pem \
+  -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+```
+
 ```bash
 # The hook endpoint. The signing secret is the whsec_… shown once when you
 # issued the plugin's token in workspace settings.
@@ -51,6 +60,9 @@ MULTICA_SIGNING_SECRET=whsec_... node server/handler.mjs      # :8788
 # The MCP server behind the `metrics` hook.
 METRICS_TOKEN=metrics-dev-token node server/metrics-mcp.mjs   # :8789
 ```
+
+Both read `TLS_CERT` / `TLS_KEY`, defaulting to `dev-cert.pem` / `dev-key.pem`
+in the working directory.
 
 Then point Multica at them. Both endpoints are on loopback, which the outbound
 guard refuses by design, so name them explicitly:

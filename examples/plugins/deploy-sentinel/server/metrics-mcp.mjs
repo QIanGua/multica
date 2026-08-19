@@ -12,7 +12,29 @@
 // Try adding a tool below and re-opening the approval panel: the new tool shows
 // up as unapproved and agents cannot call it until somebody ticks it.
 
-import { createServer } from "node:http";
+import { createServer } from "node:https";
+import { readFileSync } from "node:fs";
+
+// HTTPS, not HTTP. A hook's transport URL must be an https:// URL or the
+// manifest will not install, and MULTICA_PLUGIN_DEV_CA only changes WHICH
+// certificate Multica trusts — it never turns verification off. Generate one:
+//
+//   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+//     -keyout dev-key.pem -out dev-cert.pem \
+//     -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+//
+// then point MULTICA_PLUGIN_DEV_CA at dev-cert.pem.
+function tlsOptions() {
+  const cert = process.env.TLS_CERT ?? "dev-cert.pem";
+  const key = process.env.TLS_KEY ?? "dev-key.pem";
+  try {
+    return { cert: readFileSync(cert), key: readFileSync(key) };
+  } catch (error) {
+    console.error(`Could not read ${cert} / ${key}: ${error.message}`);
+    console.error("See the README for the openssl one-liner that generates them.");
+    process.exit(1);
+  }
+}
 
 const PORT = Number(process.env.PORT ?? 8789);
 const TOKEN = process.env.METRICS_TOKEN ?? "metrics-dev-token";
@@ -74,7 +96,7 @@ function callTool(name, args) {
   }
 }
 
-createServer(async (req, res) => {
+createServer(tlsOptions(), async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
 
@@ -122,4 +144,4 @@ createServer(async (req, res) => {
         error: { code: -32601, message: `method not found: ${request.method}` },
       }));
   }
-}).listen(PORT, () => console.log(`metrics MCP server on http://127.0.0.1:${PORT}`));
+}).listen(PORT, () => console.log(`metrics MCP server on https://127.0.0.1:${PORT}`));
