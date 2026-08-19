@@ -137,6 +137,17 @@ var clientCallSurface = map[string]bool{
 	"GenerateJSON": true,
 }
 
+// methodNameCollisions are call sites the scan below flags by name without
+// being consumers of this layer — some unrelated type that happens to have a
+// method called Chat or GenerateText. The scan matches on selector name alone,
+// which cannot tell the two apart.
+//
+// This is deliberately NOT part of documentedConsumers. That map is published
+// to operators as "what this deployment sends to a third party"; parking a
+// name collision there to quiet a test would corrupt a privacy disclosure to
+// save a line. Empty today — the repository has no collisions.
+var methodNameCollisions = map[string]bool{}
+
 // TestDocumentedConsumersAreTheOnlyCallers keeps the published consumer
 // inventory from going quietly stale.
 //
@@ -160,7 +171,7 @@ func TestDocumentedConsumersAreTheOnlyCallers(t *testing.T) {
 			if !ok {
 				return true
 			}
-			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && clientCallSurface[sel.Sel.Name] {
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && clientCallSurface[sel.Sel.Name] && !methodNameCollisions[rel] {
 				found[rel] = append(found[rel], sel.Sel.Name)
 			}
 			return true
@@ -173,8 +184,9 @@ func TestDocumentedConsumersAreTheOnlyCallers(t *testing.T) {
 				"If it sends content upstream, it must be disclosed before it ships: add it to "+
 				"documentedConsumers, to this package's doc comment, and to the operator copy in "+
 				".env.example and apps/docs/content/docs/environment-variables*.mdx (all four locales).\n"+
-				"If it is an unrelated type that happens to share a method name, add it to "+
-				"documentedConsumers with a note saying so, or rename the method.", rel, methods)
+				"If it is an unrelated type that merely shares a method name, add it to "+
+				"methodNameCollisions — never to documentedConsumers, which operators read as the "+
+				"list of things that send their chat content somewhere.", rel, methods)
 		}
 	}
 	for rel, summary := range documentedConsumers {
