@@ -1,0 +1,196 @@
+---
+title: Manifest 参考
+description: multica.plugin.json 的全部字段，以及宿主在安装时强制执行的校验规则与限额。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+对 Multica 来说，`multica.plugin.json` 就是整个插件。它在预览时被抓取、严格解析，规范化后的结果作为 `admin` 授权的快照存入安装记录。
+
+## 解析规则
+
+以下规则在检查任何字段之前生效：
+
+- **只支持版本 1。** `manifest_version` 必须为 `1`。
+- **未知字段直接失败。** 顶层和每个配置项内部都是如此。一个拼写错误不能悄悄削弱 `admin` 批准过的内容，所以宁可拒绝也不忽略。
+- **多余的 JSON 直接失败。** 文档必须恰好是一个对象。
+- **大小上限** 1 MiB。
+- **至少一项贡献**，surface、hook、resource 合计最多 64 项。
+
+manifest 非法时安装会失败，并给出指明字段的错误信息，例如 ``contributes.hooks[1].transport.url host "api.example.com" is not covered by a net: scope``。
+
+## 完整示例
+
+```json
+{
+  "manifest_version": 1,
+  "key": "com.example.deploy-sentinel",
+  "name": "Deploy Sentinel",
+  "description": "把线上故障与近期发布关联起来。",
+  "version": "1.0.0",
+  "author": { "name": "Example Infra Team", "url": "https://example.com" },
+  "icon": "assets/icon.png",
+
+  "scopes": [
+    "issues:read",
+    "comments:write",
+    "storage:workspace",
+    "net:sentinel.example.com"
+  ],
+
+  "config": {
+    "environment": {
+      "type": "enum",
+      "label": "环境",
+      "options": ["production", "staging"],
+      "required": true
+    },
+    "sentinel_token": {
+      "type": "secret",
+      "label": "Deploy Sentinel API token",
+      "required": true
+    }
+  },
+
+  "contributes": {
+    "surfaces": [
+      {
+        "key": "incident",
+        "type": "issue_panel",
+        "name": "Deploy Sentinel",
+        "entry": "ui/main.js",
+        "platforms": ["web", "desktop"]
+      }
+    ],
+    "hooks": [
+      {
+        "key": "correlate_deploys",
+        "name": "关联近期发布",
+        "description": "列出指定时间窗口内的发布，含 commit、作者与影响面。排查线上故障时先调用它。",
+        "input_schema": {
+          "type": "object",
+          "required": ["service"],
+          "properties": {
+            "service": { "type": "string" },
+            "window_minutes": { "type": "number" }
+          }
+        },
+        "triggers": ["agent", "manual", "ui"],
+        "transport": { "type": "http", "url": "https://sentinel.example.com/hooks/correlate" },
+        "timeout_ms": 15000
+      }
+    ],
+    "resources": [
+      { "type": "skill", "key": "incident-response", "entry": "skills/incident-response/SKILL.md" }
+    ]
+  }
+}
+```
+
+## 顶层字段
+
+| 字段 | 类型 | 必填 | 规则 |
+| --- | --- | --- | --- |
+| `manifest_version` | number | 是 | 必须为 `1`。 |
+| `key` | string | 是 | 反向 DNS 命名空间：至少两段、以点分隔，每段匹配 `[a-z][a-z0-9]*(-[a-z0-9]+)*`。最长 255 字节。永久标识该插件。 |
+| `name` | string | 是 | 单行，首尾无空白，最长 160 字节。 |
+| `description` | string | 否 | 最长 2000 字节，不能含回车符。 |
+| `version` | string | 是 | 语义化版本号，最长 64 字节。允许预发布与构建元数据。 |
+| `author.name` | string | 是 | 单行，最长 160 字节。 |
+| `author.url` | string | 否 | 纯 HTTPS URL，不含用户信息与 fragment，最长 2048 字节。 |
+| `icon` | string | 否 | 插件目录内的相对路径。不能以斜杠开头，不能含 `..`，最长 1024 字节。 |
+| `scopes` | string[] | 是 | 非空、去重，最多 64 项。见 [Scope](/plugins/scopes)。 |
+| `config` | object | 否 | 最多 32 项，以字段名为键。 |
+| `contributes` | object | 是 | `surfaces`、`hooks`、`resources` 至少有一项。 |
+
+<Callout type="warn">
+改 `key` 等于换了一个插件。已有安装仍指向旧的那个，没有改名路径。
+</Callout>
+
+## `contributes.surfaces`
+
+由 Multica 挂载在固定位置的 iframe。你决定里面渲染什么，宿主决定它出现在哪里。
+
+| 字段 | 类型 | 必填 | 规则 |
+| --- | --- | --- | --- |
+| `key` | string | 是 | surface 之间唯一。匹配 `[a-z][a-z0-9]*([_-][a-z0-9]+)*`。 |
+| `type` | string | 是 | `issue_panel`、`sidebar_panel` 或 `modal`。 |
+| `name` | string | 是 | 单行，最长 160 字节。 |
+| `entry` | string | 是 | 以 `.js` 或 `.mjs` 结尾的相对路径。 |
+| `platforms` | string[] | 否 | `web`、`desktop` 的子集，不可重复。留空或省略表示全部平台。 |
+
+`entry` 必须是脚本而不是 HTML 页面：宿主自己渲染 surface 文档，才能挂上由 `net:` scope 推导出的 CSP。由插件作者提供的文档会带着它自己服务器发的策略，那样 `net:` 就只是一句声明，而不是一道控制。
+
+目前挂载的是 `issue_panel` 和 `modal`。`sidebar_panel` 能被解析但还没有宿主位置，声明它的 manifest 会在安装时被拒绝，而不是装上一个看不见的贡献。
+
+## `contributes.hooks`
+
+由你的服务器实现的一项能力。触发方式说明谁可以调用它；宿主绝不会凭空发明 manifest 未列出的调用点。
+
+| 字段 | 类型 | 必填 | 规则 |
+| --- | --- | --- | --- |
+| `key` | string | 是 | hook 之间唯一。匹配 `[a-z][a-z0-9]*([_-][a-z0-9]+)*`。 |
+| `name` | string | 是 | 单行，最长 160 字节。 |
+| `description` | string | 是 | 非空，最长 2000 字节。允许多行。 |
+| `input_schema` | object | 否 | 一个 JSON Schema 对象，其 `type` 必须是 `object`。 |
+| `triggers` | string[] | 是 | 非空、去重，取值来自 `ui`、`manual`、`agent`、`event`。 |
+| `events` | string[] | 条件必填 | 声明 `event` 时必填，否则禁止出现。去重，取值见下表。 |
+| `transport.type` | string | 是 | `http` 或 `mcp`。 |
+| `transport.url` | string | 是 | 纯 HTTPS URL，其主机必须被某个 `net:` scope 精确覆盖。 |
+| `timeout_ms` | number | 否 | 100 到 30000 之间，默认 10000。 |
+
+`description` 之所以必填，是因为当 hook 声明 `agent` 触发方式时，它就是智能体读到的 MCP 工具描述。宿主不会改写它——请为那个要据此决定是否调用的读者来写。
+
+### 事件
+
+| 事件 | 触发时机 | 需要 scope |
+| --- | --- | --- |
+| `issue.created` | 创建任务 | `issues:read` |
+| `issue.updated` | 更新任务 | `issues:read` |
+| `issue.status_changed` | 任务状态变化 | `issues:read` |
+| `comment.created` | 发表评论 | `comments:read` |
+| `task.started` | 智能体运行开始 | `tasks:read` |
+| `task.completed` | 智能体运行完成 | `tasks:read` |
+| `task.failed` | 智能体运行失败 | `tasks:read` |
+
+这条 scope 要求在解析阶段强制执行。事件推送的内容，正是 Action API 需要 scope 才能拉取的内容——`issue.*` 携带描述，`comment.created` 携带正文——所以没有对应读权限却能订阅，等于绕过读权限拿到同一份数据。
+
+## `contributes.resources`
+
+静态贡献，两个方向都不发生调用。
+
+| 字段 | 类型 | 必填 | 规则 |
+| --- | --- | --- | --- |
+| `type` | string | 是 | 目前只支持 `skill`。 |
+| `key` | string | 是 | resource 之间唯一。匹配 `[a-z][a-z0-9]*([_-][a-z0-9]+)*`。 |
+| `entry` | string | 是 | 必须恰好是 `skills/<key>/SKILL.md`。 |
+
+路径固定而非自由填写，是为了让文件位置可以从 `admin` 已经在授权页面看到的 key 推导出来。见[智能体与 skill](/plugins/agents-and-skills#skill-资源)。
+
+## `config`
+
+一个以字段名为键的 JSON 对象，声明顺序即表单渲染顺序。字段名匹配 `[a-z][a-z0-9]*([_-][a-z0-9]+)*`。表单由 Multica 渲染——插件不需要自带配置界面。
+
+| 字段 | 类型 | 必填 | 规则 |
+| --- | --- | --- | --- |
+| `type` | string | 是 | `string`、`number`、`bool`、`enum` 或 `secret`。 |
+| `label` | string | 是 | 单行，最长 160 字节。 |
+| `description` | string | 否 | 最长 500 字节。 |
+| `required` | boolean | 否 | 把该项渲染为必填。 |
+| `options` | string[] | 条件必填 | `enum` 必填且非空，其他类型禁止出现。最多 64 项、去重，每项最长 160 字节。 |
+| `placeholder` | string | 否 | 最长 160 字节。 |
+| `multiline` | boolean | 否 | 仅对 `string` 有效，渲染为多行文本框。 |
+
+`secret` 的值以只写方式存放在独立的加密表中。它永远不会进入 surface，不会出现在 hook 请求体里，也没有任何读接口会返回它——连打码版本都没有。见[配置与存储](/plugins/configuration-and-storage)。
+
+## 发布前的校验清单
+
+发布 manifest URL 前确认：
+
+- `key` 是反向 DNS，且是你打算长期使用的那个。
+- `version` 是语义化版本号，且高于已安装的版本。
+- 每个 `transport.url` 的主机都有精确匹配的 `net:` scope。
+- 每个声明 `event` 的 hook 都列出了 `events`，并持有各事件所要求的读权限。
+- 每个 surface 的 `entry` 以 `.js` 或 `.mjs` 结尾，且在解析出的 URL 上可访问。
+- 每个 skill resource 的 `entry` 恰好是 `skills/<key>/SKILL.md`。
+- 任何地方都没有未知字段——包括 `config` 内部，一个多余的键会让整份文档失败。

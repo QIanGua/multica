@@ -1,0 +1,132 @@
+---
+title: Configuration and storage
+description: Declare a settings form Multica renders for you, handle secrets safely, and keep plugin state in server-side storage that survives the sandbox.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+A plugin has two kinds of state, and they are not interchangeable. **Configuration** is what an admin sets once — declared in the manifest, rendered by Multica, validated server-side. **Storage** is what your plugin writes at runtime, per workspace or per member.
+
+## Configuration
+
+Declare the fields; Multica renders the form. Plugins never ship configuration UI.
+
+```json
+"config": {
+  "team": {
+    "type": "string",
+    "label": "Team",
+    "description": "Passed to the triage service so it can route the issue.",
+    "required": true,
+    "placeholder": "platform"
+  },
+  "items": {
+    "type": "string",
+    "label": "Checklist items",
+    "description": "One per line. Shared by the whole workspace.",
+    "required": true,
+    "multiline": true
+  },
+  "environment": {
+    "type": "enum",
+    "label": "Environment",
+    "options": ["production", "staging"],
+    "required": true
+  },
+  "notify_on_failure": { "type": "bool", "label": "Notify on failure" },
+  "retry_limit": { "type": "number", "label": "Retry limit" },
+  "api_token": { "type": "secret", "label": "API token", "required": true }
+}
+```
+
+Declaration order is the render order, so the form is stable across installs.
+
+### Field types
+
+| Type | Stored as | Notes |
+| --- | --- | --- |
+| `string` | string | Max 4096 bytes. `multiline: true` renders a textarea. |
+| `number` | number | Any JSON number. |
+| `bool` | boolean | Renders a switch. |
+| `enum` | string | Must be one of `options`; validated server-side. |
+| `secret` | encrypted, write-only | Max 8192 bytes. Never returned by any endpoint. |
+
+Validation happens against the **stored manifest snapshot**, so a value can never be saved for a field the installed version does not declare. Submitting a value of the wrong type is a `400` naming the field.
+
+Partial updates merge over what is stored, so a form that submits only what changed does not silently clear the rest.
+
+### Reading configuration
+
+| Where | How |
+| --- | --- |
+| Surface | `(await multica.context.get()).config` |
+| Hook handler | The `config` object in the request body |
+
+Both carry **non-secret values only**. There is no configuration endpoint on the Action API, which is why the hook payload includes `config` at all — a plugin forced to keep its own second copy would make the manifest's `config` block decorative.
+
+### Secrets
+
+A `secret` field is your credential for your own service. It is encrypted at rest with a deployment key and:
+
+- never reaches a surface,
+- never appears in a hook payload,
+- is never returned by a read endpoint, not even masked.
+
+What an admin sees instead is which secret fields *hold* a value, by name. To change one, they type a new value; submitting an empty string clears it rather than storing `""`.
+
+<Callout type="warn">
+Secret storage requires `MULTICA_PLUGIN_SECRET_KEY` on the deployment. Without it, saving a secret field fails closed with a `502`-class error rather than storing plaintext. If your plugin needs a secret, say so in your README — a self-hosted operator has to generate that key.
+</Callout>
+
+The one place a secret is decrypted for use is authenticating to your own MCP server: a secret field named `<hook_key>_credential` is sent as the `Authorization` header on that hook's connection. See [the `mcp` transport](/plugins/hooks#the-mcp-transport).
+
+### What happens on upgrade
+
+Installing a new version prunes configuration the new manifest no longer declares — including secrets, and including a field whose type changed away from `secret`. It is one transaction with the snapshot update, so a snapshot can never land with the previous version's secrets still attached.
+
+If you rename a config field, treat it as a new field: the old value is pruned, and an admin has to fill the new one in.
+
+## Storage
+
+Plugin storage is a server-side key–value store scoped to your installation. It exists because the sandbox has none: `localStorage`, `sessionStorage`, and cookies all throw or read as empty inside a surface.
+
+```js
+await multica.storage.user.set("note", text);
+const note = await multica.storage.user.get("note");   // null when absent
+const keys = await multica.storage.workspace.list();   // [{ key, size_bytes, updated_at }]
+await multica.storage.workspace.delete("draft");
+```
+
+### Two scopes
+
+| Scope | Visible to | Requires | Use for |
+| --- | --- | --- | --- |
+| `workspace` | Everyone in the workspace | `storage:workspace` | Shared state: checklists, cached team settings |
+| `user` | One member | `storage:user` | Per-person state: notes, preferences, a member's own credential for your service |
+
+Choosing wrong is a privacy bug that looks like a caching bug. If two members should not see each other's value, it is `user`.
+
+`storage:user` has no meaning without a person, so a plugin-actor call — an `event` hook callback, or the install token — is refused with `403` rather than being keyed to a shared bucket masquerading as somebody's private one.
+
+### Quotas
+
+| Limit | Value |
+| --- | --- |
+| Key length | 1024 bytes |
+| Value size | 100 KiB |
+| Keys per scope | 1000 |
+| Total bytes per scope | 5 MiB |
+
+Enforced on write, never by eviction: a plugin that hits its ceiling gets an explicit `507`, because silently dropping the oldest key would corrupt state the plugin believes it stored. Replacing an existing value is measured as a replacement, so an update cannot fail on a limit the existing row already occupies.
+
+### Semantics worth knowing
+
+- Values are **strings**. Serialize your own JSON.
+- A missing key resolves to `null` through the SDK, and is `404` on the raw endpoint. Treat it as an ordinary outcome.
+- `list()` returns keys, sizes, and timestamps — never values. Listing is for discovering what you wrote, not bulk-reading state.
+- Storage belongs to the **installation**. Disabling keeps it; uninstalling deletes it along with secrets and invocation records.
+- Reads and writes are not transactional, and concurrent writers to one scope can overshoot a quota by their own sizes. The limits exist to stop runaway growth, not to be exact to the byte.
+
+### Do not use comments as storage
+
+A comment is capped at 64 KiB and, more importantly, is content a person reads. Bulk state belongs in storage.

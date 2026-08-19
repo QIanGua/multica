@@ -1,0 +1,132 @@
+---
+title: 配置与存储
+description: 声明一份由 Multica 渲染的设置表单、安全地处理 secret，并把插件状态放进能穿透沙箱的服务端存储。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+插件有两类状态，不能互换。**配置**是 `admin` 设置一次的东西——在 manifest 里声明、由 Multica 渲染、在服务端校验。**存储**是你的插件在运行时写入的东西，按工作区或按成员隔离。
+
+## 配置
+
+你声明字段，Multica 渲染表单。插件不需要自带配置界面。
+
+```json
+"config": {
+  "team": {
+    "type": "string",
+    "label": "团队",
+    "description": "传给分诊服务用于路由任务。",
+    "required": true,
+    "placeholder": "platform"
+  },
+  "items": {
+    "type": "string",
+    "label": "清单条目",
+    "description": "每行一条，整个工作区共享。",
+    "required": true,
+    "multiline": true
+  },
+  "environment": {
+    "type": "enum",
+    "label": "环境",
+    "options": ["production", "staging"],
+    "required": true
+  },
+  "notify_on_failure": { "type": "bool", "label": "失败时通知" },
+  "retry_limit": { "type": "number", "label": "重试次数上限" },
+  "api_token": { "type": "secret", "label": "API token", "required": true }
+}
+```
+
+声明顺序就是渲染顺序，因此表单在不同安装之间保持稳定。
+
+### 字段类型
+
+| 类型 | 存储形式 | 说明 |
+| --- | --- | --- |
+| `string` | 字符串 | 最长 4096 字节。`multiline: true` 渲染多行文本框。 |
+| `number` | 数字 | 任意 JSON 数字。 |
+| `bool` | 布尔 | 渲染为开关。 |
+| `enum` | 字符串 | 必须是 `options` 之一，服务端校验。 |
+| `secret` | 加密、只写 | 最长 8192 字节。任何接口都不会返回。 |
+
+校验依据是**已存储的 manifest 快照**，所以永远不可能为已安装版本未声明的字段保存值。提交类型不对的值会返回 `400` 并指明字段。
+
+局部更新会与已存值合并，因此只提交改动项的表单不会静默清空其余字段。
+
+### 读取配置
+
+| 位置 | 方式 |
+| --- | --- |
+| surface | `(await multica.context.get()).config` |
+| hook handler | 请求体里的 `config` 对象 |
+
+两者都**只含非 secret 的值**。Action API 上没有配置接口，这正是 hook 请求体要携带 `config` 的原因——如果插件被迫自己再存一份，manifest 里的 `config` 就成了摆设。
+
+### secret
+
+`secret` 字段是你访问自己服务的凭证。它用部署密钥加密存储，并且：
+
+- 不会进入 surface，
+- 不会出现在 hook 请求体里，
+- 不会被任何读接口返回，连打码版本都没有。
+
+`admin` 能看到的只是哪些 secret 字段**已经有值**，按名称列出。要修改就填入新值；提交空字符串表示清除，而不是存一个 `""`。
+
+<Callout type="warn">
+secret 存储依赖部署上的 `MULTICA_PLUGIN_SECRET_KEY`。没有它时，保存 secret 字段会以 `502` 一类的错误失败，而不是明文存储。如果你的插件需要 secret，请在 README 里写清楚——自托管运维需要自己生成这个密钥。
+</Callout>
+
+secret 唯一会被解密使用的场景，是向你自己的 MCP 服务器认证：名为 `<hook_key>_credential` 的 secret 字段会作为该 hook 连接上的 `Authorization` 头发送。见 [`mcp` transport](/plugins/hooks#mcp-transport)。
+
+## 升级时会发生什么
+
+安装新版本时，新 manifest 不再声明的配置会被清理——包括 secret，也包括类型从 `secret` 改成别的字段。这与快照更新在同一个事务内完成，所以快照永远不会带着上一版的 secret 落地。
+
+重命名配置字段等同于新增字段：旧值被清理，`admin` 需要重新填写。
+
+## 存储
+
+插件存储是一个按安装隔离的服务端键值存储。它之所以存在，是因为沙箱里没有存储：surface 内的 `localStorage`、`sessionStorage` 和 cookie 都会抛错或读到空值。
+
+```js
+await multica.storage.user.set("note", text);
+const note = await multica.storage.user.get("note");   // 不存在时为 null
+const keys = await multica.storage.workspace.list();   // [{ key, size_bytes, updated_at }]
+await multica.storage.workspace.delete("draft");
+```
+
+### 两种范围
+
+| 范围 | 可见性 | 需要 | 适合放 |
+| --- | --- | --- | --- |
+| `workspace` | 工作区内所有人 | `storage:workspace` | 共享状态：清单、缓存的团队设置 |
+| `user` | 单个成员 | `storage:user` | 个人状态：备注、偏好、该成员访问你服务的凭证 |
+
+选错是一个看起来像缓存问题的隐私问题。如果两个成员不应看到彼此的值，那就是 `user`。
+
+`storage:user` 离开"人"就没有意义，因此插件身份的调用——`event` hook 回调，或安装 token——会被拒绝并返回 `403`，而不是落到一个伪装成私人空间的共享桶里。
+
+### 限额
+
+| 项目 | 取值 |
+| --- | --- |
+| 键长度 | 1024 字节 |
+| 值大小 | 100 KiB |
+| 每个范围的键数 | 1000 |
+| 每个范围的总字节数 | 5 MiB |
+
+在写入时强制执行，绝不用淘汰机制：插件触顶时会拿到明确的 `507`，因为悄悄丢掉最旧的键会破坏插件以为已经存住的状态。覆盖已有值按"替换"计算，所以更新不会因为已有行本身占用的额度而失败。
+
+### 需要了解的语义
+
+- 值是**字符串**。JSON 请自行序列化。
+- 键不存在时，SDK 返回 `null`，原始接口返回 `404`。把它当成正常情况。
+- `list()` 返回键、大小和时间戳，从不返回值。列举是为了让你知道自己写过什么，不是用来批量读状态。
+- 存储归属于**安装**。停用会保留，卸载会连同 secret 和调用记录一起删除。
+- 读写不是事务性的，同一范围的并发写入可能各自超出限额一点。这些限制是为了防止无限增长，而不是精确到字节。
+
+### 不要拿评论当存储
+
+评论上限是 64 KiB，更重要的是，它是给人读的内容。批量状态应该放进存储。

@@ -1,0 +1,141 @@
+---
+title: 智能体与 skill
+description: 把 hook 作为工具提供给智能体，并附上一份告诉它们何时该用这些工具的 SKILL.md。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+Multica 的智能体是一等负责人：它们可以持有任务、发表评论、变更状态。插件可以扩展它们的能力——用可供调用的 hook，以及一份说明何时该调用的 skill。
+
+## `agent` 触发方式
+
+给 hook 的 triggers 加上 `agent`，它就成为该工作区内每个运行中的智能体都能看到的工具：
+
+```json
+{
+  "key": "correlate_deploys",
+  "name": "关联近期发布",
+  "description": "给定服务名和时间窗口，列出该窗口内的发布及其 commit、作者和影响面。排查线上故障时先调用它：这是搞清楚什么发生了变化最快的方式。窗口内没有发布时返回空列表，这本身就是有用的答案。",
+  "input_schema": {
+    "type": "object",
+    "required": ["service"],
+    "properties": {
+      "service": { "type": "string", "description": "服务名，不带已配置的前缀。" },
+      "window_minutes": { "type": "number", "description": "回看多久，默认 120。" }
+    }
+  },
+  "triggers": ["agent", "manual", "ui"],
+  "transport": { "type": "http", "url": "https://sentinel.example.com/hooks/correlate" }
+}
+```
+
+这是唯一一个不由宿主驱动的调用点。智能体看到工具、读描述、自行决定。这个"自行决定"正是 hook 可以被智能体访问的原因——另一种设计（每轮之前或之后必须运行的 hook）等于让第三方一直握着产品的主循环。
+
+### 它如何到达你的接口
+
+智能体运行时会渲染这个工具，但**不会**直接调用你。工具调用先回到 Multica 服务端，由服务端发出带签名的请求：
+
+```
+智能体 → 本地 MCP 服务（守护进程）→ Multica 服务端 → 你的接口
+```
+
+签名密钥从不离开服务端；跑在别人笔记本上的守护进程不该持有一个能对所有插件后端冒充 Multica 的凭证。经服务端转发还意味着频率限制、熔断器、`net:` 目标校验和调用记录对四种触发方式是同一套代码，而不是另一份会逐渐走样的实现。
+
+这次调用产生的写入归属于**该智能体**，与智能体自己直接写入完全一致。
+
+### 工具名
+
+你的 hook 会以带命名空间的名字出现：
+
+```
+<插件 key 的最后一段>_<sha256(插件 key) 的前 6 位十六进制>__<hook key>
+```
+
+对 `com.example.deploy-sentinel` 和 hook `correlate_deploys`：
+
+```
+deploy_sentinel_9a3f2c__correlate_deploys
+```
+
+摘要保证两个插件不会撞到同一个工具名；可读的那半截是人在对话记录里能认出来的部分。名字不由你决定，所以请把智能体需要的一切都写进 `description`。
+
+### 可用性
+
+- **已停用**的安装不贡献任何工具，因此停用会在下一个任务上生效，而不只是界面上消失。
+- 工具列表按稳定顺序排序，不会在两次运行之间无谓地重排。
+- 没有 `agent` 触发方式的 hook 对智能体不可见，无论它还声明了什么。
+
+## 怎样的 hook 才好用
+
+`description` 会被模型原样读取，是它做判断的全部依据。`name` 是给人看的。
+
+**说清楚什么时候该调用，而不只是它做什么。** "排查线上故障时先调用它：这是搞清楚什么发生了变化最快的方式"能换来正确时机的调用；"关联发布"则不能。
+
+**描述空结果的含义。** 返回 `[]` 的工具，和会说"该窗口内没有发布，因此不太可能是发布导致"的工具，写起来成本一样，但在智能体手里表现完全不同。
+
+**拒绝时给出理由。** 只会成功的 hook 是简单情况。对超出配置窗口的发布拒绝回滚，并在响应里说明原因，产出的变更请求质量会高得多。智能体能据理由调整，面对空洞的失败只会盲目重试。
+
+**`input_schema` 要收紧。** 标清楚哪些是真正必填，为每个属性写描述，能用枚举就别用自由字符串。这个 schema 就是工具的 schema，松散的 schema 产出松散的调用。
+
+**假设智能体可能出错。** 在你这一侧校验 `input`，并记住请求体里的 `issue_id` 是宿主解析过的，而 `input` 里的任何东西都不是。
+
+<Callout type="info">
+hook 也是插件用来做"智能体不应作为副作用触发"的事情的途径。插件发表的评论刻意不触发 `@mention` 派发，因此发一段文字永远不会启动智能体运行、消耗工作区预算。如果你的插件需要启动工作，请为它声明一个 hook。
+</Callout>
+
+## skill 资源
+
+`skill` 资源是一份 `SKILL.md`，安装时成为普通的工作区 [skill](/skills)：
+
+```json
+"resources": [
+  { "type": "skill", "key": "incident-response", "entry": "skills/incident-response/SKILL.md" }
+]
+```
+
+`entry` 必须恰好是 `skills/<key>/SKILL.md`。两个方向都不发生调用——文件在安装时从 manifest 旁边抓取一次，之后它就只是一份可以配给智能体的 skill。
+
+### 生命周期
+
+| 事件 | 发生了什么 |
+| --- | --- |
+| 安装 | 抓取文件并写入工作区 skill 表，与安装记录在同一个事务里 |
+| 升级 | 重新抓取，因此改动过的 `SKILL.md` 会生效；新 manifest 删掉的资源会被清理 |
+| 卸载 | 该安装贡献的所有 skill 一并移除——按安装隔离，所以同名但由人编写的 skill 不受影响 |
+
+需要围绕它设计的规则：
+
+- **manifest 里的 key 就是 skill 名称。** frontmatter 与之不一致时不会悄悄改名安装——授权页面上列出的是 key。
+- frontmatter 的 `description` 存在时会被采用；否则 Multica 写入"Provided by the *Name* Plugin."。
+- 文件必须非空，且不超过 256 KiB。
+- 它从与 manifest 相同的源抓取。资源不能指定任意 URL。
+- 与工作区已有 skill 重名会让安装以冲突失败，而不是覆盖别人的成果。
+
+### skill 和 hook 要一起设计
+
+这是最值得从 `examples/plugins/deploy-sentinel` 借鉴的一点。`SKILL.md` 点名这些工具，并说明使用顺序：
+
+```markdown
+---
+name: incident-response
+description: 如何用 Deploy Sentinel 排查线上故障。
+---
+
+## 排查步骤
+
+1. 先用受影响的服务名调用 `correlate_deploys`。这是最便宜的信号：
+   如果窗口内没有发布，就别再往发布方向查了。
+2. 如果存在可疑发布，先看它的影响面，再提出任何建议。
+3. `request_rollback` 只是提交变更请求，并不会真的回滚。
+   它要求填写理由，理由会原样写进变更记录。
+
+## 不要做的事
+
+- 不要为超出配置窗口的发布申请回滚。它会被拒绝，而这个拒绝是正确的。
+```
+
+两半单独用效果都会打折。工具给智能体能力，skill 给它"何时该用这份能力"的判断。
+
+## 接入已有的 MCP 服务器
+
+如果你已经在运行一台 MCP 服务器，用 `"transport": { "type": "mcp" }` 的 hook 就能让 Multica 采纳它的工具，而不必再写一遍 HTTP 接口。代价是多一步审批：`admin` 挑选允许智能体使用的工具，并按名称和 schema 摘要固定下来。见 [`mcp` transport](/plugins/hooks#mcp-transport)。

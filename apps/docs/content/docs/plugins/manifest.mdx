@@ -1,0 +1,196 @@
+---
+title: Manifest reference
+description: Every field of multica.plugin.json, with the validation rules and limits the host enforces at install time.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+`multica.plugin.json` is the whole plugin as far as Multica is concerned. It is fetched at preview, parsed strictly, and the canonical result is stored on the installation as the snapshot the admin consented to.
+
+## Parsing rules
+
+These apply before any field is looked at:
+
+- **Version 1 only.** `manifest_version` must be `1`.
+- **Unknown fields fail.** Both at the top level and inside each config field. A typo cannot silently weaken what an admin approved, so it is rejected instead of ignored.
+- **Trailing JSON fails.** The document must be exactly one object.
+- **Size is bounded** at 1 MiB.
+- **At least one contribution** is required, and at most 64 across surfaces, hooks, and resources combined.
+
+An invalid manifest fails installation with a message naming the field, for example ``contributes.hooks[1].transport.url host "api.example.com" is not covered by a net: scope``.
+
+## Full example
+
+```json
+{
+  "manifest_version": 1,
+  "key": "com.example.deploy-sentinel",
+  "name": "Deploy Sentinel",
+  "description": "Correlates production incidents with recent deploys.",
+  "version": "1.0.0",
+  "author": { "name": "Example Infra Team", "url": "https://example.com" },
+  "icon": "assets/icon.png",
+
+  "scopes": [
+    "issues:read",
+    "comments:write",
+    "storage:workspace",
+    "net:sentinel.example.com"
+  ],
+
+  "config": {
+    "environment": {
+      "type": "enum",
+      "label": "Environment",
+      "options": ["production", "staging"],
+      "required": true
+    },
+    "sentinel_token": {
+      "type": "secret",
+      "label": "Deploy Sentinel API token",
+      "required": true
+    }
+  },
+
+  "contributes": {
+    "surfaces": [
+      {
+        "key": "incident",
+        "type": "issue_panel",
+        "name": "Deploy Sentinel",
+        "entry": "ui/main.js",
+        "platforms": ["web", "desktop"]
+      }
+    ],
+    "hooks": [
+      {
+        "key": "correlate_deploys",
+        "name": "Correlate recent deploys",
+        "description": "Lists deploys that landed in a time window with commit, author and blast radius. Call this first when investigating a production incident.",
+        "input_schema": {
+          "type": "object",
+          "required": ["service"],
+          "properties": {
+            "service": { "type": "string" },
+            "window_minutes": { "type": "number" }
+          }
+        },
+        "triggers": ["agent", "manual", "ui"],
+        "transport": { "type": "http", "url": "https://sentinel.example.com/hooks/correlate" },
+        "timeout_ms": 15000
+      }
+    ],
+    "resources": [
+      { "type": "skill", "key": "incident-response", "entry": "skills/incident-response/SKILL.md" }
+    ]
+  }
+}
+```
+
+## Top-level fields
+
+| Field | Type | Required | Rules |
+| --- | --- | --- | --- |
+| `manifest_version` | number | yes | Must be `1`. |
+| `key` | string | yes | Reverse-DNS namespace: at least two dot-separated segments, each matching `[a-z][a-z0-9]*(-[a-z0-9]+)*`. Max 255 bytes. Identifies the plugin permanently. |
+| `name` | string | yes | Single line, no surrounding whitespace, max 160 bytes. |
+| `description` | string | no | Max 2000 bytes, no carriage returns. |
+| `version` | string | yes | Semantic versioning, max 64 bytes. Pre-release and build metadata are accepted. |
+| `author.name` | string | yes | Single line, max 160 bytes. |
+| `author.url` | string | no | Plain HTTPS URL. No userinfo, no fragment, max 2048 bytes. |
+| `icon` | string | no | Relative path inside the plugin directory. No leading slash, no `..`, max 1024 bytes. |
+| `scopes` | string[] | yes | Non-empty, unique, max 64 entries. See [Scopes](/plugins/scopes). |
+| `config` | object | no | Max 32 fields. Keyed by field name. |
+| `contributes` | object | yes | At least one of `surfaces`, `hooks`, `resources`. |
+
+<Callout type="warn">
+Changing `key` creates a different plugin. Existing installations keep pointing at the old one; there is no rename path.
+</Callout>
+
+## `contributes.surfaces`
+
+An iframe Multica mounts at a fixed location. You own what renders inside it; the host owns where it appears.
+
+| Field | Type | Required | Rules |
+| --- | --- | --- | --- |
+| `key` | string | yes | Unique among surfaces. Matches `[a-z][a-z0-9]*([_-][a-z0-9]+)*`. |
+| `type` | string | yes | `issue_panel`, `sidebar_panel`, or `modal`. |
+| `name` | string | yes | Single line, max 160 bytes. |
+| `entry` | string | yes | Relative path ending in `.js` or `.mjs`. |
+| `platforms` | string[] | no | Subset of `web`, `desktop`, no duplicates. Empty or omitted means everywhere. |
+
+`entry` must be a script, not an HTML page: the host renders the surface document itself so it can attach the CSP derived from your `net:` scopes. A plugin-authored document would carry whatever policy your own server sent, which would make `net:` a claim rather than a control.
+
+`issue_panel` and `modal` are mounted today. `sidebar_panel` parses but has no host location yet, and a manifest declaring one is refused at install rather than installed with an invisible contribution.
+
+## `contributes.hooks`
+
+One capability your server implements. Triggers say who may invoke it; the host never invents a call site the manifest did not list.
+
+| Field | Type | Required | Rules |
+| --- | --- | --- | --- |
+| `key` | string | yes | Unique among hooks. Matches `[a-z][a-z0-9]*([_-][a-z0-9]+)*`. |
+| `name` | string | yes | Single line, max 160 bytes. |
+| `description` | string | yes | Non-empty, max 2000 bytes. May be multi-line. |
+| `input_schema` | object | no | A JSON Schema object. Its `type` must be `object`. |
+| `triggers` | string[] | yes | Non-empty, unique, from `ui`, `manual`, `agent`, `event`. |
+| `events` | string[] | conditional | Required when `event` is a trigger, forbidden otherwise. Unique, from the event list below. |
+| `transport.type` | string | yes | `http` or `mcp`. |
+| `transport.url` | string | yes | Plain HTTPS URL whose host is covered by a `net:` scope, exact match. |
+| `timeout_ms` | number | no | Between 100 and 30000. Defaults to 10000. |
+
+`description` is mandatory because it is what an agent reads as the MCP tool description when the hook declares the `agent` trigger. The host never paraphrases it — write it for the reader who has to decide whether to call this.
+
+### Events
+
+| Event | Fires when | Requires scope |
+| --- | --- | --- |
+| `issue.created` | An issue is created | `issues:read` |
+| `issue.updated` | An issue is updated | `issues:read` |
+| `issue.status_changed` | An issue's status changes | `issues:read` |
+| `comment.created` | A comment is posted | `comments:read` |
+| `task.started` | An agent run starts | `tasks:read` |
+| `task.completed` | An agent run completes | `tasks:read` |
+| `task.failed` | An agent run fails | `tasks:read` |
+
+The scope requirement is enforced at parse time. An event pushes the same content the Action API would have required a scope to pull — `issue.*` carries the description, `comment.created` carries the body — so subscribing without the matching read scope would be a way to receive what reading was not granted.
+
+## `contributes.resources`
+
+A static contribution. No call happens in either direction.
+
+| Field | Type | Required | Rules |
+| --- | --- | --- | --- |
+| `type` | string | yes | `skill` is the only supported type. |
+| `key` | string | yes | Unique among resources. Matches `[a-z][a-z0-9]*([_-][a-z0-9]+)*`. |
+| `entry` | string | yes | Must be exactly `skills/<key>/SKILL.md`. |
+
+The path is fixed rather than free-form so the file's location is derivable from the key an admin already saw on the consent screen. See [Agents and skills](/plugins/agents-and-skills#skill-resources).
+
+## `config`
+
+A JSON object keyed by field name, in the order the form should render. Field names match `[a-z][a-z0-9]*([_-][a-z0-9]+)*`. Multica renders the form from this — plugins never ship configuration UI.
+
+| Field | Type | Required | Rules |
+| --- | --- | --- | --- |
+| `type` | string | yes | `string`, `number`, `bool`, `enum`, or `secret`. |
+| `label` | string | yes | Single line, max 160 bytes. |
+| `description` | string | no | Max 500 bytes. |
+| `required` | boolean | no | Renders the field as required. |
+| `options` | string[] | conditional | Required and non-empty for `enum`, forbidden otherwise. Max 64, unique, each max 160 bytes. |
+| `placeholder` | string | no | Max 160 bytes. |
+| `multiline` | boolean | no | Only valid on `string`. Renders a textarea. |
+
+`secret` values are stored write-only in a separate encrypted table. They never reach a surface, never appear in a hook payload, and no read endpoint returns them — not even masked. See [Configuration and storage](/plugins/configuration-and-storage).
+
+## Validation checklist
+
+Before publishing a manifest URL, confirm:
+
+- `key` is reverse-DNS and the one you intend to keep.
+- `version` is semver and higher than what is installed.
+- Every `transport.url` host has a matching `net:` scope, exactly.
+- Every hook that declares `event` also lists `events`, and holds the read scope each event implies.
+- Every surface `entry` ends in `.js` or `.mjs` and is reachable at the URL it resolves to.
+- Every skill resource `entry` is exactly `skills/<key>/SKILL.md`.
+- No unknown fields anywhere — including inside `config`, where a stray key fails the whole document.

@@ -34,6 +34,8 @@
     "providers",
     "---自動化---",
     "autopilots",
+    "---プラグイン---",
+    "plugins",
     "---連携---",
     "channels",
     "lark-bot-integration",

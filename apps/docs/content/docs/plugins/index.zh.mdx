@@ -1,0 +1,62 @@
+---
+title: 插件
+description: 用插件扩展 Multica——任务里的面板、成员可触发的操作、智能体可调用的工具，以及教会智能体如何使用它们的 skill。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+插件用来扩展 Multica 本身不提供的能力：任务详情页里的一个面板、成员从菜单里触发的一个操作、智能体自行决定调用的一个工具，或者一份告诉智能体何时该用这些能力的 skill。
+
+一个插件就是一个 JSON 文件——`multica.plugin.json`——托管在任何支持公网 HTTPS 的地方，加上这个文件所指向的代码。没有需要上传的打包产物，Multica 也不会替你构建。工作区 `admin` 粘贴 URL 安装，阅读插件申请的权限，然后授权。
+
+## 插件与 Multica 之间只有三种关系
+
+manifest 里的每一项都属于其中之一。"由谁触发"和"调用什么能力"是两个独立的问题——一个 hook 只声明一次，可以被它声明的任意触发方式调用。
+
+| 关系 | 方向 | 含义 |
+| --- | --- | --- |
+| **Action** | 插件 → Multica | 插件调用的宿主能力：读取任务、发表评论、读写插件存储。 |
+| **Hook** | Multica → 插件 | 由**你**在自己的服务器上实现的能力。成员、智能体或产品事件触发时，Multica 会调用它。 |
+| **Resource** | 不涉及任何调用 | 静态贡献，目前是一份 `SKILL.md`：安装时写入工作区成为普通 skill，卸载时移除。 |
+
+## 你可以贡献什么
+
+| 贡献 | 类型 | 状态 | 出现位置 |
+| --- | --- | --- | --- |
+| surface | `issue_panel` | 可用 | 任务详情页的 **Plugins** 区块 |
+| surface | `modal` | 可用 | 从任务操作菜单打开的对话框 |
+| surface | `sidebar_panel` | 已定义，尚未挂载 | — |
+| hook | 触发方式 `ui` | 可用 | 你自己 surface 里的按钮 |
+| hook | 触发方式 `manual` | 可用 | 任务操作菜单与命令面板中的条目 |
+| hook | 触发方式 `agent` | 可用 | 智能体能看到并自行决定是否调用的工具 |
+| hook | 触发方式 `event` | 可用 | 产品事件发生时自动派发，永不阻塞 |
+| resource | `skill` | 可用 | 归属于该安装的工作区 skill |
+
+如果 manifest 声明了当前 Multica 版本无法运行的贡献，安装会明确失败，并一次性列出全部缺口。悄悄忽略某个贡献更糟糕——它看起来装上了，却永远不会触发。
+
+## 一屏看懂安全模型
+
+- **Multica 从不执行插件代码。** surface 运行在用户浏览器的沙箱 iframe 里，hook 运行在你自己的服务器上。你写的代码不会在 Multica 的基础设施上执行。
+- **surface 不持有任何凭证。** iframe 以 `sandbox="allow-scripts"` 挂载，且**不带** `allow-same-origin`，因此拥有不透明源：没有 cookie、没有 `localStorage`、无法访问外层页面。每次调用都是发给宿主页面的消息，由宿主用当前登录用户自己的会话执行。
+- **同时受两层上限约束。** 插件能做什么，既受 `admin` 授予的 scope 限制，也受该用户本身权限的限制。看不到某个任务的成员，通过你的 surface 同样会拿到 `404`。
+- **数据能去哪里是声明出来的。** `net:` scope 就是全部答案，同一份列表既作为 surface 的 CSP `connect-src`，也作为 hook 目标地址的白名单。任何部署配置都无法扩大它。
+- **外发调用带签名。** 每个 hook 请求都带 HMAC 签名和时间戳，你的服务器可以据此区分 Multica 的调用和其他人的调用。
+- **secret 只写不读。** `secret` 类型的配置项加密存储，任何读接口都不会回显——不给 UI，不进 iframe，也不出现在 hook 请求体里。
+
+<Callout type="info">
+设计插件之前先读 [Scope 与授权](/plugins/scopes)。你声明的 scope 列表就是 `admin` 在授权页面看到的内容，也是唯一决定插件能触及什么的东西。
+</Callout>
+
+## 可用性
+
+插件管理由 `plugins_v1` 特性开关控制，**默认关闭**。自托管部署由运维人员开启；托管云在灰度期间按工作区开启。如果找不到 **设置 → Plugins**，说明开关是关的——此时 API 直接返回 `503`，不会假装可用。
+
+## 接下来读什么
+
+- [快速上手](/plugins/quickstart)——大约十分钟装上一个能用的面板。
+- [插件如何运行](/plugins/how-plugins-run)——执行模型与身份模型，动手设计前值得读一遍。
+- [Manifest 参考](/plugins/manifest)——每个字段、每条校验规则。
+- [Surface](/plugins/surfaces)——界面部分。
+- [Hook](/plugins/hooks)——服务器部分。
+- [智能体与 skill](/plugins/agents-and-skills)——让智能体用得上你的插件。
+- [参考](/plugins/reference)——SDK、Action API、错误码与全部限额。

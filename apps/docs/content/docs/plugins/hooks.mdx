@@ -1,0 +1,246 @@
+---
+title: Hooks
+description: The server half of a plugin — triggers, the signed request format, verifying it, calling back, and the limits that govern delivery.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+A hook is a capability *you* implement. Multica calls your endpoint with a signed `POST` when a person, an agent, or a product event asks for it. This is the only direction in which Multica calls out, which is why every check around it is about the destination.
+
+## Declaring one
+
+```json
+{
+  "key": "triage_issue",
+  "name": "Triage this issue",
+  "description": "Sends the issue title and description to our triage service and posts the suggested owner and priority back as a comment.",
+  "input_schema": {
+    "type": "object",
+    "properties": { "reason": { "type": "string" } }
+  },
+  "triggers": ["ui", "manual", "event"],
+  "events": ["issue.created"],
+  "transport": { "type": "http", "url": "https://hooks.example.com/triage" },
+  "timeout_ms": 8000
+}
+```
+
+The transport URL must be HTTPS and its host must be covered by a `net:` scope, exactly. That is checked when the manifest is parsed and again at dial time.
+
+## The four triggers
+
+One hook, up to four call sites. Declaring a trigger says *who may invoke it*, never what it does.
+
+| Trigger | Initiated by | Blocks | Actor for callback writes |
+| --- | --- | --- | --- |
+| `ui` | Your surface, via `multica.hooks.invoke()` | That panel request only | The person who clicked |
+| `manual` | A person, from the issue actions menu or command palette | That menu action only | The person who picked it |
+| `agent` | An agent that chose your hook as a tool | That tool call only | The agent |
+| `event` | Multica, on a product event | Never | The plugin itself |
+
+`manual` entries are rendered by Multica, not by you — the host owns that list because the trigger decides which identity the resulting writes carry. The list is not filtered by whether the call will succeed: hiding an action whose endpoint is down would give two people on one issue different menus with nothing to explain the difference. A refusal explains itself when it happens.
+
+`event` is dispatched onto a worker pool and never blocks the request that produced the event. It is also the only trigger that retries.
+
+<Callout type="info">
+A client cannot invent a trigger. `POST /api/v1/plugin/hooks/{key}` accepts only `ui` and `manual`; `event` is dispatched by the host and never requested, and `agent` arrives over MCP. Accepting either from a browser would let a client drive a call site that is supposed to carry a different identity.
+</Callout>
+
+## The request
+
+```http
+POST /triage HTTP/1.1
+Content-Type: application/json
+User-Agent: Multica-Hooks/1
+X-Multica-Timestamp: 1755676800
+X-Multica-Signature: v1=7f0c…
+X-Multica-Plugin-Installation: 6f1e2d3c-…
+```
+
+```json
+{
+  "version": 1,
+  "hook_key": "triage_issue",
+  "trigger": "event",
+  "event_type": "issue.created",
+  "workspace_id": "8c1e…",
+  "installation_id": "6f1e…",
+  "issue_id": "2b7a…",
+  "actor": { "type": "plugin", "id": "6f1e…" },
+  "input": { "reason": "manual recheck" },
+  "config": { "team": "platform" },
+  "callback_token": "mpc_…",
+  "callback_url": "https://multica.example.com/api/v1/plugin"
+}
+```
+
+| Field | Present | Notes |
+| --- | --- | --- |
+| `version` | always | `1`. The wire format is stable and small on purpose. |
+| `hook_key` | always | Which hook was called. |
+| `trigger` | always | `ui`, `manual`, `agent`, or `event`. |
+| `event_type` | `event` only | Which event fired. |
+| `workspace_id`, `installation_id` | always | Identify the installation. Use them as your own tenancy key. |
+| `issue_id` | when there is one | Already resolved and permission-checked by the host. |
+| `actor` | always | `{ "type": "member" \| "agent" \| "plugin", "id": "…" }` |
+| `input` | when supplied | Verbatim from the caller. Validate it — for `ui`/`manual` it came from a browser. |
+| `config` | when set | The installation's **non-secret** configuration. |
+| `callback_token`, `callback_url` | when callbacks are enabled | See [Calling back](#calling-back). |
+
+<Callout type="warn">
+Prefer `issue_id` over anything in `input`. The host resolved and permission-checked it; a client-supplied id is not something a handler should trust, and for the `event` trigger there was no client at all.
+</Callout>
+
+### Why `config` is in the payload and secrets are not
+
+Your handler has no other way to read what an admin typed into the configuration form — the Action API deliberately has no config endpoint. Secret-typed fields are never included: they are *your* credentials for *your own* services, you already have them, and putting them on the wire would hand every value to whoever holds the endpoint.
+
+## Verifying the signature
+
+The signature is HMAC-SHA256 over the timestamp, a literal `.`, and the **raw request body**, hex-encoded:
+
+```
+signature = HMAC_SHA256(secret, timestamp + "." + rawBody)
+```
+
+The header carries a scheme version: `X-Multica-Signature: v1=<hex>`. The secret is the `whsec_…` value shown once, next to the install token, when an admin rotates the plugin's token in **Settings → Plugins**. Strip the `whsec_` prefix and hex-decode it before use. It is derived from the deployment key and is stable for an installation.
+
+Four things a correct handler does:
+
+1. **Verify against the raw bytes, before parsing.** Re-serializing the JSON and signing that instead is the classic way to make valid signatures fail and invalid ones pass — key order and whitespace are not preserved.
+2. **Check the timestamp.** It is inside the signature, so a captured request expires. Multica's tolerance is 5 minutes in either direction.
+3. **Compare in constant time.** A byte-at-a-time comparison leaks how much of a guessed signature was right, which is enough to recover the rest.
+4. **Remember signatures inside the window.** This is the part the host cannot do for you. The timestamp bounds a replay to a few minutes; only the receiver can close the gap by refusing bytes it has already seen.
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const TOLERANCE_SECONDS = 5 * 60;
+const seen = new Map();
+
+export function verify(rawBody, headers, secret) {
+  const timestamp = headers["x-multica-timestamp"];
+  const presented = String(headers["x-multica-signature"] ?? "").replace(/^v1=/, "");
+  if (!timestamp || !presented) return "missing signature headers";
+
+  const drift = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
+  if (!Number.isFinite(drift) || drift > TOLERANCE_SECONDS) return "timestamp outside the window";
+
+  const key = Buffer.from(secret.replace(/^whsec_/, ""), "hex");
+  const expected = createHmac("sha256", key)
+    .update(timestamp).update(".").update(rawBody).digest("hex");
+
+  const a = Buffer.from(expected, "utf8");
+  const b = Buffer.from(presented, "utf8");
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return "signature does not match";
+
+  const now = Date.now();
+  for (const [sig, at] of seen) if (now - at > TOLERANCE_SECONDS * 1000) seen.delete(sig);
+  if (seen.has(presented)) return "already delivered";
+  seen.set(presented, now);
+
+  return null;
+}
+```
+
+A Go handler can call `service.VerifyHookSignature` from the Multica repository directly — the scheme is exported so both sides implement it identically.
+
+## Responding
+
+- Answer `2xx`. Anything else is recorded as a failure, and for `event` triggers it counts toward the circuit breaker.
+- The body must be JSON, or empty. An empty body is a successful call with no output.
+- Responses are read up to 1 MiB. A hook that answers with a gigabyte fails rather than consuming the host.
+- Answer within `timeout_ms` (default 10s, max 30s). Long work belongs behind a callback, not in the response.
+- Do not echo internal error text. Whatever you return is classified by the host, and echoing internals is how a handler leaks its own configuration into somebody's log.
+
+For a `ui`, `manual`, or `agent` call, your JSON body comes back to the caller as `result.output`. For an `event` call nobody is waiting, and the body is discarded.
+
+### Refusing well
+
+A hook that only ever succeeds is the easy case. When your business rules say no, say why:
+
+```json
+{ "error": "deploy d-4802 is 380 minutes old; the rollback window is 60 minutes" }
+```
+
+paired with a non-2xx status if it should count as a failure, or `200` if the refusal is a legitimate answer. An agent that gets a reason can act on it; an agent that gets a bare failure retries blindly.
+
+## Calling back
+
+Every request carries a `callback_token` and a `callback_url`. Together they let your handler use the [Action API](/plugins/reference#action-api) while it works:
+
+```js
+const issue = await fetch(`${body.callback_url}/issues/${body.issue_id}`, {
+  headers: { Authorization: `Bearer ${body.callback_token}` },
+}).then((r) => r.json());
+```
+
+Properties worth knowing:
+
+- **Scoped to one invocation**, not one call. Reading an issue and then commenting on it is two requests, which is the floor for a handler that does anything with what it read.
+- **Minutes, not hours.** It expires 5 minutes after issue, and Multica revokes it as soon as your handler answers. Spend it on the work at hand; do not store it.
+- **Narrowed to the issue** the invocation was about. Reaching a different issue is a `404`.
+- **The actor was decided at dispatch.** A `ui`/`manual` callback writes as the person who triggered it; an `agent` callback writes as the agent; an `event` callback writes as the plugin. Your handler cannot elect to write as somebody else.
+- **Its scopes are the installation's**, never wider.
+
+### When a callback is not enough
+
+If you genuinely need standing access — a nightly reconciliation job, say — use the **install token** (`mpi_…`), issued alongside the signing secret. It never expires, always acts as the plugin, and is stored hashed, so an admin who loses it rotates rather than recovers it. Prefer the callback: it is bounded to one invocation and one issue.
+
+## Reliability and limits
+
+| Limit | Value |
+| --- | --- |
+| Default timeout | 10s (`timeout_ms`, between 100 and 30000) |
+| Response size | 1 MiB |
+| Rate limit | 120 calls per minute, per hook, counted in attempts |
+| Event retries | 3 attempts, backoff 2s then 4s |
+| Circuit breaker | Opens after 5 failures in 5 minutes; event delivery stops until the window rolls off |
+| Signature tolerance | 5 minutes |
+| Callback token TTL | 5 minutes, revoked when the call completes |
+| Invocation retention | 7 days |
+
+A **refusal** is not retried. A hook that is disabled, out of scope, or rate limited has been answered — retrying just burns the budget. Timeouts and endpoint failures are retried on the `event` trigger only.
+
+The circuit breaker only gates `event` delivery. A person or an agent invoking a hook still gets a real attempt and a real error, because they are waiting for an answer.
+
+## Watching hook activity
+
+Every attempt is recorded and shown per installation in **Settings → Plugins**: hook key, trigger, event type, status, attempt number, latency, and a redacted error. Statuses are `ok`, `failed`, `timeout`, and `refused`.
+
+Bodies are never stored, so the log answers "what happened and how often", not "what was sent". Error text is the host's own description with anything the remote end supplied stripped out — an endpoint that echoes its input could otherwise write issue content into a table with no deletion path for it.
+
+Records are swept after 7 days. Nothing reads a row older than the breaker and rate-limit windows, which look minutes back.
+
+## The `mcp` transport
+
+An `http` hook declares one endpoint that an admin read and approved. An MCP server decides its own tool list at runtime and can change it whenever it likes — so installing a plugin would otherwise be a standing grant to run whatever that server offers next week.
+
+Hence a second step. For a hook with `"transport": { "type": "mcp", "url": "https://metrics.example.com/mcp" }`:
+
+1. An admin opens the hook's approval panel; Multica discovers the tools the server currently offers. Discovery adopts nothing.
+2. The admin ticks the tools agents may reach. Each is pinned by name **and schema digest**.
+3. Agents can call exactly those. A tool that appears later is not adopted; a tool whose schema drifts stops being called.
+
+Installing the plugin is not the grant — approving the tools is. Until somebody approves, an `mcp` hook contributes nothing.
+
+To authenticate to your own MCP server, declare a secret config field named `<hook_key>_credential`. Its value is sent as the `Authorization` header, decrypted only at the moment of use:
+
+```json
+"config": {
+  "metrics_credential": { "type": "secret", "label": "Metrics MCP server token" }
+}
+```
+
+for a hook keyed `metrics`. A plugin's MCP server going down does not fail an agent's task — the connection is optional, so the agent can still work on the issue.
+
+## Local development
+
+Hook URLs must be HTTPS, so a local handler needs a certificate. Point Multica at it with two operator settings:
+
+```bash
+export MULTICA_PLUGIN_DEV_ORIGINS=https://127.0.0.1:8788
+export MULTICA_PLUGIN_DEV_CA=/path/to/your-dev-ca.pem
+```
+
+The first names origins exempt from the public-address guard; the second trusts an additional CA for exactly those origins. Neither disables certificate verification, and neither widens `net:` — a hook still cannot reach a host the admin did not approve, so declare `net:127.0.0.1` too. See [Distribution](/plugins/distribution#local-development).

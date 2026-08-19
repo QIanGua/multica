@@ -1,0 +1,142 @@
+---
+title: Agents and skills
+description: Offer your hooks to agents as tools, and ship a SKILL.md that teaches them when to use those tools.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+Multica's agents are first-class assignees: they own issues, comment, and change status. A plugin can extend what they are able to do — with hooks they may call, and with a skill that tells them when to call them.
+
+## The `agent` trigger
+
+Add `agent` to a hook's triggers and it becomes a tool every agent running in that workspace can see:
+
+```json
+{
+  "key": "correlate_deploys",
+  "name": "Correlate recent deploys",
+  "description": "Given a service and a time window, list the deploys that landed in that window with their commit, author and blast radius. Call this first when investigating a production incident: it is the fastest way to find out what changed. Returns an empty list when nothing deployed, which is itself a useful answer.",
+  "input_schema": {
+    "type": "object",
+    "required": ["service"],
+    "properties": {
+      "service": { "type": "string", "description": "Service name, without the configured prefix." },
+      "window_minutes": { "type": "number", "description": "How far back to look. Defaults to 120." }
+    }
+  },
+  "triggers": ["agent", "manual", "ui"],
+  "transport": { "type": "http", "url": "https://sentinel.example.com/hooks/correlate" }
+}
+```
+
+This is the one call site the host does not drive. An agent sees the tool, reads the description, and decides. That choice is why hooks may be reached from an agent at all — the alternative, a hook that must run before or after every turn, would be a third party holding the product's main loop open.
+
+### How it reaches your endpoint
+
+The agent runtime renders the tool but does **not** call you. A tool call goes back to the Multica server, which makes the signed request:
+
+```
+agent → local MCP server (daemon) → Multica server → your endpoint
+```
+
+The signing secret never leaves the server; a daemon on somebody's laptop must not hold a credential that can impersonate Multica to every plugin backend. Routing through the server also means the rate limit, the circuit breaker, the `net:` destination check, and the invocation record are the same code for all four triggers rather than a second implementation that drifts.
+
+Writes the call produces are attributed to **the agent**, exactly as if the agent had made them directly.
+
+### Tool names
+
+Your hook appears under a namespaced name:
+
+```
+<last segment of plugin key>_<6 hex chars of sha256(plugin key)>__<hook key>
+```
+
+For `com.example.deploy-sentinel` and hook `correlate_deploys`:
+
+```
+deploy_sentinel_9a3f2c__correlate_deploys
+```
+
+The digest is what keeps two plugins from colliding on one tool name; the readable half is what a person recognises in a transcript. You do not choose the name, so put everything an agent needs into `description`.
+
+### Availability
+
+- A **disabled** installation contributes no tools, so disabling takes effect on the next task rather than only in the UI.
+- Tools are sorted stably, so a task's tool list does not reshuffle between runs.
+- A hook without the `agent` trigger is invisible to agents, however else it is declared.
+
+## Writing hooks agents use well
+
+`description` is read by the model, verbatim, and is the entire basis for its decision. `name` is for humans.
+
+**Say when to call it, not just what it does.** "Call this first when investigating a production incident: it is the fastest way to find out what changed" earns a call at the right moment. "Correlates deploys" does not.
+
+**Describe the empty result.** A tool that returns `[]` and a tool that says "no deploys in this window, so this is unlikely to be a deploy" cost the same to write and behave very differently in an agent's hands.
+
+**Refuse with a reason.** A hook that only ever succeeds is the easy case. Refusing a rollback for a deploy older than the configured window — and saying so in the response — produces better change requests than accepting everything. The agent can act on a reason; it retries blindly against a bare failure.
+
+**Keep `input_schema` tight.** Mark what is genuinely required, describe each property, and prefer enums over free strings. The schema is the tool's schema, so a loose one produces loose calls.
+
+**Assume the agent may be wrong.** Validate `input` on your side, and remember that `issue_id` in the request body was resolved by the host while anything in `input` was not.
+
+<Callout type="info">
+Hooks are also how a plugin does work an agent must not do as a side effect. A plugin-posted comment deliberately does not run `@mention` dispatch, so posting text can never start an agent run and spend a workspace's budget. If your plugin should start work, declare a hook for it.
+</Callout>
+
+## Skill resources
+
+A `skill` resource is a `SKILL.md` that becomes an ordinary workspace [skill](/skills) at install:
+
+```json
+"resources": [
+  { "type": "skill", "key": "incident-response", "entry": "skills/incident-response/SKILL.md" }
+]
+```
+
+`entry` must be exactly `skills/<key>/SKILL.md`. Nothing calls anything in either direction — the file is fetched once, from beside the manifest, and after that it is just a skill an agent can be given.
+
+### Lifecycle
+
+| Event | What happens |
+| --- | --- |
+| Install | The file is fetched and written into the workspace's skill table, in the same transaction as the installation |
+| Upgrade | Re-fetched, so a changed `SKILL.md` takes effect; a resource the new manifest dropped is pruned |
+| Uninstall | Every skill this installation contributed is removed — scoped by installation, so a skill a person wrote is untouched even if it shares a name |
+
+Rules to design around:
+
+- The **manifest key is the skill's name**. Frontmatter that disagrees does not silently install under another name — the key is what the consent screen listed.
+- Frontmatter `description` is used if present; otherwise Multica writes "Provided by the *Name* Plugin."
+- The file must be non-empty and at most 256 KiB.
+- It is fetched from the same origin as the manifest. A resource cannot name an arbitrary URL.
+- A name collision with an existing workspace skill fails the install with a conflict rather than overwriting somebody's work.
+
+### Design the skill and the hooks together
+
+This is the part worth copying from `examples/plugins/deploy-sentinel`. The `SKILL.md` names the tools and says what order to use them in:
+
+```markdown
+---
+name: incident-response
+description: How to investigate a production incident using Deploy Sentinel.
+---
+
+## Investigating
+
+1. Call `correlate_deploys` first with the affected service. It is the cheapest
+   signal available: if nothing deployed in the window, stop looking at deploys.
+2. If a suspect deploy exists, read its blast radius before proposing anything.
+3. `request_rollback` files a change request; it does not roll anything back.
+   It requires a written reason, which goes into the change record verbatim.
+
+## What not to do
+
+- Do not request a rollback for a deploy outside the configured window. It will
+  be refused, and the refusal is correct.
+```
+
+Neither half works as well alone. The tools give an agent capability; the skill gives it judgement about when capability applies.
+
+## Adopting an existing MCP server
+
+If you already run an MCP server, a hook with `"transport": { "type": "mcp" }` lets Multica adopt its tools instead of you writing HTTP endpoints. The trade is an extra approval step: an admin picks which tools agents may reach, pinned by name and schema digest. See [the `mcp` transport](/plugins/hooks#the-mcp-transport).

@@ -1,0 +1,216 @@
+---
+title: 快速上手
+description: 编写、托管并安装一个 Multica 插件——十分钟做出可用的任务面板，再给它加上运行在你自己服务器上的 hook。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+这一页把同一个插件做两遍：先是能渲染出来的最小形态（一个面板），再是加上由你自己服务器应答的 hook。
+
+你需要：一个你是 `admin` 的工作区、该部署已开启插件功能，以及一个能用 HTTPS 托管两个静态文件的地方。
+
+## 1. 两个文件
+
+插件 = 一份 manifest + 它指向的东西。把两者放在同一个目录下。
+
+```
+hello-panel/
+  multica.plugin.json
+  ui/main.js
+```
+
+`multica.plugin.json`：
+
+```json
+{
+  "manifest_version": 1,
+  "key": "com.example.hello-panel",
+  "name": "Hello Panel",
+  "description": "读取当前任务，并保存一条私人备注。",
+  "version": "1.0.0",
+  "author": { "name": "Your Name", "url": "https://example.com" },
+  "scopes": ["issues:read", "comments:write", "storage:user"],
+  "contributes": {
+    "surfaces": [
+      {
+        "key": "hello",
+        "type": "issue_panel",
+        "name": "Hello",
+        "entry": "ui/main.js",
+        "platforms": ["web", "desktop"]
+      }
+    ]
+  }
+}
+```
+
+这个文件里有三处容易出错：
+
+- `key` 必须是反向 DNS 命名空间，至少两段、以点分隔。它永久标识你的插件；安装一份 `key` 与现有安装相同的 manifest 属于**升级**，而不是第二次安装。
+- `version` 必须是合法的语义化版本号。
+- `entry` 是相对于 manifest URL 的路径，而且必须是 `.js` 或 `.mjs` **脚本**，不能是 HTML 页面。承载脚本的文档由 Multica 生成——正是这一点让它能挂上由你的 scope 推导出的 CSP。
+
+## 2. 入口脚本
+
+`ui/main.js` 是一个普通 ES module。生产环境引入 SDK：
+
+```js
+import { multica } from "@multica/plugin-sdk";
+
+const context = await multica.context.get();
+const issue = await multica.issue.get();
+
+document.getElementById("root").innerHTML = `
+  <div style="padding:12px 14px; display:grid; gap:10px">
+    <div style="color:var(--muted-foreground)">
+      ${context.user.name} · ${context.workspace.name}
+    </div>
+    <div style="font-weight:600">${issue.title}</div>
+    <input id="note" placeholder="只有你自己能看到的备注"
+      style="padding:6px 8px; border:1px solid var(--border);
+             border-radius:var(--radius,6px);
+             background:var(--background); color:var(--foreground)">
+    <button id="save">保存</button>
+  </div>`;
+
+const note = document.getElementById("note");
+note.value = (await multica.storage.user.get("note")) ?? "";
+document.getElementById("save").onclick = () =>
+  multica.storage.user.set("note", note.value);
+
+// iframe 不会自动撑高，需要主动申请高度。
+multica.ui.resize(document.body.scrollHeight + 16);
+```
+
+SDK 没有任何运行时依赖，打包后就是一个可以静态托管的文件。如果你连构建步骤都不想要，Multica 仓库里的 `examples/plugins/hello-panel/ui/main.js` 用大约 40 行内联了一个最小的 bridge 客户端，做的是同样的事。
+
+<Callout type="warn">
+surface 运行在不透明源下。`localStorage`、`sessionStorage` 和 cookie 会抛错或读到空值——请使用 `multica.storage`，它保存在服务端，生命周期长于这个 iframe。完整限制见 [Surface](/plugins/surfaces)。
+</Callout>
+
+## 3. 托管这两个文件
+
+manifest 和它引用的所有文件必须放在同一目录、通过公网 HTTPS 提供，因为 `entry` 是相对 manifest URL 解析的，而且 **Multica 从不代托管插件代码**。任何静态托管都可以：对象存储、CDN、GitHub Pages、你自己的服务器。
+
+```
+https://plugins.example.com/hello-panel/multica.plugin.json
+https://plugins.example.com/hello-panel/ui/main.js
+```
+
+不想先发布也能迭代，见[本地开发](/plugins/distribution#本地开发)。surface 的入口脚本允许走回环地址的 HTTP，用本地静态服务器就能跑起面板。
+
+## 4. 安装
+
+在工作区打开 **设置 → Plugins → 安装**，粘贴 manifest URL。
+
+安装刻意分两步。第一步抓取并解析 manifest，展示它声明的全部内容（包括每个 scope），不写入任何数据。第二步创建安装记录，且必须授予与 manifest 完全一致的 scope 列表——部分授权会被拒绝，因为少了一半权限的插件，坏得没人看得出来。
+
+打开任意任务，你的面板会渲染在 **Plugins** 区块下。
+
+## 5. 加一个 hook
+
+surface 只能做当前查看者本人能做的事。要访问你自己的服务，就得加 hook——一个由 Multica 调用、在你服务器上执行的能力。
+
+manifest 改两处：声明要访问的主机，以及声明这个 hook。
+
+```json
+{
+  "scopes": [
+    "issues:read",
+    "comments:write",
+    "storage:user",
+    "net:hooks.example.com"
+  ],
+  "contributes": {
+    "hooks": [
+      {
+        "key": "triage_issue",
+        "name": "对这个任务做分诊",
+        "description": "把任务标题和描述发给我们的分诊服务，并把建议的负责人和优先级作为评论写回。",
+        "input_schema": {
+          "type": "object",
+          "properties": { "reason": { "type": "string" } }
+        },
+        "triggers": ["ui", "manual", "event"],
+        "events": ["issue.created"],
+        "transport": { "type": "http", "url": "https://hooks.example.com/triage" },
+        "timeout_ms": 8000
+      }
+    ]
+  }
+}
+```
+
+`net:hooks.example.com` 不是可有可无的装饰：如果 hook 的 transport URL 不在已声明的 `net:` scope 覆盖范围内，manifest 校验会直接失败。它是精确主机匹配，所以 `api.hooks.example.com` 需要单独声明。
+
+上面这三种触发方式是同一个 hook 的三个入口，区别在于最终写入以谁的名义发生：
+
+| 触发方式 | 来源 | 阻塞范围 | 写入归属 |
+| --- | --- | --- | --- |
+| `ui` | 你 surface 里的按钮，经 `multica.hooks.invoke()` | 仅该面板 | 点击的人 |
+| `manual` | 任务操作菜单与命令面板，由 Multica 渲染 | 仅该菜单操作 | 选择的人 |
+| `event` | `issue.created` 时自动触发 | 从不阻塞 | 插件自身 |
+
+## 6. 应答 hook
+
+Multica 会给你的接口发一个带签名的 `POST`。handler 必须**先对原始字节验签，再解析**——先反序列化再重新序列化去验签，是让合法签名验不过、非法签名验得过的经典错误：键顺序和空白都不会被保留。
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const SECRET = process.env.MULTICA_SIGNING_SECRET.replace(/^whsec_/, "");
+const TOLERANCE_SECONDS = 5 * 60;
+
+function verify(rawBody, headers) {
+  const timestamp = headers["x-multica-timestamp"];
+  const presented = String(headers["x-multica-signature"] ?? "").replace(/^v1=/, "");
+  if (!timestamp || !presented) return "缺少签名头";
+
+  const drift = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
+  if (!Number.isFinite(drift) || drift > TOLERANCE_SECONDS) return "时间戳过期";
+
+  const expected = createHmac("sha256", Buffer.from(SECRET, "hex"))
+    .update(timestamp).update(".").update(rawBody).digest("hex");
+
+  const a = Buffer.from(expected, "utf8");
+  const b = Buffer.from(presented, "utf8");
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return "签名不匹配";
+  return null;
+}
+```
+
+签名密钥在 `admin` 于 **设置 → Plugins** 轮换插件 token 时，与安装 token 一起**只展示一次**。它对一个安装是稳定的。
+
+每个请求还带 `callback_token` 和 `callback_url`，你的 handler 可以在 token 有效的几分钟内回调 [Action API](/plugins/reference#action-api)：
+
+```js
+const issue = await fetch(`${body.callback_url}/issues/${body.issue_id}`, {
+  headers: { Authorization: `Bearer ${body.callback_token}` },
+}).then((r) => r.json());
+
+await fetch(`${body.callback_url}/issues/${body.issue_id}/comments`, {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${body.callback_token}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({ content: `分诊结果：**high**，建议负责人 **platform**。` }),
+});
+```
+
+这些写入以谁的身份落地不由你选择——在 hook 派发时就已经决定了。完整请求格式、重试计划和频率限制见 [Hook](/plugins/hooks)。
+
+## 7. 发布改动要重新安装
+
+安装记录保存的是 `admin` 当时授权的 manifest 快照。你改动托管的文件不会立即生效，直到有人重新安装新 URL，那会重新走一遍授权页面，并高亮新增的 scope。相反，surface 代码和 hook 接口属于你：部署即生效。
+
+## 可运行的示例
+
+Multica 仓库的 `examples/plugins/` 下有四个：
+
+| 示例 | 演示内容 |
+| --- | --- |
+| `hello-panel` | 参考 surface：context、读任务、写评论、按成员存储、resize |
+| `release-checklist` | 配置驱动的界面——`admin` 只配一次清单，每个任务各自保存状态 |
+| `triage-notify` | hook 引擎、三种宿主驱动的触发方式，以及带验签和防重放的参考 handler |
+| `deploy-sentinel` | 真实插件的样子：四种触发方式、两种 transport、一份 skill，以及会拒绝请求的业务规则 |

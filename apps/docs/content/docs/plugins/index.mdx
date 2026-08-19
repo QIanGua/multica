@@ -1,0 +1,62 @@
+---
+title: Plugins
+description: Extend Multica with panels inside an issue, actions people trigger, tools agents can call, and skills that teach agents how to use them.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+A plugin extends Multica with something the product does not ship itself: a panel rendered inside an issue, an action a person picks from a menu, a tool an agent decides to call, or a skill that teaches agents when to use any of it.
+
+A plugin is one JSON file — `multica.plugin.json` — served from any public HTTPS host, plus whatever code that file points at. There is no bundle to upload and no build step Multica runs. A workspace `admin` installs it by URL, reads the permissions it asks for, and approves them.
+
+## A plugin relates to Multica in exactly three ways
+
+Everything in the manifest is one of these three. "Who triggers it" and "what capability is called" are separate questions — a hook is declared once and can be reached by any trigger it opts into.
+
+| Relationship | Direction | What it is |
+| --- | --- | --- |
+| **Action** | plugin → Multica | Host capabilities your plugin calls: read an issue, post a comment, read and write plugin storage. |
+| **Hook** | Multica → plugin | A capability *you* implement on your own server. Multica calls it when a person, an agent, or an event asks for it. |
+| **Resource** | no call at all | A static contribution, currently a `SKILL.md` that becomes an ordinary workspace skill at install and is removed at uninstall. |
+
+## What you can contribute
+
+| Contribution | Type | Status | Where it appears |
+| --- | --- | --- | --- |
+| Surface | `issue_panel` | Available | A panel in the issue detail page, under **Plugins** |
+| Surface | `modal` | Available | A dialog opened from the issue actions menu |
+| Surface | `sidebar_panel` | Declared, not yet mounted | — |
+| Hook | trigger `ui` | Available | A button your own surface draws, invoking your hook |
+| Hook | trigger `manual` | Available | An entry in the issue actions menu and command palette |
+| Hook | trigger `agent` | Available | A tool an agent sees and can choose to call |
+| Hook | trigger `event` | Available | Automatic dispatch on a product event, never blocking |
+| Resource | `skill` | Available | A workspace skill, owned by the installation |
+
+A manifest that declares a contribution this Multica build cannot run fails installation loudly, listing everything that is missing. A silently ignored contribution would look installed and never fire, which is worse.
+
+## The security model, in one screen
+
+- **Multica never executes plugin code.** A surface runs in the user's browser inside a sandboxed iframe; a hook runs on your own server. Nothing you write executes on Multica's infrastructure.
+- **A surface holds no credential.** The iframe is mounted with `sandbox="allow-scripts"` and *not* `allow-same-origin`, so it has an opaque origin: no cookies, no `localStorage`, no access to the page around it. Every call is a message to the host page, which performs it on the signed-in user's own session.
+- **Two ceilings apply at once.** What a plugin can do is bounded by the scopes an admin granted *and* by what that particular user could already do themselves. A member who cannot see an issue gets a `404` through your surface too.
+- **Where data can go is declared.** `net:` scopes are the complete answer, and the same list becomes both the surface's CSP `connect-src` and the allowlist for hook destinations. Nothing a deployment configures widens it.
+- **Outbound calls are signed.** Every hook request carries an HMAC signature and a timestamp so your server can tell Multica's call from anyone else's.
+- **Secrets are write-only.** A `secret` config field is encrypted at rest and never echoed back by any read endpoint — not to the UI, not into the iframe, not in a hook payload.
+
+<Callout type="info">
+Read [Scopes and consent](/plugins/scopes) before you design a plugin. The scope list you declare is what an admin sees on the consent screen, and it is the only thing that decides what your plugin can reach.
+</Callout>
+
+## Availability
+
+Plugin management is gated by the `plugins_v1` feature flag, which is **off by default**. On a self-hosted deployment an operator enables it; on the managed cloud it is enabled per workspace during rollout. If **Settings → Plugins** is missing, the flag is off — the API answers `503` rather than pretending.
+
+## Where to go next
+
+- [Quickstart](/plugins/quickstart) — a working panel installed in about ten minutes.
+- [How plugins run](/plugins/how-plugins-run) — the execution and identity model, worth reading once before you design anything.
+- [Manifest reference](/plugins/manifest) — every field, every validation rule.
+- [Surfaces](/plugins/surfaces) — building the UI half.
+- [Hooks](/plugins/hooks) — the server half.
+- [Agents and skills](/plugins/agents-and-skills) — making your plugin usable by an agent.
+- [Reference](/plugins/reference) — SDK, Action API, error codes, and limits.

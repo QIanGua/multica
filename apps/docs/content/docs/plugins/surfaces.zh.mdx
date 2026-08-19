@@ -1,0 +1,187 @@
+---
+title: Surface
+description: 编写插件的界面部分——surface 挂载在哪里、沙箱允许什么、主题与尺寸怎么处理，以及经得起用的写法。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+surface 就是一段运行在沙箱 iframe 里的普通脚本，由 Multica 挂载在固定位置。你决定里面渲染什么，宿主决定它出现在哪里、允许它访问什么。
+
+## surface 类型
+
+| 类型 | 挂载位置 | 由谁打开 |
+| --- | --- | --- |
+| `issue_panel` | 任务详情页的 **Plugins** 区块 | 随页面渲染 |
+| `modal` | 覆盖当前页面的对话框 | 成员，从任务操作菜单 |
+| `sidebar_panel` | 尚未挂载 | — |
+
+modal 与 panel 是同一种沙箱 iframe，只是位置不同。它不是用来打断别人的：它之所以打开，是因为有人选择了它，而不是插件自作主张。
+
+现在声明 `sidebar_panel` 会导致安装失败。这是故意的——放行一个宿主无法渲染的 surface，会装出一个永远不会出现的插件。
+
+### 平台
+
+`platforms` 用来过滤 surface 在哪里渲染：
+
+```json
+{ "key": "hello", "type": "issue_panel", "name": "Hello", "entry": "ui/main.js", "platforms": ["web", "desktop"] }
+```
+
+留空或省略表示全部平台。写出来的列表是过滤器而不是提示——只声明 desktop 的面板不会在 web 上渲染。
+
+## 入口脚本
+
+`entry` 是相对于 manifest URL 的路径，必须以 `.js` 或 `.mjs` 结尾。HTML 文档由 Multica 生成，并把你的脚本加载进去：
+
+```
+https://plugins.example.com/hello/multica.plugin.json   ← manifest
+https://plugins.example.com/hello/ui/main.js            ← entry: "ui/main.js"
+```
+
+脚本必须通过 HTTPS 提供。纯 HTTP 只在回环地址（`localhost`、`127.0.0.1`、`[::1]`）下被接受，与浏览器本身对安全上下文的判断一致——这让本地开发成为可能，又不会在真实部署上开放明文传输。
+
+<Callout type="warn">
+以 `local:` 来源安装的插件无法渲染 surface。浏览器没有可以抓取入口脚本的 URL，所以面板会直接说明情况，而不是显示一个空白框。本地来源用于开发 manifest 和安装流程；要迭代界面，请用 HTTPS 托管。
+</Callout>
+
+## 沙箱允许什么
+
+iframe 以 `sandbox="allow-scripts"` 挂载，**不带** `allow-same-origin`，因此拥有不透明源。
+
+**不可用：**
+
+- `localStorage`、`sessionStorage`、cookie、`IndexedDB`——抛错或读到空值
+- 访问外层页面或另一个插件的 iframe
+- 顶层导航与表单提交
+- 通过 URL 加载图片、字体或样式表
+
+**可用：**
+
+- 你自己的入口脚本，以及它从你的源导入的内容
+- 内联 `<style>` 与内联脚本
+- `data:` 与 `blob:` 图片、`data:` 字体
+- 向被 `net:` scope 覆盖的主机发 `fetch`
+- [Action API](/plugins/reference#action-api) 的全部能力，经由 SDK
+
+### 生成的 CSP
+
+由已授予的 scope 构建，而不是你的 URL 今天返回的 manifest：
+
+```
+default-src 'none';
+script-src <入口脚本的源> 'unsafe-inline';
+style-src 'unsafe-inline';
+img-src data: blob:;
+font-src data:;
+connect-src <每个 net: scope 对应的 https 主机，没有则为 'none'>;
+form-action 'none';
+base-uri 'none'
+```
+
+`img-src` 刻意收窄到内联数据：图片 URL 是回连作者最廉价的旁路信道。请把图片内联成 `data:` / `blob:`，或者直接用 SVG 画。
+
+## 主题
+
+宿主在初始化时把设计 token 推入 iframe，主题切换时再推一次。SDK 会把它们写成 `:root` 上的自定义属性，所以只要用这些变量，不带样式表也能看起来是原生的：
+
+```css
+color: var(--foreground);
+background: var(--background);
+border: 1px solid var(--border);
+border-radius: var(--radius);
+font-size: var(--text-body);
+```
+
+目前转发的 token：
+
+`--background`、`--foreground`、`--muted`、`--muted-foreground`、`--border`、`--primary`、`--primary-foreground`、`--destructive`、`--radius`、`--text-caption`、`--text-body`
+
+需要在 JavaScript 里响应变化时：
+
+```js
+const unsubscribe = multica.ui.onThemeChange((theme) => {
+  // theme 是同一批 token 的 Record<string, string>
+});
+```
+
+如果已有 token 到达，监听器会立即以当前值触发一次，之后每次变化再触发。
+
+## 尺寸
+
+iframe 不会自动撑高。内容稳定后调用 `multica.ui.resize(px)`：
+
+```js
+multica.ui.resize(document.body.scrollHeight + 16);
+```
+
+宿主会把取值夹在 `0…4000` CSS 像素之间。任何改变高度的动作之后都要再调一次——请求返回、列表展开、错误信息出现。从不调用 `resize` 的 surface 会以默认高度渲染，内容被截断。
+
+## 读取上下文
+
+`multica.context.get()` 是大多数 surface 的第一个调用。它不需要任何 scope，因为其中没有用户在 iframe 外的页面上看不到的信息：
+
+```js
+const ctx = await multica.context.get();
+// ctx.workspace          → { id, name, slug }
+// ctx.user               → { id, name }（插件身份调用时不存在）
+// ctx.issue              → { id, identifier, title }（挂载在任务上时）
+// ctx.config             → 非 secret 的安装配置
+// ctx.granted_net_domains → 该安装可访问的域名
+```
+
+结果会被缓存，传 `true` 可强制刷新。
+
+`ctx.config` 是 surface 读取 `admin` 在配置表单里填写内容的方式。其中永远不含 secret——那是你访问自己服务的凭证，iframe 是它最不该出现的地方。
+
+## 调用自己的 hook
+
+surface 不直接调用自己的后端，而是请宿主调用一个声明了 `ui` 触发方式的 hook：
+
+```js
+const result = await multica.hooks.invoke("triage_issue", { reason: "手动重查" });
+// result.status    → "ok" | "failed" | "timeout" | "refused"
+// result.output    → 你的接口返回的 JSON
+// result.latency_ms、result.attempts、result.hook_key、result.trigger
+```
+
+这一层绕行本身就是价值：经宿主转发才会带签名、受频率限制、被约束在已授予的 `net:` 域名内、并拿到短期 callback token，同时留下 `admin` 可查的调用记录。surface 自己去 fetch 后端则一样都没有。
+
+`status` 是宿主的判定，不是你接口的返回。`refused` 表示这次调用根本没离开 Multica：scope 未授予、触发频率限制、安装被停用。把"没人授权"说成"插件坏了"，会让用户去排查错误的系统。
+
+## 错误处理
+
+SDK 的每个调用都会以 `MulticaPluginError` 拒绝，其 `status` 对应 HTTP 状态码：
+
+```js
+import { MulticaPluginError } from "@multica/plugin-sdk";
+
+try {
+  await multica.issue.comment({ body: text });
+} catch (error) {
+  if (error instanceof MulticaPluginError && error.status === 403) {
+    show("这个工作区没有授予该插件评论权限。");
+  } else {
+    show(error.message);
+  }
+}
+```
+
+| 状态码 | 通常意味着 |
+| --- | --- |
+| `403` | scope 未授予、安装被停用，或接口需要成员身份而调用者是插件 |
+| `404` | 任务不存在，或该用户看不到它——两者刻意无法区分 |
+| `400` | 入参不合法，或 bridge 不允许的路径 |
+| `408` | 宿主 15 秒内没有应答（SDK 自己的超时） |
+| `507` | 超出存储限额 |
+
+## 经得起用的写法
+
+**先渲染再取数。** bridge 握手加一次往返不是瞬时的。先画骨架，再填内容，最后 `resize`。
+
+**把"键不存在"当成正常情况。** `multica.storage.*.get()` 在键不存在时返回 `null`，只有真正的失败才抛错。
+
+**不要自建设置界面。** 在 manifest 里声明 `config`，Multica 会渲染表单、校验取值并安全保存 secret。从 `ctx.config` 读回来即可。
+
+**有意识地选择存储范围。** `storage:user` 按成员隔离——另一个成员在同一个任务上打开同一个面板，看到的是他自己的值。`storage:workspace` 则所有人共享。选错是一个看起来像缓存问题的隐私问题。
+
+**预期自己会被停用。** `admin` 随时可以停用某个安装，之后每次调用都会返回 `403`。请把这个状态展示出来，而不是不断重试。

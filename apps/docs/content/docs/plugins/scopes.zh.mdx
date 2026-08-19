@@ -1,0 +1,106 @@
+---
+title: Scope 与授权
+description: 完整的 scope 列表、每个 scope 解锁什么、net: 如何界定数据的去向，以及 admin 安装前会看到什么。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+这个模型里没有签名、没有发布者认证、没有信任分级。**`admin` 阅读你的 scope 列表这件事本身，就是信任决策。** 请据此设计：只申请让插件能工作的最小集合，并让每一项都能从插件的功能描述中看出必要性。
+
+## 完整列表
+
+列表是封闭的。不在其中的取值在解析阶段被拒绝，因此无法凭空发明 scope。
+
+| Scope | 授予的能力 |
+| --- | --- |
+| `issues:read` | 读取调用者本来就能看到的任务 |
+| `issues:write` | 更新任务的标题和描述 |
+| `comments:read` | 列出任务的评论 |
+| `comments:write` | 在任务下发表评论 |
+| `tasks:read` | 订阅 `task.*` 事件 |
+| `tasks:write` | 预留给任务写入，目前尚无 Action API 接口使用 |
+| `agents:read` | 预留给读取智能体，目前尚无 Action API 接口使用 |
+| `members:read` | 预留给读取成员，目前尚无 Action API 接口使用 |
+| `storage:user` | 读写按成员隔离的插件存储 |
+| `storage:workspace` | 读写工作区共享的插件存储 |
+| `net:<domain>` | 访问且仅访问这个主机——surface 与 hook 目标地址都受它约束 |
+
+<Callout type="info">
+声明一个目前还没有接口消费的 scope 没有用处，还会占用授权页面的注意力。只申请你今天真的会用的。
+</Callout>
+
+## `net:` 就是"数据去哪里"的全部答案
+
+`net:` 是唯一带参数的 scope，一个字符串同时承担两件事：
+
+1. 它构成 surface 的 CSP `connect-src`。没有任何 `net:` scope 的 surface 会拿到 `connect-src 'none'`，字面意义上无法把数据发到任何地方。
+2. 它是 hook 目标地址的白名单。transport URL 的主机没被覆盖，manifest 校验就不通过，拨号时还会再检查一次。
+
+它是**精确主机匹配**，不做后缀匹配：
+
+```json
+"scopes": ["net:example.com", "net:api.example.com"]
+```
+
+只写 `net:example.com` 并不覆盖 `api.example.com`。这是刻意的——授权页面为每个 scope 渲染一行（"向 example.com 发送数据"），后缀匹配会让同一个字符串在两处含义不同。
+
+域名语法：小写标签、至少两段、最长 253 个字符。不带协议、不带端口、不带路径。
+
+<Callout type="warn">
+`net:` 界定的是**第三方**目标，而不是笼统意义上的"防外泄"。surface 的脚本本来就从你的源加载，作者提供的脚本总能回连到作者。要堵住这条路径，就得让 Multica 代托管第三方代码，而这个设计刻意不这么做。判断一个插件，看的是你是否信任它的作者，而不是它的 CSP 有多严密。
+</Callout>
+
+## 事件隐含读权限
+
+订阅事件的 hook 会收到 Action API 需要 scope 才能拉取的内容。所以 manifest 必须持有对应的读权限，在解析阶段检查：
+
+| 事件 | 需要 |
+| --- | --- |
+| `issue.created`、`issue.updated`、`issue.status_changed` | `issues:read` |
+| `comment.created` | `comments:read` |
+| `task.started`、`task.completed`、`task.failed` | `tasks:read` |
+
+关键在授权页面：批准一个订阅的 `admin`，看到的是这个订阅实际隐含的读权限，而不是同一份数据被两套标准对待。
+
+## admin 会看到什么
+
+安装分两步，第一步不写入任何数据。
+
+**预览**抓取并解析 manifest，返回：
+
+- 解析后的 manifest，包含全部贡献
+- 完整的 scope 列表
+- 将被渲染为表单的配置 schema
+- 该插件是否已安装、版本是多少，以及**哪些 scope 是新增申请的**
+
+**安装**创建安装记录，且必须授予与 manifest 完全一致的 scope 列表。两种情况会被拒绝：
+
+- 授予的 scope 少于 manifest 申请的——部分授权会让插件坏得没人看得出来
+- 授予了 manifest 未申请的 scope——那等于给出一份没人被告知理由的权限
+
+## 升级与新增 scope
+
+安装一份 `key` 与现有安装相同的 manifest 属于升级。预览响应会返回 `added_scopes`，供授权页面高亮当前已安装版本之后新增的部分。
+
+对插件作者的实际影响：
+
+- **新增 scope 需要人重新授权。** 请把 scope 变更安排成一次明确的发布，并在更新说明里写清楚它用来做什么。
+- **删除配置项会清理其存储值**，包括 secret，与快照更新在同一个事务里完成。类型从 `secret` 改成别的，其已存 secret 同样会被清理。
+- **运行的是已存储的快照。** 在你托管的文件里改 hook 地址，要等重新安装才生效。
+
+## 永远有两层上限
+
+被授予的 scope 是上限，而不是对具体数据的授权。每次 Action API 调用还受调用者本人权限约束：
+
+- 看不到某个任务的成员，通过你的 surface 同样拿到 `404`。
+- `admin` 拒绝的 scope 会返回 `403`，并指明是哪个 scope。
+- 已停用的安装在每次调用上立即返回 `403`，包括留在旧标签页里的 iframe。
+
+所以 `issues:read` 并不意味着"读取工作区里的所有任务"，而是"你可以读任务，上限是你面前这个人本来就能读到的范围"。
+
+## 如何设计 scope 列表
+
+- 从插件实际执行的操作出发，而不是从它以后可能想要什么出发。
+- 状态只属于某一个人时，优先用 `storage:user` 而不是 `storage:workspace`。工作区共享的桶对每个成员的会话都可见。
+- 如果 surface 从不调用第三方主机，就一个 `net:` scope 都别声明。`connect-src 'none'` 在授权页面上是一个强而清晰的表态。
+- 需要子域名就明确声明。不要申请父域名指望它能覆盖更多。

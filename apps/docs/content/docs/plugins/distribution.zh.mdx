@@ -1,0 +1,139 @@
+---
+title: 分发与本地开发
+description: 如何托管插件、发布新版本、在本地迭代，以及自托管部署需要配置什么。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+没有注册中心，没有审核队列，也没有上传。插件通过发布一个 URL 来分发，由 `admin` 把它粘贴进 **设置 → Plugins** 来安装。
+
+## 托管
+
+把 manifest 和它引用的所有文件放在同一目录下：
+
+```
+https://plugins.example.com/deploy-sentinel/multica.plugin.json
+https://plugins.example.com/deploy-sentinel/ui/main.js
+https://plugins.example.com/deploy-sentinel/skills/incident-response/SKILL.md
+```
+
+要求：
+
+- **公网 HTTPS。** manifest 在服务端抓取，走的是与远程 MCP 接口相同的校验：纯 HTTPS，不带用户信息、query 和 fragment，内网与元数据地址段一律拒绝。拨号时会重新解析，因此校验之后到抓取之间的 DNS 重绑定无法访问内部主机。
+- **返回 `200` 和 JSON 内容。** 其他状态码会让安装失败，并在错误信息里带上状态码。
+- **资源同源。** `entry` 路径相对 manifest URL 解析。资源不能指定任意地址——那等于给安装流程一个没被审阅过的第二抓取目标。
+
+surface 入口由浏览器通过 `<script src>` 加载，不需要 CORS 头。如果你的 surface 用 `fetch` 调用**你自己的**后端，那个后端必须接受 `Origin: null`——沙箱 iframe 的源是不透明的。
+
+任何静态托管都可以：CDN 后的对象存储、GitHub Pages、发布产物、你自己的服务器。
+
+## 版本与升级
+
+安装一份 `key` 与现有安装相同的 manifest 属于升级，而不是第二次安装。实际含义：
+
+- **运行的是已存储的快照。** 你改动托管文件不会影响现有安装，直到有人重新安装该 URL。
+- **surface 代码和 hook 行为不在快照里。** 部署新的 `ui/main.js` 或新的接口，对所有人立即生效。
+- **升级会重新走授权流程**，并高亮新增申请的 scope。
+- **被删除的配置项会被清理**，包括 secret，与快照更新在同一个事务里。
+- **skill 资源会重新抓取**，因此改动过的 `SKILL.md` 会生效，删掉的会被移除。
+
+这个划分本身就是一种设计工具。修一个面板或接口的 bug 是一次部署；改变插件**被允许做什么**则是一次版本升级加一次人的决定。无论如何，每次发布都请提升 `version`——这是 `admin` 用来比对的依据。
+
+两个稳定 URL 的做法效果不错：一个固定版本（`/deploy-sentinel/1.2.0/multica.plugin.json`）给想自己选择的工作区，一个滚动版本（`/deploy-sentinel/latest/...`）给不想选的。
+
+<Callout type="warn">
+不要在不通知的情况下，把已发布的 manifest 指向另一个 `transport.url` 主机。URL 要等重新安装才生效，而重新安装正是 `admin` 看到"数据现在发往哪里"的那一刻。
+</Callout>
+
+## 本地开发
+
+三个运维配置让未发布的插件也能安装。它们放宽的是网络校验的适用范围，都不会扩大 `admin` 批准过的内容。
+
+### `MULTICA_PLUGIN_DIR`——从磁盘安装
+
+指向一个存放插件文件夹的目录，每个文件夹内含一份 `multica.plugin.json`，然后用来源 `local:<文件夹名>` 安装：
+
+```bash
+export MULTICA_PLUGIN_DIR=/srv/multica-plugins
+# 目录 /srv/multica-plugins/deploy-sentinel  →  安装 "local:deploy-sentinel"
+```
+
+skill 资源同样从磁盘读取。名称必须是单个目录名——不含分隔符、不以点开头——并且拼接后的路径会再次校验，资源无法逃出自己的文件夹。
+
+<Callout type="info">
+`local:` 安装**无法渲染 surface**。浏览器没有可以抓取入口脚本的 URL，面板会直接说明情况，而不是显示一个空白框。用 `local:` 迭代 manifest、授权页面、配置、hook 和 skill；要做界面，就用 HTTPS 托管（回环地址即可）。
+</Callout>
+
+### `MULTICA_PLUGIN_DEV_ORIGINS`——放行本地服务器
+
+一个逗号分隔的裸源列表，这些源在抓取 manifest 和拨打 hook 时跳过公网地址校验：
+
+```bash
+export MULTICA_PLUGIN_DEV_ORIGINS=https://127.0.0.1:8788,https://127.0.0.1:8789
+```
+
+必须是裸源——带路径或 query 的条目会被整条丢弃，而不是勉强采用。`net:` 校验仍然生效，所以要声明对应的 scope，比如 `net:127.0.0.1`。（像 `localhost` 这样的单标签主机不是合法的 `net:` 域名，请用回环地址。）
+
+### `MULTICA_PLUGIN_DEV_CA`——信任开发证书
+
+hook 的 transport URL 必须是 HTTPS，所以本地 handler 需要证书。提供一个 CA 文件，它**只**对已经在 `MULTICA_PLUGIN_DEV_ORIGINS` 里的源生效：
+
+```bash
+export MULTICA_PLUGIN_DEV_CA=/path/to/dev-ca.pem
+```
+
+证书校验从不关闭，重定向仍然被拒绝。生成证书：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout dev-key.pem -out dev-cert.pem \
+  -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+```
+
+### 一个可用的循环
+
+1. 把 `MULTICA_PLUGIN_DIR` 指向你的插件目录，安装 `local:my-plugin`，迭代 manifest、配置表单和授权页面。
+2. 开始做 surface 时，用本地静态服务器以 `http://localhost:PORT` 提供同一目录，改为按 URL 安装——surface 入口允许回环地址的 HTTP。
+3. 开始做 hook 时，加上 `MULTICA_PLUGIN_DEV_ORIGINS` 和 `MULTICA_PLUGIN_DEV_CA`，并用 HTTPS 运行你的 handler。
+4. 轮换插件 token 拿到签名密钥，注入到 handler 的环境变量里。
+
+## 自托管配置
+
+| 变量 | 未设置时的影响 |
+| --- | --- |
+| `MULTICA_PLUGIN_SECRET_KEY` | `secret` 配置项无法保存——写入直接失败而不是明文存储。**hook 签名同样不可用**，因此 hook 完全无法被调用。用 `openssl rand -base64 32` 生成。 |
+| `MULTICA_PUBLIC_URL` | hook 请求不带 `callback_url`，handler 无法回调。 |
+| `MULTICA_PLUGIN_DIR` | 只接受公网 HTTPS 的 manifest URL。 |
+| `MULTICA_PLUGIN_DEV_ORIGINS` | 所有 manifest 抓取和 hook 调用都走公网地址校验。 |
+| `MULTICA_PLUGIN_DEV_CA` | 不额外信任任何 CA。 |
+
+插件管理还受 `plugins_v1` 特性开关控制，默认关闭。关闭时管理 API 和 Action API 返回 `503`，也不会派发任何 event hook——把开关关掉会立即停止外发调用，而不是等到下次重启。
+
+## 发布之前
+
+- 用真实的公网 URL（而不是 `local:`）把 manifest 装进一个测试工作区。
+- 读一遍你自己的授权页面。每个 scope 都应该能从功能描述里看出正当理由。
+- 如果声明了两个平台，确认 surface 在 web 和 desktop 上都能渲染。
+- 逐个触发方式调用每个 hook，确认调用记录里是 `ok`。
+- 验证 handler 会拒绝：没有签名的请求、过期的时间戳、重放的请求体。
+- 停用该安装，确认你的 surface 会明确报错而不是静默失败。
+- 卸载一次，确认没有你以为会保留的数据被留下。
+- 写一份 README：插件做什么、需要哪些 scope 及原因、`admin` 需要配置什么，以及如果用到 secret 字段，说明该部署需要 `MULTICA_PLUGIN_SECRET_KEY`。
+
+## 排查
+
+| 现象 | 可能原因 |
+| --- | --- |
+| 看不到 **设置 → Plugins** | 该部署的 `plugins_v1` 未开启 |
+| 安装失败并返回 `422` | manifest 声明了当前版本无法运行的贡献，通常是 `sidebar_panel` |
+| 安装失败并提到 `net:` scope | hook 的 transport 主机未被精确覆盖，子域名需要单独声明 |
+| 安装失败并提到未知字段 | manifest 里有拼写错误。未知字段会被拒绝，包括 `config` 内部 |
+| 面板空白 | 入口 URL 不可访问、不是 HTTPS（也不是回环地址），或者安装来源是 `local:` |
+| 面板能渲染但所有调用都 `403` | 安装被停用，或该 scope 未被授予 |
+| 面板内容被截断 | 内容稳定后没有调用 `multica.ui.resize()` |
+| surface 里的 `fetch` 被拦截 | 目标主机未被 `net:` scope 覆盖，查看控制台里的 `connect-src` |
+| hook 从不被调用 | 触发方式未声明、安装被停用，或反复失败后熔断器已打开 |
+| hook 返回 `refused` | 调用根本没离开 Multica：scope、频率限制或安装被停用，与你的接口无关 |
+| 签名总是验不过 | 验签前重新序列化了请求体，或者十六进制解码前没去掉 `whsec_` 前缀 |
+| 回调返回 `403` | token 已过期（5 分钟）、本次调用已结束，或该成员已失去访问权限 |
+| 回调访问其他任务返回 `404` | 回调授权被收窄到本次调用相关的那个任务 |

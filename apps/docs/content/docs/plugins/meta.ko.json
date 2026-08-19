@@ -1,0 +1,17 @@
+{
+  "title": "플러그인",
+  "description": "Multica 플러그인 개발: surface, hook, 에이전트 도구, skill.",
+  "pages": [
+    "index",
+    "quickstart",
+    "how-plugins-run",
+    "manifest",
+    "scopes",
+    "surfaces",
+    "hooks",
+    "agents-and-skills",
+    "configuration-and-storage",
+    "reference",
+    "distribution"
+  ]
+}

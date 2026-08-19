@@ -34,6 +34,8 @@
     "providers",
     "---自动化---",
     "autopilots",
+    "---插件---",
+    "plugins",
     "---集成---",
     "channels",
     "lark-bot-integration",

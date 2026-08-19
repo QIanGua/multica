@@ -1,0 +1,238 @@
+---
+title: Reference
+description: The plugin SDK, the Action API, the bridge protocol, error codes, and every limit in one place.
+---
+
+## SDK
+
+```bash
+npm install @multica/plugin-sdk
+```
+
+```js
+import multica, { MulticaPluginError } from "@multica/plugin-sdk";
+```
+
+Zero runtime dependencies, and deliberately no dependency on Multica's own packages — it ships to third parties. The default export and the named `multica` export are the same object.
+
+### `multica.context`
+
+| Method | Returns |
+| --- | --- |
+| `get(force = false)` | `Promise<PluginContext>` — cached after the first call; pass `true` to refetch |
+
+```ts
+interface PluginContext {
+  workspace: { id: string; name: string; slug: string };
+  user: { id: string; name: string };
+  issue?: { id: string; identifier: string; title: string };
+  config: Record<string, unknown>;   // non-secret installation configuration
+  granted_net_domains: string[];     // domains granted via net: scopes
+}
+```
+
+The server also sends `actor`, which is `"member"` or `"plugin"`; `user` is absent for a plugin actor. Requires no scope.
+
+### `multica.issue`
+
+Every method defaults to the issue the surface is mounted on. Called from a surface that is not on an issue without an explicit id, they reject with a `400`.
+
+| Method | Scope | Returns |
+| --- | --- | --- |
+| `get(issueId?)` | `issues:read` | `Promise<Issue>` |
+| `update(patch, issueId?)` | `issues:write` | `Promise<Issue>` — `patch` accepts `title` and `description` |
+| `comments(issueId?)` | `comments:read` | `Promise<Comment[]>` — newest 200, chronological |
+| `comment({ body, parentId? }, issueId?)` | `comments:write` | `Promise<Comment>` |
+
+```ts
+interface Issue {
+  id: string; identifier: string; title: string;
+  description?: string | null; status: string; priority: string;
+}
+
+interface Comment {
+  id: string; author_type: string; author_id: string;
+  content: string; type: string; parent_id?: string; created_at: string;
+}
+```
+
+### `multica.storage`
+
+`multica.storage.workspace` and `multica.storage.user` expose the same four methods.
+
+| Method | Returns |
+| --- | --- |
+| `list()` | `Promise<StorageKey[]>` — `{ key, size_bytes, updated_at }` |
+| `get(key)` | `Promise<string \| null>` — `null` when absent |
+| `set(key, value)` | `Promise<void>` |
+| `delete(key)` | `Promise<void>` |
+
+### `multica.hooks`
+
+| Method | Returns |
+| --- | --- |
+| `invoke(hookKey, input?)` | `Promise<HookResult>` |
+
+```ts
+interface HookResult {
+  status: string;      // "ok" | "failed" | "timeout" | "refused"
+  output?: unknown;    // your endpoint's JSON body
+  error?: string;
+  latency_ms: number;
+  hook_key: string;
+  trigger: string;     // always "ui" from a surface
+  attempts: number;
+}
+```
+
+The host refuses any hook this plugin's manifest did not declare with the `ui` trigger, and a surface cannot reach another plugin's hook.
+
+### `multica.ui`
+
+| Method | Notes |
+| --- | --- |
+| `resize(height)` | CSS pixels, clamped to `0…4000`. Fire-and-forget. |
+| `onThemeChange(listener)` | Returns an unsubscribe function. Fires immediately with current tokens if any have arrived. |
+
+### `MulticaPluginError`
+
+```ts
+class MulticaPluginError extends Error {
+  readonly status: number;   // mirrors HTTP
+}
+```
+
+The SDK's own request timeout is 15 seconds, surfaced as status `408`.
+
+## Action API
+
+Base path `/api/v1/plugin`. Two kinds of caller reach it, and the difference is only in *who* the call acts as:
+
+- **A surface**, with no credential — the host page re-issues the call on the signed-in user's session and names the installation in the `X-Multica-Plugin-Installation` header.
+- **A hook handler**, with `Authorization: Bearer <token>` — a callback token (`mpc_…`) or an install token (`mpi_…`).
+
+The workspace always comes from the installation, never from the client.
+
+| Method | Path | Scope | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/context` | — | Accepts `?issue_id=` |
+| `GET` | `/issues/{id}` | `issues:read` | `id` may be a UUID or an identifier like `MUL-42` |
+| `PATCH` | `/issues/{id}` | `issues:write` | `title` and `description` only |
+| `GET` | `/issues/{id}/comments` | `comments:read` | Newest 200, chronological |
+| `POST` | `/issues/{id}/comments` | `comments:write` | `content` required, max 64 KiB; optional `parent_id` |
+| `GET` | `/storage/{scope}` | `storage:{scope}` | `scope` is `workspace` or `user` |
+| `GET` | `/storage/{scope}/{key}` | `storage:{scope}` | `404` when absent |
+| `PUT` | `/storage/{scope}/{key}` | `storage:{scope}` | Body `{ "value": "…" }`; `204` |
+| `DELETE` | `/storage/{scope}/{key}` | `storage:{scope}` | `204` |
+| `POST` | `/hooks/{key}` | — | `trigger` must be `ui` or `manual`; requires a member |
+
+### Why `PATCH` is limited to title and description
+
+Status, priority, assignee, parent, project, and stage each carry dispatch, catalog, or hierarchy semantics — a status change can start an agent run, and custom statuses resolve through a per-workspace catalog. Duplicating those rules here would give plugins a second, drifting copy of them. Widening the set later is additive; getting the side effects wrong now is not.
+
+### What posting a comment does
+
+A comment created through this API is authored **by the user** and marked with the plugin that produced it, so the timeline can render "Jiayuan (via Hello Panel)". When the caller is the plugin itself — an `event` hook callback, or the install token — the comment is authored by the installation.
+
+It deliberately does **not** run `@mention` trigger dispatch. A plugin that could post a mention could start agent runs, and spend a workspace's budget, from a button somebody clicked for another reason.
+
+### Paths a surface may name
+
+The host bridge allowlists paths before anything reaches `fetch`:
+
+```
+/context
+/issues/{id}
+/issues/{id}/comments
+/storage/(workspace|user)
+/storage/(workspace|user)/{key}
+/hooks/{key}
+```
+
+## Management API
+
+Admin-facing, used by **Settings → Plugins**. Listed here because plugin authors write installation instructions against it. All are workspace-scoped under `/api/workspaces/{id}`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/plugins` | List installations |
+| `POST` | `/plugins/preview` | Step 1: parse a manifest, show scopes. Writes nothing |
+| `POST` | `/plugins` | Step 2: install, consenting to exactly the manifest scopes |
+| `PUT` | `/plugins/{installationId}/config` | Save configuration values |
+| `POST` | `/plugins/{installationId}/enable` | Enable |
+| `POST` | `/plugins/{installationId}/disable` | Disable, keeping storage and secrets |
+| `DELETE` | `/plugins/{installationId}` | Uninstall and delete plugin-owned data |
+| `POST` | `/plugins/{installationId}/token` | Issue or rotate the install token; returns the token and the signing secret **once** |
+| `DELETE` | `/plugins/{installationId}/token` | Revoke the install token |
+| `GET` | `/plugins/{installationId}/invocations` | Recent hook attempts, newest 100 |
+| `GET` | `/plugins/{installationId}/mcp/{hookKey}/tools` | Discover an MCP hook's tools |
+| `PUT` | `/plugins/{installationId}/mcp/{hookKey}/tools` | Approve a pinned tool list |
+
+## Bridge protocol
+
+Implemented by the SDK. Documented because a blank panel looks the same whether the handshake was missed or the version mismatched.
+
+| Constant | Value |
+| --- | --- |
+| Protocol version | `1` |
+| Guest → host | `multica:plugin-surface-ready`, repeated up to 50 times at 120 ms |
+| Host → guest | `multica:plugin-bridge-init`, carrying one `MessagePort` and the theme tokens |
+
+```ts
+type BridgeRequest =
+  | { id: string; kind: "action"; method: "GET"|"POST"|"PATCH"|"PUT"|"DELETE"; path: string; body?: unknown }
+  | { id: string; kind: "ui.resize"; height: number };
+
+type BridgeResponse =
+  | { id: string; ok: true;  status: number; data: unknown }
+  | { id: string; ok: false; status: number; error: string };
+
+type BridgeEvent = { kind: "theme"; theme: Record<string, string> };
+```
+
+The handshake starts from the guest because a `srcdoc` frame can finish executing before the embedder attaches its listener. Identity is bound by the port, not by `event.origin` — a sandboxed frame reports `"null"`. The SDK accepts a port only from `window.parent`, and only the first one.
+
+## Error codes
+
+| Status | Kind | Typical cause |
+| --- | --- | --- |
+| `400` | invalid | Bad request body, unknown storage scope, an unsupported bridge path |
+| `403` | forbidden | Scope not granted, installation disabled, endpoint needs a member, bad or expired token |
+| `404` | not_found | Issue or storage key absent, or the user cannot see it |
+| `409` | conflict | Already installed, granted scopes do not match the manifest, skill name collision |
+| `422` | incompatible | The manifest declares a contribution this build cannot run |
+| `503` | — | Plugin management is not enabled on this deployment |
+| `507` | quota | Storage or hook rate limit exceeded |
+| `502` | unavailable | Manifest could not be fetched, hook endpoint failed, secrets not configured |
+
+## All limits
+
+| Limit | Value |
+| --- | --- |
+| Manifest size | 1 MiB |
+| Contributions per manifest | 64 |
+| Scopes per manifest | 64 |
+| Config fields | 32 |
+| `name` / `label` / enum option | 160 bytes |
+| `description` (plugin, hook) | 2000 bytes |
+| Config field description | 500 bytes |
+| `version` | 64 bytes, semver |
+| Config `string` value | 4096 bytes |
+| Config `secret` value | 8192 bytes |
+| `SKILL.md` | 256 KiB |
+| Comment | 64 KiB |
+| Comments per read | 200 |
+| Storage key | 1024 bytes |
+| Storage value | 100 KiB |
+| Storage keys per scope | 1000 |
+| Storage bytes per scope | 5 MiB |
+| Hook timeout | 100–30000 ms, default 10000 |
+| Hook response body | 1 MiB |
+| Hook rate limit | 120 per minute per hook |
+| Hook event retries | 3 attempts, 2 s and 4 s backoff |
+| Circuit breaker | 5 failures in 5 minutes |
+| Signature tolerance | 5 minutes |
+| Callback token TTL | 5 minutes |
+| Invocation retention | 7 days |
+| Surface resize | 0–4000 px |
+| SDK request timeout | 15 s |

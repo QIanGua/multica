@@ -1,0 +1,187 @@
+---
+title: Surfaces
+description: Build the UI half of a plugin — where a surface mounts, what the sandbox allows, how theming and sizing work, and the patterns that hold up.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+A surface is an ordinary script running in a sandboxed iframe that Multica mounts at a fixed location. You own what renders inside it; the host owns where it appears and what it is allowed to reach.
+
+## Surface types
+
+| Type | Where it mounts | Opened by |
+| --- | --- | --- |
+| `issue_panel` | The issue detail page, in the **Plugins** section | Rendered with the page |
+| `modal` | A dialog over the current page | A person, from the issue actions menu |
+| `sidebar_panel` | Not mounted yet | — |
+
+A modal is the same sandboxed frame as a panel, differing only in where it appears. It is not a way to interrupt somebody: it opens because a person picked it, never on the plugin's own initiative.
+
+Declaring `sidebar_panel` today fails installation. That is intentional — enabling a surface the host cannot render would install a plugin that silently never appears.
+
+### Platforms
+
+`platforms` filters where a surface renders:
+
+```json
+{ "key": "hello", "type": "issue_panel", "name": "Hello", "entry": "ui/main.js", "platforms": ["web", "desktop"] }
+```
+
+An empty or omitted list means everywhere. A declared list is a filter, not a hint — a desktop-only panel does not render on web.
+
+## The entry script
+
+`entry` is a path relative to the manifest URL and must end in `.js` or `.mjs`. Multica generates the HTML document and loads your script into it:
+
+```
+https://plugins.example.com/hello/multica.plugin.json   ← manifest
+https://plugins.example.com/hello/ui/main.js            ← entry: "ui/main.js"
+```
+
+The script must be served over HTTPS. Plain HTTP is accepted only from loopback (`localhost`, `127.0.0.1`, `[::1]`), matching what browsers already treat as a secure context — that is what makes local development possible without opening plaintext delivery on a real deployment.
+
+<Callout type="warn">
+A plugin installed from a `local:` source cannot render a surface. There is no URL a browser could fetch the entry from, so the panel says so rather than showing an empty frame. Local sources are for developing the manifest and the install flow; serve over HTTPS to iterate on UI.
+</Callout>
+
+## What the sandbox allows
+
+The frame is mounted `sandbox="allow-scripts"` **without** `allow-same-origin`, giving it an opaque origin.
+
+**Not available:**
+
+- `localStorage`, `sessionStorage`, cookies, `IndexedDB` — they throw or read as empty
+- Any access to the embedding page or to another plugin's frame
+- Top-level navigation and form submission
+- Images, fonts, or stylesheets fetched from a URL
+
+**Available:**
+
+- Your own entry script, and anything it imports from your origin
+- Inline `<style>` and inline scripts
+- `data:` and `blob:` images, `data:` fonts
+- `fetch` to hosts covered by your `net:` scopes
+- Everything on the [Action API](/plugins/reference#action-api), through the SDK
+
+### The generated CSP
+
+Built from the granted scopes, not from the manifest your URL serves today:
+
+```
+default-src 'none';
+script-src <your entry origin> 'unsafe-inline';
+style-src 'unsafe-inline';
+img-src data: blob:;
+font-src data:;
+connect-src <https://host for each net: scope, or 'none'>;
+form-action 'none';
+base-uri 'none'
+```
+
+`img-src` is narrowed to inline data on purpose: an image URL is the cheapest possible side channel back to the author. Inline your artwork as `data:` or `blob:`, or draw it in SVG.
+
+## Theming
+
+The host pushes design tokens into the frame at init and again on every theme switch. The SDK writes them as custom properties on `:root`, so using them is enough to look native without shipping a stylesheet:
+
+```css
+color: var(--foreground);
+background: var(--background);
+border: 1px solid var(--border);
+border-radius: var(--radius);
+font-size: var(--text-body);
+```
+
+Tokens currently forwarded:
+
+`--background`, `--foreground`, `--muted`, `--muted-foreground`, `--border`, `--primary`, `--primary-foreground`, `--destructive`, `--radius`, `--text-caption`, `--text-body`
+
+To react in JavaScript:
+
+```js
+const unsubscribe = multica.ui.onThemeChange((theme) => {
+  // theme is a Record<string, string> of the same tokens
+});
+```
+
+The listener fires immediately with the current tokens if any have arrived, then on every change.
+
+## Sizing
+
+The frame does not auto-size. Call `multica.ui.resize(px)` once your content has settled:
+
+```js
+multica.ui.resize(document.body.scrollHeight + 16);
+```
+
+The host clamps the value to `0…4000` CSS pixels. Call it again after anything that changes height — a fetch resolving, a list expanding, an error message appearing. A surface that never calls `resize` renders at the default height with its content clipped.
+
+## Reading context
+
+`multica.context.get()` is the first call most surfaces make. It needs no scope, because it contains nothing the user cannot already see on the page around the frame:
+
+```js
+const ctx = await multica.context.get();
+// ctx.workspace          → { id, name, slug }
+// ctx.user               → { id, name }        (absent for a plugin actor)
+// ctx.issue              → { id, identifier, title }  (when mounted on an issue)
+// ctx.config             → non-secret installation configuration
+// ctx.granted_net_domains → domains this installation may reach
+```
+
+The result is cached; pass `true` to force a refetch.
+
+`ctx.config` is how a surface reads what an admin typed into your configuration form. Secrets are never included — they are your credentials for your own services, and the frame is the last place they should be.
+
+## Calling your own hook
+
+A surface does not call its own backend directly. It asks the host to invoke a hook that declares the `ui` trigger:
+
+```js
+const result = await multica.hooks.invoke("triage_issue", { reason: "manual recheck" });
+// result.status    → "ok" | "failed" | "timeout" | "refused"
+// result.output    → whatever your endpoint returned, as JSON
+// result.latency_ms, result.attempts, result.hook_key, result.trigger
+```
+
+The detour is the value: routing through the host makes the call signed, rate limited, bounded to your granted `net:` domains, and issued a short-lived callback token — and it leaves an invocation record an admin can read. A surface that fetched its own server would have none of that.
+
+`status` is the host's verdict, not your endpoint's. `refused` means the call never left Multica: a scope that was not granted, a rate limit, a disabled installation. Telling a user their plugin is broken when the real answer is "nobody approved this" sends them to debug the wrong system.
+
+## Error handling
+
+Every SDK call rejects with `MulticaPluginError`, carrying a `status` that mirrors HTTP:
+
+```js
+import { MulticaPluginError } from "@multica/plugin-sdk";
+
+try {
+  await multica.issue.comment({ body: text });
+} catch (error) {
+  if (error instanceof MulticaPluginError && error.status === 403) {
+    show("This workspace has not granted comment access to this plugin.");
+  } else {
+    show(error.message);
+  }
+}
+```
+
+| Status | Usually means |
+| --- | --- |
+| `403` | A scope was not granted, the installation is disabled, or the endpoint needs a member and the caller is the plugin |
+| `404` | The issue does not exist, or this user cannot see it — the two are deliberately indistinguishable |
+| `400` | Bad input, or a path the bridge does not allow |
+| `408` | The host did not answer in 15 seconds (the SDK's own timeout) |
+| `507` | A storage quota was exceeded |
+
+## Patterns that hold up
+
+**Render before you fetch.** The bridge handshake plus a round trip is not instant. Draw the shell, then fill it, then `resize`.
+
+**Treat a missing storage key as normal.** `multica.storage.*.get()` resolves to `null` for a key that does not exist; only a real failure throws.
+
+**Do not build a settings UI.** Declare `config` in the manifest and Multica renders the form, validates it, and stores secrets safely. Read the values from `ctx.config`.
+
+**Scope state deliberately.** `storage:user` is per member — another member opening the same panel on the same issue sees their own value. `storage:workspace` is shared by everyone. Choosing the wrong one is a privacy bug that looks like a caching bug.
+
+**Expect to be disabled.** An admin can disable an installation at any moment, and every subsequent call fails with `403`. Show that state rather than retrying.

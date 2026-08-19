@@ -1,0 +1,17 @@
+{
+  "title": "插件",
+  "description": "开发 Multica 插件：surface、hook、智能体工具与 skill。",
+  "pages": [
+    "index",
+    "quickstart",
+    "how-plugins-run",
+    "manifest",
+    "scopes",
+    "surfaces",
+    "hooks",
+    "agents-and-skills",
+    "configuration-and-storage",
+    "reference",
+    "distribution"
+  ]
+}

@@ -1,0 +1,106 @@
+---
+title: Scopes and consent
+description: The complete scope list, what each one unlocks, how net: bounds where data can go, and what an admin sees before installing.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+There is no signature, no publisher verification, and no trust tier in this model. **The admin reading your scope list is the trust decision.** Design for that: ask for the smallest set that makes the plugin work, and make each one obviously necessary from what the plugin does.
+
+## The complete list
+
+The list is closed. Anything not on it is rejected at parse time, so there is no way to invent a scope.
+
+| Scope | Grants |
+| --- | --- |
+| `issues:read` | Read issues in the workspace the caller can already see |
+| `issues:write` | Update an issue's title and description |
+| `comments:read` | List comments on an issue |
+| `comments:write` | Post a comment on an issue |
+| `tasks:read` | Subscribe to `task.*` events |
+| `tasks:write` | Reserved for task writes; no Action API endpoint uses it yet |
+| `agents:read` | Reserved for reading agents; no Action API endpoint uses it yet |
+| `members:read` | Reserved for reading members; no Action API endpoint uses it yet |
+| `storage:user` | Read and write per-member plugin storage |
+| `storage:workspace` | Read and write workspace-shared plugin storage |
+| `net:<domain>` | Reach exactly this host — both from a surface and as a hook destination |
+
+<Callout type="info">
+Declaring a scope no endpoint consumes yet is not useful and costs you consent-screen surface area. Ask for what you use today.
+</Callout>
+
+## `net:` is the whole answer for where data goes
+
+`net:` is the only parameterized scope, and it does two jobs from one string:
+
+1. It becomes the surface's CSP `connect-src`. A surface with no `net:` scope gets `connect-src 'none'` and literally cannot send data anywhere.
+2. It is the allowlist for hook destinations. A hook whose `transport.url` host is not covered fails manifest validation, and the check runs again at dial time.
+
+It is an **exact host match**, never a suffix:
+
+```json
+"scopes": ["net:example.com", "net:api.example.com"]
+```
+
+`net:example.com` alone does not cover `api.example.com`. This is deliberate — the consent screen renders one line per scope ("send data to example.com"), and a suffix match would make one string mean two different things in two places.
+
+Domain syntax: lowercase labels, at least two of them, max 253 characters. No scheme, no port, no path.
+
+<Callout type="warn">
+`net:` bounds **third-party** destinations, not exfiltration in general. Your surface's own script is loaded from your origin, so a script served by its author can always reach its author back. Closing that would mean Multica re-hosting third-party code, which this design deliberately does not do. Judge a plugin by whether you trust its author, not by whether its CSP is airtight.
+</Callout>
+
+## Events imply read scopes
+
+A hook that subscribes to an event receives content the Action API would have required a scope to pull. So the manifest must hold the matching read scope, checked at parse time:
+
+| Event | Requires |
+| --- | --- |
+| `issue.created`, `issue.updated`, `issue.status_changed` | `issues:read` |
+| `comment.created` | `comments:read` |
+| `task.started`, `task.completed`, `task.failed` | `tasks:read` |
+
+The point is the consent screen: an admin approving a subscription sees the read scope the subscription actually implies, rather than one dataset held to two different standards.
+
+## What the admin sees
+
+Installation is two steps, and nothing is written by the first one.
+
+**Preview** fetches and parses the manifest and returns:
+
+- the parsed manifest, including every contribution
+- the full scope list
+- the config schema that will be rendered as a form
+- whether this plugin is already installed, at what version, and **which scopes are newly requested**
+
+**Install** creates the installation and must consent to exactly the manifest's scope list. Two things are refused:
+
+- consenting to fewer scopes than the manifest requests — partial consent leaves a plugin silently broken
+- consenting to a scope the manifest does not request — that grants access nobody was shown a reason for
+
+## Upgrades and new scopes
+
+Installing a manifest whose `key` matches an existing installation is an upgrade. The preview response lists `added_scopes` so the consent screen can highlight what is new since the version currently installed.
+
+Practical consequences for a plugin author:
+
+- **Adding a scope requires a human to re-consent.** Plan releases so a scope addition is deliberate, and say in your changelog what it is for.
+- **Removing a config field prunes its stored value**, including a secret, in the same transaction as the snapshot update. A field that changed type away from `secret` also has its stored secret pruned.
+- **The stored snapshot is what runs.** Repointing a hook URL in the file you serve has no effect until a reinstall.
+
+## Two ceilings, always
+
+A granted scope is a ceiling, not a grant of access to specific data. Every Action API call is also bounded by what the calling user can already do:
+
+- A member who cannot see an issue gets `404` through your surface too.
+- A scope the admin declined is `403` naming the scope.
+- A disabled installation is `403` on every call, immediately, including from a frame left open in a stale tab.
+
+So `issues:read` does not mean "read every issue in the workspace" — it means "you may read issues, up to whatever the person in front of you could read anyway."
+
+## Designing a scope list
+
+- Start from the actions your plugin performs, not from what it might want later.
+- Prefer `storage:user` over `storage:workspace` when the state is one person's. A workspace-shared bucket is visible to every member's session.
+- If your surface never calls a third-party host, declare no `net:` scope at all. `connect-src 'none'` is a strong, legible claim on the consent screen.
+- If you need a subdomain, declare it. Do not ask for the parent domain hoping it covers more.

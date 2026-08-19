@@ -1,0 +1,238 @@
+---
+title: 参考
+description: 插件 SDK、Action API、bridge 协议、错误码和全部限额。
+---
+
+## SDK
+
+```bash
+npm install @multica/plugin-sdk
+```
+
+```js
+import multica, { MulticaPluginError } from "@multica/plugin-sdk";
+```
+
+零运行时依赖，并且刻意不依赖 Multica 自己的包——它是要交付给第三方的。默认导出和具名导出 `multica` 是同一个对象。
+
+### `multica.context`
+
+| 方法 | 返回 |
+| --- | --- |
+| `get(force = false)` | `Promise<PluginContext>`——首次调用后缓存，传 `true` 强制刷新 |
+
+```ts
+interface PluginContext {
+  workspace: { id: string; name: string; slug: string };
+  user: { id: string; name: string };
+  issue?: { id: string; identifier: string; title: string };
+  config: Record<string, unknown>;   // 非 secret 的安装配置
+  granted_net_domains: string[];     // 由 net: scope 授予的域名
+}
+```
+
+服务端还会返回 `actor`，取值为 `"member"` 或 `"plugin"`；插件身份时 `user` 不存在。该接口不需要任何 scope。
+
+### `multica.issue`
+
+所有方法默认作用于 surface 所挂载的任务。如果 surface 不在任务上又没有显式传 id，调用会以 `400` 拒绝。
+
+| 方法 | Scope | 返回 |
+| --- | --- | --- |
+| `get(issueId?)` | `issues:read` | `Promise<Issue>` |
+| `update(patch, issueId?)` | `issues:write` | `Promise<Issue>`——`patch` 接受 `title` 和 `description` |
+| `comments(issueId?)` | `comments:read` | `Promise<Comment[]>`——最新 200 条，按时间正序 |
+| `comment({ body, parentId? }, issueId?)` | `comments:write` | `Promise<Comment>` |
+
+```ts
+interface Issue {
+  id: string; identifier: string; title: string;
+  description?: string | null; status: string; priority: string;
+}
+
+interface Comment {
+  id: string; author_type: string; author_id: string;
+  content: string; type: string; parent_id?: string; created_at: string;
+}
+```
+
+### `multica.storage`
+
+`multica.storage.workspace` 和 `multica.storage.user` 提供相同的四个方法。
+
+| 方法 | 返回 |
+| --- | --- |
+| `list()` | `Promise<StorageKey[]>`——`{ key, size_bytes, updated_at }` |
+| `get(key)` | `Promise<string \| null>`——不存在时为 `null` |
+| `set(key, value)` | `Promise<void>` |
+| `delete(key)` | `Promise<void>` |
+
+### `multica.hooks`
+
+| 方法 | 返回 |
+| --- | --- |
+| `invoke(hookKey, input?)` | `Promise<HookResult>` |
+
+```ts
+interface HookResult {
+  status: string;      // "ok" | "failed" | "timeout" | "refused"
+  output?: unknown;    // 你的接口返回的 JSON
+  error?: string;
+  latency_ms: number;
+  hook_key: string;
+  trigger: string;     // 从 surface 调用时始终是 "ui"
+  attempts: number;
+}
+```
+
+宿主会拒绝任何本插件 manifest 未以 `ui` 触发方式声明的 hook，surface 也无法访问其他插件的 hook。
+
+### `multica.ui`
+
+| 方法 | 说明 |
+| --- | --- |
+| `resize(height)` | CSS 像素，夹在 `0…4000`。发出即忘。 |
+| `onThemeChange(listener)` | 返回取消订阅函数。已有 token 到达时会立即以当前值触发一次。 |
+
+### `MulticaPluginError`
+
+```ts
+class MulticaPluginError extends Error {
+  readonly status: number;   // 对应 HTTP 状态码
+}
+```
+
+SDK 自身的请求超时是 15 秒，以状态码 `408` 呈现。
+
+## Action API
+
+基础路径 `/api/v1/plugin`。有两类调用方，区别只在于这次调用**以谁的身份**发生：
+
+- **surface**，不持任何凭证——宿主页面用当前登录用户的会话重新发起调用，并在 `X-Multica-Plugin-Installation` 头里标明是哪个安装。
+- **hook handler**，带 `Authorization: Bearer <token>`——callback token（`mpc_…`）或安装 token（`mpi_…`）。
+
+工作区始终来自安装记录，绝不取自客户端。
+
+| 方法 | 路径 | Scope | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/context` | — | 支持 `?issue_id=` |
+| `GET` | `/issues/{id}` | `issues:read` | `id` 可以是 UUID，也可以是 `MUL-42` 这样的标识 |
+| `PATCH` | `/issues/{id}` | `issues:write` | 仅 `title` 与 `description` |
+| `GET` | `/issues/{id}/comments` | `comments:read` | 最新 200 条，按时间正序 |
+| `POST` | `/issues/{id}/comments` | `comments:write` | `content` 必填，最长 64 KiB；可选 `parent_id` |
+| `GET` | `/storage/{scope}` | `storage:{scope}` | `scope` 为 `workspace` 或 `user` |
+| `GET` | `/storage/{scope}/{key}` | `storage:{scope}` | 不存在时 `404` |
+| `PUT` | `/storage/{scope}/{key}` | `storage:{scope}` | 请求体 `{ "value": "…" }`；返回 `204` |
+| `DELETE` | `/storage/{scope}/{key}` | `storage:{scope}` | 返回 `204` |
+| `POST` | `/hooks/{key}` | — | `trigger` 只能是 `ui` 或 `manual`；要求成员身份 |
+
+### 为什么 `PATCH` 只支持标题和描述
+
+状态、优先级、负责人、父任务、项目、阶段各自带有派发、目录或层级语义——状态变更可能启动一次智能体运行，自定义状态要经过按工作区维护的目录解析。在这里重复这些规则，等于给插件一份会逐渐走样的副本。以后再放开是增量的；现在把副作用做错则不是。
+
+### 通过插件发表评论会发生什么
+
+通过这个接口创建的评论，作者是**该用户**，并标记产生它的插件，因此时间线可以渲染成"Jiayuan（通过 Hello Panel）"。当调用方是插件自身时——`event` hook 回调或安装 token——评论作者是该安装。
+
+它刻意**不会**触发 `@mention` 派发。能发 mention 的插件就能启动智能体运行、消耗工作区预算，而用户点那个按钮本来是为了别的事。
+
+### surface 可以访问哪些路径
+
+宿主 bridge 在任何请求到达 `fetch` 之前先做路径白名单：
+
+```
+/context
+/issues/{id}
+/issues/{id}/comments
+/storage/(workspace|user)
+/storage/(workspace|user)/{key}
+/hooks/{key}
+```
+
+## 管理 API
+
+面向 `admin`，由 **设置 → Plugins** 使用。列在这里是因为插件作者需要照着它写安装说明。全部按工作区限定，位于 `/api/workspaces/{id}` 下。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/plugins` | 列出安装 |
+| `POST` | `/plugins/preview` | 第一步：解析 manifest、展示 scope，不写入任何数据 |
+| `POST` | `/plugins` | 第二步：安装，授予与 manifest 完全一致的 scope |
+| `PUT` | `/plugins/{installationId}/config` | 保存配置 |
+| `POST` | `/plugins/{installationId}/enable` | 启用 |
+| `POST` | `/plugins/{installationId}/disable` | 停用，保留存储与 secret |
+| `DELETE` | `/plugins/{installationId}` | 卸载并删除插件拥有的数据 |
+| `POST` | `/plugins/{installationId}/token` | 签发或轮换安装 token，**只此一次**返回 token 和签名密钥 |
+| `DELETE` | `/plugins/{installationId}/token` | 吊销安装 token |
+| `GET` | `/plugins/{installationId}/invocations` | 最近的 hook 调用记录，最新 100 条 |
+| `GET` | `/plugins/{installationId}/mcp/{hookKey}/tools` | 探测 mcp hook 的工具 |
+| `PUT` | `/plugins/{installationId}/mcp/{hookKey}/tools` | 批准并固定工具列表 |
+
+## bridge 协议
+
+由 SDK 实现。写在这里是因为不论握手错过还是版本不匹配，看起来都只是一个空白面板。
+
+| 常量 | 取值 |
+| --- | --- |
+| 协议版本 | `1` |
+| 访客 → 宿主 | `multica:plugin-surface-ready`，每 120 毫秒重发，最多 50 次 |
+| 宿主 → 访客 | `multica:plugin-bridge-init`，携带一个 `MessagePort` 和主题 token |
+
+```ts
+type BridgeRequest =
+  | { id: string; kind: "action"; method: "GET"|"POST"|"PATCH"|"PUT"|"DELETE"; path: string; body?: unknown }
+  | { id: string; kind: "ui.resize"; height: number };
+
+type BridgeResponse =
+  | { id: string; ok: true;  status: number; data: unknown }
+  | { id: string; ok: false; status: number; error: string };
+
+type BridgeEvent = { kind: "theme"; theme: Record<string, string> };
+```
+
+握手从访客端发起，因为 `srcdoc` iframe 可能在外层挂上监听器之前就执行完了。身份由 port 绑定而不是 `event.origin`——沙箱 iframe 的源是 `"null"`。SDK 只接受来自 `window.parent` 的 port，且只接受第一个。
+
+## 错误码
+
+| 状态码 | 类别 | 常见原因 |
+| --- | --- | --- |
+| `400` | invalid | 请求体不合法、存储范围未知、bridge 不支持的路径 |
+| `403` | forbidden | scope 未授予、安装被停用、接口要求成员身份、token 无效或过期 |
+| `404` | not_found | 任务或存储键不存在，或该用户看不到它 |
+| `409` | conflict | 已安装、授予的 scope 与 manifest 不一致、skill 重名 |
+| `422` | incompatible | manifest 声明了当前版本无法运行的贡献 |
+| `503` | — | 该部署未启用插件管理 |
+| `507` | quota | 超出存储限额或 hook 频率限制 |
+| `502` | unavailable | manifest 抓取失败、hook 接口失败、secret 未配置 |
+
+## 全部限额
+
+| 项目 | 取值 |
+| --- | --- |
+| manifest 大小 | 1 MiB |
+| 每份 manifest 的贡献数 | 64 |
+| 每份 manifest 的 scope 数 | 64 |
+| 配置项数量 | 32 |
+| `name` / `label` / 枚举选项 | 160 字节 |
+| `description`（插件、hook） | 2000 字节 |
+| 配置项 description | 500 字节 |
+| `version` | 64 字节，语义化版本号 |
+| 配置 `string` 值 | 4096 字节 |
+| 配置 `secret` 值 | 8192 字节 |
+| `SKILL.md` | 256 KiB |
+| 评论 | 64 KiB |
+| 单次读取评论数 | 200 |
+| 存储键 | 1024 字节 |
+| 存储值 | 100 KiB |
+| 每个范围的键数 | 1000 |
+| 每个范围的字节数 | 5 MiB |
+| hook 超时 | 100–30000 毫秒，默认 10000 |
+| hook 响应体 | 1 MiB |
+| hook 频率限制 | 每个 hook 每分钟 120 次 |
+| hook 事件重试 | 共 3 次，退避 2 秒与 4 秒 |
+| 熔断器 | 5 分钟内失败 5 次 |
+| 签名时间容差 | 5 分钟 |
+| callback token 有效期 | 5 分钟 |
+| 调用记录保留 | 7 天 |
+| surface 高度 | 0–4000 像素 |
+| SDK 请求超时 | 15 秒 |

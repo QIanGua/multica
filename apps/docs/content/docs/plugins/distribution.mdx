@@ -1,0 +1,139 @@
+---
+title: Distribution and local development
+description: How to host a plugin, ship a new version, iterate locally, and what a self-hosted deployment needs to configure.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+There is no registry, no review queue, and no upload. A plugin is distributed by publishing a URL, and installed by an admin pasting it into **Settings → Plugins**.
+
+## Hosting
+
+Serve the manifest and everything it references from the same directory:
+
+```
+https://plugins.example.com/deploy-sentinel/multica.plugin.json
+https://plugins.example.com/deploy-sentinel/ui/main.js
+https://plugins.example.com/deploy-sentinel/skills/incident-response/SKILL.md
+```
+
+Requirements:
+
+- **Public HTTPS.** The manifest is fetched server-side through the same guard used for remote MCP endpoints: plain HTTPS, no userinfo, no query, no fragment, and private or metadata address ranges are refused. The dialer re-resolves at connection time, so a DNS rebind between validation and fetch cannot reach an internal host.
+- **`200` with the JSON body.** Any other status fails the install with the code in the message.
+- **Same origin for resources.** `entry` paths resolve relative to the manifest URL. A resource cannot name an arbitrary address — that would hand the install path a second, unreviewed fetch target.
+
+Surface entries are loaded by the browser with a `<script src>`, so no CORS headers are needed. If your surface calls *your own* backend with `fetch`, that backend must accept `Origin: null` — a sandboxed frame has an opaque origin.
+
+Any static host works: object storage behind a CDN, GitHub Pages, a release artifact, your own server.
+
+## Versioning and upgrades
+
+Installing a manifest whose `key` matches an existing installation is an upgrade, not a second install. What that means in practice:
+
+- **The stored snapshot is what runs.** Changing the file you serve has no effect on existing installations until somebody reinstalls the URL.
+- **Surface code and hook behaviour are outside the snapshot.** Deploying new `ui/main.js` or a new endpoint takes effect immediately, for everyone.
+- **The upgrade re-runs consent** and highlights newly requested scopes.
+- **Dropped config fields are pruned**, including secrets, in the same transaction as the snapshot.
+- **Skill resources are re-fetched**, so a changed `SKILL.md` lands and a removed one is deleted.
+
+This split is a design tool. Fixing a bug in your panel or your endpoint is a deploy; changing what your plugin is *allowed* to do is a version bump plus a human decision. Bump `version` on every published change anyway — it is what an admin compares against.
+
+Two stable URLs work well: a pinned one (`/deploy-sentinel/1.2.0/multica.plugin.json`) for workspaces that want to choose, and a moving one (`/deploy-sentinel/latest/...`) for those that do not.
+
+<Callout type="warn">
+Never repoint an existing published manifest at a different `transport.url` host without also announcing it. The URL only takes effect after a reinstall, and the reinstall is the moment the admin sees where their data now goes.
+</Callout>
+
+## Local development
+
+Three operator settings make an unpublished plugin installable. They relax where the network guard applies; none of them widens what an admin approved.
+
+### `MULTICA_PLUGIN_DIR` — install from disk
+
+Point it at a directory of plugin folders, each containing a `multica.plugin.json`, then install with the source `local:<folder-name>`:
+
+```bash
+export MULTICA_PLUGIN_DIR=/srv/multica-plugins
+# folder /srv/multica-plugins/deploy-sentinel  →  install "local:deploy-sentinel"
+```
+
+Skill resources are read from disk too. The name must be a single directory name — no separators, no leading dot — and paths are re-checked after joining so a resource cannot escape its own folder.
+
+<Callout type="info">
+A `local:` install **cannot render a surface**. There is no URL a browser could fetch the entry script from, and the panel says so rather than showing an empty frame. Use `local:` to iterate on the manifest, the consent screen, config, hooks, and skills; serve over HTTPS (loopback is fine) to work on UI.
+</Callout>
+
+### `MULTICA_PLUGIN_DEV_ORIGINS` — allow a local server
+
+A comma-separated list of bare origins that skip the public-address guard, both for fetching a manifest and for dialling a hook:
+
+```bash
+export MULTICA_PLUGIN_DEV_ORIGINS=https://127.0.0.1:8788,https://127.0.0.1:8789
+```
+
+Entries must be bare origins — a path or query is dropped rather than half-honoured. The `net:` check still runs, so declare a matching scope such as `net:127.0.0.1`. (A single-label host like `localhost` is not a valid `net:` domain; use the loopback address.)
+
+### `MULTICA_PLUGIN_DEV_CA` — trust a development certificate
+
+Hook transport URLs must be HTTPS, so a local handler needs a certificate. Supply a CA file and it is trusted **only** for the origins already in `MULTICA_PLUGIN_DEV_ORIGINS`:
+
+```bash
+export MULTICA_PLUGIN_DEV_CA=/path/to/dev-ca.pem
+```
+
+Certificate verification is never disabled, and redirects are still refused. Generate a certificate with:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout dev-key.pem -out dev-cert.pem \
+  -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+```
+
+### A working loop
+
+1. `MULTICA_PLUGIN_DIR` pointed at your plugins directory; install `local:my-plugin` and iterate on the manifest, config form, and consent screen.
+2. Serve the same directory from a local static server over `http://localhost:PORT` and install by URL when you start working on the surface — loopback HTTP is accepted for a surface entry.
+3. Add `MULTICA_PLUGIN_DEV_ORIGINS` and `MULTICA_PLUGIN_DEV_CA` when you start working on hooks, and run your handler over HTTPS.
+4. Rotate the plugin token to get the signing secret, and export it into your handler.
+
+## Self-hosting settings
+
+| Variable | Effect if unset |
+| --- | --- |
+| `MULTICA_PLUGIN_SECRET_KEY` | `secret` config fields cannot be saved — the write fails closed rather than storing plaintext. **Hook signing is also unavailable**, so hooks cannot be called at all. Generate with `openssl rand -base64 32`. |
+| `MULTICA_PUBLIC_URL` | Hook requests carry no `callback_url`, so handlers cannot call back. |
+| `MULTICA_PLUGIN_DIR` | Only public HTTPS manifest URLs are accepted. |
+| `MULTICA_PLUGIN_DEV_ORIGINS` | Every manifest fetch and hook call goes through the public-address guard. |
+| `MULTICA_PLUGIN_DEV_CA` | No additional CA is trusted. |
+
+Plugin management is also behind the `plugins_v1` feature flag, off by default. With it off, the management and Action APIs answer `503` and no event hooks are dispatched — flipping it off stops outbound calls immediately, not at the next restart.
+
+## Before you publish
+
+- Install the manifest into a scratch workspace from its real public URL, not from `local:`.
+- Read your own consent screen. Every scope should be justifiable from the description alone.
+- Confirm the surface renders on both web and desktop if you declared both platforms.
+- Trigger each hook from each declared trigger, and check the invocation log shows `ok`.
+- Verify your handler rejects an unsigned request, a stale timestamp, and a replayed body.
+- Disable the installation and confirm your surface fails visibly rather than silently.
+- Uninstall and confirm nothing of yours is left behind that you expected to survive.
+- Write a README that says what the plugin does, which scopes it needs and why, what an admin must configure, and — if you use secret fields — that the deployment needs `MULTICA_PLUGIN_SECRET_KEY`.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+| --- | --- |
+| **Settings → Plugins** is missing | `plugins_v1` is off for this deployment |
+| Install fails with `422` | The manifest declares a contribution this build cannot run — `sidebar_panel` is the usual one |
+| Install fails naming a `net:` scope | A hook's transport host is not covered exactly; subdomains need their own scope |
+| Install fails on an unknown field | A typo in the manifest. Unknown fields are rejected, including inside `config` |
+| Panel is blank | The entry URL is unreachable, is not HTTPS (or loopback), or the install came from `local:` |
+| Panel renders but every call fails with `403` | The installation is disabled, or the scope was not granted |
+| Panel is clipped | Nothing called `multica.ui.resize()` after the content settled |
+| `fetch` from a surface is blocked | The host is not covered by a `net:` scope; check `connect-src` in the console |
+| Hook is never called | The trigger is not declared, the installation is disabled, or the circuit breaker is open after repeated failures |
+| Hook returns `refused` | The call never left Multica: scope, rate limit, or disabled installation — not your endpoint |
+| Signature never verifies | The body was re-serialized before verifying, or the `whsec_` prefix was not stripped before hex-decoding |
+| Callback returns `403` | The token expired (5 minutes), the invocation already finished, or the member lost access |
+| Callback returns `404` on another issue | Callback grants are narrowed to the issue the invocation was about |
