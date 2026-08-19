@@ -119,6 +119,20 @@ type zeroDeleteCommentDB struct {
 	delegate db.DBTX
 }
 
+type deleteCommentResultRow struct {
+	changed bool
+	err     error
+}
+
+func (r deleteCommentResultRow) Scan(dest ...interface{}) error {
+	if r.err != nil {
+		return r.err
+	}
+	*(dest[0].(*bool)) = r.changed
+	*(dest[1].(*int64)) = 0
+	return nil
+}
+
 func (f *failDeleteCommentDB) Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
 	if strings.Contains(query, "-- name: DeleteComment") {
 		return pgconn.CommandTag{}, errors.New("injected comment deletion failure")
@@ -131,6 +145,9 @@ func (f *failDeleteCommentDB) Query(ctx context.Context, query string, args ...i
 }
 
 func (f *failDeleteCommentDB) QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row {
+	if strings.Contains(query, "-- name: DeleteComment") {
+		return deleteCommentResultRow{err: errors.New("injected comment deletion failure")}
+	}
 	return f.delegate.QueryRow(ctx, query, args...)
 }
 
@@ -146,6 +163,9 @@ func (z *zeroDeleteCommentDB) Query(ctx context.Context, query string, args ...i
 }
 
 func (z *zeroDeleteCommentDB) QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row {
+	if strings.Contains(query, "-- name: DeleteComment") {
+		return deleteCommentResultRow{changed: false}
+	}
 	return z.delegate.QueryRow(ctx, query, args...)
 }
 

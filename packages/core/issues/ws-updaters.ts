@@ -6,6 +6,7 @@ import { projectKeys } from "../projects/queries";
 import {
   applyIssueChange,
   invalidateIssueDerivatives,
+  invalidateLastActivitySortedIssueLists,
   invalidateStaleListKeys,
   invalidateUpdatedAtSortedIssueLists,
   type IssueFlatCache,
@@ -293,25 +294,22 @@ function refetchForUnversionedIssueEvent(
   return true;
 }
 
-function invalidateStaleIssueOwnerProjections(
+function invalidateIssueOwnerProjectionsWhere(
   qc: QueryClient,
   wsId: string,
   issueId: string,
-  revision: number,
+  shouldInvalidate: (issue: Issue | undefined) => boolean,
 ) {
-  const isStale = (issue: Issue | undefined) =>
-    issue !== undefined &&
-    (issue.revision === undefined || issue.revision < revision);
   const invalidateExact = (queryKey: readonly unknown[]) => {
     qc.invalidateQueries({ queryKey, exact: true });
   };
 
   const detailKey = issueKeys.detail(wsId, issueId);
-  if (isStale(qc.getQueryData<Issue>(detailKey))) invalidateExact(detailKey);
+  if (shouldInvalidate(qc.getQueryData<Issue>(detailKey))) invalidateExact(detailKey);
 
   for (const prefix of [issueKeys.list(wsId), issueKeys.myAll(wsId)]) {
     for (const [key, data] of qc.getQueriesData<ListIssuesCache>({ queryKey: prefix })) {
-      if (isStale(data ? findIssueLocation(data, issueId)?.issue : undefined)) {
+      if (shouldInvalidate(data ? findIssueLocation(data, issueId)?.issue : undefined)) {
         invalidateExact(key);
       }
     }
@@ -319,24 +317,56 @@ function invalidateStaleIssueOwnerProjections(
   for (const [key, data] of qc.getQueriesData<IssueFlatCache>({
     queryKey: issueKeys.flatAll(wsId),
   })) {
-    if (data?.pages.some((page) => isStale(page.issues.find((issue) => issue.id === issueId)))) {
+    if (data?.pages.some((page) => shouldInvalidate(page.issues.find((issue) => issue.id === issueId)))) {
       invalidateExact(key);
     }
   }
   for (const [key, data] of qc.getQueriesData<IssueTableRowsResponse>({
     queryKey: issueKeys.tableAll(wsId),
   })) {
-    if (data?.rows.some((row) => row.issue.id === issueId && isStale(row.issue))) {
+    if (data?.rows.some((row) => row.issue.id === issueId && shouldInvalidate(row.issue))) {
       invalidateExact(key);
     }
   }
   for (const prefix of [issueKeys.childrenAll(wsId), issueKeys.projectGanttAll(wsId)]) {
     for (const [key, data] of qc.getQueriesData<Issue[]>({ queryKey: prefix })) {
-      if (data?.some((issue) => issue.id === issueId && isStale(issue))) {
+      if (data?.some((issue) => issue.id === issueId && shouldInvalidate(issue))) {
         invalidateExact(key);
       }
     }
   }
+}
+
+function invalidateStaleIssueOwnerProjections(
+  qc: QueryClient,
+  wsId: string,
+  issueId: string,
+  revision: number,
+) {
+  invalidateIssueOwnerProjectionsWhere(
+    qc,
+    wsId,
+    issueId,
+    (issue) =>
+      issue !== undefined &&
+      (issue.revision === undefined || issue.revision < revision),
+  );
+}
+
+/** Fallback for successful auxiliary mutations whose HTTP response cannot
+ * carry an owner revision (notably 204 comment deletion). Only loaded
+ * projections containing the owner are invalidated. */
+export function invalidateIssueOwnerProjections(
+  qc: QueryClient,
+  wsId: string,
+  issueId: string,
+) {
+  invalidateIssueOwnerProjectionsWhere(
+    qc,
+    wsId,
+    issueId,
+    (issue) => issue !== undefined,
+  );
 }
 
 /**
@@ -557,6 +587,7 @@ export function onIssueLabelsChanged(
   }
   patchIssueLabels(qc, wsId, issueId, labels, revision);
   invalidateIssueLabelDerivatives(qc, wsId);
+  invalidateLastActivitySortedIssueLists(qc, wsId);
 }
 
 /** Deterministic label snapshot patch used by optimistic mutation legs. */
@@ -650,6 +681,7 @@ export function onIssueMetadataChanged(
   }
   patchIssueSnapshot(qc, wsId, issueId, { metadata }, revision);
   onIssueAuxiliaryRevision(qc, wsId, issueId, revision, "metadata");
+  invalidateLastActivitySortedIssueLists(qc, wsId);
   qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });
   // A metadata write bumps issue.updated_at server-side (SetIssueMetadataKey /
   // DeleteIssueMetadataKey), but the patches above keep each card's slot, so a
@@ -676,6 +708,7 @@ export function onIssuePropertiesChanged(
 ) {
   if (refetchForUnversionedIssueEvent(qc, wsId, issueId, revision)) return;
   patchIssueProperties(qc, wsId, issueId, properties, revision);
+  invalidateLastActivitySortedIssueLists(qc, wsId);
   // Per-parent rows are patched for immediate UI feedback, then all children
   // projections are marked stale so older fetches cannot win after commit.
   qc.invalidateQueries({ queryKey: issueKeys.childrenAll(wsId) });

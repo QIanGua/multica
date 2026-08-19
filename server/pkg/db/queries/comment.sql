@@ -483,38 +483,66 @@ ORDER BY created_at ASC, id ASC
 LIMIT 1;
 
 -- name: UpdateComment :one
-WITH target AS (
-    SELECT issue_id, workspace_id
-    FROM comment
+WITH locked_issue AS MATERIALIZED (
+    -- Keep the global issue -> child lock order used by issue teardown. The
+    -- aggregate below still yields one row when the parent was concurrently
+    -- deleted, preserving best-effort edits of an orphaned comment.
+    SELECT issue.id
+    FROM issue
+    JOIN comment ON comment.issue_id = issue.id
+                AND comment.workspace_id = issue.workspace_id
     WHERE comment.id = $1
+    FOR UPDATE OF issue
+), issue_fence AS MATERIALIZED (
+    SELECT count(*) AS locked_count FROM locked_issue
+), target AS MATERIALIZED (
+    SELECT comment.*,
+           ROW(comment.content, comment.source_task_id) IS DISTINCT FROM
+               ROW($2, sqlc.narg(source_task_id)::uuid) AS did_change
+    FROM comment
+    CROSS JOIN issue_fence
+    WHERE comment.id = $1
+      AND issue_fence.locked_count >= 0
       AND (sqlc.narg('expected_revision')::bigint IS NULL OR revision = sqlc.narg('expected_revision')::bigint)
       AND (
         sqlc.narg('content_base')::text IS NULL
         OR content IS NOT DISTINCT FROM sqlc.narg('content_base')::text
         OR content IS NOT DISTINCT FROM $2
       )
-      AND (comment.content IS DISTINCT FROM $2 OR comment.source_task_id IS DISTINCT FROM sqlc.narg(source_task_id))
+    FOR UPDATE OF comment
+), updated_comment AS (
+    UPDATE comment SET
+        content = $2,
+        source_task_id = sqlc.narg(source_task_id)::uuid,
+        revision = comment.revision + CASE WHEN target.did_change THEN 1 ELSE 0 END,
+        updated_at = CASE WHEN target.did_change THEN now() ELSE comment.updated_at END
+    FROM target
+    WHERE comment.id = target.id
+    RETURNING comment.id, comment.issue_id, comment.author_type, comment.author_id,
+              comment.content, comment.type, comment.created_at, comment.updated_at,
+              comment.parent_id, comment.workspace_id, comment.resolved_at,
+              comment.resolved_by_type, comment.resolved_by_id, comment.source_task_id,
+              comment.quick_action_id, comment.via_plugin_id, comment.revision,
+              target.did_change
 ), touched_issue AS (
     UPDATE issue
-    SET revision = revision + 1,
-        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
-    FROM target
-    WHERE issue.id = target.issue_id AND issue.workspace_id = target.workspace_id
-    RETURNING issue.id
+    SET revision = issue.revision + 1,
+        last_activity_at = GREATEST(COALESCE(issue.last_activity_at, issue.updated_at), now())
+    FROM updated_comment
+    WHERE updated_comment.did_change
+      AND issue.id = updated_comment.issue_id
+      AND issue.workspace_id = updated_comment.workspace_id
+    RETURNING issue.id, issue.revision
 )
-UPDATE comment SET
-    content = $2,
-    source_task_id = sqlc.narg(source_task_id),
-    revision = revision + CASE WHEN ROW(content, source_task_id) IS DISTINCT FROM ROW($2, sqlc.narg(source_task_id)) THEN 1 ELSE 0 END,
-    updated_at = CASE WHEN ROW(content, source_task_id) IS DISTINCT FROM ROW($2, sqlc.narg(source_task_id)) THEN now() ELSE updated_at END
-WHERE comment.id = $1
-  AND (sqlc.narg('expected_revision')::bigint IS NULL OR comment.revision = sqlc.narg('expected_revision')::bigint)
-  AND (
-    sqlc.narg('content_base')::text IS NULL
-    OR comment.content IS NOT DISTINCT FROM sqlc.narg('content_base')::text
-    OR comment.content IS NOT DISTINCT FROM $2
-  )
-RETURNING *;
+SELECT updated_comment.id, updated_comment.issue_id, updated_comment.author_type,
+       updated_comment.author_id, updated_comment.content, updated_comment.type,
+       updated_comment.created_at, updated_comment.updated_at, updated_comment.parent_id,
+       updated_comment.workspace_id, updated_comment.resolved_at,
+       updated_comment.resolved_by_type, updated_comment.resolved_by_id,
+       updated_comment.source_task_id, updated_comment.quick_action_id,
+       updated_comment.via_plugin_id, updated_comment.revision,
+       COALESCE((SELECT revision FROM touched_issue), 0)::bigint AS issue_revision
+FROM updated_comment;
 
 -- name: BumpCommentRevision :one
 UPDATE comment
@@ -540,22 +568,36 @@ SELECT EXISTS (
 SELECT count(*) > 0 AS has_replied FROM comment
 WHERE parent_id = @parent_id AND author_type = 'agent' AND author_id = @agent_id;
 
--- name: DeleteComment :execrows
+-- name: DeleteComment :one
 -- Defense-in-depth: workspace_id is a SQL-layer tenant guard. See DeleteIssue.
-WITH target AS (
-    SELECT issue_id, workspace_id
-    FROM comment
+WITH locked_issue AS MATERIALIZED (
+    -- Lock the aggregate owner before its child so this cannot deadlock with
+    -- issue teardown (which takes the same issue -> comment order).
+    SELECT issue.id
+    FROM issue
+    JOIN comment ON comment.issue_id = issue.id
+                AND comment.workspace_id = issue.workspace_id
     WHERE comment.id = $1 AND comment.workspace_id = $2
+    FOR UPDATE OF issue
+), issue_fence AS MATERIALIZED (
+    SELECT count(*) AS locked_count FROM locked_issue
+), deleted_comment AS (
+    DELETE FROM comment
+    USING issue_fence
+    WHERE comment.id = $1 AND comment.workspace_id = $2
+      AND issue_fence.locked_count >= 0
+    RETURNING issue_id, workspace_id
 ), touched_issue AS (
     UPDATE issue
-    SET revision = revision + 1,
-        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
-    FROM target
-    WHERE issue.id = target.issue_id AND issue.workspace_id = target.workspace_id
-    RETURNING issue.id
+    SET revision = issue.revision + 1,
+        last_activity_at = GREATEST(COALESCE(issue.last_activity_at, issue.updated_at), now())
+    FROM deleted_comment
+    WHERE issue.id = deleted_comment.issue_id
+      AND issue.workspace_id = deleted_comment.workspace_id
+    RETURNING issue.id, issue.revision
 )
-DELETE FROM comment
-WHERE comment.id = $1 AND comment.workspace_id = $2;
+SELECT EXISTS(SELECT 1 FROM deleted_comment) AS changed,
+       COALESCE((SELECT revision FROM touched_issue), 0)::bigint AS issue_revision;
 
 -- name: ResolveComment :one
 -- Idempotent: re-resolving keeps the original resolved_at + resolver. Always
