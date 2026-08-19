@@ -85,9 +85,6 @@ Telegram regression covering binding, commands, task execution, issue origin,
 streamed quoted replies, reconnect behavior, UTF-16 content, long replies, and
 the text-only media response.
 
-The detailed evidence and channel capability comparison are maintained in
-`docs/telegram-channel-review-2026-08-08.md`.
-
 ## Deployment prerequisites
 
 - Set a 32-byte base64 `MULTICA_TELEGRAM_SECRET_KEY` in the server environment.
