@@ -3583,11 +3583,13 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateAssigneePair verifies the (assignee_type, assignee_id) pair refers
-// to an existing entity in the workspace. For agent assignees it also rejects
-// archived agents and runs the private-agent gate via canAccessPrivateAgent
-// — assigning an issue is a task-producing surface, so it must use the same
-// predicate as chat / @-mention / history. Agent callers (X-Agent-ID) bypass
-// the gate so A2A flows can still hand work off to private agents.
+// to an existing entity in the workspace. For agent and squad assignees it
+// also rejects archived targets and runs the INVOKE gate — canInvokeAgent, not
+// the softer canAccessPrivateAgent view gate: assigning an issue produces a
+// run, so it must clear the same predicate as chat / @-mention (MUL-3963).
+// That means owner-only for a private agent, with NO workspace-admin bypass
+// and NO unconditional agent-to-agent bypass — an agent caller (X-Agent-ID) is
+// judged by the top-of-chain human originator like everywhere else.
 //
 // Returns (statusCode, errorMessage). statusCode == 0 means the pair is valid;
 // callers should treat any non-zero status as a rejection and surface it back
@@ -3628,11 +3630,13 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 		actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
 		if !h.canInvokeAgent(ctx, agent, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID) {
 			// Names the missing permission, not the target's configuration: the
-			// old "private agent" wording both leaked the agent's permission
+			// old "private agent" wording both disclosed the agent's permission
 			// mode and was simply wrong for a `public_to` agent scoped to
-			// specific people. Stays as generic as ReasonInvocationNotAllowed
-			// (dispatch/reason.go), which deliberately does not distinguish
-			// "not permitted" from "does not exist" (MUL-6380 / GH #7180).
+			// specific people. This is NOT full enumeration-safety — the
+			// not-in-workspace branch above still answers 400 where this
+			// answers 403, so existence remains observable; the guarantee here
+			// is only that the reason no longer names the target's permission
+			// mode (MUL-6380 / GH #7180).
 			return http.StatusForbidden, "you do not have permission to assign work to this agent"
 		}
 		return 0, ""
