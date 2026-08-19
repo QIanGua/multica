@@ -268,6 +268,71 @@ describe("useRealtimeSync — task:message fanout guards (MUL-6396)", () => {
     release();
   });
 
+  it("drops a batch whose timeline was garbage-collected during the flush window", async () => {
+    // Production shape: app-wide staleTime Infinity, and a gcTime short enough
+    // to land inside the 100ms batching window. Writes do NOT postpone the GC
+    // timer (query-core arms it when the last observer leaves), so a run that
+    // keeps streaming after its transcript is closed reaches this every time.
+    qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: 50 } },
+    });
+    listTaskMessages.mockResolvedValue([msg(HELD_TASK, 1, { content: "history" })]);
+
+    const handler = mount();
+    const release = holdTimeline(HELD_TASK);
+    await vi.waitFor(() => expect(cached(qc, HELD_TASK)?.map((m) => m.seq)).toEqual([1]));
+
+    // Frame batched while the entry is still held, then the viewer closes.
+    handler(msg(HELD_TASK, 2, { content: "live" }));
+    release();
+
+    // GC lands first (50ms), flush second (100ms).
+    vi.advanceTimersByTime(60);
+    expect(qc.getQueryCache().find({ queryKey: chatKeys.taskMessages(HELD_TASK) })).toBeUndefined();
+    vi.advanceTimersByTime(60);
+
+    // Writing would have rebuilt the entry holding ONLY seq 2. Under
+    // staleTime: Infinity the next open would read that stub as fresh and
+    // never fetch, losing seq 1 until the window is reloaded.
+    expect(qc.getQueryCache().find({ queryKey: chatKeys.taskMessages(HELD_TASK) })).toBeUndefined();
+
+    // And the history is still recoverable: reopening fetches the full timeline.
+    listTaskMessages.mockClear();
+    const reopen = holdTimeline(HELD_TASK);
+    await vi.waitFor(() => expect(listTaskMessages).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(cached(qc, HELD_TASK)?.map((m) => m.seq)).toEqual([1]));
+    reopen();
+  });
+
+  it("does not backfill a timeline that was collected while the batch waited", async () => {
+    qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: 50 } },
+    });
+    const handler = mount();
+    const release = holdTimeline(HELD_TASK);
+    await vi.waitFor(() => expect(cached(qc, HELD_TASK)).toEqual([]));
+    listTaskMessages.mockClear();
+
+    handler(msg(HELD_TASK, 1, { input: { content: "clip" }, truncated: true }));
+    release();
+    vi.advanceTimersByTime(120);
+
+    // The batch was dropped, so its repair fetch must be dropped with it —
+    // otherwise the response would rebuild the very entry GC just removed.
+    expect(listTaskMessages).not.toHaveBeenCalled();
+    expect(qc.getQueryCache().find({ queryKey: chatKeys.taskMessages(HELD_TASK) })).toBeUndefined();
+  });
+
+  it("does not rebuild a collected timeline when a backfill response lands late", async () => {
+    // The same invariant on the async side: the entry can go away while the
+    // repair request is in flight.
+    listTaskMessages.mockResolvedValue([msg(HELD_TASK, 1)]);
+
+    await backfillTaskMessages(qc, HELD_TASK);
+
+    expect(qc.getQueryCache().find({ queryKey: chatKeys.taskMessages(HELD_TASK) })).toBeUndefined();
+  });
+
   it("does not refetch when nothing was truncated", () => {
     const handler = mount();
     const release = holdTimeline(HELD_TASK);

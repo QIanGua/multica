@@ -278,14 +278,22 @@ export function unionTaskMessagesBySeq(
 }
 
 /**
- * True when this client already holds (or is actively loading) the message
- * timeline for `taskId` — i.e. some mounted view is rendering it.
+ * True when this client holds a timeline cache entry for `taskId` — i.e. the
+ * task was opened at some point and has not been garbage-collected since.
+ *
+ * Deliberately NOT "a view is mounted right now". Observer count would be a
+ * tighter bound but an unsafe one: with `staleTime: Infinity` a task that
+ * briefly drops to zero observers (an unmount/remount while navigating) would
+ * discard frames, and the remount would read the surviving cache as fresh and
+ * never fetch them back. Entry presence has no such gap — either the entry is
+ * there and keeps accumulating, or it is gone and the next open fetches the
+ * whole timeline. The cost is a bounded tail: writes do not postpone the GC
+ * timer, so an entry outlives its last viewer by at most one `gcTime`.
  *
  * The realtime layer uses this to decide whether a `task:message` frame is
  * worth caching. Every client in the workspace receives every run's frames,
- * but only a handful of runs are ever on screen; without this gate the cache
- * accumulates the full transcript of runs the user will never open, for as
- * long as they keep streaming (MUL-6396).
+ * but only a handful of runs are ever opened; without this gate every client
+ * accumulates the transcript of runs its user will never look at (MUL-6396).
  *
  * Presence, not data: mounting a `useQuery` registers the entry before the
  * fetch resolves, so a frame that lands mid-backfill is still kept. Dropping
@@ -314,6 +322,10 @@ export async function backfillTaskMessages(
 ): Promise<void> {
   if (!isTaskMessageTaskId(taskId)) return;
   const msgs = await api.listTaskMessages(taskId);
+  // The entry can be collected while this request is open. Writing anyway
+  // would rebuild a timeline nothing is watching, re-arming another gcTime of
+  // accumulation for a task the user has already closed.
+  if (!isTaskMessageTimelineHeld(qc, taskId)) return;
   qc.setQueryData<TaskMessagePayload[]>(chatKeys.taskMessages(taskId), msgs);
 }
 

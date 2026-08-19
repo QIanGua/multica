@@ -1324,6 +1324,20 @@ export function useRealtimeSync(
       taskMessageFlushTimer = null;
 
       for (const [taskId, batch] of taskMessageBatches) {
+        // Re-check, because holding was last verified up to a window ago and
+        // `setQueryData` does NOT postpone garbage collection — query-core arms
+        // that timer when the last observer leaves and never again on write.
+        // Closing a transcript while its run keeps streaming therefore has the
+        // entry disappear mid-window, and writing then REBUILDS it holding only
+        // this batch. With the app-wide `staleTime: Infinity` the next open
+        // would read that stub as fresh and never fetch, so everything before
+        // it would be missing until the window is reloaded. Dropping the batch
+        // instead costs nothing: the rows are persisted, so the next open
+        // fetches the whole timeline.
+        if (!isTaskMessageTimelineHeld(qc, taskId)) {
+          truncatedTaskIds.delete(taskId);
+          continue;
+        }
         qc.setQueryData<TaskMessagePayload[]>(
           chatKeys.taskMessages(taskId),
           (old = []) => mergeTaskMessagesBySeq(old, batch),
