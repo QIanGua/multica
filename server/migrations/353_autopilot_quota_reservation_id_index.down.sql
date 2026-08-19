@@ -1,1 +1,1 @@
-DROP INDEX CONCURRENTLY IF EXISTS uq_autopilot_quota_reservation_id;
+DROP INDEX CONCURRENTLY IF EXISTS autopilot_quota_reservation_pkey_uidx;

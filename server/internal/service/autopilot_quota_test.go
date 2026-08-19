@@ -3,17 +3,79 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/entitlement/entitlementtest"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+type autopilotQuotaFixture struct {
+	pool          *pgxpool.Pool
+	queries       *db.Queries
+	service       *AutopilotService
+	stub          *entitlementtest.Stub
+	workspace     uuid.UUID
+	workspaceID   pgtype.UUID
+	autopilotID   pgtype.UUID
+	issueID       pgtype.UUID
+	periodStart   time.Time
+	periodEnd     time.Time
+	resetAt       time.Time
+	policyLimit   int
+	createRunArgs db.CreateAutopilotRunParams
+}
+
+func newAutopilotQuotaFixture(t *testing.T, action entitlement.Action, limit int) *autopilotQuotaFixture {
+	t.Helper()
+	pool := newResolveOriginatorPool(t)
+	q := db.New(pool)
+	workspaceIDString, publisherID, agentID, issueIDString := seedAttributionFixture(t, pool)
+	autopilotIDString, _ := seedRunOnlyAutopilot(t, pool, workspaceIDString, agentID, publisherID)
+	workspaceID := util.MustParseUUID(workspaceIDString)
+	workspace := uuid.UUID(workspaceID.Bytes)
+	periodStart := time.Now().UTC().Truncate(time.Second)
+	periodEnd := periodStart.Add(37 * time.Hour)
+	stub := entitlementtest.New()
+	fixture := &autopilotQuotaFixture{
+		pool: pool, queries: q, stub: stub, workspace: workspace,
+		workspaceID: workspaceID, autopilotID: util.MustParseUUID(autopilotIDString),
+		issueID:     util.MustParseUUID(issueIDString),
+		periodStart: periodStart, periodEnd: periodEnd, resetAt: periodEnd,
+		policyLimit: limit,
+		createRunArgs: db.CreateAutopilotRunParams{
+			AutopilotID: util.MustParseUUID(autopilotIDString), Source: "api", Status: "running",
+		},
+	}
+	fixture.service = &AutopilotService{
+		Queries: q, TxStarter: pool, Bus: events.New(), Entitlements: stub,
+	}
+	fixture.setPolicy(action, periodStart, periodEnd, limit)
+	t.Cleanup(func() {
+		pool.Exec(context.Background(), `DELETE FROM autopilot_quota_reservation WHERE workspace_id = $1`, workspaceID)
+		pool.Exec(context.Background(), `DELETE FROM autopilot_quota_period WHERE workspace_id = $1`, workspaceID)
+	})
+	return fixture
+}
+
+func (f *autopilotQuotaFixture) setPolicy(action entitlement.Action, start, end time.Time, limit int) {
+	f.stub.Set(f.workspace, entitlement.GateAutopilotRuns, entitlement.Decision{
+		Gate: entitlement.Gate{
+			Action: action, Limit: &limit,
+			PeriodStart: &start, PeriodEnd: &end, ResetAt: &end,
+		},
+		PolicyRevision: 7, SubscriptionVersion: 11,
+	})
+}
 
 func TestAutopilotQuotaDisabledDoesNotReadQuotaTables(t *testing.T) {
 	ctx := context.Background()
@@ -98,23 +160,327 @@ func TestAutopilotQuotaEnforcesBoundaryAndFinalizesIdempotently(t *testing.T) {
 	if err != nil || usage.Used == nil || usage.Reserved == nil || *usage.Used != 0 || *usage.Reserved != int64(limit) {
 		t.Fatalf("reserved usage = %+v, %v", usage, err)
 	}
-	if err := settleAutopilotQuota(ctx, q, runs[0].QuotaReservationID, true); err != nil {
+	if _, err := settleAutopilotQuota(ctx, q, runs[0].QuotaReservationID, true); err != nil {
 		t.Fatalf("consume: %v", err)
 	}
-	if err := settleAutopilotQuota(ctx, q, runs[0].QuotaReservationID, true); err != nil {
+	if _, err := settleAutopilotQuota(ctx, q, runs[0].QuotaReservationID, true); err != nil {
 		t.Fatalf("duplicate consume: %v", err)
 	}
-	if err := settleAutopilotQuota(ctx, q, runs[1].QuotaReservationID, false); err != nil {
+	if _, err := settleAutopilotQuota(ctx, q, runs[1].QuotaReservationID, false); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	// A create_issue run can consume at issue creation and later fail; release
-	// must compensate the previously consumed unit exactly once.
-	if err := settleAutopilotQuota(ctx, q, runs[0].QuotaReservationID, false); err != nil {
-		t.Fatalf("compensating release: %v", err)
+	// Consumed usage is monotonic: later issue cancellation/deletion cannot
+	// turn a successfully created issue back into quota.
+	if _, err := settleAutopilotQuota(ctx, q, runs[0].QuotaReservationID, false); err != nil {
+		t.Fatalf("release consumed reservation: %v", err)
 	}
 	usage, err = svc.AutopilotQuotaUsage(ctx, workspaceID)
+	if err != nil || *usage.Used != 1 || *usage.Reserved != 0 {
+		t.Fatalf("final usage = %+v, %v; want one immutable consumed unit", usage, err)
+	}
+}
+
+func TestAutopilotQuotaConcurrentAdmissionNeverExceedsLimit(t *testing.T) {
+	const attempts = 25
+	const limit = 5
+	fixture := newAutopilotQuotaFixture(t, entitlement.ActionEnforce, limit)
+	ctx := context.Background()
+	start := make(chan struct{})
+	unexpected := make(chan error, attempts)
+	var admitted atomic.Int64
+	var blocked atomic.Int64
+	var wg sync.WaitGroup
+
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, _, err := fixture.service.createAutopilotRunWithQuota(
+				ctx, fixture.workspaceID, "api", fmt.Sprintf("concurrent-%d", i), fixture.createRunArgs,
+			)
+			if err == nil {
+				admitted.Add(1)
+				return
+			}
+			var quotaErr *AutopilotQuotaExceededError
+			if errors.As(err, &quotaErr) {
+				blocked.Add(1)
+				return
+			}
+			unexpected <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(unexpected)
+	for err := range unexpected {
+		t.Errorf("unexpected concurrent admission error: %v", err)
+	}
+	if got := admitted.Load(); got != limit {
+		t.Fatalf("admitted = %d, want %d", got, limit)
+	}
+	if got := blocked.Load(); got != attempts-limit {
+		t.Fatalf("blocked = %d, want %d", got, attempts-limit)
+	}
+	usage, err := fixture.service.AutopilotQuotaUsage(ctx, fixture.workspaceID)
+	if err != nil || usage.Reserved == nil || *usage.Reserved != limit || *usage.Used != 0 {
+		t.Fatalf("concurrent usage = %+v, %v; want %d reserved", usage, err, limit)
+	}
+}
+
+func TestAutopilotQuotaObserveToEnforceAndOffFinalization(t *testing.T) {
+	fixture := newAutopilotQuotaFixture(t, entitlement.ActionObserve, 1)
+	ctx := context.Background()
+	runs := make([]db.AutopilotRun, 0, 2)
+	for i := 0; i < 2; i++ {
+		run, _, err := fixture.service.createAutopilotRunWithQuota(
+			ctx, fixture.workspaceID, "api", fmt.Sprintf("observe-%d", i), fixture.createRunArgs,
+		)
+		if err != nil {
+			t.Fatalf("observe admission %d: %v", i, err)
+		}
+		runs = append(runs, run)
+	}
+	usage, err := fixture.service.AutopilotQuotaUsage(ctx, fixture.workspaceID)
+	if err != nil || usage.Action != string(entitlement.ActionObserve) || *usage.Reserved != 2 {
+		t.Fatalf("observe usage = %+v, %v; want two reservations", usage, err)
+	}
+	var wouldBlock map[string]int64
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT would_block_counts FROM autopilot_quota_period
+		WHERE workspace_id = $1 AND period_start = $2 AND period_end = $3`,
+		fixture.workspaceID, fixture.periodStart, fixture.periodEnd).Scan(&wouldBlock); err != nil {
+		t.Fatalf("read would-block counts: %v", err)
+	}
+	if wouldBlock["api"] != 1 {
+		t.Fatalf("api would-block count = %d, want 1", wouldBlock["api"])
+	}
+
+	fixture.setPolicy(entitlement.ActionEnforce, fixture.periodStart, fixture.periodEnd, 1)
+	_, _, err = fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "enforce-after-observe", fixture.createRunArgs,
+	)
+	var quotaErr *AutopilotQuotaExceededError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("enforce after observe error = %v, want quota exceeded", err)
+	}
+
+	// Switching the current policy off must not strand reservations created
+	// under observe/enforce. Terminal finalization relies on the persisted slot.
+	fixture.setPolicy(entitlement.ActionOff, fixture.periodStart, fixture.periodEnd, 1)
+	for _, run := range runs {
+		if _, err := fixture.service.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
+			ID: run.ID, FailureReason: pgtype.Text{String: "test cleanup", Valid: true},
+		}); err != nil {
+			t.Fatalf("finalize while policy off: %v", err)
+		}
+	}
+	fixture.setPolicy(entitlement.ActionEnforce, fixture.periodStart, fixture.periodEnd, 1)
+	usage, err = fixture.service.AutopilotQuotaUsage(ctx, fixture.workspaceID)
 	if err != nil || *usage.Used != 0 || *usage.Reserved != 0 {
-		t.Fatalf("final usage = %+v, %v; want zero", usage, err)
+		t.Fatalf("usage after off finalization = %+v, %v; want zero", usage, err)
+	}
+	if _, _, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "reopened-after-off", fixture.createRunArgs,
+	); err != nil {
+		t.Fatalf("admission after reopening policy: %v", err)
+	}
+}
+
+func TestAutopilotQuotaConsumedCreateIssueCannotBeRefunded(t *testing.T) {
+	fixture := newAutopilotQuotaFixture(t, entitlement.ActionEnforce, 2)
+	ctx := context.Background()
+
+	cancelled, _, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "consumed-then-cancelled", fixture.createRunArgs,
+	)
+	if err != nil {
+		t.Fatalf("admit cancelled run: %v", err)
+	}
+	if _, err := settleAutopilotQuota(ctx, fixture.queries, cancelled.QuotaReservationID, true); err != nil {
+		t.Fatalf("consume cancelled run: %v", err)
+	}
+	if _, err := fixture.service.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
+		ID: cancelled.ID, FailureReason: pgtype.Text{String: "issue cancelled", Valid: true},
+	}); err != nil {
+		t.Fatalf("fail consumed run: %v", err)
+	}
+
+	deleted, _, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "consumed-then-deleted", fixture.createRunArgs,
+	)
+	if err != nil {
+		t.Fatalf("admit deleted run: %v", err)
+	}
+	deleted, err = fixture.queries.UpdateAutopilotRunIssueCreated(ctx, db.UpdateAutopilotRunIssueCreatedParams{
+		ID: deleted.ID, IssueID: fixture.issueID,
+	})
+	if err != nil {
+		t.Fatalf("link issue-created run: %v", err)
+	}
+	if _, err := settleAutopilotQuota(ctx, fixture.queries, deleted.QuotaReservationID, true); err != nil {
+		t.Fatalf("consume deleted run: %v", err)
+	}
+	if err := fixture.service.FailAutopilotRunsByIssue(ctx, fixture.issueID); err != nil {
+		t.Fatalf("fail runs before issue deletion: %v", err)
+	}
+
+	usage, err := fixture.service.AutopilotQuotaUsage(ctx, fixture.workspaceID)
+	if err != nil || *usage.Used != 2 || *usage.Reserved != 0 {
+		t.Fatalf("usage after cancellation/deletion = %+v, %v; want two consumed units", usage, err)
+	}
+}
+
+func TestAutopilotQuotaTerminalUpdateNeedsNoTransactionStarter(t *testing.T) {
+	fixture := newAutopilotQuotaFixture(t, entitlement.ActionOff, 1)
+	ctx := context.Background()
+	run, err := fixture.queries.CreateAutopilotRun(ctx, fixture.createRunArgs)
+	if err != nil {
+		t.Fatalf("create off-path run: %v", err)
+	}
+	serviceWithoutTx := &AutopilotService{Queries: fixture.queries}
+	updated, err := serviceWithoutTx.completeAutopilotRun(ctx, db.UpdateAutopilotRunCompletedParams{ID: run.ID})
+	if err != nil {
+		t.Fatalf("complete off-path run: %v", err)
+	}
+	if updated.Status != "completed" || updated.QuotaReservationID.Valid {
+		t.Fatalf("completed off-path run = %+v", updated)
+	}
+}
+
+func TestAutopilotQuotaSettlementStaysInOriginalPeriod(t *testing.T) {
+	fixture := newAutopilotQuotaFixture(t, entitlement.ActionEnforce, 1)
+	ctx := context.Background()
+	run, _, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "cross-period", fixture.createRunArgs,
+	)
+	if err != nil {
+		t.Fatalf("admit first-period run: %v", err)
+	}
+	secondStart := fixture.periodEnd
+	secondEnd := secondStart.Add(19 * time.Hour)
+	fixture.setPolicy(entitlement.ActionEnforce, secondStart, secondEnd, 1)
+	if _, err := fixture.service.completeAutopilotRun(ctx, db.UpdateAutopilotRunCompletedParams{ID: run.ID}); err != nil {
+		t.Fatalf("complete after period rollover: %v", err)
+	}
+
+	first, err := fixture.queries.GetAutopilotQuotaPeriod(ctx, db.GetAutopilotQuotaPeriodParams{
+		WorkspaceID: fixture.workspaceID,
+		PeriodStart: pgtype.Timestamptz{Time: fixture.periodStart, Valid: true},
+		PeriodEnd:   pgtype.Timestamptz{Time: fixture.periodEnd, Valid: true},
+	})
+	if err != nil || first.UsedCount != 1 || first.ReservedCount != 0 {
+		t.Fatalf("first period = %+v, %v; want one consumed", first, err)
+	}
+	second, err := fixture.service.AutopilotQuotaUsage(ctx, fixture.workspaceID)
+	if err != nil || *second.Used != 0 || *second.Reserved != 0 {
+		t.Fatalf("second period usage = %+v, %v; want zero", second, err)
+	}
+	if _, _, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "second-period", fixture.createRunArgs,
+	); err != nil {
+		t.Fatalf("admit second-period run: %v", err)
+	}
+}
+
+func TestAutopilotQuotaWorkspaceIsolation(t *testing.T) {
+	first := newAutopilotQuotaFixture(t, entitlement.ActionEnforce, 1)
+	second := newAutopilotQuotaFixture(t, entitlement.ActionEnforce, 1)
+	ctx := context.Background()
+	if _, _, err := first.service.createAutopilotRunWithQuota(
+		ctx, first.workspaceID, "api", "isolated", first.createRunArgs,
+	); err != nil {
+		t.Fatalf("first workspace admission: %v", err)
+	}
+	_, _, err := first.service.createAutopilotRunWithQuota(
+		ctx, first.workspaceID, "api", "isolated-over-limit", first.createRunArgs,
+	)
+	var quotaErr *AutopilotQuotaExceededError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("first workspace over-limit error = %v", err)
+	}
+	if _, _, err := second.service.createAutopilotRunWithQuota(
+		ctx, second.workspaceID, "api", "isolated", second.createRunArgs,
+	); err != nil {
+		t.Fatalf("second workspace admission leaked first usage: %v", err)
+	}
+}
+
+func TestAutopilotQuotaReconcilerSettlesTerminalOnlyOnce(t *testing.T) {
+	fixture := newAutopilotQuotaFixture(t, entitlement.ActionEnforce, 2)
+	ctx := context.Background()
+	terminal, _, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "reconcile-terminal", fixture.createRunArgs,
+	)
+	if err != nil {
+		t.Fatalf("admit terminal run: %v", err)
+	}
+	active, _, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "reconcile-active", fixture.createRunArgs,
+	)
+	if err != nil {
+		t.Fatalf("admit active run: %v", err)
+	}
+	// Simulate a crash after the run reached terminal state but before the old
+	// two-step finalizer settled its reservation.
+	if _, err := fixture.queries.UpdateAutopilotRunCompleted(ctx, db.UpdateAutopilotRunCompletedParams{ID: terminal.ID}); err != nil {
+		t.Fatalf("seed terminal crash window: %v", err)
+	}
+
+	type reconcileResult struct {
+		settled int
+		err     error
+	}
+	results := make(chan reconcileResult, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			settled, err := fixture.service.ReconcileAutopilotQuotaReservations(ctx, time.Now().Add(time.Minute), 10)
+			results <- reconcileResult{settled: settled, err: err}
+		}()
+	}
+	total := 0
+	for i := 0; i < 2; i++ {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("reconcile replica %d: %v", i, result.err)
+		}
+		total += result.settled
+	}
+	if total != 1 {
+		t.Fatalf("replicas reported %d settlements, want exactly 1", total)
+	}
+	activeAfter, err := fixture.queries.GetAutopilotRun(ctx, active.ID)
+	if err != nil || activeAfter.Status != "running" {
+		t.Fatalf("active run after reconcile = %+v, %v; want running", activeAfter, err)
+	}
+	usage, err := fixture.service.AutopilotQuotaUsage(ctx, fixture.workspaceID)
+	if err != nil || *usage.Used != 1 || *usage.Reserved != 1 {
+		t.Fatalf("reconciled usage = %+v, %v; want one used/one reserved", usage, err)
+	}
+}
+
+func TestAutopilotQuotaIdempotencyRecoversOrphanedReservation(t *testing.T) {
+	fixture := newAutopilotQuotaFixture(t, entitlement.ActionEnforce, 1)
+	ctx := context.Background()
+	first, _, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "orphaned-key", fixture.createRunArgs,
+	)
+	if err != nil {
+		t.Fatalf("first admission: %v", err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `DELETE FROM autopilot_run WHERE id = $1`, first.ID); err != nil {
+		t.Fatalf("remove quota-linked run: %v", err)
+	}
+	recovered, reused, err := fixture.service.createAutopilotRunWithQuota(
+		ctx, fixture.workspaceID, "api", "orphaned-key", fixture.createRunArgs,
+	)
+	if err != nil || reused || recovered.ID.Bytes == first.ID.Bytes {
+		t.Fatalf("orphan recovery = run %s reused=%v err=%v", util.UUIDToString(recovered.ID), reused, err)
+	}
+	usage, err := fixture.service.AutopilotQuotaUsage(ctx, fixture.workspaceID)
+	if err != nil || *usage.Used != 0 || *usage.Reserved != 1 {
+		t.Fatalf("orphan-recovered usage = %+v, %v; want one reservation", usage, err)
 	}
 }
 

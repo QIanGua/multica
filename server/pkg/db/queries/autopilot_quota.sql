@@ -92,7 +92,7 @@ RETURNING p.*;
 -- name: ReleaseAutopilotQuotaReservation :one
 WITH locked AS (
     SELECT qr.* FROM autopilot_quota_reservation qr
-    WHERE qr.id = @reservation_id AND qr.state IN ('reserved', 'consumed')
+    WHERE qr.id = @reservation_id AND qr.state = 'reserved'
     FOR UPDATE
 ), changed AS (
     UPDATE autopilot_quota_reservation AS r
@@ -105,11 +105,10 @@ WITH locked AS (
             AND p.period_start = locked.period_start
             AND p.period_end = locked.period_end
       )
-    RETURNING locked.workspace_id, locked.period_start, locked.period_end, locked.state AS previous_state
+    RETURNING locked.workspace_id, locked.period_start, locked.period_end
 )
 UPDATE autopilot_quota_period AS p
-SET reserved_count = reserved_count - CASE WHEN changed.previous_state = 'reserved' THEN 1 ELSE 0 END,
-    used_count = used_count - CASE WHEN changed.previous_state = 'consumed' THEN 1 ELSE 0 END,
+SET reserved_count = reserved_count - 1,
     updated_at = now()
 FROM changed
 WHERE p.workspace_id = changed.workspace_id
@@ -126,7 +125,6 @@ WHERE r.state = 'reserved'
   AND (
       ar.id IS NULL
       OR ar.status IN ('completed', 'failed', 'skipped')
-      OR (ar.issue_id IS NULL AND ar.task_id IS NULL)
   )
 ORDER BY r.created_at
 LIMIT @row_limit;

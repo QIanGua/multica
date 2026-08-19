@@ -42,6 +42,7 @@ type BusinessMetrics struct {
 	runtimeGCFailed                   prometheus.Counter
 	runtimeGCBlocked                  prometheus.Gauge
 	runtimeGCBlockedObservationFailed prometheus.Counter
+	entitlementConfigError            prometheus.Counter
 	entitlementCache                  *prometheus.CounterVec
 	entitlementRefresh                *prometheus.CounterVec
 	entitlementRefreshDuration        *prometheus.HistogramVec
@@ -203,6 +204,10 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Name:      "blocked_observation_failed_total",
 			Help:      "Total failures while observing stale runtimes blocked from garbage collection.",
 		}),
+		entitlementConfigError: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "multica", Subsystem: "entitlement", Name: "config_error_total",
+			Help: "Total startup failures caused by explicitly enabled but invalid entitlement policy configuration.",
+		}),
 		entitlementCache: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "entitlement", Name: "cache_total",
 			Help: "Total entitlement cache outcomes.",
@@ -259,6 +264,7 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.runtimeGCFailed,
 		m.runtimeGCBlocked,
 		m.runtimeGCBlockedObservationFailed,
+		m.entitlementConfigError,
 		m.entitlementCache,
 		m.entitlementRefresh,
 		m.entitlementRefreshDuration,
@@ -266,6 +272,12 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.entitlementVersionRegression,
 		m.autopilotQuotaDecision,
 	}, m.events.collectors()...)
+}
+
+func (m *BusinessMetrics) RecordEntitlementConfigError() {
+	if m != nil {
+		m.entitlementConfigError.Inc()
+	}
 }
 
 func (m *BusinessMetrics) RecordEntitlementCache(outcome string) {

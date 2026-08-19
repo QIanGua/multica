@@ -3,6 +3,7 @@
 -- defaults or calendar assumptions live in this schema.
 
 CREATE TABLE autopilot_quota_period (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL,
     period_start TIMESTAMPTZ NOT NULL,
     period_end TIMESTAMPTZ NOT NULL,
@@ -22,7 +23,9 @@ CREATE TABLE autopilot_quota_reservation (
     period_end TIMESTAMPTZ NOT NULL,
     policy_revision BIGINT NOT NULL,
     subscription_version BIGINT NOT NULL,
-    source TEXT NOT NULL CHECK (source IN ('schedule', 'manual', 'webhook', 'api')),
+    -- Policy-neutral execution metadata. Keep this open-ended so adding a new
+    -- trigger surface does not require a production constraint migration.
+    source TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'reserved'
         CHECK (state IN ('reserved', 'consumed', 'released')),

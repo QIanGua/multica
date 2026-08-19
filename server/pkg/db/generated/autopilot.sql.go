@@ -519,24 +519,81 @@ func (q *Queries) DeleteAutopilotTrigger(ctx context.Context, id pgtype.UUID) er
 }
 
 const failAutopilotRunsByIssue = `-- name: FailAutopilotRunsByIssue :many
-UPDATE autopilot_run
-SET status = 'failed', completed_at = now(), failure_reason = 'linked issue was deleted'
-WHERE issue_id = $1
-  AND status IN ('issue_created', 'running')
-RETURNING id, autopilot_id, trigger_id, source, status, issue_id, task_id, triggered_at, completed_at, failure_reason, trigger_payload, result, created_at, squad_id, planned_at, webhook_delivery_id, quota_reservation_id, reason_code
+WITH updated_runs AS (
+    UPDATE autopilot_run
+    SET status = 'failed', completed_at = now(), failure_reason = 'linked issue was deleted'
+    WHERE issue_id = $1
+      AND status IN ('issue_created', 'running')
+    RETURNING id, autopilot_id, trigger_id, source, status, issue_id, task_id, triggered_at, completed_at, failure_reason, trigger_payload, result, created_at, squad_id, planned_at, webhook_delivery_id, quota_reservation_id, reason_code
+), locked_reservations AS MATERIALIZED (
+    SELECT qr.id, qr.workspace_id, qr.period_start, qr.period_end, qr.policy_revision, qr.subscription_version, qr.source, qr.idempotency_key, qr.state, qr.created_at, qr.finalized_at
+    FROM autopilot_quota_reservation qr
+    JOIN updated_runs ar ON ar.quota_reservation_id = qr.id
+    WHERE qr.state = 'reserved'
+    FOR UPDATE
+), released_reservations AS (
+    UPDATE autopilot_quota_reservation AS qr
+    SET state = 'released', finalized_at = now()
+    FROM locked_reservations AS locked
+    WHERE qr.id = locked.id
+      AND EXISTS (
+          SELECT 1 FROM autopilot_quota_period p
+          WHERE p.workspace_id = locked.workspace_id
+            AND p.period_start = locked.period_start
+            AND p.period_end = locked.period_end
+      )
+    RETURNING locked.workspace_id, locked.period_start, locked.period_end
+), released_by_period AS (
+    SELECT workspace_id, period_start, period_end, count(*)::bigint AS released_count
+    FROM released_reservations
+    GROUP BY workspace_id, period_start, period_end
+), settled_periods AS (
+    UPDATE autopilot_quota_period AS p
+    SET reserved_count = reserved_count - released.released_count,
+        updated_at = now()
+    FROM released_by_period AS released
+    WHERE p.workspace_id = released.workspace_id
+      AND p.period_start = released.period_start
+      AND p.period_end = released.period_end
+    RETURNING p.workspace_id
+)
+SELECT id, autopilot_id, trigger_id, source, status, issue_id, task_id, triggered_at, completed_at, failure_reason, trigger_payload, result, created_at, squad_id, planned_at, webhook_delivery_id, quota_reservation_id, reason_code FROM updated_runs
 `
+
+type FailAutopilotRunsByIssueRow struct {
+	ID                 pgtype.UUID        `json:"id"`
+	AutopilotID        pgtype.UUID        `json:"autopilot_id"`
+	TriggerID          pgtype.UUID        `json:"trigger_id"`
+	Source             string             `json:"source"`
+	Status             string             `json:"status"`
+	IssueID            pgtype.UUID        `json:"issue_id"`
+	TaskID             pgtype.UUID        `json:"task_id"`
+	TriggeredAt        pgtype.Timestamptz `json:"triggered_at"`
+	CompletedAt        pgtype.Timestamptz `json:"completed_at"`
+	FailureReason      pgtype.Text        `json:"failure_reason"`
+	TriggerPayload     []byte             `json:"trigger_payload"`
+	Result             []byte             `json:"result"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	SquadID            pgtype.UUID        `json:"squad_id"`
+	PlannedAt          pgtype.Timestamptz `json:"planned_at"`
+	WebhookDeliveryID  pgtype.UUID        `json:"webhook_delivery_id"`
+	QuotaReservationID pgtype.UUID        `json:"quota_reservation_id"`
+	ReasonCode         pgtype.Text        `json:"reason_code"`
+}
 
 // Fails active autopilot runs linked to a given issue.
 // Must be called BEFORE issue deletion (ON DELETE SET NULL clears issue_id).
-func (q *Queries) FailAutopilotRunsByIssue(ctx context.Context, issueID pgtype.UUID) ([]AutopilotRun, error) {
+// Only still-reserved run_only slots are released. A create_issue slot was
+// consumed when the issue was created and remains counted after deletion.
+func (q *Queries) FailAutopilotRunsByIssue(ctx context.Context, issueID pgtype.UUID) ([]FailAutopilotRunsByIssueRow, error) {
 	rows, err := q.db.Query(ctx, failAutopilotRunsByIssue, issueID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []AutopilotRun{}
+	items := []FailAutopilotRunsByIssueRow{}
 	for rows.Next() {
-		var i AutopilotRun
+		var i FailAutopilotRunsByIssueRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.AutopilotID,
@@ -1529,13 +1586,41 @@ func (q *Queries) PauseAutopilotsByUnrunnableSquad(ctx context.Context, squadID 
 }
 
 const recoverPartialAutopilotRun = `-- name: RecoverPartialAutopilotRun :exec
-UPDATE autopilot_run
-SET status = 'failed',
-    completed_at = now(),
-    failure_reason = 'recovered partial dispatch (crashed before downstream creation)',
-    reason_code = 'internal_error',
-    planned_at = NULL
-WHERE id = $1
+WITH updated_run AS (
+    UPDATE autopilot_run AS ar
+    SET status = 'failed',
+        completed_at = now(),
+        failure_reason = 'recovered partial dispatch (crashed before downstream creation)',
+        reason_code = 'internal_error',
+        planned_at = NULL
+    WHERE ar.id = $1
+    RETURNING ar.quota_reservation_id
+), locked_reservation AS MATERIALIZED (
+    SELECT qr.id, qr.workspace_id, qr.period_start, qr.period_end, qr.policy_revision, qr.subscription_version, qr.source, qr.idempotency_key, qr.state, qr.created_at, qr.finalized_at
+    FROM autopilot_quota_reservation qr
+    JOIN updated_run ar ON ar.quota_reservation_id = qr.id
+    WHERE qr.state = 'reserved'
+    FOR UPDATE
+), released_reservation AS (
+    UPDATE autopilot_quota_reservation AS qr
+    SET state = 'released', finalized_at = now()
+    FROM locked_reservation AS locked
+    WHERE qr.id = locked.id
+      AND EXISTS (
+          SELECT 1 FROM autopilot_quota_period p
+          WHERE p.workspace_id = locked.workspace_id
+            AND p.period_start = locked.period_start
+            AND p.period_end = locked.period_end
+      )
+    RETURNING locked.workspace_id, locked.period_start, locked.period_end
+)
+UPDATE autopilot_quota_period AS p
+SET reserved_count = reserved_count - 1,
+    updated_at = now()
+FROM released_reservation AS released
+WHERE p.workspace_id = released.workspace_id
+  AND p.period_start = released.period_start
+  AND p.period_end = released.period_end
 `
 
 // Recovers a partial-state autopilot_run from a crashed first attempt
@@ -2151,6 +2236,126 @@ type UpdateAutopilotRunSkippedWithResultParams struct {
 func (q *Queries) UpdateAutopilotRunSkippedWithResult(ctx context.Context, arg UpdateAutopilotRunSkippedWithResultParams) (AutopilotRun, error) {
 	row := q.db.QueryRow(ctx, updateAutopilotRunSkippedWithResult, arg.ID, arg.FailureReason, arg.Result)
 	var i AutopilotRun
+	err := row.Scan(
+		&i.ID,
+		&i.AutopilotID,
+		&i.TriggerID,
+		&i.Source,
+		&i.Status,
+		&i.IssueID,
+		&i.TaskID,
+		&i.TriggeredAt,
+		&i.CompletedAt,
+		&i.FailureReason,
+		&i.TriggerPayload,
+		&i.Result,
+		&i.CreatedAt,
+		&i.SquadID,
+		&i.PlannedAt,
+		&i.WebhookDeliveryID,
+		&i.QuotaReservationID,
+		&i.ReasonCode,
+	)
+	return i, err
+}
+
+const updateAutopilotRunTerminalWithQuota = `-- name: UpdateAutopilotRunTerminalWithQuota :one
+WITH updated_run AS (
+    UPDATE autopilot_run AS ar
+    SET status = $1::text,
+        completed_at = now(),
+        result = CASE
+            WHEN $1::text = 'completed' THEN $2::jsonb
+            ELSE ar.result
+        END,
+        failure_reason = CASE
+            WHEN $1::text IN ('failed', 'skipped') THEN $3::text
+            ELSE ar.failure_reason
+        END,
+        reason_code = CASE
+            WHEN $1::text IN ('failed', 'skipped') THEN $4::text
+            ELSE ar.reason_code
+        END
+    WHERE ar.id = $5
+    RETURNING ar.id, ar.autopilot_id, ar.trigger_id, ar.source, ar.status, ar.issue_id, ar.task_id, ar.triggered_at, ar.completed_at, ar.failure_reason, ar.trigger_payload, ar.result, ar.created_at, ar.squad_id, ar.planned_at, ar.webhook_delivery_id, ar.quota_reservation_id, ar.reason_code
+), locked_reservation AS MATERIALIZED (
+    SELECT qr.id, qr.workspace_id, qr.period_start, qr.period_end, qr.policy_revision, qr.subscription_version, qr.source, qr.idempotency_key, qr.state, qr.created_at, qr.finalized_at
+    FROM autopilot_quota_reservation qr
+    JOIN updated_run ar ON ar.quota_reservation_id = qr.id
+    WHERE qr.state = 'reserved'
+    FOR UPDATE
+), finalized_reservation AS (
+    UPDATE autopilot_quota_reservation AS qr
+    SET state = CASE WHEN $6::boolean THEN 'consumed' ELSE 'released' END,
+        finalized_at = now()
+    FROM locked_reservation AS locked
+    WHERE qr.id = locked.id
+      AND EXISTS (
+          SELECT 1 FROM autopilot_quota_period p
+          WHERE p.workspace_id = locked.workspace_id
+            AND p.period_start = locked.period_start
+            AND p.period_end = locked.period_end
+      )
+    RETURNING locked.workspace_id, locked.period_start, locked.period_end
+), settled_period AS (
+    UPDATE autopilot_quota_period AS p
+    SET reserved_count = reserved_count - 1,
+        used_count = used_count + CASE WHEN $6::boolean THEN 1 ELSE 0 END,
+        updated_at = now()
+    FROM finalized_reservation AS finalized
+    WHERE p.workspace_id = finalized.workspace_id
+      AND p.period_start = finalized.period_start
+      AND p.period_end = finalized.period_end
+    RETURNING p.workspace_id
+)
+SELECT id, autopilot_id, trigger_id, source, status, issue_id, task_id, triggered_at, completed_at, failure_reason, trigger_payload, result, created_at, squad_id, planned_at, webhook_delivery_id, quota_reservation_id, reason_code FROM updated_run
+`
+
+type UpdateAutopilotRunTerminalWithQuotaParams struct {
+	TerminalStatus string      `json:"terminal_status"`
+	Result         []byte      `json:"result"`
+	FailureReason  pgtype.Text `json:"failure_reason"`
+	ReasonCode     pgtype.Text `json:"reason_code"`
+	RunID          pgtype.UUID `json:"run_id"`
+	Consume        bool        `json:"consume"`
+}
+
+type UpdateAutopilotRunTerminalWithQuotaRow struct {
+	ID                 pgtype.UUID        `json:"id"`
+	AutopilotID        pgtype.UUID        `json:"autopilot_id"`
+	TriggerID          pgtype.UUID        `json:"trigger_id"`
+	Source             string             `json:"source"`
+	Status             string             `json:"status"`
+	IssueID            pgtype.UUID        `json:"issue_id"`
+	TaskID             pgtype.UUID        `json:"task_id"`
+	TriggeredAt        pgtype.Timestamptz `json:"triggered_at"`
+	CompletedAt        pgtype.Timestamptz `json:"completed_at"`
+	FailureReason      pgtype.Text        `json:"failure_reason"`
+	TriggerPayload     []byte             `json:"trigger_payload"`
+	Result             []byte             `json:"result"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	SquadID            pgtype.UUID        `json:"squad_id"`
+	PlannedAt          pgtype.Timestamptz `json:"planned_at"`
+	WebhookDeliveryID  pgtype.UUID        `json:"webhook_delivery_id"`
+	QuotaReservationID pgtype.UUID        `json:"quota_reservation_id"`
+	ReasonCode         pgtype.Text        `json:"reason_code"`
+}
+
+// Finalizes a run and its still-reserved quota slot in one statement. Runs
+// created while the entitlement gate is off have a NULL reservation ID, so
+// the quota CTEs become empty without an extra BEGIN/COMMIT round trip.
+// Consumed slots are deliberately immutable: create_issue is chargeable once
+// the issue exists, even if that issue is later blocked, cancelled, or deleted.
+func (q *Queries) UpdateAutopilotRunTerminalWithQuota(ctx context.Context, arg UpdateAutopilotRunTerminalWithQuotaParams) (UpdateAutopilotRunTerminalWithQuotaRow, error) {
+	row := q.db.QueryRow(ctx, updateAutopilotRunTerminalWithQuota,
+		arg.TerminalStatus,
+		arg.Result,
+		arg.FailureReason,
+		arg.ReasonCode,
+		arg.RunID,
+		arg.Consume,
+	)
+	var i UpdateAutopilotRunTerminalWithQuotaRow
 	err := row.Scan(
 		&i.ID,
 		&i.AutopilotID,

@@ -201,11 +201,12 @@ var concurrentIndexCleanups = map[string]string{
 	"349_agent_task_queue_chat_terminal_resume_index":           "idx_agent_task_queue_chat_terminal_resume",
 	"350_agent_task_queue_chat_retired_session_index":           "idx_agent_task_queue_chat_retired_session",
 	"352_autopilot_quota_period_scope_index":                    "uq_autopilot_quota_period_scope",
-	"353_autopilot_quota_reservation_id_index":                  "uq_autopilot_quota_reservation_id",
+	"353_autopilot_quota_reservation_id_index":                  "autopilot_quota_reservation_pkey_uidx",
 	"354_autopilot_quota_reservation_key_index":                 "uq_autopilot_quota_reservation_key",
 	"355_autopilot_run_quota_reservation_index":                 "uq_autopilot_run_quota_reservation",
 	"356_webhook_delivery_replay_idempotency_index":             "uq_webhook_delivery_replay_idempotency",
 	"357_autopilot_quota_reservation_state_index":               "idx_autopilot_quota_reservation_state",
+	"358_autopilot_quota_period_id_index":                       "autopilot_quota_period_pkey_uidx",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction

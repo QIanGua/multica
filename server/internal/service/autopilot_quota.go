@@ -128,14 +128,24 @@ func (s *AutopilotService) createAutopilotRunWithQuota(
 	})
 	if err == nil {
 		run, runErr := qtx.GetAutopilotRunByQuotaReservation(ctx, existing.ID)
-		if runErr != nil {
+		if errors.Is(runErr, pgx.ErrNoRows) && existing.State == "reserved" {
+			// The reservation/run insert normally commits atomically. Recover a
+			// manually removed or otherwise orphaned reserved row so the stable
+			// idempotency key does not wedge every retry for the whole period.
+			if _, releaseErr := settleAutopilotQuota(ctx, qtx, existing.ID, false); releaseErr != nil {
+				return db.AutopilotRun{}, false, fmt.Errorf("release orphaned idempotency reservation: %w", releaseErr)
+			}
+			period.ReservedCount--
+			err = pgx.ErrNoRows // continue through the normal fresh-reservation path
+		} else if runErr != nil {
 			return db.AutopilotRun{}, false, fmt.Errorf("load idempotent quota run: %w", runErr)
+		} else {
+			if err := tx.Commit(ctx); err != nil {
+				return db.AutopilotRun{}, false, fmt.Errorf("commit idempotent quota admission: %w", err)
+			}
+			s.recordAutopilotQuotaDecision(policy.action, source, "reused")
+			return run, true, nil
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return db.AutopilotRun{}, false, fmt.Errorf("commit idempotent quota admission: %w", err)
-		}
-		s.recordAutopilotQuotaDecision(policy.action, source, "reused")
-		return run, true, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return db.AutopilotRun{}, false, fmt.Errorf("lookup quota reservation: %w", err)
@@ -202,9 +212,9 @@ func (s *AutopilotService) recordAutopilotQuotaDecision(action entitlement.Actio
 	}
 }
 
-func settleAutopilotQuota(ctx context.Context, q *db.Queries, reservationID pgtype.UUID, consume bool) error {
+func settleAutopilotQuota(ctx context.Context, q *db.Queries, reservationID pgtype.UUID, consume bool) (bool, error) {
 	if !reservationID.Valid {
-		return nil
+		return false, nil
 	}
 	var err error
 	if consume {
@@ -213,106 +223,62 @@ func settleAutopilotQuota(ctx context.Context, q *db.Queries, reservationID pgty
 		_, err = q.ReleaseAutopilotQuotaReservation(ctx, reservationID)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil // terminal replay: reservation already finalized
+		return false, nil // terminal replay: reservation already finalized
 	}
-	return err
+	return err == nil, err
 }
 
 func (s *AutopilotService) completeAutopilotRun(ctx context.Context, params db.UpdateAutopilotRunCompletedParams) (db.AutopilotRun, error) {
-	tx, err := s.TxStarter.Begin(ctx)
-	if err != nil {
-		return db.AutopilotRun{}, err
-	}
-	defer tx.Rollback(ctx)
-	qtx := s.Queries.WithTx(tx)
-	run, err := qtx.UpdateAutopilotRunCompleted(ctx, params)
-	if err != nil {
-		return db.AutopilotRun{}, err
-	}
-	if err := settleAutopilotQuota(ctx, qtx, run.QuotaReservationID, true); err != nil {
-		return db.AutopilotRun{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return db.AutopilotRun{}, err
-	}
-	return run, nil
+	row, err := s.Queries.UpdateAutopilotRunTerminalWithQuota(ctx, db.UpdateAutopilotRunTerminalWithQuotaParams{
+		TerminalStatus: "completed",
+		Result:         params.Result,
+		RunID:          params.ID,
+		Consume:        true,
+	})
+	return autopilotRunFromTerminalRow(row), err
 }
 
 func (s *AutopilotService) failAutopilotRun(ctx context.Context, params db.UpdateAutopilotRunFailedParams) (db.AutopilotRun, error) {
-	tx, err := s.TxStarter.Begin(ctx)
-	if err != nil {
-		return db.AutopilotRun{}, err
-	}
-	defer tx.Rollback(ctx)
-	qtx := s.Queries.WithTx(tx)
-	run, err := qtx.UpdateAutopilotRunFailed(ctx, params)
-	if err != nil {
-		return db.AutopilotRun{}, err
-	}
-	if err := settleAutopilotQuota(ctx, qtx, run.QuotaReservationID, false); err != nil {
-		return db.AutopilotRun{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return db.AutopilotRun{}, err
-	}
-	return run, nil
+	row, err := s.Queries.UpdateAutopilotRunTerminalWithQuota(ctx, db.UpdateAutopilotRunTerminalWithQuotaParams{
+		TerminalStatus: "failed",
+		FailureReason:  params.FailureReason,
+		ReasonCode:     params.ReasonCode,
+		RunID:          params.ID,
+	})
+	return autopilotRunFromTerminalRow(row), err
 }
 
 func (s *AutopilotService) skipAutopilotRun(ctx context.Context, params db.UpdateAutopilotRunSkippedParams) (db.AutopilotRun, error) {
-	tx, err := s.TxStarter.Begin(ctx)
-	if err != nil {
-		return db.AutopilotRun{}, err
+	row, err := s.Queries.UpdateAutopilotRunTerminalWithQuota(ctx, db.UpdateAutopilotRunTerminalWithQuotaParams{
+		TerminalStatus: "skipped",
+		FailureReason:  params.FailureReason,
+		ReasonCode:     params.ReasonCode,
+		RunID:          params.ID,
+	})
+	return autopilotRunFromTerminalRow(row), err
+}
+
+func autopilotRunFromTerminalRow(row db.UpdateAutopilotRunTerminalWithQuotaRow) db.AutopilotRun {
+	return db.AutopilotRun{
+		ID: row.ID, AutopilotID: row.AutopilotID, TriggerID: row.TriggerID,
+		Source: row.Source, Status: row.Status, IssueID: row.IssueID, TaskID: row.TaskID,
+		TriggeredAt: row.TriggeredAt, CompletedAt: row.CompletedAt,
+		FailureReason: row.FailureReason, TriggerPayload: row.TriggerPayload,
+		Result: row.Result, CreatedAt: row.CreatedAt, SquadID: row.SquadID,
+		PlannedAt: row.PlannedAt, WebhookDeliveryID: row.WebhookDeliveryID,
+		QuotaReservationID: row.QuotaReservationID, ReasonCode: row.ReasonCode,
 	}
-	defer tx.Rollback(ctx)
-	qtx := s.Queries.WithTx(tx)
-	run, err := qtx.UpdateAutopilotRunSkipped(ctx, params)
-	if err != nil {
-		return db.AutopilotRun{}, err
-	}
-	if err := settleAutopilotQuota(ctx, qtx, run.QuotaReservationID, false); err != nil {
-		return db.AutopilotRun{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return db.AutopilotRun{}, err
-	}
-	return run, nil
 }
 
 func (s *AutopilotService) recoverPartialAutopilotRun(ctx context.Context, run db.AutopilotRun) error {
-	tx, err := s.TxStarter.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	qtx := s.Queries.WithTx(tx)
-	if err := qtx.RecoverPartialAutopilotRun(ctx, run.ID); err != nil {
-		return err
-	}
-	if err := settleAutopilotQuota(ctx, qtx, run.QuotaReservationID, false); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return s.Queries.RecoverPartialAutopilotRun(ctx, run.ID)
 }
 
-// FailAutopilotRunsByIssue compensates create_issue quota consumption before
-// deletion clears issue_id via ON DELETE SET NULL.
+// FailAutopilotRunsByIssue keeps create_issue consumption immutable while
+// releasing any still-reserved run_only slots before deletion clears issue_id.
 func (s *AutopilotService) FailAutopilotRunsByIssue(ctx context.Context, issueID pgtype.UUID) error {
-	tx, err := s.TxStarter.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	qtx := s.Queries.WithTx(tx)
-	runs, err := qtx.FailAutopilotRunsByIssue(ctx, issueID)
-	if err != nil {
-		return err
-	}
-	for _, run := range runs {
-		if err := settleAutopilotQuota(ctx, qtx, run.QuotaReservationID, false); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
+	_, err := s.Queries.FailAutopilotRunsByIssue(ctx, issueID)
+	return err
 }
 
 func (s *AutopilotService) AutopilotQuotaUsage(ctx context.Context, workspaceID pgtype.UUID) (AutopilotQuotaUsage, error) {
@@ -360,27 +326,37 @@ func (s *AutopilotService) ReconcileAutopilotQuotaReservations(ctx context.Conte
 		run, runErr := s.Queries.GetAutopilotRunByQuotaReservation(ctx, reservation.ID)
 		switch {
 		case errors.Is(runErr, pgx.ErrNoRows):
-			if err := settleAutopilotQuota(ctx, s.Queries, reservation.ID, false); err != nil {
+			changed, err := settleAutopilotQuota(ctx, s.Queries, reservation.ID, false)
+			if err != nil {
 				return settled, fmt.Errorf("release orphan quota reservation: %w", err)
+			}
+			if !changed {
+				continue
 			}
 		case runErr != nil:
 			return settled, fmt.Errorf("load quota-linked run: %w", runErr)
 		case run.Status == "completed":
-			if err := settleAutopilotQuota(ctx, s.Queries, reservation.ID, true); err != nil {
+			changed, err := settleAutopilotQuota(ctx, s.Queries, reservation.ID, true)
+			if err != nil {
 				return settled, fmt.Errorf("consume completed quota reservation: %w", err)
 			}
+			if !changed {
+				continue
+			}
 		case run.Status == "failed" || run.Status == "skipped":
-			if err := settleAutopilotQuota(ctx, s.Queries, reservation.ID, false); err != nil {
+			changed, err := settleAutopilotQuota(ctx, s.Queries, reservation.ID, false)
+			if err != nil {
 				return settled, fmt.Errorf("release terminal quota reservation: %w", err)
 			}
-		default:
-			if _, err := s.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
-				ID:            run.ID,
-				FailureReason: pgtype.Text{String: "quota reservation recovery: downstream side effect missing", Valid: true},
-				ReasonCode:    pgtype.Text{String: "internal_error", Valid: true},
-			}); err != nil {
-				return settled, fmt.Errorf("fail partial quota run: %w", err)
+			if !changed {
+				continue
 			}
+		default:
+			// Admission retries own recovery for live partial runs: schedule
+			// clears its planned slot, webhook resumes from durable delivery,
+			// and manual/API reuse the idempotency key. A time-based sweeper
+			// must never race those paths and force a still-live run to failed.
+			continue
 		}
 		settled++
 	}

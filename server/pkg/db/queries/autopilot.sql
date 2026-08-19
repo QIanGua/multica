@@ -340,13 +340,41 @@ LIMIT 1;
 -- The row stays in autopilot_run as a FAILED record (with a recovery
 -- reason) so ops still see the abandoned attempt in the run history —
 -- it is not silently deleted.
-UPDATE autopilot_run
-SET status = 'failed',
-    completed_at = now(),
-    failure_reason = 'recovered partial dispatch (crashed before downstream creation)',
-    reason_code = 'internal_error',
-    planned_at = NULL
-WHERE id = $1;
+WITH updated_run AS (
+    UPDATE autopilot_run AS ar
+    SET status = 'failed',
+        completed_at = now(),
+        failure_reason = 'recovered partial dispatch (crashed before downstream creation)',
+        reason_code = 'internal_error',
+        planned_at = NULL
+    WHERE ar.id = $1
+    RETURNING ar.quota_reservation_id
+), locked_reservation AS MATERIALIZED (
+    SELECT qr.*
+    FROM autopilot_quota_reservation qr
+    JOIN updated_run ar ON ar.quota_reservation_id = qr.id
+    WHERE qr.state = 'reserved'
+    FOR UPDATE
+), released_reservation AS (
+    UPDATE autopilot_quota_reservation AS qr
+    SET state = 'released', finalized_at = now()
+    FROM locked_reservation AS locked
+    WHERE qr.id = locked.id
+      AND EXISTS (
+          SELECT 1 FROM autopilot_quota_period p
+          WHERE p.workspace_id = locked.workspace_id
+            AND p.period_start = locked.period_start
+            AND p.period_end = locked.period_end
+      )
+    RETURNING locked.workspace_id, locked.period_start, locked.period_end
+)
+UPDATE autopilot_quota_period AS p
+SET reserved_count = reserved_count - 1,
+    updated_at = now()
+FROM released_reservation AS released
+WHERE p.workspace_id = released.workspace_id
+  AND p.period_start = released.period_start
+  AND p.period_end = released.period_end;
 
 -- name: GetAutopilotRun :one
 SELECT * FROM autopilot_run
@@ -395,6 +423,62 @@ SET status = 'skipped', completed_at = now(), failure_reason = $2,
     reason_code = sqlc.narg('reason_code')
 WHERE id = $1
 RETURNING *;
+
+-- name: UpdateAutopilotRunTerminalWithQuota :one
+-- Finalizes a run and its still-reserved quota slot in one statement. Runs
+-- created while the entitlement gate is off have a NULL reservation ID, so
+-- the quota CTEs become empty without an extra BEGIN/COMMIT round trip.
+-- Consumed slots are deliberately immutable: create_issue is chargeable once
+-- the issue exists, even if that issue is later blocked, cancelled, or deleted.
+WITH updated_run AS (
+    UPDATE autopilot_run AS ar
+    SET status = @terminal_status::text,
+        completed_at = now(),
+        result = CASE
+            WHEN @terminal_status::text = 'completed' THEN sqlc.narg('result')::jsonb
+            ELSE ar.result
+        END,
+        failure_reason = CASE
+            WHEN @terminal_status::text IN ('failed', 'skipped') THEN sqlc.narg('failure_reason')::text
+            ELSE ar.failure_reason
+        END,
+        reason_code = CASE
+            WHEN @terminal_status::text IN ('failed', 'skipped') THEN sqlc.narg('reason_code')::text
+            ELSE ar.reason_code
+        END
+    WHERE ar.id = @run_id
+    RETURNING ar.*
+), locked_reservation AS MATERIALIZED (
+    SELECT qr.*
+    FROM autopilot_quota_reservation qr
+    JOIN updated_run ar ON ar.quota_reservation_id = qr.id
+    WHERE qr.state = 'reserved'
+    FOR UPDATE
+), finalized_reservation AS (
+    UPDATE autopilot_quota_reservation AS qr
+    SET state = CASE WHEN @consume::boolean THEN 'consumed' ELSE 'released' END,
+        finalized_at = now()
+    FROM locked_reservation AS locked
+    WHERE qr.id = locked.id
+      AND EXISTS (
+          SELECT 1 FROM autopilot_quota_period p
+          WHERE p.workspace_id = locked.workspace_id
+            AND p.period_start = locked.period_start
+            AND p.period_end = locked.period_end
+      )
+    RETURNING locked.workspace_id, locked.period_start, locked.period_end
+), settled_period AS (
+    UPDATE autopilot_quota_period AS p
+    SET reserved_count = reserved_count - 1,
+        used_count = used_count + CASE WHEN @consume::boolean THEN 1 ELSE 0 END,
+        updated_at = now()
+    FROM finalized_reservation AS finalized
+    WHERE p.workspace_id = finalized.workspace_id
+      AND p.period_start = finalized.period_start
+      AND p.period_end = finalized.period_end
+    RETURNING p.workspace_id
+)
+SELECT * FROM updated_run;
 
 -- name: UpdateAutopilotRunSkippedWithResult :one
 UPDATE autopilot_run
@@ -496,11 +580,47 @@ LIMIT 1;
 -- name: FailAutopilotRunsByIssue :many
 -- Fails active autopilot runs linked to a given issue.
 -- Must be called BEFORE issue deletion (ON DELETE SET NULL clears issue_id).
-UPDATE autopilot_run
-SET status = 'failed', completed_at = now(), failure_reason = 'linked issue was deleted'
-WHERE issue_id = $1
-  AND status IN ('issue_created', 'running')
-RETURNING *;
+-- Only still-reserved run_only slots are released. A create_issue slot was
+-- consumed when the issue was created and remains counted after deletion.
+WITH updated_runs AS (
+    UPDATE autopilot_run
+    SET status = 'failed', completed_at = now(), failure_reason = 'linked issue was deleted'
+    WHERE issue_id = $1
+      AND status IN ('issue_created', 'running')
+    RETURNING *
+), locked_reservations AS MATERIALIZED (
+    SELECT qr.*
+    FROM autopilot_quota_reservation qr
+    JOIN updated_runs ar ON ar.quota_reservation_id = qr.id
+    WHERE qr.state = 'reserved'
+    FOR UPDATE
+), released_reservations AS (
+    UPDATE autopilot_quota_reservation AS qr
+    SET state = 'released', finalized_at = now()
+    FROM locked_reservations AS locked
+    WHERE qr.id = locked.id
+      AND EXISTS (
+          SELECT 1 FROM autopilot_quota_period p
+          WHERE p.workspace_id = locked.workspace_id
+            AND p.period_start = locked.period_start
+            AND p.period_end = locked.period_end
+      )
+    RETURNING locked.workspace_id, locked.period_start, locked.period_end
+), released_by_period AS (
+    SELECT workspace_id, period_start, period_end, count(*)::bigint AS released_count
+    FROM released_reservations
+    GROUP BY workspace_id, period_start, period_end
+), settled_periods AS (
+    UPDATE autopilot_quota_period AS p
+    SET reserved_count = reserved_count - released.released_count,
+        updated_at = now()
+    FROM released_by_period AS released
+    WHERE p.workspace_id = released.workspace_id
+      AND p.period_start = released.period_start
+      AND p.period_end = released.period_end
+    RETURNING p.workspace_id
+)
+SELECT * FROM updated_runs;
 
 -- =====================
 -- Failure-rate auto-pause

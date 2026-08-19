@@ -222,6 +222,7 @@ type AutopilotCollaborator struct {
 }
 
 type AutopilotQuotaPeriod struct {
+	ID               pgtype.UUID        `json:"id"`
 	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
 	PeriodStart      pgtype.Timestamptz `json:"period_start"`
 	PeriodEnd        pgtype.Timestamptz `json:"period_end"`
