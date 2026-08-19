@@ -11,8 +11,8 @@
     "compare_comment": "评论存在并发修改，请比较两个版本。",
     "server_version": "服务端最新版本",
     "local_version": "你的本地版本",
-    "keep_local": "采用本地版本并保存",
-    "save_again": "确认后再次点击“保存”即可采用本地版本。"
+    "keep_local": "保留我的版本",
+    "use_server": "使用最新版本"
   },
   "page": {
     "breadcrumb_title": "任务",
