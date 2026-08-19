@@ -53,7 +53,7 @@ ALTER TABLE plugin_installation ADD COLUMN IF NOT EXISTS token_rotated_at TIMEST
 -- produced that would be a lie attributed to any member. NOT the same shape,
 -- though — 107 revalidated the whole table under ACCESS EXCLUSIVE, which was
 -- cheap on the comment table of that era and is not on today's. NOT VALID adds
--- the constraint without a scan; migration 352 validates it under a lock that
+-- the constraint without a scan; migration 355 validates it under a lock that
 -- readers and writers can share.
 --
 -- New rows are checked from the moment this lands. NOT VALID only means "do not
