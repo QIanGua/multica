@@ -312,7 +312,7 @@ func TestEventDispatchRespectsTheFeatureFlagEndToEnd(t *testing.T) {
 	dispatch := func() {
 		dispatcher := service.NewPluginEventDispatcher(testHandler.PluginService)
 		defer dispatcher.Close()
-		dispatcher.Dispatch(plugincontract.EventIssueCreated, testWorkspaceID, parseUUID(testWorkspaceID), map[string]any{})
+		dispatcher.Dispatch(plugincontract.EventIssueCreated, testWorkspaceID, map[string]any{})
 		// Long enough for a worker to pick the job up and complete the call.
 		time.Sleep(2 * time.Second)
 	}

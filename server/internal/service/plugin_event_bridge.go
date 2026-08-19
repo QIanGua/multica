@@ -23,7 +23,7 @@ import (
 // this file decides is WHICH plugin event an internal one becomes, and that is
 // worth asserting on its own rather than through a live endpoint.
 type EventSink interface {
-	Dispatch(eventType, workspaceID string, issueID pgtype.UUID, payload any)
+	Dispatch(eventType, workspaceID string, payload any)
 }
 
 // SubscribePluginEvents wires the dispatcher onto the bus.
@@ -36,9 +36,15 @@ func SubscribePluginEvents(bus *events.Bus, dispatcher EventSink) {
 		return
 	}
 
+	// The listener does the least it possibly can: hand over the payload
+	// unexamined. Extracting the issue id here would put a JSON round-trip of a
+	// full issue body on the publishing request's goroutine, for every one of
+	// these events, in every workspace — including deployments where plugins are
+	// switched off entirely. It happens on a worker instead, after the flag
+	// check, where it costs nothing anyone is waiting for.
 	forward := func(pluginEvent string) events.Handler {
 		return func(e events.Event) {
-			dispatcher.Dispatch(pluginEvent, e.WorkspaceID, issueIDFromPayload(e.Payload), e.Payload)
+			dispatcher.Dispatch(pluginEvent, e.WorkspaceID, e.Payload)
 		}
 	}
 
@@ -54,10 +60,10 @@ func SubscribePluginEvents(bus *events.Bus, dispatcher EventSink) {
 	// event, and lets a plugin subscribe to the specific thing it cares about
 	// instead of filtering every field change itself.
 	bus.Subscribe(protocol.EventIssueUpdated, func(e events.Event) {
-		issueID := issueIDFromPayload(e.Payload)
-		dispatcher.Dispatch(plugincontract.EventIssueUpdated, e.WorkspaceID, issueID, e.Payload)
+		dispatcher.Dispatch(plugincontract.EventIssueUpdated, e.WorkspaceID, e.Payload)
+		// A map lookup, not a parse: cheap enough for the request goroutine.
 		if payloadFlag(e.Payload, "status_changed") {
-			dispatcher.Dispatch(plugincontract.EventIssueStatusChanged, e.WorkspaceID, issueID, e.Payload)
+			dispatcher.Dispatch(plugincontract.EventIssueStatusChanged, e.WorkspaceID, e.Payload)
 		}
 	})
 }

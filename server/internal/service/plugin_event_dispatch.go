@@ -145,7 +145,7 @@ func (d *PluginEventDispatcher) sweepOnce() {
 // Note it takes no context from that request. Tying an outbound hook to the
 // request that triggered it would cancel the hook the moment the browser got
 // its response, which is exactly when the hook is only just starting.
-func (d *PluginEventDispatcher) Dispatch(eventType, workspaceID string, issueID pgtype.UUID, payload any) {
+func (d *PluginEventDispatcher) Dispatch(eventType, workspaceID string, payload any) {
 	if d == nil || d.service == nil || workspaceID == "" {
 		return
 	}
@@ -154,13 +154,14 @@ func (d *PluginEventDispatcher) Dispatch(eventType, workspaceID string, issueID 
 		return
 	}
 
-	// The lookup is cheap and local, but it is still a database read, so it
-	// happens on a worker rather than on the publishing goroutine.
+	// Nothing is inspected here. The installation lookup is a database read and
+	// finding the issue id is a JSON round-trip; both belong on a worker, and
+	// both sit behind the feature-flag check so a deployment with plugins off
+	// pays for neither.
 	select {
 	case d.queue <- dispatchJob{
 		installation: db.PluginInstallation{WorkspaceID: parsedWorkspace},
 		eventType:    eventType,
-		issueID:      issueID,
 		payload:      payload,
 	}:
 	default:
@@ -229,6 +230,10 @@ func (d *PluginEventDispatcher) run(job dispatchJob) {
 	if !featureflags.PluginsV1Enabled(ctx, d.service.FeatureFlags) {
 		return
 	}
+
+	// Only now, past the flag: the id is needed to narrow the callback grant,
+	// and finding it means parsing the payload.
+	job.issueID = issueIDFromPayload(job.payload)
 
 	installations, err := d.service.Queries.ListWorkspacePluginInstallations(ctx, job.installation.WorkspaceID)
 	if err != nil {

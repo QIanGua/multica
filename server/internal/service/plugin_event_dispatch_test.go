@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/featureflags"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -73,7 +72,7 @@ func TestEventDispatchShedsLoadRatherThanGrowingWithoutBound(t *testing.T) {
 	// Well past the queue depth. Every call must return, none may panic, and
 	// Dispatch must stay safe after the pool has stopped.
 	for i := 0; i < dispatchQueueDepth*3; i++ {
-		dispatcher.Dispatch(plugincontract.EventIssueCreated, "00000000-0000-4000-8000-000000000001", pgtype.UUID{}, nil)
+		dispatcher.Dispatch(plugincontract.EventIssueCreated, "00000000-0000-4000-8000-000000000001", nil)
 	}
 	dropped := dispatcher.Dropped()
 	if dropped == 0 {
@@ -224,7 +223,7 @@ func TestEventDispatchStampsThePluginActor(t *testing.T) {
 // asserted directly, with no worker pool or endpoint in the way.
 type recordingSink func(eventType string)
 
-func (r recordingSink) Dispatch(eventType, _ string, _ pgtype.UUID, _ any) { r(eventType) }
+func (r recordingSink) Dispatch(eventType, _ string, _ any) { r(eventType) }
 
 // The shape that took down cmd/server's router test: a dispatcher built over a
 // Queries whose pool was never opened.
@@ -272,5 +271,49 @@ func TestEventDispatchTreatsMissingFlagsAsDisabled(t *testing.T) {
 	case <-harness.received:
 		t.Fatal("a request left with no feature flag service configured")
 	default:
+	}
+}
+
+// countingPayload records how many times something serialized it.
+//
+// json.Marshal calls MarshalJSON, so this counts exactly the work the bus
+// listener used to do on the publishing request's goroutine.
+type countingPayload struct{ marshals *int }
+
+func (c countingPayload) MarshalJSON() ([]byte, error) {
+	*c.marshals++
+	return []byte(`{"issue":{"id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}}`), nil
+}
+
+// Publishing must not parse the payload.
+//
+// The listener used to pass issueIDFromPayload(e.Payload) as an argument, which
+// put a JSON marshal + unmarshal of a full issue body on the request goroutine
+// for seven event types, in every workspace — including deployments with plugins
+// switched off, where the flag check downstream then threw the result away.
+// Finding the id belongs on a worker, past the flag.
+func TestPublishingDoesNotParseThePayload(t *testing.T) {
+	marshals := 0
+	bus := events.New()
+	SubscribePluginEvents(bus, recordingSink(func(string) {}))
+
+	bus.Publish(events.Event{
+		Type:        protocol.EventIssueCreated,
+		WorkspaceID: "00000000-0000-4000-8000-000000000001",
+		Payload:     countingPayload{marshals: &marshals},
+	})
+
+	if marshals != 0 {
+		t.Fatalf("the payload was serialized %d time(s) on the publishing goroutine; the id must be extracted on a worker instead", marshals)
+	}
+}
+
+// And the id still arrives — moved, not dropped. issueIDFromPayload remains the
+// one place that knows the payload shapes; only where it runs changed.
+func TestTheIssueIDIsStillFoundOnTheWorker(t *testing.T) {
+	issueID := "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	found := issueIDFromPayload(map[string]any{"issue": map[string]any{"id": issueID}})
+	if uuidString(found) != issueID {
+		t.Fatalf("issue id = %q, want %q", uuidString(found), issueID)
 	}
 }
