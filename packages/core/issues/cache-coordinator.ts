@@ -122,7 +122,20 @@ function listContractFromKey(key: QueryKey): {
   };
 }
 
-function bucketedListEntries(
+/**
+ * SHAPE-FILTERED CACHE SCANS.
+ *
+ * `getQueriesData` matches a key PREFIX, and every issue-surface prefix also
+ * covers sibling queries that hold a different shape: `myAll` covers the
+ * assignee-grouped caches, `tableAll` covers the grouped (infinite) and facet
+ * caches next to the row pages, `flatAll` covers the export window. Reading
+ * `data.rows` / `data.pages` / `data.byStatus` off those siblings throws
+ * ("Cannot read properties of undefined"), and inside a mutation's onSuccess
+ * that throw surfaces as a failed write the server already accepted
+ * (MUL-6394). Every scan goes through these helpers so the shape check can't
+ * be forgotten at a new call site.
+ */
+export function bucketedListEntries(
   qc: QueryClient,
   wsId: string,
 ): [QueryKey, ListIssuesCache][] {
@@ -134,7 +147,7 @@ function bucketedListEntries(
   );
 }
 
-function flatListEntries(
+export function flatListEntries(
   qc: QueryClient,
   wsId: string,
 ): [QueryKey, IssueFlatCache][] {
@@ -146,7 +159,7 @@ function flatListEntries(
     );
 }
 
-function tableRowEntries(
+export function tableRowEntries(
   qc: QueryClient,
   wsId: string,
 ): [QueryKey, IssueTableRowCache][] {
@@ -158,6 +171,17 @@ function tableRowEntries(
         typeof entry[1] === "object" &&
         Array.isArray((entry[1] as IssueTableRowCache).rows),
     );
+}
+
+/** Caches under `prefix` that hold a plain `Issue[]` — per-parent children and
+ *  the project Gantt list. */
+export function issueArrayEntries(
+  qc: QueryClient,
+  prefix: readonly unknown[],
+): [QueryKey, Issue[]][] {
+  return qc
+    .getQueriesData<Issue[]>({ queryKey: prefix })
+    .filter((entry): entry is [QueryKey, Issue[]] => Array.isArray(entry[1]));
 }
 
 function flatContractFromKey(key: QueryKey): {

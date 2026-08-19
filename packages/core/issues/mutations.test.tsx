@@ -10,6 +10,7 @@ import { setApiInstance } from "../api";
 import type { ApiClient } from "../api/client";
 import {
   useBatchUpdateIssues,
+  useCreateComment,
   useDeleteComment,
   useResolveComment,
   useUpdateComment,
@@ -946,5 +947,78 @@ describe("useResolveComment", () => {
 
     // Only b1 is cleared; a1 stays resolved (unresolve never mirrors the clear).
     expect(resolvedIds(qc)).toEqual(["a1"]);
+  });
+});
+
+// MUL-6394: posting a comment while the Table view's grouped/facet caches are
+// loaded rejected `mutateAsync` with "Cannot read properties of undefined
+// (reading 'some')" — the comment WAS created server-side (the agent task
+// started), but the composer showed an error toast and never appended the
+// entry, so it only appeared after a reload.
+describe("useCreateComment — sibling caches under a shared key prefix", () => {
+  const ISSUE_ID = "issue-1";
+  const tableQuery = {
+    scope: { kind: "workspace" },
+    filters: {},
+    sort: { field: "position", direction: "asc" },
+  } as const;
+
+  let qc: QueryClient;
+
+  beforeEach(() => {
+    qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    setApiInstance({
+      createComment: vi.fn().mockResolvedValue({
+        id: "comment-1",
+        issue_id: ISSUE_ID,
+        author_type: "member",
+        author_id: "user-1",
+        content: "hello",
+        type: "comment",
+        parent_id: null,
+        reactions: [],
+        attachments: [],
+        created_at: "2026-08-19T00:00:00Z",
+        updated_at: "2026-08-19T00:00:00Z",
+        resolved_at: null,
+        resolved_by_type: null,
+        resolved_by_id: null,
+        issue_revision: 7,
+      }),
+    } as unknown as ApiClient);
+  });
+
+  afterEach(() => {
+    qc.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("appends the created comment even when non-row table caches are loaded", async () => {
+    qc.setQueryData<TimelineEntry[]>(issueKeys.timeline(ISSUE_ID), []);
+    // Grouped rows are an infinite cache and facets a plain object — both live
+    // under the `table-query` prefix next to the row pages, and neither has a
+    // `rows` array.
+    qc.setQueryData(issueKeys.tableGroups(WS_ID, tableQuery, { kind: "status" }), {
+      pages: [
+        { query_fingerprint: "sha256:groups", total: 0, groups: [], next_cursor: null },
+      ],
+      pageParams: [null],
+    });
+    qc.setQueryData(
+      issueKeys.tableFacets(WS_ID, { query: tableQuery, facets: [{ kind: "status" }] }),
+      { query_fingerprint: "sha256:facets", total: 0, facets: [] },
+    );
+
+    const { result } = renderHook(() => useCreateComment(ISSUE_ID), {
+      wrapper: createWrapper(qc),
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync({ content: "hello" });
+    });
+
+    expect(
+      qc.getQueryData<TimelineEntry[]>(issueKeys.timeline(ISSUE_ID))?.map((e) => e.id),
+    ).toEqual(["comment-1"]);
   });
 });
