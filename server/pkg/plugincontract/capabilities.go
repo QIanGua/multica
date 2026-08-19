@@ -44,7 +44,11 @@ func HostCapabilities() Capabilities {
 			TriggerEvent:  true,
 		},
 		HookTransport: map[string]bool{TransportHTTP: true},
-		ResourceTypes: map[string]bool{},
+		// A skill resource is not a call in either direction — it is a SKILL.md
+		// written into the existing skill table at install and removed at
+		// uninstall. Nothing executes, so it ships ahead of the agent trigger
+		// and the mcp transport, which both still need the daemon-side server.
+		ResourceTypes: map[string]bool{ResourceSkill: true},
 	}
 }
 

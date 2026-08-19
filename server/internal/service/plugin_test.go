@@ -325,8 +325,10 @@ func TestShippedHostCapabilitiesRunTheSurfacesTheHostMounts(t *testing.T) {
 		t.Fatal("the mcp transport has no implementation yet")
 	}
 
-	if shipped.ResourceTypes[plugincontract.ResourceSkill] {
-		t.Fatal("skill resources are enabled but the agent integration has not landed")
+	// service.InstallSkillResources writes these into the skill table, and
+	// Uninstall removes them again.
+	if !shipped.ResourceTypes[plugincontract.ResourceSkill] {
+		t.Fatal("skill resources are installed by InstallSkillResources and must be shipped")
 	}
 }
 
