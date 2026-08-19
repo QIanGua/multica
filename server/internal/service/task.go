@@ -26,6 +26,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/redact"
@@ -1113,6 +1114,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	createParams := db.CreateAgentTaskParams{
+		ID:                   dbid.NewV7(),
 		AgentID:              issue.AssigneeID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1139,6 +1141,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	var task db.AgentTaskQueue
 	if fireAt.Valid {
 		task, err = s.Queries.CreateDeferredChannelIssueTask(ctx, db.CreateDeferredChannelIssueTaskParams{
+			ID:                   dbid.NewV7(),
 			AgentID:              createParams.AgentID,
 			RuntimeID:            createParams.RuntimeID,
 			IssueID:              createParams.IssueID,
@@ -1263,6 +1266,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+		ID:                   dbid.NewV7(),
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1344,6 +1348,7 @@ func (s *TaskService) EnqueueDeferredAssigneeFallback(ctx context.Context, issue
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	isLeader := squadID.Valid
 	task, err := s.Queries.CreateDeferredAgentTask(ctx, db.CreateDeferredAgentTaskParams{
+		ID:                   dbid.NewV7(),
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1492,6 +1497,7 @@ func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, r
 	attrSource, _, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, requesterID, agent)
 	task, err := s.Queries.CreateQuickCreateTask(ctx, db.CreateQuickCreateTaskParams{
+		ID:                   dbid.NewV7(),
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		Priority:             priorityToInt("high"),
@@ -1682,6 +1688,7 @@ func (s *TaskService) EnqueueChatTask(ctx context.Context, chatSession db.ChatSe
 		mediaPendingUntil = pgtype.Timestamptz{}
 	}
 	task, err := qtx.CreateChatTask(ctx, db.CreateChatTaskParams{
+		ID:                dbid.NewV7(),
 		AgentID:           chatSession.AgentID,
 		RuntimeID:         agent.RuntimeID,
 		Priority:          2, // medium priority for chat
@@ -1971,6 +1978,7 @@ func (s *TaskService) SendDirectChatMessage(
 		out.Queued = queued
 
 		task, err := qtx.CreateChatTask(ctx, db.CreateChatTaskParams{
+			ID:                   dbid.NewV7(),
 			AgentID:              session.AgentID,
 			RuntimeID:            carrier.RuntimeID,
 			Priority:             2, // medium priority for chat; matches EnqueueChatTask
@@ -2014,6 +2022,7 @@ func (s *TaskService) SendDirectChatMessage(
 		// Create the user message already owned by this task (task_id = task.id),
 		// so it belongs to this immutable input batch the instant it exists.
 		msg, err := qtx.CreateChatMessage(ctx, db.CreateChatMessageParams{
+			ID:            dbid.NewV7(),
 			ChatSessionID: session.ID,
 			Role:          "user",
 			Content:       content,
@@ -2107,6 +2116,7 @@ func (s *TaskService) OpenMikaOnboardingChat(ctx context.Context, session db.Cha
 		}
 
 		kickoffRow, err := qtx.CreateChatMessage(ctx, db.CreateChatMessageParams{
+			ID:            dbid.NewV7(),
 			ChatSessionID: session.ID,
 			Role:          "user",
 			Content:       kickoff,
@@ -2120,6 +2130,7 @@ func (s *TaskService) OpenMikaOnboardingChat(ctx context.Context, session db.Cha
 		// Ordered one microsecond after the kickoff — see the query comment for
 		// why a shared transaction timestamp is not good enough here.
 		openingRow, err := qtx.CreateMikaOnboardingOpening(ctx, db.CreateMikaOnboardingOpeningParams{
+			ID:               dbid.NewV7(),
 			ChatSessionID:    session.ID,
 			KickoffCreatedAt: kickoffRow.CreatedAt,
 			Content:          opening,
@@ -2604,6 +2615,7 @@ func (s *TaskService) settleQueuedChatInput(
 	}
 	if channelIngested {
 		if _, err := createAssistantChatMessage(ctx, qtx, db.CreateChatMessageParams{
+			ID:            dbid.NewV7(),
 			ChatSessionID: task.ChatSessionID,
 			Role:          "assistant",
 			Content:       "Stopped.",
@@ -2751,6 +2763,7 @@ func (s *TaskService) finalizeCancelledChatMessage(ctx context.Context, task db.
 			return nil
 		}
 		if _, err := createAssistantChatMessage(ctx, qtx, db.CreateChatMessageParams{
+			ID:            dbid.NewV7(),
 			ChatSessionID: task.ChatSessionID,
 			Role:          "assistant",
 			Content:       "Stopped.",
@@ -2906,6 +2919,7 @@ func (s *TaskService) FinalizeDeferredCancelledChat(ctx context.Context, taskID 
 			return nil
 		}
 		row, err := createAssistantChatMessage(ctx, qtx, db.CreateChatMessageParams{
+			ID:            dbid.NewV7(),
 			ChatSessionID: claimed.ChatSessionID,
 			Role:          "assistant",
 			Content:       "Stopped.",
@@ -3907,6 +3921,7 @@ func (s *TaskService) writeChatCompletionOutcome(ctx context.Context, qtx *db.Qu
 	}
 
 	params := db.CreateChatMessageParams{
+		ID:            dbid.NewV7(),
 		ChatSessionID: task.ChatSessionID,
 		Role:          "assistant",
 		TaskID:        task.ID,
@@ -4185,6 +4200,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		// and the bumped chat-retry priority; broadcast/notify happen after commit.
 		if wantRetry {
 			child, cerr := qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
+				NewTaskID:            dbid.NewV7(),
 				ID:                   taskID,
 				FireAt:               retryFireAt,
 				MaxAttempts:          retryMaxAttempts,
@@ -4220,6 +4236,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 				return fmt.Errorf("release onboarding kickoff: %w", err)
 			}
 			if _, err := createAssistantChatMessage(ctx, qtx, db.CreateChatMessageParams{
+				ID:            dbid.NewV7(),
 				ChatSessionID: t.ChatSessionID,
 				Role:          "assistant",
 				Content:       redact.Text(errMsg),
@@ -4550,6 +4567,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
 	}
 	child, err := s.Queries.CreateRetryTask(ctx, db.CreateRetryTaskParams{
+		NewTaskID:            dbid.NewV7(),
 		ID:                   parent.ID,
 		FireAt:               retryFireAt,
 		MaxAttempts:          pgtype.Int4{Int32: retryAttemptCeiling(reason, parent.MaxAttempts), Valid: true},
@@ -5070,6 +5088,7 @@ func (s *TaskService) ensureDelegatedFailureRecoveryComment(ctx context.Context,
 			return fmt.Errorf("find recovery comment: %w", err)
 		}
 		createdComment, err := qtx.CreateComment(ctx, db.CreateCommentParams{
+			ID:           dbid.NewV7(),
 			IssueID:      target.issue.ID,
 			WorkspaceID:  target.issue.WorkspaceID,
 			AuthorType:   "system",
@@ -5175,6 +5194,7 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 		}
 
 		createdComment, err := qtx.CreateComment(ctx, db.CreateCommentParams{
+			ID:           dbid.NewV7(),
 			IssueID:      target.issue.ID,
 			WorkspaceID:  target.issue.WorkspaceID,
 			AuthorType:   "system",
@@ -5216,6 +5236,7 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 				return fmt.Errorf("encode delegated failure exhaustion details: %w", err)
 			}
 			exhaustedInbox, err = qtx.CreateInboxItem(ctx, db.CreateInboxItemParams{
+				ID:            dbid.NewV7(),
 				WorkspaceID:   target.issue.WorkspaceID,
 				RecipientType: "member",
 				RecipientID:   recipient,
@@ -5355,6 +5376,7 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 		}
 		overlay := s.buildRuntimeMCPOverlay(ctx, originator, target.agent)
 		task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+			ID:                   dbid.NewV7(),
 			AgentID:              target.agent.ID,
 			RuntimeID:            target.agent.RuntimeID,
 			IssueID:              target.issue.ID,
@@ -6016,6 +6038,7 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		}
 	}
 	created, err := s.Queries.CreateComment(ctx, db.CreateCommentParams{
+		ID:           dbid.NewV7(),
 		IssueID:      issueID,
 		WorkspaceID:  issue.WorkspaceID,
 		AuthorType:   "agent",
@@ -6327,6 +6350,7 @@ func (s *TaskService) notifyQuickCreateCompleted(ctx context.Context, task db.Ag
 		"original_prompt": qc.Prompt,
 	})
 	item, err := s.Queries.CreateInboxItem(ctx, db.CreateInboxItemParams{
+		ID:            dbid.NewV7(),
 		WorkspaceID:   workspaceID,
 		RecipientType: "member",
 		RecipientID:   requesterID,
@@ -6426,6 +6450,7 @@ func (s *TaskService) writeQuickCreateOutcomeInbox(ctx context.Context, task db.
 		"error":           redact.Text(errMsg),
 	})
 	item, err := s.Queries.CreateInboxItem(ctx, db.CreateInboxItemParams{
+		ID:            dbid.NewV7(),
 		WorkspaceID:   workspaceID,
 		RecipientType: "member",
 		RecipientID:   requesterID,

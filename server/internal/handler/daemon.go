@@ -30,6 +30,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/redact"
 	"github.com/multica-ai/multica/server/pkg/skillbundle"
@@ -1745,6 +1746,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		// the exact claim is requeued and omitted from this batch.
 		commentBackedTask := task.TriggerCommentID.Valid || len(task.CoalescedCommentIds) > 0
 		receipt, ferr := h.TaskService.FinalizeTaskClaim(r.Context(), task, db.CreateTaskTokenParams{
+			ID:          dbid.NewV7(),
 			TokenHash:   auth.HashToken(tokenStr),
 			TaskID:      task.ID,
 			AgentID:     task.AgentID,
@@ -3212,6 +3214,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	receipt, ferr := h.TaskService.FinalizeTaskClaim(r.Context(), *task, db.CreateTaskTokenParams{
+		ID:          dbid.NewV7(),
 		TokenHash:   auth.HashToken(tokenStr),
 		TaskID:      task.ID,
 		AgentID:     task.AgentID,
