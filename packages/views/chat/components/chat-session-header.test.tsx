@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { I18nProvider } from "@multica/core/i18n/react";
 import type { ChatSession } from "@multica/core/types";
 import enChat from "../../locales/en/chat.json";
@@ -33,6 +33,7 @@ import { ChatSessionHeader } from "./chat-session-header";
 
 const TEST_RESOURCES = { en: { chat: enChat } };
 const RENAME_LABEL = enChat.header.rename;
+const OUTSIDE_LABEL = "Outside control";
 
 const session: ChatSession = {
   id: "session-1",
@@ -51,9 +52,12 @@ const session: ChatSession = {
 
 function startRename(): HTMLInputElement {
   render(
-    <I18nProvider locale="en" resources={TEST_RESOURCES}>
-      <ChatSessionHeader session={session} agent={null} />
-    </I18nProvider>,
+    <>
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <ChatSessionHeader session={session} agent={null} />
+      </I18nProvider>
+      <button type="button">{OUTSIDE_LABEL}</button>
+    </>,
   );
   fireEvent.click(screen.getByTitle(RENAME_LABEL));
   return screen.getByRole("textbox", { name: RENAME_LABEL });
@@ -94,13 +98,15 @@ describe("ChatSessionHeader rename keyboard behavior", () => {
 
   it("defers blur submission until an active composition ends", () => {
     const input = startRename();
+    const outside = screen.getByRole("button", { name: OUTSIDE_LABEL });
     fireEvent.change(input, { target: { value: "yanjiu" } });
     fireEvent.compositionStart(input);
 
-    fireEvent.blur(input);
+    outside.focus();
 
     expect(updateMutate).not.toHaveBeenCalled();
     expect(input).toBeInTheDocument();
+    expect(outside).toHaveFocus();
 
     fireEvent.change(input, { target: { value: "研究" } });
     fireEvent.compositionEnd(input);
@@ -113,17 +119,51 @@ describe("ChatSessionHeader rename keyboard behavior", () => {
     expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
   });
 
-  it("still submits the current value on an ordinary blur", () => {
+  it("falls back to the current value when compositionend does not arrive", async () => {
     const input = startRename();
+    const outside = screen.getByRole("button", { name: OUTSIDE_LABEL });
+    fireEvent.change(input, { target: { value: "研究" } });
+    fireEvent.compositionStart(input);
+
+    outside.focus();
+
+    await waitFor(() => {
+      expect(updateMutate).toHaveBeenCalledTimes(1);
+    });
+    expect(updateMutate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      title: "研究",
+    });
+    expect(screen.queryByRole("textbox", { name: RENAME_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("still submits the current value when focus moves outside", () => {
+    const input = startRename();
+    const outside = screen.getByRole("button", { name: OUTSIDE_LABEL });
     fireEvent.change(input, { target: { value: "Blurred title" } });
 
-    fireEvent.blur(input);
+    outside.focus();
 
     expect(updateMutate).toHaveBeenCalledTimes(1);
     expect(updateMutate).toHaveBeenCalledWith({
       sessionId: "session-1",
       title: "Blurred title",
     });
+    expect(outside).toHaveFocus();
+  });
+
+  it.each([
+    ["standard composition signal", { isComposing: true, keyCode: 27 }],
+    ["Safari composition signal", { isComposing: false, keyCode: 229 }],
+  ])("keeps editing when Escape carries the %s", (_name, eventInit) => {
+    const input = startRename();
+    fireEvent.change(input, { target: { value: "yanjiu" } });
+
+    fireEvent.keyDown(input, { key: "Escape", ...eventInit });
+
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(input).toBeInTheDocument();
+    expect(input).toHaveValue("yanjiu");
   });
 
   it("still cancels the edit on Escape", () => {

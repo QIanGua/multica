@@ -68,6 +68,7 @@ export function ChatSessionHeader({
   // A browser can blur the input before it emits compositionend. Remember
   // that intent so the final composed value is committed, not the draft.
   const commitAfterCompositionRef = useRef(false);
+  const blurCommitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const title = session.title?.trim() || t(($) => $.window.untitled);
 
@@ -78,7 +79,23 @@ export function ChatSessionHeader({
     }
   }, [editing]);
 
+  useEffect(
+    () => () => {
+      if (blurCommitTimeoutRef.current !== null) {
+        clearTimeout(blurCommitTimeoutRef.current);
+      }
+    },
+    [],
+  );
+
+  const clearPendingBlurCommit = () => {
+    if (blurCommitTimeoutRef.current === null) return;
+    clearTimeout(blurCommitTimeoutRef.current);
+    blurCommitTimeoutRef.current = null;
+  };
+
   const startRename = () => {
+    clearPendingBlurCommit();
     isComposingRef.current = false;
     commitAfterCompositionRef.current = false;
     setDraft(session.title ?? "");
@@ -86,6 +103,7 @@ export function ChatSessionHeader({
   };
 
   const commitRename = (raw = draft) => {
+    clearPendingBlurCommit();
     isComposingRef.current = false;
     commitAfterCompositionRef.current = false;
     setEditing(false);
@@ -133,17 +151,27 @@ export function ChatSessionHeader({
             onBlur={(e) => {
               if (isComposingRef.current) {
                 commitAfterCompositionRef.current = true;
+                const input = e.currentTarget;
+                // Let a compositionend queued by the same focus change win.
+                // If it never arrives, commit on the next task instead of
+                // leaving an unfocused editor open indefinitely.
+                clearPendingBlurCommit();
+                blurCommitTimeoutRef.current = setTimeout(() => {
+                  if (!commitAfterCompositionRef.current) return;
+                  commitRename(input.value);
+                }, 0);
                 return;
               }
               commitRename(e.currentTarget.value);
             }}
             onKeyDown={(e) => {
+              if (isImeComposing(e)) return;
               if (e.key === "Enter") {
-                if (isImeComposing(e)) return;
                 e.preventDefault();
                 commitRename();
               } else if (e.key === "Escape") {
                 e.preventDefault();
+                clearPendingBlurCommit();
                 isComposingRef.current = false;
                 commitAfterCompositionRef.current = false;
                 setEditing(false);

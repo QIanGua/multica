@@ -68,8 +68,8 @@ export function SessionRenameInput({
         // Keep editing keys inside the input instead of letting the row
         // selection keyboard handler consume them.
         e.stopPropagation();
+        if (isImeComposing(e)) return;
         if (e.key === "Enter") {
-          if (isImeComposing(e)) return;
           e.preventDefault();
           onSubmit(value);
         } else if (e.key === "Escape") {

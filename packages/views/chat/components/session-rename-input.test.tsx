@@ -50,6 +50,20 @@ describe("SessionRenameInput", () => {
     expect(onSubmit).toHaveBeenCalledWith("研究");
   });
 
+  it.each([
+    ["standard composition signal", { isComposing: true, keyCode: 27 }],
+    ["Safari composition signal", { isComposing: false, keyCode: 229 }],
+  ])("does not cancel Escape with the %s", (_name, eventInit) => {
+    const input = renderInput();
+    fireEvent.change(input, { target: { value: "yanjiu" } });
+
+    fireEvent.keyDown(input, { key: "Escape", ...eventInit });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(input).toHaveValue("yanjiu");
+  });
+
   it("keeps normal Enter and Escape behavior", () => {
     const input = renderInput();
     fireEvent.change(input, { target: { value: "Renamed chat" } });
