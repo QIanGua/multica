@@ -210,7 +210,7 @@ export function HtmlBlockPreview({ html, className }: HtmlBlockPreviewProps) {
                   </span>
                 </button>
               </div>
-              <div className="grid min-h-0 flex-1 grid-rows-[minmax(220px,0.8fr)_minmax(260px,1.2fr)] md:grid-cols-[minmax(320px,0.85fr)_minmax(0,1.15fr)] md:grid-rows-1">
+              <div className="grid min-h-0 flex-1 grid-rows-[minmax(220px,0.8fr)_minmax(260px,1.2fr)] overflow-y-auto overscroll-contain md:grid-cols-[minmax(320px,0.85fr)_minmax(0,1.15fr)] md:grid-rows-1 md:overflow-hidden">
                 <div className="min-h-0 border-b border-border bg-muted/20 md:border-r md:border-b-0">
                   <textarea
                     value={draftHtml}

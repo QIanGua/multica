@@ -168,6 +168,33 @@ test("edits an assistant HTML preview live without mutating message history", as
       });
     }
 
+    await page.keyboard.press("Escape");
+    await page.setViewportSize({ width: 390, height: 430 });
+    await htmlBlock.hover();
+    await page.getByRole("button", { name: "Edit live preview" }).click();
+    const shortEditor = page.getByRole("textbox", { name: "HTML editor" });
+    await shortEditor.fill(EDITED_HTML);
+
+    const shortPreviewElement = page.locator('iframe[title="Live preview workspace"]');
+    await shortPreviewElement.scrollIntoViewIfNeeded();
+    const shortFrame = page.frameLocator('iframe[title="Live preview workspace"]');
+    await expect(
+      shortFrame.getByRole("heading", { name: "Edited live preview" }),
+    ).toBeVisible();
+
+    if (process.env.LIVE_PREVIEW_SHORT_SCREENSHOT_PATH) {
+      await page.screenshot({
+        path: process.env.LIVE_PREVIEW_SHORT_SCREENSHOT_PATH,
+        fullPage: true,
+      });
+    }
+
+    await shortEditor.scrollIntoViewIfNeeded();
+    await expect(shortEditor).toBeVisible();
+    await shortEditor.fill(ORIGINAL_HTML);
+    await expect(shortEditor).toHaveValue(ORIGINAL_HTML);
+    expect(await horizontalOverflowPx(page)).toBe(0);
+
     const persisted = await db.query<{ content: string }>(
       `SELECT content FROM chat_message
        WHERE chat_session_id = $1 AND role = 'assistant'
