@@ -3627,7 +3627,13 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 		}
 		actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
 		if !h.canInvokeAgent(ctx, agent, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID) {
-			return http.StatusForbidden, "cannot assign to private agent"
+			// Names the missing permission, not the target's configuration: the
+			// old "private agent" wording both leaked the agent's permission
+			// mode and was simply wrong for a `public_to` agent scoped to
+			// specific people. Stays as generic as ReasonInvocationNotAllowed
+			// (dispatch/reason.go), which deliberately does not distinguish
+			// "not permitted" from "does not exist" (MUL-6380 / GH #7180).
+			return http.StatusForbidden, "you do not have permission to assign work to this agent"
 		}
 		return 0, ""
 	case "squad":
@@ -3647,7 +3653,9 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 		}
 		actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
 		if !h.canInvokeAgent(ctx, leader, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID) {
-			return http.StatusForbidden, "cannot assign to squad with private leader"
+			// Same wording rule as the agent branch above; "this squad"
+			// avoids disclosing the leader agent's permission mode.
+			return http.StatusForbidden, "you do not have permission to assign work to this squad"
 		}
 		return 0, ""
 	default:
