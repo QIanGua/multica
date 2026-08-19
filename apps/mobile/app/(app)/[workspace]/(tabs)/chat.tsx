@@ -50,6 +50,7 @@ import {
   hideQueuedChatMessages,
   removePendingChatTask,
 } from "@multica/core/chat/pending";
+import { canAssignAgentToIssue } from "@multica/core/permissions";
 import { api } from "@/data/api";
 import { useAuthStore } from "@/data/auth-store";
 import { useWorkspaceStore } from "@/data/workspace-store";
@@ -77,7 +78,6 @@ import {
   invalidatePendingTask,
   seedAcceptedPendingTask,
 } from "@/data/realtime/chat-ws-updaters";
-import { canAssignAgent } from "@/lib/can-assign-agent";
 import { useWorkspaceAgentAvailability } from "@/lib/workspace-agent-availability";
 import { useAgentPresence } from "@/lib/use-agent-presence";
 import { Header } from "@/components/ui/header";
@@ -154,14 +154,22 @@ export default function ChatTab() {
 
   // ── Derived ────────────────────────────────────────────────────────────
   const memberRole = useMemo(
-    () => members.find((m) => m.user_id === userId)?.role,
+    () => members.find((m) => m.user_id === userId)?.role ?? null,
     [members, userId],
   );
 
+  // The picker must list only agents this user can actually TRIGGER — sending
+  // a message enqueues a run, so it clears the server's invoke gate
+  // (`canInvokeAgent`), which has no admin bypass. Shared rule, not a mobile
+  // copy: a local mirror drifted from it and let admins pick a teammate's
+  // personal agent only to be 403'd on send (MUL-6380 / GH #7180).
   const availableAgents = useMemo(
     () =>
       agents.filter(
-        (a) => !a.archived_at && canAssignAgent(a, userId, memberRole),
+        (a) =>
+          !a.archived_at &&
+          canAssignAgentToIssue(a, { userId: userId ?? null, role: memberRole })
+            .allowed,
       ),
     [agents, userId, memberRole],
   );
