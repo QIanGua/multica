@@ -158,17 +158,6 @@ export function IssueStatusesTab() {
 
   const archivedCount = statuses.filter((s) => !s.is_system && s.archived_at).length;
 
-  // The drag handle gets a gutter only when something in the workspace can
-  // actually be dragged. A default workspace has nothing custom to reorder, and
-  // an empty 16px column in front of all seven rows is indentation that means
-  // nothing. Decided once for the whole list so the categories stay aligned
-  // with each other.
-  const showDragColumn =
-    isAdmin &&
-    groups.some(
-      (group) => group.custom.filter((entry) => !entry.archived_at).length > 1,
-    );
-
   return (
     <SettingsTab
       title={t(($) => $.issue_statuses.title)}
@@ -208,7 +197,6 @@ export function IssueStatusesTab() {
                 custom={group.custom}
                 canManage={isAdmin}
                 canCreate={isAdmin && canCreate}
-                showDragColumn={showDragColumn}
                 onCreate={() => setCreateCategory(group.category)}
                 onEdit={setEditing}
                 onArchive={setPendingArchive}
@@ -240,7 +228,6 @@ function CategorySection({
   custom,
   canManage,
   canCreate,
-  showDragColumn,
   onCreate,
   onEdit,
   onArchive,
@@ -250,7 +237,6 @@ function CategorySection({
   custom: IssueStatusEntry[];
   canManage: boolean;
   canCreate: boolean;
-  showDragColumn: boolean;
   onCreate: () => void;
   onEdit: (status: IssueStatusEntry) => void;
   onArchive: (status: IssueStatusEntry) => void;
@@ -334,7 +320,6 @@ function CategorySection({
             entry={builtIn}
             label={labelOf(builtIn.key)}
             behavior={t(($) => $.issue_statuses.categories[category])}
-            showDragColumn={showDragColumn}
           />
         )}
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
@@ -345,7 +330,6 @@ function CategorySection({
                 entry={entry}
                 canManage={canManage}
                 canReorder={canReorder && !entry.archived_at}
-                showDragColumn={showDragColumn}
                 onEdit={() => onEdit(entry)}
                 onArchive={() => onArchive(entry)}
               />
@@ -361,16 +345,13 @@ function BuiltInRow({
   entry,
   label,
   behavior,
-  showDragColumn,
 }: {
   entry: IssueStatusEntry;
   label: string;
   behavior: string;
-  showDragColumn: boolean;
 }) {
   return (
     <div className="flex min-h-12 items-center gap-3 px-4 py-2">
-      {showDragColumn && <span className="w-4 shrink-0" />}
       <StatusIcon status={entry.key} category={entry.category} className="size-4" />
       <div className="min-w-0">
         <p className="truncate text-body font-medium">{label}</p>
@@ -389,14 +370,12 @@ function CustomStatusRow({
   entry,
   canManage,
   canReorder,
-  showDragColumn,
   onEdit,
   onArchive,
 }: {
   entry: IssueStatusEntry;
   canManage: boolean;
   canReorder: boolean;
-  showDragColumn: boolean;
   onEdit: () => void;
   onArchive: () => void;
 }) {
@@ -412,22 +391,23 @@ function CustomStatusRow({
     <div
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition }}
-      className={`flex min-h-12 items-center gap-3 bg-card px-4 py-2 ${isDragging ? "relative z-10 shadow-[var(--surface-shadow)]" : ""} ${archived ? "opacity-60" : ""}`}
+      className={`group/row relative flex min-h-12 items-center gap-3 bg-card px-4 py-2 ${isDragging ? "z-10 shadow-[var(--surface-shadow)]" : ""} ${archived ? "opacity-60" : ""}`}
     >
-      {showDragColumn &&
-        (canReorder ? (
-          <button
-            type="button"
-            aria-label={t(($) => $.issue_statuses.actions.reorder, { name: entry.name })}
-            className="w-4 shrink-0 cursor-grab text-muted-foreground active:cursor-grabbing"
-            {...attributes}
-            {...listeners}
-          >
-            <GripVertical className="size-4" />
-          </button>
-        ) : (
-          <span className="w-4 shrink-0" />
-        ))}
+      {/* The handle rides inside the row's own left padding instead of taking a
+          column of its own. A reserved gutter indents every status away from
+          the card edge — including the built-in rows, which can never be
+          dragged — and that indent is what the list reads as. (MUL-6422) */}
+      {canReorder && (
+        <button
+          type="button"
+          aria-label={t(($) => $.issue_statuses.actions.reorder, { name: entry.name })}
+          className="absolute left-0 top-1/2 flex w-4 -translate-y-1/2 cursor-grab justify-center text-faint-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100 active:cursor-grabbing"
+          {...attributes}
+          {...listeners}
+        >
+          <GripVertical className="size-4" />
+        </button>
+      )}
       <StatusIcon
         status={entry.key}
         category={entry.category}
