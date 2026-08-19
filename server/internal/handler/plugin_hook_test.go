@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"github.com/multica-ai/multica/server/internal/service"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
@@ -241,4 +244,96 @@ func rotateToken(t *testing.T, installationID string) pluginTokenResponse {
 		t.Fatalf("decode token response: %v", err)
 	}
 	return issued
+}
+
+// The feature flag gates the EVENT path, observed where it matters: does a
+// request actually leave for the plugin's endpoint.
+//
+// Every other plugin surface is refused by a handler that can read the flag off
+// a request. An event hook has none — the dispatcher is subscribed at startup
+// and runs on a worker — so without a check inside it, turning plugins off
+// would hide the UI and refuse the Action API while the outbound calls kept
+// going. That is fail-open on the one path that reaches a third party.
+//
+// Needs a database because the dispatcher only calls anything when a real,
+// enabled installation declares an event hook.
+func TestEventDispatchRespectsTheFeatureFlagEndToEnd(t *testing.T) {
+	withPluginsV1Flag(t, testHandler, true)
+	cleanupPluginInstallations(t)
+
+	received := make(chan struct{}, 4)
+	endpoint := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		received <- struct{}{}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(endpoint.Close)
+
+	host := strings.Split(strings.TrimPrefix(endpoint.URL, "https://"), ":")[0]
+	manifest := strings.NewReplacer(
+		"https://example.com/hooks/summarize", endpoint.URL+"/hooks/summarize",
+		"https://example.com/hooks/manual", endpoint.URL+"/hooks/manual",
+		`"net:example.com"`, `"net:`+host+`"`,
+	).Replace(hookHandlerTestManifest)
+
+	source := withLocalPluginSource(t, manifest)
+	// The dev-origin opt-in is what lets a loopback endpoint be dialled at all;
+	// the granted net: scope still has to cover it, which the replace above did.
+	previousOrigins := testHandler.PluginService.DevOrigins
+	previousClient := testHandler.PluginService.HookClient
+	previousFlags := testHandler.PluginService.FeatureFlags
+	previousKey := testHandler.PluginService.DeploymentKey
+	previousCallbacks := testHandler.PluginService.Callbacks
+	testHandler.PluginService.DevOrigins = []string{endpoint.URL}
+	testHandler.PluginService.HookClient = endpoint.Client()
+	// Without a deployment key there is nothing to sign with and the call is
+	// refused before it leaves — which would make this test pass for the wrong
+	// reason in the flag-off half.
+	testHandler.PluginService.DeploymentKey = bytes.Repeat([]byte{5}, 32)
+	testHandler.PluginService.Callbacks = service.NewCallbackTokens()
+	t.Cleanup(func() {
+		testHandler.PluginService.DevOrigins = previousOrigins
+		testHandler.PluginService.HookClient = previousClient
+		testHandler.PluginService.FeatureFlags = previousFlags
+		testHandler.PluginService.DeploymentKey = previousKey
+		testHandler.PluginService.Callbacks = previousCallbacks
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"source_url":     source,
+		"granted_scopes": []string{"issues:read", "comments:write", "net:" + host},
+	})
+	install := httptest.NewRecorder()
+	testHandler.InstallPlugin(install, pluginHandlerRequest(http.MethodPost, "/plugins", body, map[string]string{"id": testWorkspaceID}))
+	if install.Code != http.StatusCreated {
+		t.Fatalf("install: status=%d body=%s", install.Code, install.Body.String())
+	}
+
+	dispatch := func() {
+		dispatcher := service.NewPluginEventDispatcher(testHandler.PluginService)
+		defer dispatcher.Close()
+		dispatcher.Dispatch(plugincontract.EventIssueCreated, testWorkspaceID, parseUUID(testWorkspaceID), map[string]any{})
+		// Long enough for a worker to pick the job up and complete the call.
+		time.Sleep(2 * time.Second)
+	}
+
+	// Flag on: the endpoint is called.
+	testHandler.PluginService.FeatureFlags = testHandler.FeatureFlags
+	dispatch()
+	select {
+	case <-received:
+	default:
+		t.Fatal("with the flag on, an installed event hook was never called")
+	}
+
+	// Flag off: nothing leaves, even though the same installation is still
+	// enabled and still declares the hook.
+	withPluginsV1Flag(t, testHandler, false)
+	testHandler.PluginService.FeatureFlags = testHandler.FeatureFlags
+	dispatch()
+	select {
+	case <-received:
+		t.Fatal("with the flag off, an event hook still called out — the flag does not gate the outbound path")
+	default:
+	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/featureflag"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
 	"github.com/multica-ai/multica/server/pkg/remotemcp"
 )
@@ -59,6 +60,11 @@ type PluginService struct {
 	// CallbackBaseURL is the Action API root a hook handler should call, sent
 	// alongside the callback token so a plugin does not hardcode our hostname.
 	CallbackBaseURL string
+	// FeatureFlags gates the hook engine. Held here because the EVENT path has
+	// no request to read the flag from: it runs on a worker, so the check has to
+	// live with the service rather than in a handler. Nil reads as disabled,
+	// which is the safe direction for the one path that reaches a third party.
+	FeatureFlags *featureflag.Service
 	// HookClient overrides the outbound client, and ONLY for an endpoint whose
 	// origin the operator already named in DevOrigins. Nil everywhere else, so
 	// a public endpoint always goes through the SSRF-guarded client and this

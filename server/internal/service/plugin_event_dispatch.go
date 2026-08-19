@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/featureflags"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
 )
@@ -215,6 +216,19 @@ func (d *PluginEventDispatcher) run(job dispatchJob) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+
+	// The flag gates this path too, and checking it HERE rather than at
+	// subscription is the point: a deployment that turns plugins off after
+	// something was installed must stop the outbound calls, not just hide the
+	// UI. Reading it per delivery means the flip takes effect immediately
+	// instead of at the next restart.
+	//
+	// It also keeps the flag-off cost at zero. Without this every dispatched
+	// event ran a ListWorkspacePluginInstallations query to discover there was
+	// nothing to call.
+	if !featureflags.PluginsV1Enabled(ctx, d.service.FeatureFlags) {
+		return
+	}
 
 	installations, err := d.service.Queries.ListWorkspacePluginInstallations(ctx, job.installation.WorkspaceID)
 	if err != nil {
