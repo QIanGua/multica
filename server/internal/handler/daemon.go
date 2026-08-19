@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -4438,7 +4439,8 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 
 		if workspaceID != "" {
 			h.publishTask(protocol.EventTaskMessage, workspaceID, "system", "", taskID,
-				taskMessageToPayload(created, taskID, uuidToString(task.IssueID)))
+				truncateTaskMessageForBroadcast(
+					taskMessageToPayload(created, taskID, uuidToString(task.IssueID))))
 		}
 	}
 
@@ -4550,6 +4552,123 @@ func taskMessageToPayload(m db.TaskMessage, taskID, issueID string) protocol.Tas
 		Output:    m.Output.String,
 		CreatedAt: createdAt,
 	}
+}
+
+// Byte budgets for the realtime fanout of a task message (MUL-6396).
+//
+// A `task:message` frame is broadcast to EVERY client in the workspace, and a
+// tool_use input is unbounded: a Write of a large file, or a MultiEdit with
+// long old/new strings, ships the whole body to every open client, which then
+// retains it. Persisted rows keep the full content — only the broadcast copy
+// is clipped, and `Truncated` tells the client to backfill from the REST
+// endpoint when it actually needs the full text.
+const (
+	// broadcastStringLimit caps each individual string inside Input, so small
+	// fields (file_path, command, description) survive intact and only the
+	// genuinely large ones are clipped.
+	broadcastStringLimit = 4096
+	// broadcastInputLimit caps the serialized Input after per-string clipping.
+	// A map with thousands of small keys can still be large; past this the
+	// input is dropped entirely and the client backfills.
+	broadcastInputLimit = 16384
+	// broadcastOutputLimit mirrors the daemon-side cap on tool output
+	// (see daemon.reportMessages). Belt and braces: other producers, and any
+	// future relaxation of the daemon cap, must not reopen the fanout hole.
+	broadcastOutputLimit = 8192
+)
+
+// clipUTF8 truncates s to at most limit bytes without splitting a rune.
+func clipUTF8(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// clipJSONValue returns v with every string at any depth clipped to
+// broadcastStringLimit. It never mutates the input: containers are rebuilt
+// only when something inside them actually changed.
+func clipJSONValue(v any) (any, bool) {
+	switch t := v.(type) {
+	case string:
+		if len(t) <= broadcastStringLimit {
+			return t, false
+		}
+		return clipUTF8(t, broadcastStringLimit), true
+	case map[string]any:
+		var out map[string]any
+		for k, val := range t {
+			clipped, did := clipJSONValue(val)
+			if !did {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]any, len(t))
+				for ck, cv := range t {
+					out[ck] = cv
+				}
+			}
+			out[k] = clipped
+		}
+		if out == nil {
+			return t, false
+		}
+		return out, true
+	case []any:
+		var out []any
+		for i, val := range t {
+			clipped, did := clipJSONValue(val)
+			if !did {
+				continue
+			}
+			if out == nil {
+				out = make([]any, len(t))
+				copy(out, t)
+			}
+			out[i] = clipped
+		}
+		if out == nil {
+			return t, false
+		}
+		return out, true
+	default:
+		return v, false
+	}
+}
+
+// truncateTaskMessageForBroadcast clips the realtime copy of a task message so
+// one oversized tool call cannot flood every client in the workspace. The
+// returned payload is a copy; the caller's row and the REST responses built
+// from it are untouched.
+func truncateTaskMessageForBroadcast(p protocol.TaskMessagePayload) protocol.TaskMessagePayload {
+	truncated := false
+
+	if len(p.Output) > broadcastOutputLimit {
+		p.Output = clipUTF8(p.Output, broadcastOutputLimit)
+		truncated = true
+	}
+
+	if p.Input != nil {
+		clipped, didClip := clipJSONValue(p.Input)
+		if didClip {
+			truncated = true
+			if m, ok := clipped.(map[string]any); ok {
+				p.Input = m
+			}
+		}
+		// Re-measure: per-string clipping bounds each value, not the total.
+		if encoded, err := json.Marshal(p.Input); err != nil || len(encoded) > broadcastInputLimit {
+			p.Input = nil
+			truncated = true
+		}
+	}
+
+	p.Truncated = truncated
+	return p
 }
 
 // ListTaskMessages returns the persisted messages for a task (for catch-up after reconnect).

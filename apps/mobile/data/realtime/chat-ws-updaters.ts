@@ -326,4 +326,13 @@ export function appendTaskMessage(
       return [...old, payload].sort((a, b) => a.seq - b.seq);
     },
   );
+
+  // The server clips oversized tool input/output out of the realtime copy so
+  // one big Write is not broadcast to every client (MUL-6396). The full row is
+  // only in the DB, and `taskMessagesOptions` is staleTime:Infinity — without
+  // this the clipped text would be pinned forever. Invalidating refetches for
+  // whoever is mounted and is a no-op otherwise.
+  if (payload.truncated) {
+    qc.invalidateQueries({ queryKey: chatKeys.taskMessages(payload.task_id) });
+  }
 }

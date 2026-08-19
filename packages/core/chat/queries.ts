@@ -1,4 +1,4 @@
-import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query";
+import { infiniteQueryOptions, queryOptions, type QueryClient } from "@tanstack/react-query";
 import { api } from "../api";
 import type { TaskMessagePayload } from "../types/events";
 import type {
@@ -225,6 +225,59 @@ export function mergeTaskMessagesBySeq(
   const fresh = incoming.filter((m) => !knownSeqs.has(m.seq));
   if (fresh.length === 0) return existing as TaskMessagePayload[];
   return [...existing, ...fresh].sort((a, b) => a.seq - b.seq);
+}
+
+/**
+ * True when this client already holds (or is actively loading) the message
+ * timeline for `taskId` — i.e. some mounted view is rendering it.
+ *
+ * The realtime layer uses this to decide whether a `task:message` frame is
+ * worth caching. Every client in the workspace receives every run's frames,
+ * but only a handful of runs are ever on screen; without this gate the cache
+ * accumulates the full transcript of runs the user will never open, for as
+ * long as they keep streaming (MUL-6396).
+ *
+ * Presence, not data: mounting a `useQuery` registers the entry before the
+ * fetch resolves, so a frame that lands mid-backfill is still kept. Dropping
+ * a frame for an unregistered task is safe — the row is persisted before it
+ * is broadcast, so whoever opens the task next fetches it from the server.
+ */
+export function isTaskMessageTimelineHeld(
+  qc: QueryClient,
+  taskId: string,
+): boolean {
+  return qc.getQueryCache().find({ queryKey: chatKeys.taskMessages(taskId) }) !== undefined;
+}
+
+/**
+ * Refetch a task's full timeline and swap the clipped rows for the real ones.
+ *
+ * Used when a broadcast frame arrived `truncated`: the live copy carries
+ * clipped tool input/output and the full text exists only in the DB.
+ *
+ * `mergeTaskMessagesBySeq` deliberately lets the entry already in the cache win
+ * on conflict, so a plain merge would leave the clipped copy in place forever.
+ * A truncated row is therefore dropped first — but only when the fetch actually
+ * returned a replacement for that seq. That keeps two backfills racing (a run
+ * writing large files back to back schedules one per flush) from deleting a row
+ * the older response simply hadn't seen yet: it stays clipped and the newer
+ * backfill fixes it.
+ */
+export async function backfillTaskMessages(
+  qc: QueryClient,
+  taskId: string,
+): Promise<void> {
+  if (!isTaskMessageTaskId(taskId)) return;
+  const msgs = await api.listTaskMessages(taskId);
+  const replaced = new Set(msgs.map((m) => m.seq));
+  qc.setQueryData<TaskMessagePayload[]>(
+    chatKeys.taskMessages(taskId),
+    (old = []) =>
+      mergeTaskMessagesBySeq(
+        old.filter((m) => !(m.truncated && replaced.has(m.seq))),
+        msgs,
+      ),
+  );
 }
 
 /**

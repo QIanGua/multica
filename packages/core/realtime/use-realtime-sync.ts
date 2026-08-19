@@ -56,7 +56,9 @@ import {
 } from "../platform/system-notification";
 import type { Workspace } from "../types/workspace";
 import {
+  backfillTaskMessages,
   chatKeys,
+  isTaskMessageTimelineHeld,
   mergeTaskMessagesBySeq,
   sortChatSessions,
   QUICK_ACTIONS_PENDING_TIMEOUT_MS,
@@ -117,6 +119,18 @@ import type {
 } from "../types";
 
 const chatWsLogger = createLogger("chat.ws");
+
+/**
+ * Window over which incoming `task:message` frames are batched into a single
+ * timeline cache write (MUL-6396).
+ *
+ * A fixed window, armed on the first frame and not reset by later ones, so a
+ * sustained stream still lands every 100ms rather than being deferred until
+ * the stream pauses. Short enough that streamed text still reads as live;
+ * long enough that a run emitting several frames per second costs one merge
+ * and one render instead of one per frame.
+ */
+const TASK_MESSAGE_FLUSH_MS = 100;
 
 const logger = createLogger("realtime-sync");
 
@@ -1291,12 +1305,65 @@ export function useRealtimeSync(
     // task:completed / task:failed invalidate messages + pending-task so the
     // DB remains authoritative.
 
+    // Two guards stand between the workspace-wide message firehose and the
+    // renderer (MUL-6396). `task:message` is broadcast to EVERY client for
+    // EVERY run in the workspace, but only the handful of runs on screen are
+    // ever rendered:
+    //
+    // 1. Frames for a task no mounted view holds are dropped. The old
+    //    `(old = [])` default built a cache entry on first sight, so each
+    //    client accumulated the full transcript of every run it would never
+    //    open — unbounded tool input included — for the life of the run.
+    // 2. Frames that survive that gate are coalesced into one cache write per
+    //    window, so a burst costs one merge and one render instead of N.
+    const taskMessageBatches = new Map<string, TaskMessagePayload[]>();
+    const truncatedTaskIds = new Set<string>();
+    let taskMessageFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flushTaskMessages = () => {
+      taskMessageFlushTimer = null;
+
+      for (const [taskId, batch] of taskMessageBatches) {
+        qc.setQueryData<TaskMessagePayload[]>(
+          chatKeys.taskMessages(taskId),
+          (old = []) => mergeTaskMessagesBySeq(old, batch),
+        );
+      }
+      taskMessageBatches.clear();
+
+      // A truncated frame carries clipped tool input/output — the full row
+      // lives only in the DB, and `taskMessagesOptions` is staleTime:Infinity,
+      // so nothing would ever replace the clipped copy on its own. Backfill
+      // once per flush, not once per frame: a run writing several large files
+      // in a row would otherwise queue a fetch for each one.
+      for (const taskId of truncatedTaskIds) {
+        void backfillTaskMessages(qc, taskId).catch((err: unknown) => {
+          chatWsLogger.debug("task:message backfill failed", {
+            task_id: taskId,
+            error: err,
+          });
+        });
+      }
+      truncatedTaskIds.clear();
+    };
+
     const unsubTaskMessage = ws.on("task:message", (p) => {
       const payload = p as TaskMessagePayload;
-      qc.setQueryData<TaskMessagePayload[]>(
-        chatKeys.taskMessages(payload.task_id),
-        (old = []) => mergeTaskMessagesBySeq(old, [payload]),
-      );
+      // Cheap Map lookup, and it runs before anything allocates — this is the
+      // hot path for every run in the workspace, not just the visible ones.
+      if (!isTaskMessageTimelineHeld(qc, payload.task_id)) return;
+
+      const batch = taskMessageBatches.get(payload.task_id);
+      if (batch) batch.push(payload);
+      else taskMessageBatches.set(payload.task_id, [payload]);
+      if (payload.truncated) truncatedTaskIds.add(payload.task_id);
+
+      // Fixed window, not a resetting debounce: a continuous stream must still
+      // flush every TASK_MESSAGE_FLUSH_MS instead of being starved until a gap.
+      if (!taskMessageFlushTimer) {
+        taskMessageFlushTimer = setTimeout(flushTaskMessages, TASK_MESSAGE_FLUSH_MS);
+      }
+
       chatWsLogger.debug("task:message (global)", {
         task_id: payload.task_id,
         seq: payload.seq,
@@ -1638,6 +1705,7 @@ export function useRealtimeSync(
       unsubChatSessionRead();
       unsubChatSessionDeleted();
       unsubChatSessionUpdated();
+      if (taskMessageFlushTimer) clearTimeout(taskMessageFlushTimer);
       if (aggregateRefreshTimer) clearTimeout(aggregateRefreshTimer);
       timers.forEach(clearTimeout);
       timers.clear();
