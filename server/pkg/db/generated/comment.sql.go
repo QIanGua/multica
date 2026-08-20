@@ -201,8 +201,7 @@ const createComment = `-- name: CreateComment :one
 WITH touched_issue AS (
     UPDATE issue SET
         updated_at = now(),
-        revision = revision + 1,
-        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
+        revision = revision + 1
     WHERE issue.id = $1 AND issue.workspace_id = $2
     RETURNING issue.id, issue.workspace_id, issue.revision
 ), inserted_comment AS (
@@ -251,8 +250,9 @@ type CreateCommentRow struct {
 	IssueRevision  int64              `json:"issue_revision"`
 }
 
-// A new comment counts as activity on its issue, so the same statement bumps
-// the parent issue's updated_at and last_activity_at. The touch is a leading data-modifying CTE and
+// A new comment still advances its parent issue's updated_at and revision, but
+// intentionally preserves the separate last_activity_at clock. The touch is a
+// leading data-modifying CTE and
 // the INSERT selects the issue/workspace back out of it, which makes the two
 // inseparable and gives two query-level guarantees:
 //   - atomicity — the insert and the timestamp bump commit or roll back

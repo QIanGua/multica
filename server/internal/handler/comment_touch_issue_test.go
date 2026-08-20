@@ -18,10 +18,10 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// TestCreateComment_BumpsIssueActivity pins MUL-5009 and MUL-6343: a new
-// comment advances both the legacy updated_at clock and the semantic activity
-// clock in the same statement.
-func TestCreateComment_BumpsIssueActivity(t *testing.T) {
+// TestCreateComment_BumpsUpdatedAtWithoutChangingLastActivity pins MUL-5009
+// and MUL-6456: a new comment advances the legacy updated_at clock without
+// moving the separate semantic activity clock.
+func TestCreateComment_BumpsUpdatedAtWithoutChangingLastActivity(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -56,8 +56,8 @@ func TestCreateComment_BumpsIssueActivity(t *testing.T) {
 	if !after.After(before) {
 		t.Fatalf("issue updated_at was not bumped by a new comment: before=%s after=%s", before, after)
 	}
-	if !activityAfter.After(activityBefore) {
-		t.Fatalf("issue last_activity_at was not bumped by a new comment: before=%s after=%s", activityBefore, activityAfter)
+	if !activityAfter.Equal(activityBefore) {
+		t.Fatalf("new comment changed issue last_activity_at: before=%s after=%s", activityBefore, activityAfter)
 	}
 }
 
