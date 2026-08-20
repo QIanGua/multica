@@ -571,8 +571,12 @@ func writeWorkflowAutopilot(b *strings.Builder, ctx TaskContextForEnv) {
 // the "asked to research stays todo" example from the no-write bullet: that
 // run's work WAS research toward its own issue's ask, so the example
 // pattern-matched the exact case it was never meant to cover. Ancillary is
-// now defined by output — the turn produced none of the issue's own
-// deliverable — and research/design count as work when they are the ask.
+// now defined by output alone — the turn produced none of the issue's own
+// deliverable. No activity word decides in either direction (Elon's review
+// on #7295 caught "review" still sitting in a skip-list, which would replay
+// the same incident on an issue whose ask IS reviewing a PR): research,
+// design, planning, and review all count as work exactly when they are what
+// the issue asks for.
 //
 // The invariants MUL-6300 pinned survive as consequences instead of gates: a
 // conversational turn changes nothing about the issue's state, so it writes
@@ -611,7 +615,7 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 
 	b.WriteString("1. Read the issue (`multica issue get`) to understand the context — its JSON already carries the issue's `metadata` bag (empty `{}` is normal), so no separate metadata read is needed. What to look for: `## Issue Metadata`.\n")
 	b.WriteString("2. Catch up on the comment history — this is mandatory, not optional — in two bounded reads, never one bulk pull: scan every thread cheaply (`--roots-only --summary --compact`), then expand only the threads that matter (`--thread <id> --tail 30 --compact`). Earlier comments often carry context the issue body lacks. Skipping this step is the most common cause of agents acting on stale or incomplete instructions — so always run the scan, even when the trigger looks self-contained. When a comment triggered this run, the per-turn user message names the thread to expand first; the scan is how you decide whether any OTHER thread is also relevant.\n")
-	b.WriteString("3. If this turn's work advances what the issue itself asks for — including research or design when that IS the ask — set `in_progress` FIRST (skip when the status already says so, or when your Agent Identity forbids status writes): the board should show the issue being worked while you work, not only after. A turn that only answers, reviews, or consults skips this write. Then complete the task within your Agent Identity boundaries (`## Instruction Precedence` lists the actions Agent Identity can forbid). If your role is delegation-only, perform the allowed delegation work and stop once that outcome is delivered. Before self-assigning, check the target issue's comment history for an existing claim and any `## Active sibling runs` block; when assignment or status only records ownership/progress for work already underway, pass `--no-start` on every such command (the default start behavior is for handing off fresh work).\n")
+	b.WriteString("3. If this turn starts producing what the issue itself asks for — in whatever form: code, research, a design, a plan, or a review when reviewing is the ask — set `in_progress` FIRST (skip when the status already says so, or when your Agent Identity forbids status writes): the board should show the issue being worked while you work, not only after. Only a turn that produces none of THIS issue's deliverable — answering a question, consulting on work owned elsewhere — skips this write. Then complete the task within your Agent Identity boundaries (`## Instruction Precedence` lists the actions Agent Identity can forbid). If your role is delegation-only, perform the allowed delegation work and stop once that outcome is delivered. Before self-assigning, check the target issue's comment history for an existing claim and any `## Active sibling runs` block; when assignment or status only records ownership/progress for work already underway, pass `--no-start` on every such command (the default start behavior is for handing off fresh work).\n")
 	if ctx.IsSquadLeader {
 		b.WriteString("4. **Post your final results as a comment** (unless your outcome is `no_action` — in that case, calling `multica squad activity <issue-id> no_action --reason \"...\"` alone is sufficient; you MUST exit without posting any comment. DO NOT post a comment announcing no_action or saying you are exiting silently): post it with `multica issue comment add` using the platform-correct non-inline mode from ## Comment Formatting (never inline `--content`). When the per-turn user message carries a triggering comment, reply in its thread with the `--parent` value it gives you for THIS turn (never one from an earlier turn); when it lists several threads, post one reply per thread. With no triggering comment, post a new top-level comment. Your results are only visible to the user if posted via this CLI call; text in your terminal or run logs is NOT delivered.\n")
 	} else {
@@ -627,7 +631,7 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 	if ctx.IsSquadLeader {
 		b.WriteString("- Squad leader: dispatching members is not delivery — a dispatch turn leaves the parent `in_progress`, and it moves to `in_review` only on the later turn (a member update or stage-barrier re-trigger) where you confirm the overall goal is met.\n")
 	}
-	b.WriteString("- Your turn produced none of the issue's own deliverable — you only answered a question, reviewed, or discussed → write nothing, at the start or the end; questions, discussion, and acknowledgements never touch status. This no-write default is what keeps concurrent runs from flapping the board.\n\n")
+	b.WriteString("- Your turn produced none of the issue's own deliverable — you answered a question or consulted on work owned elsewhere → write nothing, at any point; questions, discussion, and acknowledgements never touch status. The kind of activity (research, design, planning, review) never decides this — only whether the output is part of what THIS issue asks for. This no-write default is what keeps concurrent runs from flapping the board.\n\n")
 }
 
 // writeSubIssueCreation emits the Sub-issue Creation section.

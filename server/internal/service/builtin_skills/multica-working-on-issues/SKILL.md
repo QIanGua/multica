@@ -199,9 +199,11 @@ on it. These are the contracts, not advice:
   the issue's own ask → `in_review`; work continues beyond the turn
   (dispatched sub-issues, partial delivery) → `in_progress`; stuck →
   `blocked`. A turn that produces none of the issue's own deliverable —
-  answering a question, reviewing,
-  discussing — writes nothing at any point; research and design count as
-  the work when they are what the issue asks for. Questions, discussion, or
+  answering a question, consulting on work owned elsewhere — writes nothing
+  at any point. The kind of activity never decides this: research, design,
+  planning, and review all count as the work exactly when they are what the
+  issue asks for (a review-the-PR issue is being worked the moment reviewing
+  starts). Questions, discussion, or
   acknowledgements never move the status. Squad leaders:
   dispatching members is not delivery — a dispatch turn leaves the parent
   `in_progress`, and it moves to `in_review` only when a later re-trigger

@@ -175,10 +175,13 @@ func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 		// The start moment: INSIDE step 3, at the read→work boundary. A run
 		// on MUL-6460 proved a detached status-block bullet does not fire —
 		// the model is walking the numbered list when the condition triggers.
-		"3. If this turn's work advances what the issue itself asks for",
-		// Research/design ARE the work when they are the ask — the MUL-6460
-		// turn (investigate + design proposal) must not read as ancillary.
-		"including research or design when that IS the ask",
+		"3. If this turn starts producing what the issue itself asks for",
+		// No activity word decides in either direction: research broke it
+		// once (MUL-6460), and Elon's #7295 review caught "review" queued to
+		// break it the same way on a review-the-PR issue. The form list must
+		// include review as work when reviewing is the ask.
+		"a review when reviewing is the ask",
+		"The kind of activity (research, design, planning, review) never decides this",
 		"the board should show the issue being worked while you work, not only after",
 		// No assignee gate: the judgment applies to whoever is running.
 		"whoever the assignee is",
@@ -217,6 +220,10 @@ func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 		// The example that misled the MUL-6460 run: research that IS the
 		// issue's ask pattern-matched an example meant for consult pull-ins.
 		"asked to research stays",
+		// Activity-word skip-lists must not come back in any form — they
+		// are the failure class behind both the research and review cases.
+		"A turn that only answers, reviews, or consults",
+		"you only answered a question, reviewed, or discussed",
 	} {
 		if strings.Contains(out, banned) {
 			t.Errorf("brief still carries retired status gate %q (MUL-6417)\n---\n%s", banned, out)
