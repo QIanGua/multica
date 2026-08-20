@@ -267,6 +267,36 @@ func ListModels(ctx context.Context, providerType string, runtimeCmd Command) (C
 	}
 }
 
+// ModelIDsAreProviderQualified reports whether a runtime's catalog IDs carry
+// their own `<provider>/` prefix, which is the precondition for
+// QualifyModelID being able to do anything at all. It is the gate that keeps
+// catalog discovery off the task-start path for every runtime that cannot
+// benefit from it: discovery costs a CLI subprocess with a 15-30s ceiling, and
+// cachedDiscovery deliberately does not memoize empty or fallback results, so
+// an unconditional lookup would make a logged-out or failing runtime pay that
+// ceiling again on every single task (MUL-6471 review).
+//
+// True only where Model.Provider is literally the ID's own prefix — pi builds
+// `provider + "/" + id`, opencode reads the provider back off the id. Runtimes
+// that expose a bare id alongside a display-name Provider (claude's
+// "anthropic", copilot's "openai", dsh's "DeepSeek" against a
+// `deepseek-official/...` id) can never match and are correctly excluded.
+//
+// Built-in runtime identities resolve through their protocol family, so a new
+// pi-family or opencode-family fork inherits this from its descriptor entry
+// rather than needing a line here.
+func ModelIDsAreProviderQualified(providerType string) bool {
+	if desc, ok := BuiltinRuntimeByID(providerType); ok {
+		providerType = desc.ProtocolFamily
+	}
+	switch providerType {
+	case "pi", "opencode":
+		return true
+	default:
+		return false
+	}
+}
+
 // QualifyModelID resolves a persisted model string to the canonical ID the
 // runtime's own catalog advertises, and reports whether it rewrote anything.
 // catalog is the runtime's discovered catalog; callers already holding one

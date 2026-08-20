@@ -6140,6 +6140,52 @@ func skillRefFromBundle(bundle SkillData) SkillRefData {
 	}
 }
 
+// qualifyTaskModel promotes a persisted model id to the canonical
+// `<provider>/<id>` selector its runtime catalog advertises, and returns the
+// model to actually launch with.
+//
+// agent.model holds whatever was persisted, and for gateway-style providers a
+// bare model id is itself slash-shaped (`claude/claude-opus-5` under provider
+// `multica-anthropic`), so the delimiter cannot tell a missing provider from a
+// present one — only the catalog knows. Without this, opencode rejects an
+// unqualified id outright and the thinking_level / service_tier checks
+// downstream silently drop a valid value because the id matches no catalog
+// entry (GH #7300).
+//
+// Discovery is a CLI subprocess with a 15-30s ceiling that cachedDiscovery
+// deliberately does not memoize when it comes back empty or as a fallback, so
+// the ModelIDsAreProviderQualified gate is load-bearing rather than an
+// optimization: without it a logged-out or failing runtime would pay that
+// ceiling on every task, including the runtimes whose bare ids could never be
+// rewritten anyway (MUL-6471 review).
+func qualifyTaskModel(ctx context.Context, provider string, runtimeCmd agent.Command, model string, taskLog *slog.Logger) string {
+	if model == "" || !agent.ModelIDsAreProviderQualified(provider) {
+		return model
+	}
+	catalog, err := listModels(ctx, provider, runtimeCmd)
+	if err != nil {
+		// Same fail-open posture as the capability checks in runTask: an
+		// unreachable catalog must not stop a task whose model may well be
+		// exactly what the CLI expects.
+		taskLog.Warn("model: catalog lookup failed; using the configured model as-is",
+			"provider", provider,
+			"model", model,
+			"error", err,
+		)
+		return model
+	}
+	qualified, rewritten := agent.QualifyModelID(catalog, model)
+	if !rewritten {
+		return model
+	}
+	taskLog.Info("model: qualified against the runtime catalog",
+		"provider", provider,
+		"configured_model", model,
+		"model", qualified,
+	)
+	return qualified
+}
+
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (taskResult TaskResult, returnErr error) {
 	// A claim carries the task-row agent id both at the top level and inside
 	// the expanded agent configuration. The top-level id is authoritative
@@ -7024,44 +7070,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// has no overlay to protect and keeps its flags untouched.
 		customArgs = hermesOverlayCustomArgs
 	}
-	// Ask the runtime's own catalog which provider owns this model before
-	// anything downstream reads it. Runtimes that namespace their catalog want
-	// the qualified `<provider>/<id>` selector, but agent.model holds whatever
-	// was persisted, and a gateway-style model id is itself slash-shaped
-	// (`claude/claude-opus-5` under provider `multica-anthropic`) — so the
-	// delimiter is no help in telling a missing provider from a present one.
-	// An unambiguous catalog match is promoted, everything else passes through
-	// untouched. Without this an unqualified id is rejected outright by
-	// opencode, and the capability lookups below silently drop a perfectly
-	// valid thinking_level / service_tier because the id matches no catalog
-	// entry (GH #7300).
-	//
-	// Runtimes whose ids are not provider-namespaced can never be rewritten,
-	// but they are not special-cased away: an allowlist of "runtimes that
-	// namespace" is a list that rots the day the next gateway-style runtime
-	// lands, and this costs one memoized catalog read on a path that already
-	// takes one for thinking_level / service_tier — the two checks below reuse
-	// this lookup rather than re-shelling the CLI.
-	if model != "" {
-		catalog, err := listModels(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs))
-		if err != nil {
-			// Same fail-open posture as the capability checks below: an
-			// unreachable catalog must not stop a task whose model may well be
-			// exactly what the CLI expects.
-			taskLog.Warn("model: catalog lookup failed; using the configured model as-is",
-				"provider", provider,
-				"model", model,
-				"error", err,
-			)
-		} else if qualified, rewritten := agent.QualifyModelID(catalog, model); rewritten {
-			taskLog.Info("model: qualified against the runtime catalog",
-				"provider", provider,
-				"configured_model", model,
-				"model", qualified,
-			)
-			model = qualified
-		}
-	}
+	model = qualifyTaskModel(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs), model, taskLog)
 	thinkingLevel := ""
 	serviceTier := ""
 	if task.Agent != nil {

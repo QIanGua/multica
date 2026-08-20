@@ -2044,3 +2044,57 @@ func TestSlashShapedPiModelKeepsItsThinkingCatalog(t *testing.T) {
 		t.Errorf("thinking catalog for %q missing \"high\": %+v", qualified, thinking.SupportedLevels)
 	}
 }
+
+// TestModelIDsAreProviderQualifiedMatchesCatalogShape guards the gate against
+// rot. ModelIDsAreProviderQualified decides whether the daemon spends a
+// discovery subprocess at task start, so it must agree with what the catalog
+// producers actually emit rather than with someone's memory of them. Each case
+// runs the real producer and derives the truth from its output: a runtime
+// qualifies exactly when Model.Provider is literally the ID's own prefix.
+//
+// Adding a runtime? Add its producer to the map below: the case then fails
+// until ModelIDsAreProviderQualified agrees with the shape it really emits.
+func TestModelIDsAreProviderQualifiedMatchesCatalogShape(t *testing.T) {
+	t.Parallel()
+
+	ompFixture := `{"models":[{"provider":"anthropic","id":"claude-sonnet-5","selector":"anthropic/claude-sonnet-5","name":"Claude Sonnet 5"}]}`
+	ompModels, err := parseOmpModels([]byte(ompFixture))
+	if err != nil {
+		t.Fatalf("parseOmpModels: %v", err)
+	}
+
+	producers := map[string][]Model{
+		"pi": parsePiModels("provider  model  context\n" +
+			"multica-anthropic  claude/claude-opus-5  128K\n"),
+		"opencode": parseOpenCodeModels("multica-anthropic/claude/claude-opus-5\n" +
+			"opencode/big-pickle\n"),
+		"omp":     ompModels,
+		"claude":  claudeStaticModels(),
+		"codex":   codexStaticModels(),
+		"copilot": copilotStaticModels(),
+		"cursor":  cursorStaticModels(),
+	}
+
+	for provider, models := range producers {
+		t.Run(provider, func(t *testing.T) {
+			t.Parallel()
+			if len(models) == 0 {
+				t.Fatalf("%s producer returned no models; the fixture no longer parses", provider)
+			}
+			// The catalog is provider-qualified when its entries carry their
+			// own provider as an ID prefix — the only shape QualifyModelID can
+			// act on.
+			qualified := true
+			for _, m := range models {
+				if m.Provider == "" || !strings.HasPrefix(m.ID, m.Provider+"/") {
+					qualified = false
+					break
+				}
+			}
+			if got := ModelIDsAreProviderQualified(provider); got != qualified {
+				t.Errorf("ModelIDsAreProviderQualified(%q) = %v, but its catalog is provider-qualified = %v (models: %+v)",
+					provider, got, qualified, models)
+			}
+		})
+	}
+}
