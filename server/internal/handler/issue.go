@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/channelmedia"
 	"github.com/multica-ai/multica/server/internal/dispatch"
+	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/issueguard"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
@@ -595,7 +596,7 @@ type searchResult struct {
 // It uses LOWER(column) LIKE for case-insensitive matching compatible with pg_bigm 1.2 GIN indexes.
 // Search patterns are lowercased in Go to avoid redundant LOWER() on the pattern side in SQL.
 // LIKE patterns are pre-built in Go (e.g. "%html%") so pg_bigm can extract bigrams from a single parameter value.
-func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, includeClosed bool) (string, []any) {
+func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, includeClosed bool, creationWindowLimit ...int64) (string, []any) {
 	// Lowercase in Go so SQL only needs LOWER() on the column side.
 	phrase = strings.ToLower(phrase)
 	for i, t := range terms {
@@ -678,6 +679,10 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 
 	if !includeClosed {
 		whereClause += " AND issue_effective_status(i.workspace_id, i.status) NOT IN ('done', 'cancelled')"
+	}
+	if len(creationWindowLimit) > 0 {
+		limitRef := nextArg(creationWindowLimit[0])
+		whereClause = issueWindowPredicate("i", wsParam, limitRef) + " AND " + whereClause
 	}
 
 	// --- ORDER BY clause ---
@@ -888,8 +893,15 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	}
 	terms := splitSearchTerms(q)
 	queryNum, hasNum := parseQueryNumber(q)
+	policy, windowEnabled := h.issueWindowPolicy(ctx, wsUUID)
 
-	sqlQuery, args := buildSearchQuery(q, terms, queryNum, hasNum, includeClosed)
+	var sqlQuery string
+	var args []any
+	if windowEnabled && policy.action == entitlement.ActionEnforce {
+		sqlQuery, args = buildSearchQuery(q, terms, queryNum, hasNum, includeClosed, policy.limit)
+	} else {
+		sqlQuery, args = buildSearchQuery(q, terms, queryNum, hasNum, includeClosed)
+	}
 	// Fill placeholder args: $4 = workspace_id, last two = limit, offset
 	args[3] = wsUUID
 	args[len(args)-2] = limit
@@ -955,6 +967,13 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	if len(results) > 0 {
 		total = results[0].totalCount
 	}
+	resultIDs := make([]pgtype.UUID, len(results))
+	for i, result := range results {
+		resultIDs[i] = result.issue.ID
+	}
+	if windowEnabled {
+		h.observeIssueWindow(ctx, wsUUID, policy, resultIDs, "search")
+	}
 
 	prefix := h.getIssuePrefix(ctx, wsUUID)
 	fillSearch := h.newStatusCategoryFiller(ctx, wsUUID)
@@ -1019,6 +1038,7 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	windowPolicy, windowEnabled := h.issueWindowPolicy(ctx, wsUUID)
 
 	// Parse optional filter params. Malformed UUIDs in filters return 400 —
 	// silently coercing them to a zero UUID would mask a client bug and let
@@ -1117,6 +1137,26 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list issues")
 			return
+		}
+		openIDs := make([]pgtype.UUID, len(issues))
+		for i, issue := range issues {
+			openIDs[i] = issue.ID
+		}
+		if windowEnabled && windowPolicy.action == entitlement.ActionEnforce {
+			visible, visibleErr := h.visibleIssueIDSet(ctx, wsUUID, windowPolicy, openIDs)
+			if visibleErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to list issues")
+				return
+			}
+			filtered := issues[:0]
+			for _, issue := range issues {
+				if _, ok := visible[issue.ID]; ok {
+					filtered = append(filtered, issue)
+				}
+			}
+			issues = filtered
+		} else if windowEnabled {
+			h.observeIssueWindow(ctx, wsUUID, windowPolicy, openIDs, "list")
 		}
 
 		prefix := h.getIssuePrefix(ctx, wsUUID)
@@ -1429,6 +1469,9 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
     ))
 )`, ref))
 	}
+	if windowEnabled {
+		where = appendIssueWindow(where, addArg, windowPolicy, "$1", "i")
+	}
 
 	whereSql := strings.Join(where, " AND ")
 
@@ -1525,6 +1568,9 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 	ids := make([]pgtype.UUID, len(issues))
 	for i, issue := range issues {
 		ids[i] = issue.ID
+	}
+	if windowEnabled {
+		h.observeIssueWindow(ctx, wsUUID, windowPolicy, ids, "list")
 	}
 	labelsMap := h.labelsByIssue(ctx, wsUUID, ids)
 	resp := make([]IssueResponse, len(issues))
@@ -1720,6 +1766,7 @@ func (h *Handler) ListGroupedIssues(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	windowPolicy, windowEnabled := h.issueWindowPolicy(ctx, wsUUID)
 
 	limit := 50
 	offset := 0
@@ -1966,6 +2013,9 @@ func (h *Handler) ListGroupedIssues(w http.ResponseWriter, r *http.Request) {
 			))
 		}
 	}
+	if windowEnabled {
+		where = appendIssueWindow(where, addArg, windowPolicy, "$1", "i")
+	}
 
 	sortCol := "position"
 	sortIsExpr := false
@@ -2129,6 +2179,9 @@ ORDER BY
 	for i, row := range groupedRows {
 		ids[i] = row.ID
 	}
+	if windowEnabled {
+		h.observeIssueWindow(ctx, wsUUID, windowPolicy, ids, "grouped")
+	}
 	labelsMap := h.labelsByIssue(ctx, wsUUID, ids)
 	prefix := h.getIssuePrefix(ctx, wsUUID)
 	// One Resolver for the whole page — a per-row filler would query the
@@ -2216,6 +2269,27 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list child issues")
 		return
 	}
+	windowPolicy, windowEnabled := h.issueWindowPolicy(r.Context(), issue.WorkspaceID)
+	childIDs := make([]pgtype.UUID, len(children))
+	for i, child := range children {
+		childIDs[i] = child.ID
+	}
+	if windowEnabled && windowPolicy.action == entitlement.ActionEnforce {
+		visible, visibleErr := h.visibleIssueIDSet(r.Context(), issue.WorkspaceID, windowPolicy, childIDs)
+		if visibleErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list child issues")
+			return
+		}
+		filtered := children[:0]
+		for _, child := range children {
+			if _, ok := visible[child.ID]; ok {
+				filtered = append(filtered, child)
+			}
+		}
+		children = filtered
+	} else if windowEnabled {
+		h.observeIssueWindow(r.Context(), issue.WorkspaceID, windowPolicy, childIDs, "children")
+	}
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
 	ids := make([]pgtype.UUID, len(children))
 	for i, child := range children {
@@ -2302,6 +2376,27 @@ func (h *Handler) ListChildrenByParents(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "failed to list child issues")
 		return
 	}
+	windowPolicy, windowEnabled := h.issueWindowPolicy(r.Context(), wsUUID)
+	childIDs := make([]pgtype.UUID, len(children))
+	for i, child := range children {
+		childIDs[i] = child.ID
+	}
+	if windowEnabled && windowPolicy.action == entitlement.ActionEnforce {
+		visible, visibleErr := h.visibleIssueIDSet(r.Context(), wsUUID, windowPolicy, childIDs)
+		if visibleErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list child issues")
+			return
+		}
+		filtered := children[:0]
+		for _, child := range children {
+			if _, ok := visible[child.ID]; ok {
+				filtered = append(filtered, child)
+			}
+		}
+		children = filtered
+	} else if windowEnabled {
+		h.observeIssueWindow(r.Context(), wsUUID, windowPolicy, childIDs, "children")
+	}
 	prefix := h.getIssuePrefix(r.Context(), wsUUID)
 	ids := make([]pgtype.UUID, len(children))
 	for i, child := range children {
@@ -2336,23 +2431,54 @@ func (h *Handler) ChildIssueProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := h.Queries.ChildIssueProgress(r.Context(), wsUUID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
-		return
-	}
-
 	type progressEntry struct {
 		ParentIssueID string `json:"parent_issue_id"`
 		Total         int64  `json:"total"`
 		Done          int64  `json:"done"`
 	}
-	resp := make([]progressEntry, len(rows))
-	for i, row := range rows {
-		resp[i] = progressEntry{
-			ParentIssueID: uuidToString(row.ParentIssueID),
-			Total:         row.Total,
-			Done:          row.Done,
+	policy, windowEnabled := h.issueWindowPolicy(r.Context(), wsUUID)
+	resp := []progressEntry{}
+	if windowEnabled && policy.action == entitlement.ActionEnforce {
+		query := fmt.Sprintf(`SELECT i.parent_issue_id,
+			COUNT(*)::bigint AS total,
+			COUNT(*) FILTER (WHERE issue_effective_status(i.workspace_id, i.status) IN ('done', 'cancelled'))::bigint AS done
+		FROM issue i
+		WHERE i.workspace_id = $1
+		  AND i.parent_issue_id IS NOT NULL
+		  AND %s
+		GROUP BY i.parent_issue_id`, issueWindowPredicate("i", "$1", "$2"))
+		rows, err := h.DB.Query(r.Context(), query, wsUUID, policy.limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var parentID pgtype.UUID
+			var entry progressEntry
+			if err := rows.Scan(&parentID, &entry.Total, &entry.Done); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
+				return
+			}
+			entry.ParentIssueID = uuidToString(parentID)
+			resp = append(resp, entry)
+		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
+			return
+		}
+	} else {
+		rows, err := h.Queries.ChildIssueProgress(r.Context(), wsUUID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
+			return
+		}
+		for _, row := range rows {
+			resp = append(resp, progressEntry{
+				ParentIssueID: uuidToString(row.ParentIssueID),
+				Total:         row.Total,
+				Done:          row.Done,
+			})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

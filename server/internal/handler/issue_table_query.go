@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -405,6 +406,13 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusInternalServerError, "failed to canonicalize table query")
 		return issueTableSQL{}, false
 	}
+	windowPolicy, windowEnabled := h.issueWindowPolicy(r.Context(), workspaceUUID)
+	if windowEnabled && windowPolicy.action == entitlement.ActionEnforce {
+		// A cursor issued under a different entitlement revision or limit must
+		// not be accepted after the visible collection changes.
+		digest := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%d", fingerprint, windowPolicy.action, windowPolicy.limit, windowPolicy.policyRevision)))
+		fingerprint = "sha256:" + hex.EncodeToString(digest[:])
+	}
 
 	where := []string{"i.workspace_id = $1"}
 	args := []any{workspaceUUID}
@@ -633,6 +641,9 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 		where = append(where, "i.parent_issue_id IS NULL")
 	}
 	where = appendIssueTableSearchFilter(where, addArg, spec.Search)
+	if windowEnabled {
+		where = appendIssueWindow(where, addArg, windowPolicy, "$1", "i")
+	}
 
 	return issueTableSQL{
 		where:       strings.Join(where, " AND "),

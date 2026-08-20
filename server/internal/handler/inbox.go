@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/logger"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -114,9 +115,31 @@ func (h *Handler) ListInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := make([]InboxItemResponse, len(items))
-	for i, item := range items {
-		resp[i] = inboxRowToResponse(item)
+	policy, windowEnabled := h.issueWindowPolicy(r.Context(), wsUUID)
+	issueIDs := make([]pgtype.UUID, 0, len(items))
+	for _, item := range items {
+		if item.IssueID.Valid {
+			issueIDs = append(issueIDs, item.IssueID)
+		}
+	}
+	var visible map[pgtype.UUID]struct{}
+	if windowEnabled && policy.action == entitlement.ActionEnforce {
+		visible, err = h.visibleIssueIDSet(r.Context(), wsUUID, policy, issueIDs)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list inbox")
+			return
+		}
+	} else if windowEnabled {
+		h.observeIssueWindow(r.Context(), wsUUID, policy, issueIDs, "inbox")
+	}
+	resp := make([]InboxItemResponse, 0, len(items))
+	for _, item := range items {
+		if visible != nil && item.IssueID.Valid {
+			if _, ok := visible[item.IssueID]; !ok {
+				continue
+			}
+		}
+		resp = append(resp, inboxRowToResponse(item))
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -151,9 +174,31 @@ func (h *Handler) ListArchivedInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := make([]InboxItemResponse, len(items))
-	for i, item := range items {
-		resp[i] = archivedInboxRowToResponse(item)
+	policy, windowEnabled := h.issueWindowPolicy(r.Context(), wsUUID)
+	issueIDs := make([]pgtype.UUID, 0, len(items))
+	for _, item := range items {
+		if item.IssueID.Valid {
+			issueIDs = append(issueIDs, item.IssueID)
+		}
+	}
+	var visible map[pgtype.UUID]struct{}
+	if windowEnabled && policy.action == entitlement.ActionEnforce {
+		visible, err = h.visibleIssueIDSet(r.Context(), wsUUID, policy, issueIDs)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list archived inbox")
+			return
+		}
+	} else if windowEnabled {
+		h.observeIssueWindow(r.Context(), wsUUID, policy, issueIDs, "inbox")
+	}
+	resp := make([]InboxItemResponse, 0, len(items))
+	for _, item := range items {
+		if visible != nil && item.IssueID.Valid {
+			if _, ok := visible[item.IssueID]; !ok {
+				continue
+			}
+		}
+		resp = append(resp, archivedInboxRowToResponse(item))
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -298,11 +343,18 @@ func (h *Handler) CountUnreadInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	count, err := h.Queries.CountUnreadInbox(r.Context(), db.CountUnreadInboxParams{
-		WorkspaceID:   wsUUID,
-		RecipientType: "member",
-		RecipientID:   parseUUID(userID),
-	})
+	policy, windowEnabled := h.issueWindowPolicy(r.Context(), wsUUID)
+	var count int64
+	var err error
+	if windowEnabled {
+		count, err = h.windowedUnreadInboxCount(r.Context(), wsUUID, parseUUID(userID), policy)
+	} else {
+		count, err = h.Queries.CountUnreadInbox(r.Context(), db.CountUnreadInboxParams{
+			WorkspaceID:   wsUUID,
+			RecipientType: "member",
+			RecipientID:   parseUUID(userID),
+		})
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to count unread inbox")
 		return
@@ -336,15 +388,69 @@ func (h *Handler) UnreadInboxSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := make([]InboxWorkspaceUnreadResponse, len(rows))
-	for i, row := range rows {
-		resp[i] = InboxWorkspaceUnreadResponse{
-			WorkspaceID: uuidToString(row.WorkspaceID),
-			Count:       row.Count,
+	resp := make([]InboxWorkspaceUnreadResponse, 0, len(rows))
+	for _, row := range rows {
+		count := row.Count
+		if policy, enabled := h.issueWindowPolicy(r.Context(), row.WorkspaceID); enabled {
+			var countErr error
+			count, countErr = h.windowedUnreadInboxCount(r.Context(), row.WorkspaceID, parseUUID(userID), policy)
+			if countErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to summarize unread inbox")
+				return
+			}
 		}
+		if count == 0 {
+			continue
+		}
+		resp = append(resp, InboxWorkspaceUnreadResponse{
+			WorkspaceID: uuidToString(row.WorkspaceID),
+			Count:       count,
+		})
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) windowedUnreadInboxCount(ctx context.Context, workspaceID, recipientID pgtype.UUID, policy issueWindowPolicy) (int64, error) {
+	items, err := h.Queries.ListInboxItems(ctx, db.ListInboxItemsParams{
+		WorkspaceID: workspaceID, RecipientType: "member", RecipientID: recipientID,
+	})
+	if err != nil {
+		return 0, err
+	}
+	issueIDs := make([]pgtype.UUID, 0, len(items))
+	for _, item := range items {
+		if item.IssueID.Valid {
+			issueIDs = append(issueIDs, item.IssueID)
+		}
+	}
+	if policy.action == entitlement.ActionObserve {
+		h.observeIssueWindow(ctx, workspaceID, policy, issueIDs, "inbox")
+		var count int64
+		for _, item := range items {
+			if !item.Read {
+				count++
+			}
+		}
+		return count, nil
+	}
+	visible, err := h.visibleIssueIDSet(ctx, workspaceID, policy, issueIDs)
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	for _, item := range items {
+		if item.Read {
+			continue
+		}
+		if item.IssueID.Valid {
+			if _, ok := visible[item.IssueID]; !ok {
+				continue
+			}
+		}
+		count++
+	}
+	return count, nil
 }
 
 func (h *Handler) MarkAllInboxRead(w http.ResponseWriter, r *http.Request) {
