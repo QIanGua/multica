@@ -33,6 +33,7 @@ export function PluginSurfaceFrame({ wsId, installation, surface, issueId, class
   const anchorRef = useRef<HTMLDivElement>(null);
   const [height, setHeight] = useState(DEFAULT_HEIGHT);
   const [failed, setFailed] = useState(false);
+  const [navigated, setNavigated] = useState(false);
 
   // The code comes from us, not from the plugin author's server. It is keyed by
   // the installed version, which is immutable — so this is fetched once and an
@@ -72,18 +73,44 @@ export function PluginSurfaceFrame({ wsId, installation, surface, issueId, class
   }, [bridge]);
 
   useEffect(() => {
-    // A surface whose script 404s posts this to the parent window rather than
-    // rendering blank — the frame has no other way to tell us.
     const onMessage = (event: MessageEvent) => {
-      if ((event.data as { type?: string } | null)?.type !== "multica:plugin-surface-error") return;
+      const type = (event.data as { type?: string } | null)?.type;
+      if (type !== "multica:plugin-surface-error" && type !== "multica:plugin-surface-navigated") return;
       // Same window-identity rule as the bridge: without it any frame on the
       // page could light up the failure banner on every other panel.
       if (!frameRef.current?.contentWindow || event.source !== frameRef.current.contentWindow) return;
-      setFailed(true);
+      // A surface whose script throws on its first line posts the error rather
+      // than rendering blank — the frame has no other way to tell us.
+      if (type === "multica:plugin-surface-error") return setFailed(true);
+      setNavigated(true);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, []);
+
+  // Navigating away replaces the document we generated with one whose CSP we do
+  // not write, in a frame whose contentWindow is unchanged — so the bridge's
+  // window-identity check would happily hand the MessagePort, and the workspace
+  // access behind it, to whatever the plugin author is serving right now.
+  //
+  // This is damage control, not the boundary. The navigation request has already
+  // reached the author by the time `pagehide` fires, and a document that
+  // navigates before announcing is not covered at all. Closing it properly needs
+  // an embedder `frame-src` policy or a handshake a navigated document cannot
+  // complete; both are being decided separately. What this does buy: the bridge
+  // is closed and the frame unmounted, so the ongoing Action API access a silent
+  // takeover would otherwise get does not survive.
+  useEffect(() => {
+    if (navigated) bridge.close();
+  }, [navigated, bridge]);
+
+  if (navigated) {
+    return (
+      <div ref={anchorRef} className={cn("rounded-lg border border-surface-border px-4 py-3 text-caption text-muted-foreground", className)}>
+        <PluginSurfaceNotice installation={installation} kind="navigated" />
+      </div>
+    );
+  }
 
   if (!surfaceDocument) {
     return (
@@ -126,10 +153,11 @@ function PluginSurfaceNotice({
   kind,
 }: {
   installation: PluginInstallation;
-  kind: "unavailable" | "failed" | "loading";
+  kind: "unavailable" | "failed" | "loading" | "navigated";
 }) {
   const { t } = useT("issues");
   if (kind === "failed") return <>{t(($) => $.plugins.surface_failed, { name: installation.name })}</>;
   if (kind === "loading") return <>{t(($) => $.plugins.surface_loading, { name: installation.name })}</>;
+  if (kind === "navigated") return <>{t(($) => $.plugins.surface_navigated, { name: installation.name })}</>;
   return <>{t(($) => $.plugins.surface_unavailable, { name: installation.name })}</>;
 }

@@ -33,9 +33,9 @@ before you write one:
   directly, that backend must accept a null origin in CORS.
 - **A CSP you did not write.** The host generates the document and derives
   `connect-src` from the `net:` scopes in your manifest. Declare every host you
-  intend to reach; a surface with no `net:` scope cannot make network requests
-  at all — not even back to you, because your code is served by Multica and your
-  origin is not in the policy. `net:` is an exact host, so declare
+  intend to reach; with no `net:` scope your surface cannot issue a network
+  request at all, including back to your own origin, which is no longer in the
+  policy now that Multica serves your code. `net:` is an exact host, so declare
   `net:api.example.com` separately from `net:example.com`.
 
 ## Publishing

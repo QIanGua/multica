@@ -102,25 +102,18 @@ func (s *PluginService) PublishLocalBundle(ctx context.Context, workspaceID, use
 	return s.publish(ctx, workspaceID, userID, bundle, true)
 }
 
-// publish inserts the package row if needed, then the version and its files, in
-// one transaction. A version whose files half-landed would be a panel that loads
-// nothing, with no way to tell from the version list that anything is wrong.
+// publish writes the package row, the version and its files in ONE transaction,
+// under the (workspace, plugin key) lock.
+//
+// All three parts are in the same transaction for the same reason: any partial
+// result is a lie the version list cannot show. A version whose files half
+// landed is a panel that loads nothing; a package row whose display name was
+// updated by a publish that then conflicted claims to describe a version that
+// was never stored; and a first publish that failed after creating the package
+// leaves a plugin with zero versions in the list.
 func (s *PluginService) publish(ctx context.Context, workspaceID, userID pgtype.UUID, bundle plugincontract.Bundle, devLoop bool) (PluginPackageSummary, error) {
 	if err := bundle.Manifest.CheckCapabilities(s.Host); err != nil {
 		return PluginPackageSummary{}, &PluginError{Kind: PluginErrorIncompatible, Message: capabilityMessage(err), Err: err}
-	}
-
-	pkg, err := s.upsertPackage(ctx, workspaceID, userID, bundle.Manifest)
-	if err != nil {
-		return PluginPackageSummary{}, err
-	}
-	existing, err := s.Queries.ListPluginPackageVersions(ctx, pkg.ID)
-	if err != nil {
-		return PluginPackageSummary{}, &PluginError{Kind: PluginErrorUnavailable, Message: "list published versions", Err: err}
-	}
-	version, err := resolvePublishVersion(bundle.Manifest.Version, existing, devLoop)
-	if err != nil {
-		return PluginPackageSummary{}, err
 	}
 
 	tx, err := s.TxStarter.Begin(ctx)
@@ -129,6 +122,22 @@ func (s *PluginService) publish(ctx context.Context, workspaceID, userID pgtype.
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := s.Queries.WithTx(tx)
+
+	if err := lockPluginPackageKey(ctx, queries, workspaceID, bundle.Manifest.Key); err != nil {
+		return PluginPackageSummary{}, err
+	}
+	pkg, err := upsertPackage(ctx, queries, workspaceID, userID, bundle.Manifest)
+	if err != nil {
+		return PluginPackageSummary{}, err
+	}
+	existing, err := queries.ListPluginPackageVersions(ctx, pkg.ID)
+	if err != nil {
+		return PluginPackageSummary{}, &PluginError{Kind: PluginErrorUnavailable, Message: "list published versions", Err: err}
+	}
+	version, err := resolvePublishVersion(bundle.Manifest.Version, existing, devLoop)
+	if err != nil {
+		return PluginPackageSummary{}, err
+	}
 
 	row, err := queries.CreatePluginPackageVersion(ctx, db.CreatePluginPackageVersionParams{
 		PackageID:   pkg.ID,
@@ -210,8 +219,21 @@ func resolvePublishVersion(version string, existing []db.PluginPackageVersion, d
 	return candidate, nil
 }
 
-func (s *PluginService) upsertPackage(ctx context.Context, workspaceID, userID pgtype.UUID, manifest plugincontract.Manifest) (db.PluginPackage, error) {
-	existing, err := s.Queries.GetWorkspacePluginPackageByKey(ctx, db.GetWorkspacePluginPackageByKeyParams{
+// lockPluginPackageKey takes the transaction-scoped lock that serializes
+// publish, install and delete for one plugin. Every caller must already be in a
+// transaction — the lock is released by its commit or rollback.
+func lockPluginPackageKey(ctx context.Context, queries *db.Queries, workspaceID pgtype.UUID, pluginKey string) error {
+	if err := queries.LockPluginPackageKey(ctx, uuidString(workspaceID)+":"+pluginKey); err != nil {
+		return &PluginError{Kind: PluginErrorUnavailable, Message: "lock plugin package", Err: err}
+	}
+	return nil
+}
+
+// upsertPackage takes `queries` rather than reading s.Queries so it runs inside
+// its caller's transaction: the display name must move only if the version that
+// carries it is actually stored.
+func upsertPackage(ctx context.Context, queries *db.Queries, workspaceID, userID pgtype.UUID, manifest plugincontract.Manifest) (db.PluginPackage, error) {
+	existing, err := queries.GetWorkspacePluginPackageByKey(ctx, db.GetWorkspacePluginPackageByKeyParams{
 		WorkspaceID: workspaceID,
 		PluginKey:   manifest.Key,
 	})
@@ -220,7 +242,7 @@ func (s *PluginService) upsertPackage(ctx context.Context, workspaceID, userID p
 			return existing, nil
 		}
 		// The display name follows the newest publish; the key does not move.
-		updated, updateErr := s.Queries.UpdatePluginPackageName(ctx, db.UpdatePluginPackageNameParams{
+		updated, updateErr := queries.UpdatePluginPackageName(ctx, db.UpdatePluginPackageNameParams{
 			ID:   existing.ID,
 			Name: manifest.Name,
 		})
@@ -232,7 +254,7 @@ func (s *PluginService) upsertPackage(ctx context.Context, workspaceID, userID p
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return db.PluginPackage{}, &PluginError{Kind: PluginErrorUnavailable, Message: "load plugin package", Err: err}
 	}
-	created, err := s.Queries.CreatePluginPackage(ctx, db.CreatePluginPackageParams{
+	created, err := queries.CreatePluginPackage(ctx, db.CreatePluginPackageParams{
 		WorkspaceID: workspaceID,
 		PluginKey:   manifest.Key,
 		Name:        manifest.Name,
@@ -240,7 +262,8 @@ func (s *PluginService) upsertPackage(ctx context.Context, workspaceID, userID p
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
-			// Two publishes of a brand-new key at once: one loses the index.
+			// Belt and braces behind the lock: a publish racing one in another
+			// process that has not yet taken it still loses the index cleanly.
 			return db.PluginPackage{}, pluginErrf(PluginErrorConflict, "this plugin was just published by someone else; try again")
 		}
 		return db.PluginPackage{}, &PluginError{Kind: PluginErrorUnavailable, Message: "create plugin package", Err: err}
@@ -315,6 +338,8 @@ func (s *PluginService) DeletePackage(ctx context.Context, workspaceID pgtype.UU
 	if err != nil {
 		return pluginErrf(PluginErrorNotFound, "plugin package not found")
 	}
+	// Read once outside the transaction only to learn the plugin key the lock is
+	// taken on. Everything the decision rests on is re-read inside it.
 	pkg, err := s.Queries.GetWorkspacePluginPackage(ctx, db.GetWorkspacePluginPackageParams{
 		WorkspaceID: workspaceID,
 		ID:          parsed,
@@ -325,13 +350,6 @@ func (s *PluginService) DeletePackage(ctx context.Context, workspaceID pgtype.UU
 	if err != nil {
 		return &PluginError{Kind: PluginErrorUnavailable, Message: "load plugin package", Err: err}
 	}
-	installed, err := s.Queries.CountInstallationsOfPackageVersions(ctx, pkg.ID)
-	if err != nil {
-		return &PluginError{Kind: PluginErrorUnavailable, Message: "count installations", Err: err}
-	}
-	if installed > 0 {
-		return pluginErrf(PluginErrorConflict, "this plugin is still installed; uninstall it before deleting the published package")
-	}
 
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
@@ -339,6 +357,20 @@ func (s *PluginService) DeletePackage(ctx context.Context, workspaceID pgtype.UU
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := s.Queries.WithTx(tx)
+
+	if err := lockPluginPackageKey(ctx, queries, workspaceID, pkg.PluginKey); err != nil {
+		return err
+	}
+	// Counted INSIDE the lock, not before it. Counting outside would let an
+	// install that started after the count commit after the delete, leaving an
+	// installation whose version is gone.
+	installed, err := queries.CountInstallationsOfPackageVersions(ctx, pkg.ID)
+	if err != nil {
+		return &PluginError{Kind: PluginErrorUnavailable, Message: "count installations", Err: err}
+	}
+	if installed > 0 {
+		return pluginErrf(PluginErrorConflict, "this plugin is still installed; uninstall it before deleting the published package")
+	}
 
 	// Files first: they name a version that is about to stop existing, and there
 	// are no cascades by repository policy.
@@ -353,6 +385,28 @@ func (s *PluginService) DeletePackage(ctx context.Context, workspaceID pgtype.UU
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return &PluginError{Kind: PluginErrorUnavailable, Message: "commit delete", Err: err}
+	}
+	return nil
+}
+
+// requireVersionStillPublished re-reads a version inside the caller's locked
+// transaction.
+//
+// Install validates the version, its manifest and its scopes before opening a
+// transaction — none of that can be done under a lock without holding it across
+// work that does not need it. So the version is confirmed once more after the
+// lock is held, which is the point at which a concurrent delete can no longer
+// slip in between.
+func requireVersionStillPublished(ctx context.Context, queries *db.Queries, workspaceID, versionID pgtype.UUID) error {
+	_, err := queries.GetWorkspacePluginPackageVersion(ctx, db.GetWorkspacePluginPackageVersionParams{
+		WorkspaceID: workspaceID,
+		ID:          versionID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pluginErrf(PluginErrorConflict, "this version was deleted while the install was being confirmed; publish or pick another version")
+	}
+	if err != nil {
+		return &PluginError{Kind: PluginErrorUnavailable, Message: "re-read published plugin version", Err: err}
 	}
 	return nil
 }

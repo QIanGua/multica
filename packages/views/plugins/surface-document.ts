@@ -120,8 +120,21 @@ function encodeSurfaceCode(code: string): string {
  * The srcdoc a surface iframe renders.
  *
  * The plugin's code arrives as base64 in a non-executable element and is
- * activated by a small bootstrap. Everything executable is inline, and nothing
- * is fetched: no request leaves this frame to render it.
+ * activated by a small bootstrap. Everything executable is inline, and rendering
+ * this document fetches nothing.
+ *
+ * KNOWN GAP — a sandboxed frame may navigate ITSELF. `allow-scripts` without
+ * `allow-top-navigation` stops a surface navigating the top level or a sibling,
+ * but the HTML sandbox deliberately permits `_self`, and no shipped CSP
+ * directive covers it (`navigate-to` was dropped from CSP3, and `connect-src` /
+ * `form-action` govern other things). So a HOSTILE artifact can still run
+ * `location.replace("https://author.example/live.html")`, which reaches the
+ * author's server once and replaces this document with one whose CSP we do not
+ * write. The `pagehide` beacon below reports that so the embedder can drop the
+ * bridge, but a beacon is damage control, not a boundary: closing it needs
+ * either an embedder `frame-src` policy or a handshake the navigated document
+ * cannot complete. Tracked separately; do not describe a surface as unable to
+ * reach its author until that lands.
  */
 export function buildSurfaceDocument({ code, grantedScopes, theme }: SurfaceDocumentInput): string {
   const csp = buildSurfaceCSP(grantedScopes);
@@ -154,6 +167,13 @@ body {
 <script type="text/plain" id="multica-surface-code">${encodeSurfaceCode(code)}</script>
 <script>
 (function () {
+  // Registered BEFORE the plugin's code runs, and with an anonymous listener it
+  // holds no reference to: the plugin cannot remove it, and assigning
+  // window.onpagehide does not detach it. If this document is navigated away
+  // from, the embedder hears about it and drops the bridge.
+  window.addEventListener("pagehide", function () {
+    parent.postMessage({ type: 'multica:plugin-surface-navigated' }, '*');
+  });
   try {
     var encoded = document.getElementById("multica-surface-code").textContent;
     var binary = atob(encoded);

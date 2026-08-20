@@ -372,6 +372,13 @@ func (s *PluginService) InstallPlugin(ctx context.Context, workspaceID, userID p
 		defer func() { _ = tx.Rollback(ctx) }()
 		queries := s.Queries.WithTx(tx)
 
+		if lockErr := lockPluginPackageKey(ctx, queries, workspaceID, manifest.Key); lockErr != nil {
+			return db.PluginInstallation{}, lockErr
+		}
+		if recheckErr := requireVersionStillPublished(ctx, queries, workspaceID, version.ID); recheckErr != nil {
+			return db.PluginInstallation{}, recheckErr
+		}
+
 		installation, createErr := queries.CreatePluginInstallation(ctx, db.CreatePluginInstallationParams{
 			WorkspaceID:      workspaceID,
 			PluginKey:        manifest.Key,
@@ -421,6 +428,13 @@ func (s *PluginService) InstallPlugin(ctx context.Context, workspaceID, userID p
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := s.Queries.WithTx(tx)
+
+	if err := lockPluginPackageKey(ctx, queries, workspaceID, manifest.Key); err != nil {
+		return db.PluginInstallation{}, err
+	}
+	if err := requireVersionStillPublished(ctx, queries, workspaceID, version.ID); err != nil {
+		return db.PluginInstallation{}, err
+	}
 
 	for _, key := range orphanedSecrets {
 		if _, err := queries.DeletePluginSecret(ctx, db.DeletePluginSecretParams{InstallationID: existing.ID, Key: key}); err != nil {
