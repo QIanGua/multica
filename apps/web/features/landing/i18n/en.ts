@@ -294,6 +294,28 @@ export function createEnDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
+        version: "0.5.0",
+        date: "2026-08-20",
+        title: "Telegram agents, Dim runtime, and safer agent runs",
+        changes: [],
+        features: [
+          "Connect a Telegram bot so agents can handle messages and reply in private chats, groups, and topics.",
+          "You can now run agents with the Dim CLI.",
+        ],
+        improvements: [
+          "The web Help menu now makes the desktop app easier to find.",
+          "You can confirm an agent run before moving an assigned Issue out of backlog.",
+          "Webhook event filters are easier to add and remove.",
+          "The / picker now ranks exact skill matches first.",
+        ],
+        fixes: [
+          "Windows command-line builds now create correctly named executables.",
+          "Agents can still load skills after a brief connection drop.",
+          "Run now no longer exposes internal error details.",
+          "Agent updates stay responsive in busy workspaces.",
+        ],
+      },
+      {
         version: "0.4.30",
         date: "2026-08-19",
         title: "Safer Issue editing, empty-property filters, and clearer agent identity",

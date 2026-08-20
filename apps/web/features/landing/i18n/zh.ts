@@ -294,6 +294,28 @@ export function createZhDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
+        version: "0.5.0",
+        date: "2026-08-20",
+        title: "Telegram 智能体、Dim 运行时、更安心的智能体任务",
+        changes: [],
+        features: [
+          "现在可以连接 Telegram 机器人，让智能体处理消息并回复。",
+          "现在可以使用 Dim CLI 运行智能体。",
+        ],
+        improvements: [
+          "网页端的帮助菜单现在能直接找到桌面端下载。",
+          "将已分配的 Issue 移出 backlog 前，现在会先让你确认。",
+          "webhook 的事件筛选现在更容易添加和移除。",
+          "输入 / 时，精确匹配的 skill 会排在最前面。",
+        ],
+        fixes: [
+          "Windows 命令行构建现在会生成正确的可执行文件名。",
+          "短暂断线后，智能体的 skill 依然可以正常加载。",
+          "自动化运行失败时，不再显示内部错误详情。",
+          "繁忙工作区里的智能体更新现在更稳定。",
+        ],
+      },
+      {
         version: "0.4.30",
         date: "2026-08-19",
         title: "更安全的 Issue 编辑、未设置属性筛选、清晰的智能体身份",
