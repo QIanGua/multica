@@ -594,20 +594,33 @@ SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
 WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
--- name: CancelAgentTasksByIssueAndAgent :many
--- Cancels active tasks for a single (issue, agent) pair without touching
--- tasks belonging to other agents on the same issue. Used by the manual
--- rerun flow so re-running the assignee doesn't collateral-cancel a
--- still-running @-mention agent on the same issue.
+-- name: CancelPendingTasksByIssueAndAgent :many
+-- Cancels the not-yet-started tasks for a single (issue, agent) pair, so the
+-- manual rerun flow can enqueue a replacement without colliding with
+-- idx_one_pending_task_per_issue_agent_v2 and without dropping the rerun's own
+-- attribution onto a row somebody else created.
+--
+-- 'running' and 'waiting_local_directory' are deliberately NOT cancelled: an
+-- agent is executing in them. Neither status appears in that unique index, so a
+-- fresh queued row can be inserted alongside one, and ClaimAgentTask's
+-- per-(issue, agent) serialization holds the new row until the active run
+-- reaches a terminal state. Cancelling them made a manual rerun kill the pass
+-- the agent was still working on; interrupting an in-flight run is CancelTask's
+-- job, not rerun's.
+--
+-- Everything that has NOT begun executing is still cleared, including deferred
+-- escalations, so rerun keeps its prior "replace the pending plan" behaviour for
+-- those rows.
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+WHERE issue_id = $1 AND agent_id = $2
+  AND status IN ('queued', 'dispatched', 'deferred')
 RETURNING *;
 
 -- name: CancelAgentTasksByAgent :many
 -- Bulk-cancel every active (queued/dispatched/running) task for an agent.
 -- Returns the affected rows so callers can broadcast task:cancelled events.
--- Mirrors the shape of CancelAgentTasksByIssue / CancelAgentTasksByIssueAndAgent
+-- Mirrors the shape of CancelAgentTasksByIssue / CancelPendingTasksByIssueAndAgent
 -- (also :many + RETURNING + completed_at) so the three sibling cancel paths
 -- behave consistently.
 UPDATE agent_task_queue

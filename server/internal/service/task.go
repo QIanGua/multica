@@ -4716,17 +4716,26 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		}
 	}
 
-	// Cancel only the target agent's active/queued tasks on this issue. A manual
-	// rerun is a request to resume the issue, not to dismiss planned recovery
-	// signals, so this intentionally stays on the server-cancel query. Any
-	// undelivered delegated-failure signal remains an outbox obligation and the
-	// sweeper can merge it into the fresh rerun task.
-	cancelled, err := s.Queries.CancelAgentTasksByIssueAndAgent(ctx, db.CancelAgentTasksByIssueAndAgentParams{
+	// Clear only the tasks that have not begun executing. Those are the rows the
+	// fresh enqueue would collide with under
+	// idx_one_pending_task_per_issue_agent_v2, and replacing them costs no work
+	// while keeping the new run attributed to the rerunning member (MUL-4302 §5)
+	// rather than inheriting whoever created the pending row.
+	//
+	// A running / waiting_local_directory task is deliberately left alone: an
+	// agent is executing in it. Neither status appears in that unique index, so
+	// the enqueue below inserts a queued row BEHIND the active one, and
+	// ClaimAgentTask's per-(issue, agent) serialization holds it there until the
+	// active run reaches a terminal state. Rerun used to cancel these too, so
+	// asking an agent for another pass silently killed the pass it was still
+	// working on; interrupting an in-flight run is what CancelTask /
+	// `multica issue cancel-task` is for.
+	cancelled, err := s.Queries.CancelPendingTasksByIssueAndAgent(ctx, db.CancelPendingTasksByIssueAndAgentParams{
 		IssueID: issueID,
 		AgentID: agentID,
 	})
 	if err != nil {
-		slog.Warn("rerun: cancel prior tasks failed",
+		slog.Warn("rerun: cancel pending tasks failed",
 			"issue_id", util.UUIDToString(issueID),
 			"agent_id", util.UUIDToString(agentID),
 			"error", err,
@@ -4753,7 +4762,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		"agent_id", util.UUIDToString(agentID),
 		"source_task_id", util.UUIDToString(sourceTaskID),
 		"is_leader", isLeader,
-		"cancelled_prior", len(cancelled),
+		"cancelled_pending", len(cancelled),
 	)
 	return &task, nil
 }
