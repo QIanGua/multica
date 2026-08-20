@@ -18,6 +18,51 @@ const (
 	defaultRelayStreamMaintenanceInterval = time.Minute
 )
 
+// StreamRetentionConfig is shared by sharded and legacy relay modes so one
+// set of operator controls has the same meaning during a dual-mode rollout.
+// TTL is deliberately opt-in: deploy the compatible code with TTL disabled,
+// then enable it only after every replica can refresh or remove expirations.
+type StreamRetentionConfig struct {
+	StreamMaxLen        int64
+	TrimHorizon         time.Duration
+	StreamTTL           time.Duration
+	TTLRefreshInterval  time.Duration
+	MaintenanceInterval time.Duration
+	StreamTTLEnabled    bool
+}
+
+// DefaultStreamRetentionConfig returns safe cross-mode retention defaults.
+func DefaultStreamRetentionConfig() StreamRetentionConfig {
+	return StreamRetentionConfig{
+		StreamMaxLen:        defaultShardedRelayStreamMaxLen,
+		TrimHorizon:         defaultRelayStreamTrimHorizon,
+		StreamTTL:           defaultRelayStreamTTL,
+		TTLRefreshInterval:  defaultRelayStreamTTLRefreshInterval,
+		MaintenanceInterval: defaultRelayStreamMaintenanceInterval,
+		StreamTTLEnabled:    false,
+	}
+}
+
+func (c StreamRetentionConfig) withDefaults() StreamRetentionConfig {
+	def := DefaultStreamRetentionConfig()
+	if c.StreamMaxLen <= 0 {
+		c.StreamMaxLen = def.StreamMaxLen
+	}
+	if c.TrimHorizon <= 0 {
+		c.TrimHorizon = def.TrimHorizon
+	}
+	if c.StreamTTL < c.TrimHorizon {
+		c.StreamTTL = c.TrimHorizon + defaultShardedRelayReplayGrace
+	}
+	if c.TTLRefreshInterval <= 0 || c.TTLRefreshInterval >= c.StreamTTL {
+		c.TTLRefreshInterval = retentionSubinterval(c.StreamTTL, def.TTLRefreshInterval)
+	}
+	if c.MaintenanceInterval <= 0 || c.MaintenanceInterval >= c.StreamTTL {
+		c.MaintenanceInterval = retentionSubinterval(c.StreamTTL, def.MaintenanceInterval)
+	}
+	return c
+}
+
 // streamTTLRefresher limits PEXPIRE calls on the publish path while ensuring
 // active stream keys remain eligible for volatile-* eviction policies. A
 // maintenance pass repairs any TTL that was missed after a partial failure.
@@ -60,9 +105,31 @@ func (r *streamTTLRefresher) refreshIfDue(ctx context.Context, client *redis.Cli
 // repairMissingTTL assigns a TTL only when a stream exists without one. It
 // intentionally does not refresh a healthy TTL, so an idle stream can expire.
 func (r *streamTTLRefresher) repairMissingTTL(ctx context.Context, client *redis.Client, key string) (time.Duration, error) {
+	return r.reconcileTTL(ctx, client, key, true)
+}
+
+// reconcileTTL repairs a missing TTL when enabled and removes any persisted
+// TTL when disabled. The disabled path is the compatibility and rollback
+// phase: once all new replicas have observed it, old binaries can keep writing
+// without an inherited expiry deleting an active stream.
+func (r *streamTTLRefresher) reconcileTTL(ctx context.Context, client *redis.Client, key string, enabled bool) (time.Duration, error) {
 	ttl, err := client.PTTL(ctx, key).Result()
 	if err != nil {
 		return 0, err
+	}
+	if !enabled {
+		r.forget(key)
+		if ttl == -2 || ttl == -1 {
+			return ttl, nil
+		}
+		ok, err := client.Persist(ctx, key).Result()
+		if err != nil {
+			return ttl, err
+		}
+		if !ok {
+			return -2, nil
+		}
+		return -1, nil
 	}
 	switch ttl {
 	case -2: // key does not exist

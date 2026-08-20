@@ -88,6 +88,7 @@ func shardedRelayConfigFromEnv() realtime.ShardedStreamRelayConfig {
 	cfg.StreamTTL = envDuration("REALTIME_RELAY_STREAM_TTL", cfg.TrimHorizon+cfg.ReplayGrace)
 	cfg.TTLRefreshInterval = envDuration("REALTIME_RELAY_TTL_REFRESH_INTERVAL", cfg.TTLRefreshInterval)
 	cfg.MaintenanceInterval = envDuration("REALTIME_RELAY_MAINTENANCE_INTERVAL", cfg.MaintenanceInterval)
+	cfg.StreamTTLEnabled = envBool("REALTIME_RELAY_STREAM_TTL_ENABLED", false)
 	if err := cfg.Validate(); err != nil {
 		slog.Warn("invalid realtime relay retention config; normalizing to safe values", "error", err)
 	}
@@ -376,14 +377,14 @@ func main() {
 			switch relayMode {
 			case "legacy":
 				relayReadRedis = newNamedRedisClient(opts, "realtime-read")
-				relay = realtime.NewRedisRelayWithClients(hub, relayWriteRedis, relayReadRedis)
+				relay = realtime.NewRedisRelayWithClientsAndConfig(hub, relayWriteRedis, relayReadRedis, relayConfig.RetentionConfig())
 				slog.Info("daemon websocket wakeup: Redis fanout disabled in legacy realtime relay mode")
 			case "dual":
 				shardedReadRedis = newNamedRedisClient(opts, "realtime-read-sharded")
 				legacyReadRedis = newNamedRedisClient(opts, "realtime-read-legacy")
 				sharded := realtime.NewShardedStreamRelay(hub, relayWriteRedis, shardedReadRedis, relayConfig)
 				sharded.SetDaemonRuntimeDeliverer(daemonHub)
-				legacy := realtime.NewRedisRelayWithClients(hub, relayWriteRedis, legacyReadRedis)
+				legacy := realtime.NewRedisRelayWithClientsAndConfig(hub, relayWriteRedis, legacyReadRedis, relayConfig.RetentionConfig())
 				relay = realtime.NewMirroredRelay(sharded, legacy)
 				daemonWakeup = daemonws.NewRelayNotifier(daemonHub, sharded)
 			default:
@@ -409,6 +410,7 @@ func main() {
 				"replay_grace", relayConfig.ReplayGrace.String(),
 				"trim_horizon", relayConfig.TrimHorizon.String(),
 				"stream_ttl", relayConfig.StreamTTL.String(),
+				"stream_ttl_enabled", relayConfig.StreamTTLEnabled,
 				"xread_count", relayConfig.ReadCount,
 				"xread_block", relayConfig.ReadBlock.String(),
 				"store_pool_size", storePoolSize,

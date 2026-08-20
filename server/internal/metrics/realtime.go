@@ -58,7 +58,7 @@ func NewRealtimeCollector(m *realtime.Metrics) *RealtimeCollector {
 		redisStreamTrimmed:     newRealtimeDesc("redis_stream_trimmed_entries_total", "Total Redis Stream entries removed by retention maintenance."),
 		redisStreamMissing:     newRealtimeDesc("redis_stream_missing_total", "Total observed relay stream disappearance transitions, including eviction and expiry."),
 		redisRetentionErrors:   newRealtimeDesc("redis_retention_errors_total", "Total Redis relay retention maintenance errors."),
-		redisStreamsWithoutTTL: newRealtimeDesc("redis_streams_without_ttl", "Current number of observed relay streams without an expiry."),
+		redisStreamsWithoutTTL: newRealtimeDesc("redis_streams_without_ttl", "Current number of observed relay streams missing an expiry while TTL protection is enabled."),
 		redisUsedMemoryBytes:   newRealtimeDesc("redis_used_memory_bytes", "Redis used_memory sampled by the realtime relay."),
 		redisMaxMemoryBytes:    newRealtimeDesc("redis_maxmemory_bytes", "Redis maxmemory sampled by the realtime relay; zero means unlimited."),
 		redisEvictedKeys:       newRealtimeDesc("redis_evicted_keys", "Redis instance evicted_keys sampled by the realtime relay."),

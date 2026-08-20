@@ -3,6 +3,7 @@ package realtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -34,6 +35,9 @@ func TestShardedStreamRelayConfigDefaults(t *testing.T) {
 	}
 	if relay.config.StreamTTL != defaultRelayStreamTTL {
 		t.Fatalf("expected default stream TTL %s, got %s", defaultRelayStreamTTL, relay.config.StreamTTL)
+	}
+	if relay.config.StreamTTLEnabled {
+		t.Fatal("stream TTL must default to disabled for staged rollout safety")
 	}
 	if err := relay.config.Validate(); err != nil {
 		t.Fatalf("default config is invalid: %v", err)
@@ -204,10 +208,11 @@ func TestShardedStreamRelayMaintenanceTrimsExactlyAndRepairsTTL(t *testing.T) {
 
 	now := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
 	relay := NewShardedStreamRelay(NewHub(), rdb, rdb, ShardedStreamRelayConfig{
-		Shards:      1,
-		ReplayGrace: 5 * time.Minute,
-		TrimHorizon: 10 * time.Minute,
-		StreamTTL:   15 * time.Minute,
+		Shards:           1,
+		ReplayGrace:      5 * time.Minute,
+		TrimHorizon:      10 * time.Minute,
+		StreamTTL:        15 * time.Minute,
+		StreamTTLEnabled: true,
 	})
 	relay.now = func() time.Time { return now }
 	relay.ttl.now = relay.now
@@ -240,6 +245,43 @@ func TestShardedStreamRelayMaintenanceTrimsExactlyAndRepairsTTL(t *testing.T) {
 	}
 	if got := M.RedisEvictedKeys.Load(); got != 3 {
 		t.Fatalf("evicted keys = %d, want 3", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShardedStreamRelayMaintenanceCountsTTLRepairFailure(t *testing.T) {
+	M.Reset()
+	t.Cleanup(M.Reset)
+	rdb, mock := redismock.NewClientMock()
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	relay := NewShardedStreamRelay(NewHub(), rdb, rdb, ShardedStreamRelayConfig{
+		Shards:           1,
+		StreamTTLEnabled: true,
+	})
+	relay.now = func() time.Time { return now }
+	relay.ttl.now = relay.now
+	stream := ShardedStreamKey(0)
+
+	mock.ExpectExists(stream).SetVal(1)
+	mock.ExpectXTrimMinID(stream, streamMinID(now, relay.config.TrimHorizon)).SetVal(0)
+	mock.ExpectPTTL(stream).SetVal(-1)
+	mock.ExpectPExpire(stream, relay.config.StreamTTL).SetErr(errors.New("PEXPIRE denied"))
+	mock.ExpectXLen(stream).SetVal(1)
+	mock.ExpectMemoryUsage(stream).SetVal(1024)
+	mock.ExpectInfo("memory").SetVal("used_memory:1024\r\nmaxmemory:2048\r\n")
+	mock.ExpectInfo("stats").SetVal("evicted_keys:0\r\n")
+
+	relay.maintainStreams(context.Background())
+
+	if got := M.RedisRelayStreamsWithoutTTL.Load(); got != 1 {
+		t.Fatalf("streams without TTL = %d, want 1", got)
+	}
+	if got := M.RedisRelayRetentionErrors.Load(); got != 1 {
+		t.Fatalf("retention errors = %d, want 1", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

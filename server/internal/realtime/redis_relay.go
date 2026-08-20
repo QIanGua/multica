@@ -26,12 +26,10 @@ func HeartbeatKey(nodeID string) string {
 }
 
 const (
-	streamMaxLen          int64 = 10000
-	heartbeatTTL                = 90 * time.Second
-	heartbeatPeriod             = 30 * time.Second
-	consumerIdleGrace           = 10 * time.Minute
-	consumerSweepPeriod         = 5 * time.Minute
-	legacyStreamScanCount       = 128
+	heartbeatTTL          = 90 * time.Second
+	heartbeatPeriod       = 30 * time.Second
+	consumerIdleGrace     = 10 * time.Minute
+	legacyStreamScanCount = 128
 )
 
 // envelope is what we serialise into each XADD message. It is opaque to the
@@ -130,19 +128,23 @@ func deliverEnvelope(hub *Hub, daemonRuntime DaemonRuntimeDeliverer, ev envelope
 // per-scope Redis Stream and consumes streams for which there are local
 // subscribers. Local fanout is delegated to the wrapped *Hub.
 type RedisRelay struct {
-	hub      *Hub
-	writeRDB *redis.Client
-	readRDB  *redis.Client
-	nodeID   string
-	ttl      *streamTTLRefresher
-	now      func() time.Time
+	hub       *Hub
+	writeRDB  *redis.Client
+	readRDB   *redis.Client
+	nodeID    string
+	retention StreamRetentionConfig
+	ttl       *streamTTLRefresher
+	now       func() time.Time
 
 	mu        sync.Mutex
 	consumers map[scopeKey]*scopeConsumer
 	stopping  bool
 	wg        sync.WaitGroup
 
-	legacyScanCursor uint64
+	legacyScanCursor  uint64
+	ttlStatusMu       sync.Mutex
+	streamsWithoutTTL map[string]struct{}
+	ttlScanSeen       map[string]struct{}
 
 	daemonRuntime DaemonRuntimeDeliverer
 }
@@ -163,17 +165,27 @@ func NewRedisRelay(hub *Hub, rdb *redis.Client) *RedisRelay {
 // calls so long-polling stream consumers cannot exhaust the pool used by XADD,
 // heartbeats, acks, and other request-path Redis operations.
 func NewRedisRelayWithClients(hub *Hub, writeRDB, readRDB *redis.Client) *RedisRelay {
+	return NewRedisRelayWithClientsAndConfig(hub, writeRDB, readRDB, DefaultStreamRetentionConfig())
+}
+
+// NewRedisRelayWithClientsAndConfig applies the same stream retention controls
+// used by sharded mode so legacy and dual-mode rollouts cannot silently diverge.
+func NewRedisRelayWithClientsAndConfig(hub *Hub, writeRDB, readRDB *redis.Client, retention StreamRetentionConfig) *RedisRelay {
 	if readRDB == nil {
 		readRDB = writeRDB
 	}
+	retention = retention.withDefaults()
 	return &RedisRelay{
-		hub:       hub,
-		writeRDB:  writeRDB,
-		readRDB:   readRDB,
-		nodeID:    ulid.Make().String(),
-		ttl:       newStreamTTLRefresher(defaultRelayStreamTTL, defaultRelayStreamTTLRefreshInterval),
-		now:       time.Now,
-		consumers: make(map[scopeKey]*scopeConsumer),
+		hub:               hub,
+		writeRDB:          writeRDB,
+		readRDB:           readRDB,
+		nodeID:            ulid.Make().String(),
+		retention:         retention,
+		ttl:               newStreamTTLRefresher(retention.StreamTTL, retention.TTLRefreshInterval),
+		now:               time.Now,
+		consumers:         make(map[scopeKey]*scopeConsumer),
+		streamsWithoutTTL: make(map[string]struct{}),
+		ttlScanSeen:       make(map[string]struct{}),
 	}
 }
 
@@ -281,7 +293,7 @@ func (r *RedisRelay) publishWithID(scopeType, scopeID, exclude string, frame []b
 	stream := StreamKey(scopeType, scopeID)
 	args := &redis.XAddArgs{
 		Stream: stream,
-		MaxLen: streamMaxLen,
+		MaxLen: r.retention.StreamMaxLen,
 		Approx: true,
 		Values: envelopeRedisValues(ev),
 	}
@@ -296,8 +308,10 @@ func (r *RedisRelay) publishWithID(scopeType, scopeID, exclude string, frame []b
 	}
 	M.RedisXAddTotal.Add(1)
 	M.RedisLastXAddLagMicros.Store(time.Since(start).Microseconds())
-	if err := r.ttl.refreshIfDue(ctx, r.writeRDB, stream); err != nil {
-		r.recordRetentionError("PEXPIRE failed", err, "stream", stream)
+	if r.retention.StreamTTLEnabled {
+		if err := r.ttl.refreshIfDue(ctx, r.writeRDB, stream); err != nil {
+			r.recordRetentionError("PEXPIRE failed", err, "stream", stream)
+		}
 	}
 	return nil
 }
@@ -353,8 +367,10 @@ func (r *RedisRelay) runConsumer(ctx context.Context, c *scopeConsumer, scopeTyp
 	if err := r.ensureConsumerGroup(createCtx, stream, group, "$"); err != nil {
 		slog.Warn("realtime/redis: XGROUP CREATE failed", "error", err, "scope", scopeType, "scope_id", scopeID)
 	}
-	if err := r.ttl.refreshIfDue(createCtx, r.writeRDB, stream); err != nil {
-		r.recordRetentionError("consumer stream PEXPIRE failed", err, "stream", stream)
+	if r.retention.StreamTTLEnabled {
+		if err := r.ttl.refreshIfDue(createCtx, r.writeRDB, stream); err != nil {
+			r.recordRetentionError("consumer stream PEXPIRE failed", err, "stream", stream)
+		}
 	}
 	createCancel()
 
@@ -384,7 +400,7 @@ func (r *RedisRelay) runConsumer(ctx context.Context, c *scopeConsumer, scopeTyp
 				repairCtx, repairCancel := context.WithTimeout(ctx, 2*time.Second)
 				r.ttl.forget(stream)
 				repairErr := r.ensureConsumerGroup(repairCtx, stream, group, "0-0")
-				if repairErr == nil {
+				if repairErr == nil && r.retention.StreamTTLEnabled {
 					repairErr = r.ttl.refreshIfDue(repairCtx, r.writeRDB, stream)
 				}
 				repairCancel()
@@ -481,7 +497,7 @@ func (r *RedisRelay) heartbeatOnce(ctx context.Context) {
 // bounded SCAN over legacy per-scope streams. The scan repairs keys created by
 // older pods before TTL retention was introduced without blocking Redis.
 func (r *RedisRelay) consumerSweeper(ctx context.Context) {
-	t := time.NewTicker(consumerSweepPeriod)
+	t := time.NewTicker(r.retention.MaintenanceInterval)
 	defer t.Stop()
 	for {
 		r.sweepLegacyStreams(ctx)
@@ -497,12 +513,13 @@ func (r *RedisRelay) sweepLegacyStreams(ctx context.Context) {
 	sweepCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	now := r.now()
-	minID := streamMinID(now, defaultRelayStreamTrimHorizon)
+	minID := streamMinID(now, r.retention.TrimHorizon)
 	localStreams := make(map[string]struct{})
 
 	for _, key := range r.hub.LocalScopes() {
 		stream := StreamKey(key.Type, key.ID)
 		localStreams[stream] = struct{}{}
+		r.observeLegacyScanKey(stream)
 		r.maintainLegacyStream(sweepCtx, stream, minID)
 		r.writeRDB.ZRemRangeByScore(sweepCtx, NodesKey(key.Type, key.ID), "-inf", fmt.Sprintf("%f", float64(now.Unix())))
 	}
@@ -512,6 +529,7 @@ func (r *RedisRelay) sweepLegacyStreams(ctx context.Context) {
 		r.recordRetentionError("legacy stream SCAN failed", err, "cursor", r.legacyScanCursor)
 	} else {
 		for _, stream := range keys {
+			r.observeLegacyScanKey(stream)
 			if _, alreadyMaintained := localStreams[stream]; alreadyMaintained {
 				continue
 			}
@@ -519,9 +537,12 @@ func (r *RedisRelay) sweepLegacyStreams(ctx context.Context) {
 		}
 		if sweepCtx.Err() == nil {
 			r.legacyScanCursor = nextCursor
+			if nextCursor == 0 {
+				r.completeLegacyTTLScan()
+			}
 		}
 	}
-	r.ttl.forgetStale(now.Add(-defaultRelayStreamTTL))
+	r.ttl.forgetStale(now.Add(-r.retention.StreamTTL))
 }
 
 func (r *RedisRelay) maintainLegacyStream(ctx context.Context, stream, minID string) {
@@ -530,9 +551,44 @@ func (r *RedisRelay) maintainLegacyStream(ctx context.Context, stream, minID str
 	} else if trimmed > 0 {
 		M.RedisRelayStreamTrimmedTotal.Add(trimmed)
 	}
-	if _, err := r.ttl.repairMissingTTL(ctx, r.writeRDB, stream); err != nil {
+	ttl, err := r.ttl.reconcileTTL(ctx, r.writeRDB, stream, r.retention.StreamTTLEnabled)
+	if err == nil || ttl == -1 || ttl == -2 {
+		r.observeLegacyTTL(stream, ttl)
+	}
+	if err != nil {
 		r.recordRetentionError("stream TTL repair failed", err, "stream", stream)
 	}
+}
+
+func (r *RedisRelay) observeLegacyTTL(stream string, ttl time.Duration) {
+	r.ttlStatusMu.Lock()
+	if r.retention.StreamTTLEnabled && ttl == -1 {
+		r.streamsWithoutTTL[stream] = struct{}{}
+	} else {
+		delete(r.streamsWithoutTTL, stream)
+	}
+	count := int64(len(r.streamsWithoutTTL))
+	r.ttlStatusMu.Unlock()
+	M.SetRedisStreamsWithoutTTL("legacy", count)
+}
+
+func (r *RedisRelay) observeLegacyScanKey(stream string) {
+	r.ttlStatusMu.Lock()
+	r.ttlScanSeen[stream] = struct{}{}
+	r.ttlStatusMu.Unlock()
+}
+
+func (r *RedisRelay) completeLegacyTTLScan() {
+	r.ttlStatusMu.Lock()
+	for stream := range r.streamsWithoutTTL {
+		if _, exists := r.ttlScanSeen[stream]; !exists {
+			delete(r.streamsWithoutTTL, stream)
+		}
+	}
+	r.ttlScanSeen = make(map[string]struct{})
+	count := int64(len(r.streamsWithoutTTL))
+	r.ttlStatusMu.Unlock()
+	M.SetRedisStreamsWithoutTTL("legacy", count)
 }
 
 func (r *RedisRelay) recordRetentionError(message string, err error, attrs ...any) {

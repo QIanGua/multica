@@ -12,6 +12,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+func enabledTestRetentionConfig() StreamRetentionConfig {
+	cfg := DefaultStreamRetentionConfig()
+	cfg.StreamTTLEnabled = true
+	return cfg
+}
+
 func TestNewRedisRelayWithClientsSeparatesBlockingReadPool(t *testing.T) {
 	hub := NewHub()
 	writeClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
@@ -56,15 +62,21 @@ func TestRedisRelaySweepUsesExactTimeTrimAndRepairsTTL(t *testing.T) {
 	attachRealtimeTestClient(hub, ScopeWorkspace, "workspace-1")
 	rdb, mock := redismock.NewClientMock()
 	t.Cleanup(func() { _ = rdb.Close() })
-	relay := NewRedisRelay(hub, rdb)
+	retention := enabledTestRetentionConfig()
+	retention.StreamMaxLen = 321
+	retention.TrimHorizon = 20 * time.Minute
+	retention.StreamTTL = 30 * time.Minute
+	retention.TTLRefreshInterval = time.Minute
+	retention.MaintenanceInterval = 2 * time.Minute
+	relay := NewRedisRelayWithClientsAndConfig(hub, rdb, rdb, retention)
 	now := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
 	relay.now = func() time.Time { return now }
 	relay.ttl.now = relay.now
 	stream := StreamKey(ScopeWorkspace, "workspace-1")
 
-	mock.ExpectXTrimMinID(stream, streamMinID(now, defaultRelayStreamTrimHorizon)).SetVal(7)
+	mock.ExpectXTrimMinID(stream, streamMinID(now, retention.TrimHorizon)).SetVal(7)
 	mock.ExpectPTTL(stream).SetVal(-1)
-	mock.ExpectPExpire(stream, defaultRelayStreamTTL).SetVal(true)
+	mock.ExpectPExpire(stream, retention.StreamTTL).SetVal(true)
 	mock.ExpectZRemRangeByScore(NodesKey(ScopeWorkspace, "workspace-1"), "-inf", fmt.Sprintf("%f", float64(now.Unix()))).SetVal(1)
 	mock.ExpectScan(0, "ws:scope:*:stream", legacyStreamScanCount).SetVal(nil, 0)
 
@@ -72,6 +84,9 @@ func TestRedisRelaySweepUsesExactTimeTrimAndRepairsTTL(t *testing.T) {
 
 	if got := M.RedisRelayStreamTrimmedTotal.Load(); got != 7 {
 		t.Fatalf("trimmed total = %d, want 7", got)
+	}
+	if relay.retention.StreamMaxLen != 321 || relay.retention.MaintenanceInterval != 2*time.Minute {
+		t.Fatalf("legacy relay did not retain shared config: %+v", relay.retention)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -83,21 +98,70 @@ func TestRedisRelaySweepRepairsInactiveLegacyStreamsIncrementally(t *testing.T) 
 	t.Cleanup(M.Reset)
 	rdb, mock := redismock.NewClientMock()
 	t.Cleanup(func() { _ = rdb.Close() })
-	relay := NewRedisRelay(NewHub(), rdb)
+	retention := enabledTestRetentionConfig()
+	relay := NewRedisRelayWithClientsAndConfig(NewHub(), rdb, rdb, retention)
 	now := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
 	relay.now = func() time.Time { return now }
 	relay.ttl.now = relay.now
 	stream := StreamKey(ScopeWorkspace, "inactive-workspace")
 
 	mock.ExpectScan(0, "ws:scope:*:stream", legacyStreamScanCount).SetVal([]string{stream}, 42)
-	mock.ExpectXTrimMinID(stream, streamMinID(now, defaultRelayStreamTrimHorizon)).SetVal(3)
+	mock.ExpectXTrimMinID(stream, streamMinID(now, retention.TrimHorizon)).SetVal(3)
 	mock.ExpectPTTL(stream).SetVal(-1)
-	mock.ExpectPExpire(stream, defaultRelayStreamTTL).SetVal(true)
+	mock.ExpectPExpire(stream, retention.StreamTTL).SetVal(true)
 
 	relay.sweepLegacyStreams(context.Background())
 
 	if relay.legacyScanCursor != 42 {
 		t.Fatalf("scan cursor = %d, want 42", relay.legacyScanCursor)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisRelayCountsTTLRepairFailure(t *testing.T) {
+	M.Reset()
+	t.Cleanup(M.Reset)
+	rdb, mock := redismock.NewClientMock()
+	t.Cleanup(func() { _ = rdb.Close() })
+	retention := enabledTestRetentionConfig()
+	relay := NewRedisRelayWithClientsAndConfig(NewHub(), rdb, rdb, retention)
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	relay.now = func() time.Time { return now }
+	relay.ttl.now = relay.now
+	stream := StreamKey(ScopeWorkspace, "workspace-without-ttl")
+
+	mock.ExpectScan(0, "ws:scope:*:stream", legacyStreamScanCount).SetVal([]string{stream}, 0)
+	mock.ExpectXTrimMinID(stream, streamMinID(now, retention.TrimHorizon)).SetVal(0)
+	mock.ExpectPTTL(stream).SetVal(-1)
+	mock.ExpectPExpire(stream, retention.StreamTTL).SetErr(errors.New("PEXPIRE denied"))
+
+	relay.sweepLegacyStreams(context.Background())
+
+	if got := M.RedisRelayStreamsWithoutTTL.Load(); got != 1 {
+		t.Fatalf("streams without TTL = %d, want 1", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisRelayCompleteScanPrunesMissingTTLForDeletedStreams(t *testing.T) {
+	M.Reset()
+	t.Cleanup(M.Reset)
+	rdb, mock := redismock.NewClientMock()
+	t.Cleanup(func() { _ = rdb.Close() })
+	retention := enabledTestRetentionConfig()
+	relay := NewRedisRelayWithClientsAndConfig(NewHub(), rdb, rdb, retention)
+	relay.streamsWithoutTTL[StreamKey(ScopeWorkspace, "deleted")] = struct{}{}
+	M.SetRedisStreamsWithoutTTL("legacy", 1)
+
+	mock.ExpectScan(0, "ws:scope:*:stream", legacyStreamScanCount).SetVal(nil, 0)
+	relay.sweepLegacyStreams(context.Background())
+
+	if got := M.RedisRelayStreamsWithoutTTL.Load(); got != 0 {
+		t.Fatalf("streams without TTL after full scan = %d, want 0", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

@@ -57,6 +57,9 @@ type Metrics struct {
 	redisStreamsMu sync.RWMutex
 	redisStreams   map[string]RedisStreamObservation
 
+	redisTTLStatusMu              sync.Mutex
+	redisStreamsWithoutTTLByRelay map[string]int64
+
 	// RedisConnected is set by the relay on startup / reconnect.
 	RedisConnected atomic.Bool
 	// RedisLastError stores the most recent consumer error message.
@@ -156,6 +159,23 @@ func (m *Metrics) RedisStreamObservations() map[string]RedisStreamObservation {
 	return out
 }
 
+// SetRedisStreamsWithoutTTL updates one relay mode's latest count and exposes
+// the process-wide sum. Keeping per-mode state prevents dual mode collectors
+// from overwriting each other with whichever maintenance loop ran last.
+func (m *Metrics) SetRedisStreamsWithoutTTL(relay string, count int64) {
+	m.redisTTLStatusMu.Lock()
+	defer m.redisTTLStatusMu.Unlock()
+	if m.redisStreamsWithoutTTLByRelay == nil {
+		m.redisStreamsWithoutTTLByRelay = make(map[string]int64)
+	}
+	m.redisStreamsWithoutTTLByRelay[relay] = count
+	var total int64
+	for _, relayCount := range m.redisStreamsWithoutTTLByRelay {
+		total += relayCount
+	}
+	m.RedisRelayStreamsWithoutTTL.Store(total)
+}
+
 func snapshotCounters(s *sync.Map) map[string]int64 {
 	out := map[string]int64{}
 	s.Range(func(k, v any) bool {
@@ -245,6 +265,9 @@ func (m *Metrics) Reset() {
 	m.RedisRelayStreamMissingTotal.Store(0)
 	m.RedisRelayRetentionErrors.Store(0)
 	m.RedisRelayStreamsWithoutTTL.Store(0)
+	m.redisTTLStatusMu.Lock()
+	m.redisStreamsWithoutTTLByRelay = nil
+	m.redisTTLStatusMu.Unlock()
 	m.RedisUsedMemoryBytes.Store(0)
 	m.RedisMaxMemoryBytes.Store(0)
 	m.RedisEvictedKeys.Store(0)

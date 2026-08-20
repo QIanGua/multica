@@ -83,8 +83,24 @@ func TestShardedRelayConfigFromEnvDerivesSafeRetention(t *testing.T) {
 	if cfg.StreamTTL != 60*time.Minute {
 		t.Fatalf("stream TTL = %s, want 60m", cfg.StreamTTL)
 	}
+	if cfg.StreamTTLEnabled {
+		t.Fatal("stream TTL must remain disabled until the staged rollout flag is enabled")
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("derived retention config is invalid: %v", err)
+	}
+}
+
+func TestShardedRelayConfigFromEnvEnablesTTLExplicitly(t *testing.T) {
+	t.Setenv("REALTIME_RELAY_STREAM_TTL_ENABLED", "true")
+
+	cfg := shardedRelayConfigFromEnv()
+	if !cfg.StreamTTLEnabled {
+		t.Fatal("stream TTL flag was not applied")
+	}
+	retention := cfg.RetentionConfig()
+	if !retention.StreamTTLEnabled || retention.StreamTTL != cfg.StreamTTL {
+		t.Fatalf("legacy retention config diverged from sharded config: %+v", retention)
 	}
 }
 

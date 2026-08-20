@@ -45,22 +45,38 @@ type ShardedStreamRelayConfig struct {
 	StreamTTL           time.Duration
 	TTLRefreshInterval  time.Duration
 	MaintenanceInterval time.Duration
+	StreamTTLEnabled    bool
 }
 
 // DefaultShardedStreamRelayConfig returns production-safe defaults: a small
 // fixed number of blocking readers per pod, bounded stream retention, and
 // batched reads.
 func DefaultShardedStreamRelayConfig() ShardedStreamRelayConfig {
+	retention := DefaultStreamRetentionConfig()
 	return ShardedStreamRelayConfig{
 		Shards:              defaultShardedRelayShards,
-		StreamMaxLen:        defaultShardedRelayStreamMaxLen,
+		StreamMaxLen:        retention.StreamMaxLen,
 		ReadCount:           defaultShardedRelayReadCount,
 		ReadBlock:           defaultShardedRelayReadBlock,
 		ReplayGrace:         defaultShardedRelayReplayGrace,
-		TrimHorizon:         defaultRelayStreamTrimHorizon,
-		StreamTTL:           defaultRelayStreamTTL,
-		TTLRefreshInterval:  defaultRelayStreamTTLRefreshInterval,
-		MaintenanceInterval: defaultRelayStreamMaintenanceInterval,
+		TrimHorizon:         retention.TrimHorizon,
+		StreamTTL:           retention.StreamTTL,
+		TTLRefreshInterval:  retention.TTLRefreshInterval,
+		MaintenanceInterval: retention.MaintenanceInterval,
+		StreamTTLEnabled:    retention.StreamTTLEnabled,
+	}
+}
+
+// RetentionConfig returns the mode-independent stream retention settings.
+func (c ShardedStreamRelayConfig) RetentionConfig() StreamRetentionConfig {
+	c = c.withDefaults()
+	return StreamRetentionConfig{
+		StreamMaxLen:        c.StreamMaxLen,
+		TrimHorizon:         c.TrimHorizon,
+		StreamTTL:           c.StreamTTL,
+		TTLRefreshInterval:  c.TTLRefreshInterval,
+		MaintenanceInterval: c.MaintenanceInterval,
+		StreamTTLEnabled:    c.StreamTTLEnabled,
 	}
 }
 
@@ -269,8 +285,10 @@ func (r *ShardedStreamRelay) PublishWithID(scopeType, scopeID, exclude string, f
 	M.RedisXAddTotal.Add(1)
 	M.RedisLastXAddLagMicros.Store(time.Since(start).Microseconds())
 	r.streamSeen[shard].Store(true)
-	if err := r.ttl.refreshIfDue(ctx, r.writeRDB, stream); err != nil {
-		r.recordRetentionError("PEXPIRE failed", err, "stream", stream)
+	if r.config.StreamTTLEnabled {
+		if err := r.ttl.refreshIfDue(ctx, r.writeRDB, stream); err != nil {
+			r.recordRetentionError("PEXPIRE failed", err, "stream", stream)
+		}
 	}
 	return nil
 }
@@ -357,11 +375,12 @@ func (r *ShardedStreamRelay) maintainStreams(ctx context.Context) {
 			M.RedisRelayStreamTrimmedTotal.Add(trimmed)
 		}
 
-		ttl, err := r.ttl.repairMissingTTL(maintCtx, r.writeRDB, stream)
+		ttl, err := r.ttl.reconcileTTL(maintCtx, r.writeRDB, stream, r.config.StreamTTLEnabled)
+		if r.config.StreamTTLEnabled && ttl == -1 {
+			withoutTTL++
+		}
 		if err != nil {
 			r.recordRetentionError("stream TTL repair failed", err, "stream", stream)
-		} else if ttl == -1 {
-			withoutTTL++
 		}
 
 		length, err := r.writeRDB.XLen(maintCtx, stream).Result()
@@ -376,7 +395,7 @@ func (r *ShardedStreamRelay) maintainStreams(ctx context.Context) {
 		}
 		M.ObserveRedisStream(stream, length, memoryBytes, redisTTLMillis(ttl))
 	}
-	M.RedisRelayStreamsWithoutTTL.Store(withoutTTL)
+	M.SetRedisStreamsWithoutTTL("sharded", withoutTTL)
 	r.observeRedisServer(maintCtx)
 }
 

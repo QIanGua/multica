@@ -81,6 +81,25 @@ func TestStreamTTLRefresherRepairsOnlyMissingTTL(t *testing.T) {
 	}
 }
 
+func TestStreamTTLRefresherDisabledPersistsStreamForSafeRollback(t *testing.T) {
+	rdb, mock := redismock.NewClientMock()
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	refresher := newStreamTTLRefresher(15*time.Minute, 30*time.Second)
+	mock.ExpectPTTL("stream").SetVal(10 * time.Minute)
+	mock.ExpectPersist("stream").SetVal(true)
+	ttl, err := refresher.reconcileTTL(context.Background(), rdb, "stream", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl != -1 {
+		t.Fatalf("TTL after disabled reconciliation = %s, want -1", ttl)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRedisInfoInt64(t *testing.T) {
 	info := "# Memory\r\nused_memory:2160328\r\nmaxmemory:2097152\r\n"
 	if got, ok := redisInfoInt64(info, "used_memory"); !ok || got != 2160328 {
