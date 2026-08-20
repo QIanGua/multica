@@ -1907,3 +1907,140 @@ func TestDiscoveryCacheKeyIsolatesByExecutable(t *testing.T) {
 		t.Errorf("expected 2 underlying calls (one per executable), got %d", calls)
 	}
 }
+
+// TestQualifyModelID covers GH #7300: a persisted model id that
+// omits its provider must be promoted to the catalog's canonical selector,
+// but only when exactly one provider claims it. opencode rejects an
+// unqualified id outright, and every capability lookup keyed on the model id
+// misses until the two agree.
+func TestQualifyModelID(t *testing.T) {
+	t.Parallel()
+
+	gateway := []Model{
+		{ID: "multica-anthropic/claude/claude-opus-5", Provider: "multica-anthropic"},
+		{ID: "multica-anthropic/claude/claude-sonnet-5", Provider: "multica-anthropic"},
+		{ID: "multica-codex/codex/gpt-5.6-sol", Provider: "multica-codex"},
+	}
+
+	tests := []struct {
+		name          string
+		catalog       Catalog
+		model         string
+		want          string
+		wantRewritten bool
+	}{
+		{
+			name:          "slash-shaped id gains its provider",
+			catalog:       Catalog{Models: gateway},
+			model:         "claude/claude-opus-5",
+			want:          "multica-anthropic/claude/claude-opus-5",
+			wantRewritten: true,
+		},
+		{
+			name:    "already canonical is left alone",
+			catalog: Catalog{Models: gateway},
+			model:   "multica-anthropic/claude/claude-opus-5",
+			want:    "multica-anthropic/claude/claude-opus-5",
+		},
+		{
+			name: "an exact catalog id wins over a qualifiable one",
+			// Both a bare `shared-id` model and a `vendor/shared-id` model
+			// exist. The exact match is what the user picked; promoting it to
+			// the other provider's entry would silently reroute the task.
+			catalog: Catalog{Models: []Model{
+				{ID: "shared-id", Provider: ""},
+				{ID: "vendor/shared-id", Provider: "vendor"},
+			}},
+			model: "shared-id",
+			want:  "shared-id",
+		},
+		{
+			name: "ambiguous across providers stays untouched",
+			catalog: Catalog{Models: []Model{
+				{ID: "gateway-a/claude/claude-opus-5", Provider: "gateway-a"},
+				{ID: "gateway-b/claude/claude-opus-5", Provider: "gateway-b"},
+			}},
+			model: "claude/claude-opus-5",
+			want:  "claude/claude-opus-5",
+		},
+		{
+			name:    "unknown model is passed through for the CLI to judge",
+			catalog: Catalog{Models: gateway},
+			model:   "something-nobody-advertises",
+			want:    "something-nobody-advertises",
+		},
+		{
+			name:    "empty catalog cannot qualify anything",
+			catalog: Catalog{},
+			model:   "claude/claude-opus-5",
+			want:    "claude/claude-opus-5",
+		},
+		{
+			// A static stand-in is not what the runtime actually supports, so
+			// promoting against it would invent an id the CLI never advertised.
+			name:    "a fallback catalog is never authoritative",
+			catalog: Catalog{Models: gateway, Fallback: true},
+			model:   "claude/claude-opus-5",
+			want:    "claude/claude-opus-5",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, rewritten := QualifyModelID(tt.catalog, tt.model)
+			if got != tt.want || rewritten != tt.wantRewritten {
+				t.Errorf("QualifyModelID(%q) = (%q, %v), want (%q, %v)",
+					tt.model, got, rewritten, tt.want, tt.wantRewritten)
+			}
+		})
+	}
+}
+
+// A blank model means "let the runtime pick its own default" — there is
+// nothing to qualify, and the runtime resolves its own selection.
+func TestQualifyModelIDIgnoresBlankModel(t *testing.T) {
+	t.Parallel()
+	catalog := Catalog{Models: []Model{{ID: "vendor/only-model", Provider: "vendor"}}}
+	got, rewritten := QualifyModelID(catalog, "   ")
+	if got != "" || rewritten {
+		t.Errorf("QualifyModelID(blank) = (%q, %v), want (\"\", false)", got, rewritten)
+	}
+}
+
+// TestSlashShapedPiModelKeepsItsThinkingCatalog walks the chain that GH #7300
+// reported as a dropped thinking_level: pi's RPC catalog carries a
+// gateway-style model whose own id contains a slash, the agent persisted that
+// bare id, and every capability lookup keyed on it missed. Qualifying the id
+// first is what puts the persisted value back on the catalog entry that
+// actually advertises the levels.
+func TestSlashShapedPiModelKeepsItsThinkingCatalog(t *testing.T) {
+	t.Parallel()
+
+	// Verbatim shape of a real `get_available_models` RPC response for the
+	// reporter's models.json.
+	raw := []piRPCModel{
+		{ID: "claude/claude-opus-5", Name: "Claude Opus 5", Provider: "multica-anthropic", Reasoning: true},
+		{ID: "claude/claude-sonnet-5", Name: "Claude Sonnet 5", Provider: "multica-anthropic", Reasoning: true},
+	}
+	models := piModelsFromRPC(raw, piRPCState{})
+
+	qualified, rewritten := QualifyModelID(Catalog{Models: models}, "claude/claude-opus-5")
+	if !rewritten || qualified != "multica-anthropic/claude/claude-opus-5" {
+		t.Fatalf("qualified = (%q, %v), want (%q, true)",
+			qualified, rewritten, "multica-anthropic/claude/claude-opus-5")
+	}
+
+	var thinking *ModelThinking
+	for _, m := range models {
+		if m.ID == qualified {
+			thinking = m.Thinking
+		}
+	}
+	if thinking == nil {
+		t.Fatalf("qualified model %q advertises no thinking catalog", qualified)
+	}
+	if !piThinkingSupports(thinking, "high") {
+		t.Errorf("thinking catalog for %q missing \"high\": %+v", qualified, thinking.SupportedLevels)
+	}
+}

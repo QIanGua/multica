@@ -6973,10 +6973,32 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		return TaskResult{}, fmt.Errorf("create agent backend: %w", err)
 	}
 
+	// Two-tier model resolution: an explicit agent.model wins,
+	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
+	// both are empty we deliberately pass "" through — each
+	// backend omits `--model` from the CLI invocation, so the
+	// provider picks its own default (Claude Code's shipped
+	// default, codex app-server's account-scoped default, etc.).
+	// Baking a Go-side "recommended default" here is how the
+	// cursor regression happened — static guesses drift from
+	// whatever the upstream CLI actually accepts.
+	//
+	// Resolved before the start log rather than at first use: logging
+	// entry.Model there reported the env-var tier alone, so every task whose
+	// model came from agent.model — the common case — announced itself with an
+	// empty model and looked like the selection had been dropped (GH #7300).
+	model := ""
+	if task.Agent != nil && task.Agent.Model != "" {
+		model = task.Agent.Model
+	}
+	if model == "" {
+		model = entry.Model
+	}
+
 	taskLog.Info("starting agent",
 		"provider", provider,
 		"workdir", env.WorkDir,
-		"model", entry.Model,
+		"model", model,
 		"reused", reused,
 	)
 	if task.PriorSessionID != "" {
@@ -7002,21 +7024,43 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// has no overlay to protect and keeps its flags untouched.
 		customArgs = hermesOverlayCustomArgs
 	}
-	// Two-tier model resolution: an explicit agent.model wins,
-	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
-	// both are empty we deliberately pass "" through — each
-	// backend omits `--model` from the CLI invocation, so the
-	// provider picks its own default (Claude Code's shipped
-	// default, codex app-server's account-scoped default, etc.).
-	// Baking a Go-side "recommended default" here is how the
-	// cursor regression happened — static guesses drift from
-	// whatever the upstream CLI actually accepts.
-	model := ""
-	if task.Agent != nil && task.Agent.Model != "" {
-		model = task.Agent.Model
-	}
-	if model == "" {
-		model = entry.Model
+	// Ask the runtime's own catalog which provider owns this model before
+	// anything downstream reads it. Runtimes that namespace their catalog want
+	// the qualified `<provider>/<id>` selector, but agent.model holds whatever
+	// was persisted, and a gateway-style model id is itself slash-shaped
+	// (`claude/claude-opus-5` under provider `multica-anthropic`) — so the
+	// delimiter is no help in telling a missing provider from a present one.
+	// An unambiguous catalog match is promoted, everything else passes through
+	// untouched. Without this an unqualified id is rejected outright by
+	// opencode, and the capability lookups below silently drop a perfectly
+	// valid thinking_level / service_tier because the id matches no catalog
+	// entry (GH #7300).
+	//
+	// Runtimes whose ids are not provider-namespaced can never be rewritten,
+	// but they are not special-cased away: an allowlist of "runtimes that
+	// namespace" is a list that rots the day the next gateway-style runtime
+	// lands, and this costs one memoized catalog read on a path that already
+	// takes one for thinking_level / service_tier — the two checks below reuse
+	// this lookup rather than re-shelling the CLI.
+	if model != "" {
+		catalog, err := listModels(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs))
+		if err != nil {
+			// Same fail-open posture as the capability checks below: an
+			// unreachable catalog must not stop a task whose model may well be
+			// exactly what the CLI expects.
+			taskLog.Warn("model: catalog lookup failed; using the configured model as-is",
+				"provider", provider,
+				"model", model,
+				"error", err,
+			)
+		} else if qualified, rewritten := agent.QualifyModelID(catalog, model); rewritten {
+			taskLog.Info("model: qualified against the runtime catalog",
+				"provider", provider,
+				"configured_model", model,
+				"model", qualified,
+			)
+			model = qualified
+		}
 	}
 	thinkingLevel := ""
 	serviceTier := ""
