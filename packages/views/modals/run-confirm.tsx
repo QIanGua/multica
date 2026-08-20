@@ -14,7 +14,7 @@ import {
 import { Button } from "@multica/ui/components/ui/button";
 import { Textarea } from "@multica/ui/components/ui/textarea";
 import { Spinner } from "@multica/ui/components/ui/spinner";
-import type { IssueAssigneeType, UpdateIssueRequest } from "@multica/core/types";
+import type { IssueAssigneeType, IssueStatus, UpdateIssueRequest } from "@multica/core/types";
 import { useUpdateIssue, useBatchUpdateIssues } from "@multica/core/issues/mutations";
 import { errorCode } from "@multica/core/api";
 import { useActorName } from "@multica/core/workspace/hooks";
@@ -24,6 +24,7 @@ import { runtimeListOptions, readRuntimeCliVersion, handoffSupported } from "@mu
 import { useShortcut, shortcutMatchesEvent, isPlainShortcut } from "@multica/core/shortcuts";
 import { isImeComposing } from "@multica/core/utils";
 import { ShortcutKeycaps } from "../common/shortcut-keycaps";
+import { useStatusLabel } from "../issues/utils/status-label";
 import { useT } from "../i18n";
 
 const MAX_HANDOFF_NOTE = 2000;
@@ -48,10 +49,14 @@ function boldName(text: string): ReactNode {
 
 interface RunConfirmData {
   issueIds?: string[];
-  // Assign is the only mode: agent/squad assignment is the sole issue write that
-  // needs the pre-trigger confirmation. Batch status changes apply directly now
-  // (MUL-4155), so there is no "status" mode.
-  mode?: "assign";
+  // The two issue writes that hand work to an agent, and the only two that
+  // confirm. `assign` gives the issue an agent/squad owner; `promote` moves an
+  // already-owned issue out of the backlog category, which starts the run on
+  // its own (RunSourceStatus). Batch status changes still apply directly
+  // (MUL-4155) — `promote` is the single-issue picker path only (MUL-6463).
+  mode?: "assign" | "promote";
+  /** promote only: the status KEY the issue is moving to. */
+  status?: IssueStatus;
   assigneeType?: IssueAssigneeType;
   assigneeId?: string;
   assigneeName?: string;
@@ -59,9 +64,9 @@ interface RunConfirmData {
 }
 
 /**
- * Assignment confirmation for issues that may start agent runs.
+ * Handoff confirmation for the issue writes that start agent runs.
  *
- * The rule is "dialog = you are confirming an assignment", NOT "you are
+ * The rule is "dialog = you are handing this to an agent", NOT "you are
  * confirming N runs" (MUL-5010). It therefore does no pre-flight prediction:
  * opening it fires no request, so the note box and buttons are usable on the
  * first frame. Previously it called POST /api/issues/preview-trigger on open
@@ -69,11 +74,12 @@ interface RunConfirmData {
  * keyed per issue id with staleTime 0, every new issue was a guaranteed cache
  * miss and the wait was unavoidable.
  *
- * Completion is silent: the assignee change and any run it starts surface
- * through the issue's normal assignee / run-status updates, so the confirm adds
- * no result toast. Whether a run starts stays the server's existing decision at
- * write time. Dismissing the dialog (X / Esc / click-outside) cancels without
- * any write. Shared by single assign (1 id) and batch assign (N ids).
+ * Completion is silent: the assignee/status change and any run it starts
+ * surface through the issue's normal updates, so the confirm adds no result
+ * toast. Whether a run starts stays the server's existing decision at write
+ * time. Dismissing the dialog (X / Esc / click-outside) cancels without any
+ * write. Shared by single assign (1 id), batch assign (N ids), and the
+ * single-issue promotion out of backlog.
  */
 export function RunConfirmModal({
   onClose,
@@ -108,6 +114,9 @@ export function RunConfirmModal({
   // yet, or no runtime bound) and leaves the box enabled: the note is a soft
   // gate, and a spurious warning is worse than a note an old daemon drops.
   const wsId = useWorkspaceId();
+  // Built-ins resolve through i18n, custom statuses through the catalog, so the
+  // promotion headline reads the same way the picker the user just used does.
+  const statusLabel = useStatusLabel(wsId);
   const { data: agents = [] } = useQuery({ ...agentListOptions(wsId), enabled: !!wsId });
   const { data: runtimes = [] } = useQuery({ ...runtimeListOptions(wsId), enabled: !!wsId });
   const { data: squads = [] } = useQuery({ ...squadListOptions(wsId), enabled: !!wsId });
@@ -133,11 +142,18 @@ export function RunConfirmModal({
   // the assignment proceed (MUL-3375 §6.3).
   const noteDisabled = localHandoff === false;
 
+  // A promotion carries the status and nothing else: the owner is already on
+  // the issue, and re-sending the same assignee would turn a status write into
+  // an assignee write on the server's side of the trigger predicate.
+  const isPromote = d.mode === "promote" && !!d.status;
+
   const applyTo = (extra: Partial<UpdateIssueRequest>) => {
-    const base: UpdateIssueRequest = {
-      assignee_type: d.assigneeType ?? null,
-      assignee_id: d.assigneeId ?? null,
-    };
+    const base: UpdateIssueRequest = isPromote
+      ? { status: d.status }
+      : {
+          assignee_type: d.assigneeType ?? null,
+          assignee_id: d.assigneeId ?? null,
+        };
     return { ...base, ...extra };
   };
 
@@ -209,24 +225,35 @@ export function RunConfirmModal({
     void submit(false);
   };
 
-  // States the action, not a prediction: the assignment is certain, the run is
-  // conditional, so the copy names no run count.
+  // States the action, not a prediction: the write is certain, the run is
+  // conditional, so the copy names no run count. The promotion names the
+  // status it is moving to by its workspace label — a custom status is only
+  // recognisable by the name its admin gave it.
   const headline: ReactNode = boldName(
-    issueIds.length > 1
-      ? t(($) => $.run_confirm.assign_batch, {
+    isPromote
+      ? t(($) => $.run_confirm.promote_single, {
           name: `${NAME_FENCE}${assigneeName}${NAME_FENCE}`,
-          count: issueIds.length,
+          status: statusLabel(d.status ?? ""),
         })
-      : t(($) => $.run_confirm.assign_single, {
-          name: `${NAME_FENCE}${assigneeName}${NAME_FENCE}`,
-        }),
+      : issueIds.length > 1
+        ? t(($) => $.run_confirm.assign_batch, {
+            name: `${NAME_FENCE}${assigneeName}${NAME_FENCE}`,
+            count: issueIds.length,
+          })
+        : t(($) => $.run_confirm.assign_single, {
+            name: `${NAME_FENCE}${assigneeName}${NAME_FENCE}`,
+          }),
   );
 
   return (
     <Dialog open onOpenChange={(v) => { if (!v && !submitting) onClose(); }}>
       <DialogContent onKeyDown={onDialogKeyDown}>
         <DialogHeader>
-          <DialogTitle>{t(($) => $.run_confirm.title_assign)}</DialogTitle>
+          <DialogTitle>
+            {isPromote
+              ? t(($) => $.run_confirm.title_promote)
+              : t(($) => $.run_confirm.title_assign)}
+          </DialogTitle>
           <DialogDescription>{headline}</DialogDescription>
         </DialogHeader>
 
@@ -261,8 +288,10 @@ export function RunConfirmModal({
               <Spinner className="size-4" />
             ) : (
               <>
-                {t(($) => $.run_confirm.confirm_assign)}
-                {/* Decorative: the accessible name stays "Confirm assignment",
+                {isPromote
+                  ? t(($) => $.run_confirm.confirm_promote)
+                  : t(($) => $.run_confirm.confirm_assign)}
+                {/* Decorative: the accessible name stays the button's own copy,
                     not "Confirm assignment Command Enter". Absent when `send`
                     is unbound. */}
                 {sendShortcut ? (

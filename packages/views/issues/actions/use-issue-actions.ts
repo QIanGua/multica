@@ -9,6 +9,8 @@ import { useWorkspaceId } from "@multica/core/hooks";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { useModalStore } from "@multica/core/modals";
 import { useUpdateIssue } from "@multica/core/issues/mutations";
+import { issueStatusCategory } from "@multica/core/issues";
+import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
 import { errorCode } from "@multica/core/api";
 import { pinListOptions, useCreatePin, useDeletePin } from "@multica/core/pins";
 import { copyText } from "@multica/ui/lib/clipboard";
@@ -69,6 +71,18 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
   const issueAssigneeType = issue?.assignee_type ?? null;
   const issueAssigneeId = issue?.assignee_id ?? null;
   const issueStatus = issue?.status ?? null;
+  const { categoryOf } = useIssueStatuses(wsId);
+  // Category, never the raw key: "is this issue parked?" is a CATEGORY
+  // question, and the server answers it that way too (WillEnqueueRun
+  // normalizes both sides of the transition through issuestatus.Effective).
+  // A custom status in the `backlog` category parks exactly like Backlog, and
+  // one in the `todo` category starts a run exactly like Todo. (MUL-6243)
+  //
+  // The payload's own `status_category` wins; the catalog answers only for a
+  // response that carried none, where the alternative is reading a custom key
+  // as un-parked and starting an agent from a picker with no confirmation.
+  const issueIsParked =
+    !!issue && (issueStatusCategory(issue) ?? categoryOf(issue.status)) === "backlog";
   const updateField = useCallback(
     (
       updates: Partial<UpdateIssueRequest>,
@@ -88,13 +102,47 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
       if (
         (updates.assignee_type === "agent" || updates.assignee_type === "squad") &&
         updates.assignee_id &&
-        issueStatus !== "backlog"
+        !issueIsParked
       ) {
         openModal("issue-run-confirm", {
           issueIds: [issueId],
           mode: "assign",
           assigneeType: updates.assignee_type,
           assigneeId: updates.assignee_id,
+        });
+        return;
+      }
+      // Promoting a parked issue that already has an agent/squad owner is the
+      // OTHER write that hands work to an agent: the status change alone starts
+      // the run (RunSourceStatus). It therefore gets the same confirmation as an
+      // assignment — same preview-free dialog, same handoff note, same "don't
+      // start yet" — instead of starting an agent from a one-click picker with
+      // no way to say anything to it. (MUL-6463)
+      //
+      // The gate is the run predicate, not a status allow-list: a run starts
+      // when the issue LEAVES the backlog category for anything that is not
+      // done/cancelled. So every Todo-category status behaves identically —
+      // built-in `todo` and any custom status an admin puts in that category —
+      // and so do the other promotion targets that start a run just the same.
+      //
+      // Not wired into drag-and-drop or the batch toolbar, which keep applying
+      // directly. That is the existing split, not a new one: a drop is direct
+      // manipulation whose card has already moved, and batch status was made
+      // deliberately dialog-free in MUL-4155.
+      if (
+        updates.status &&
+        updates.status !== issueStatus &&
+        issueIsParked &&
+        (issueAssigneeType === "agent" || issueAssigneeType === "squad") &&
+        issueAssigneeId &&
+        !["backlog", "done", "cancelled"].includes(categoryOf(updates.status))
+      ) {
+        openModal("issue-run-confirm", {
+          issueIds: [issueId],
+          mode: "promote",
+          status: updates.status,
+          assigneeType: issueAssigneeType,
+          assigneeId: issueAssigneeId,
         });
         return;
       }
@@ -123,7 +171,18 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
         );
       }
     },
-    [issueId, issueStatus, surfaceActions, updateIssue, openModal, t],
+    [
+      issueId,
+      issueStatus,
+      issueIsParked,
+      issueAssigneeType,
+      issueAssigneeId,
+      categoryOf,
+      surfaceActions,
+      updateIssue,
+      openModal,
+      t,
+    ],
   );
 
   // Explicit "open it somewhere else" CTA, so the new tab takes focus

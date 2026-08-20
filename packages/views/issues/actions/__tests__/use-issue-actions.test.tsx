@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { Issue } from "@multica/core/types";
+import { buildIssueStatusCatalog } from "@multica/core/issue-statuses";
+import type { Issue, IssueStatusEntry } from "@multica/core/types";
 
 vi.mock("@multica/core/hooks", () => ({
   useWorkspaceId: () => "ws-1",
@@ -45,6 +46,38 @@ vi.mock("@multica/core/pins", () => ({
 const mockUpdateMutate = vi.fn();
 vi.mock("@multica/core/issues/mutations", () => ({
   useUpdateIssue: () => ({ mutate: mockUpdateMutate }),
+}));
+
+// The status catalog is server state; this suite only needs it to answer which
+// CATEGORY a key belongs to, so the entries are fed in directly. `later` parks
+// like Backlog and `rework` starts work like Todo — the two cases a raw
+// `status === "backlog"` / `=== "todo"` comparison gets wrong (MUL-6463).
+const catalogEntries: IssueStatusEntry[] = [
+  ...(["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"] as const).map(
+    (key, i) => statusEntry({ id: key, key, name: key, category: key, is_system: true, position: i }),
+  ),
+  statusEntry({ id: "later", key: "later", name: "Later", category: "backlog", position: 7 }),
+  statusEntry({ id: "rework", key: "rework", name: "Rework", category: "todo", position: 8 }),
+];
+function statusEntry(overrides: Partial<IssueStatusEntry>): IssueStatusEntry {
+  return {
+    id: "id",
+    workspace_id: "ws-1",
+    key: "custom",
+    name: "Custom",
+    description: "",
+    category: "todo",
+    color: "#22c55e",
+    is_system: false,
+    position: 0,
+    archived_at: null,
+    created_at: "",
+    updated_at: "",
+    ...overrides,
+  };
+}
+vi.mock("@multica/core/issue-statuses/hooks", () => ({
+  useIssueStatuses: () => buildIssueStatusCatalog(catalogEntries),
 }));
 
 vi.mock("@multica/core/paths", async () => {
@@ -166,6 +199,82 @@ describe("useIssueActions", () => {
 
     expect(mockUpdateMutate).toHaveBeenCalledWith(
       { id: "issue-1", assignee_type: "agent", assignee_id: "agent-1" },
+      expect.any(Object),
+    );
+    expect(mockOpenModal).not.toHaveBeenCalled();
+  });
+
+  it("assigning an agent to an issue parked in a CUSTOM backlog-category status applies directly", () => {
+    // "Is it parked?" is a category question. Comparing the raw key answered it
+    // only for workspaces with no custom statuses, so an issue sitting in
+    // `later` popped a confirm promising a run the server would never start.
+    const parked = { ...mockIssue, status: "later", status_category: "backlog" } as Issue;
+    const { result } = renderHook(() => useIssueActions(parked), { wrapper });
+
+    act(() => {
+      result.current.updateField({ assignee_type: "agent", assignee_id: "agent-1" });
+    });
+
+    expect(mockUpdateMutate).toHaveBeenCalledWith(
+      { id: "issue-1", assignee_type: "agent", assignee_id: "agent-1" },
+      expect.any(Object),
+    );
+    expect(mockOpenModal).not.toHaveBeenCalled();
+  });
+
+  // Promotion out of backlog is the other write that starts a run, so it gets
+  // the same confirmation — for every Todo-category status alike (MUL-6463).
+  it.each([
+    ["built-in todo", "backlog", "todo"],
+    ["custom Todo-category status", "backlog", "rework"],
+    ["custom backlog-category status", "later", "rework"],
+    ["a non-todo category that still starts a run", "backlog", "in_progress"],
+  ])("promoting an agent-owned issue (%s) routes through the run-confirm modal", (_label, from, to) => {
+    const parked = {
+      ...mockIssue,
+      status: from,
+      assignee_type: "agent",
+      assignee_id: "agent-1",
+    } as Issue;
+    const { result } = renderHook(() => useIssueActions(parked), { wrapper });
+
+    act(() => {
+      result.current.updateField({ status: to });
+    });
+
+    expect(mockOpenModal).toHaveBeenCalledWith("issue-run-confirm", {
+      issueIds: ["issue-1"],
+      mode: "promote",
+      status: to,
+      assigneeType: "agent",
+      assigneeId: "agent-1",
+    });
+    expect(mockUpdateMutate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    // No owner: nothing to hand the issue to, so nothing to confirm.
+    ["unowned", { status: "backlog" }, "todo"],
+    // A member assignee never produces a run.
+    ["member-owned", { status: "backlog", assignee_type: "member", assignee_id: "user-1" }, "todo"],
+    // Not parked: the run already started (or never will) — no new run here.
+    ["already active", { status: "todo", assignee_type: "agent", assignee_id: "agent-1" }, "in_progress"],
+    // Closing an issue never starts a run, whatever it was parked in.
+    ["promoted to done", { status: "backlog", assignee_type: "agent", assignee_id: "agent-1" }, "done"],
+    // Backlog → backlog is a re-park, not a promotion.
+    ["parked deeper", { status: "backlog", assignee_type: "agent", assignee_id: "agent-1" }, "later"],
+  ])("a status change that starts no run (%s) applies directly", (_label, issueFields, to) => {
+    const { result } = renderHook(
+      () => useIssueActions({ ...mockIssue, ...issueFields } as Issue),
+      { wrapper },
+    );
+
+    act(() => {
+      result.current.updateField({ status: to });
+    });
+
+    expect(mockUpdateMutate).toHaveBeenCalledWith(
+      { id: "issue-1", status: to },
       expect.any(Object),
     );
     expect(mockOpenModal).not.toHaveBeenCalled();
