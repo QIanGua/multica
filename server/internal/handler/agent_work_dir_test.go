@@ -25,9 +25,10 @@ func TestRelativeWorkDir(t *testing.T) {
 	const (
 		wsID   = "a05b0e10-ee7a-4603-a72d-a548b2390cb2"
 		taskID = "5c57b65b-ee7a-4603-a72d-a548b2390cb2"
-		// The env-root segment is the WHOLE task id, dashes stripped — a
-		// truncated prefix collides across concurrent tasks (#7326).
-		taskSeg = "5c57b65bee7a4603a72da548b2390cb2"
+		// The env-root segment is the TAIL of the task id, not a leading
+		// prefix: UUIDv7 puts a timestamp in front, so a leading slice is
+		// shared by every task created in the same ~65.5s window (#7326).
+		taskSeg = "a548b2390cb2"
 	)
 
 	tests := []struct {

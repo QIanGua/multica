@@ -5,10 +5,12 @@ package execenv
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
@@ -347,10 +349,23 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		logger.Warn("execenv: workspaces root marker not written; fail-closed guard limited to the task workdir", "error", err)
 	}
 
-	// Remove existing env if present. Safe because the directory segment is the
-	// full task id (see taskKey): the only task that can own this path is this
-	// one, on a rerun. It was NOT safe while the segment was an 8-char prefix —
-	// that made this line delete a live sibling task's env root (#7326).
+	// Refuse to touch an env root another task owns, then remove what is left.
+	// The step below is an os.RemoveAll over a directory that may be executing:
+	// while the segment was a UUIDv7 prefix it routinely pointed at a live
+	// sibling task and deleted its workdir, worktree and task-scoped config
+	// (#7326). taskKey now reads the id's random tail, which makes a shared
+	// path improbable rather than impossible — so prove ownership instead of
+	// assuming it. A task that refuses to start is recoverable; one that
+	// deletes a running sibling's uncommitted work is not.
+	//
+	// A rerun of the same task passes: it owns the path and is meant to reset
+	// it. Reuse of a prior task's directory never reaches here — that is Reuse,
+	// which takes an explicit WorkDir and does not delete.
+	if owner, err := readEnvRootOwner(envRoot); err != nil {
+		return nil, fmt.Errorf("execenv: check env root ownership: %w", err)
+	} else if owner != "" && owner != params.TaskID {
+		return nil, fmt.Errorf("execenv: env root %s belongs to task %s; refusing to reset it for task %s", envRoot, owner, params.TaskID)
+	}
 	if _, err := os.Stat(envRoot); err == nil {
 		if err := os.RemoveAll(envRoot); err != nil {
 			return nil, fmt.Errorf("execenv: remove existing env: %w", err)
@@ -373,6 +388,12 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 			return nil, fmt.Errorf("execenv: create directory %s: %w", dir, err)
 		}
 	}
+	// Claim the env root before anything else lands in it, so a colliding task
+	// finds an owner to compare against rather than an anonymous directory.
+	if err := writeEnvRootOwner(envRoot, params.TaskID); err != nil {
+		return nil, fmt.Errorf("execenv: claim env root: %w", err)
+	}
+
 	multicaConfigRoot := filepath.Join(envRoot, "multica-config")
 	if err := os.MkdirAll(multicaConfigRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("execenv: create task-local Multica config directory: %w", err)
@@ -1099,4 +1120,29 @@ func (env *Environment) Cleanup(removeAll bool) error {
 		return err
 	}
 	return nil
+}
+
+// envRootOwnerFile records which task an env root belongs to. It is the proof
+// Prepare checks before running os.RemoveAll over a directory that another
+// task may still be executing in (#7326).
+const envRootOwnerFile = ".task_owner"
+
+// readEnvRootOwner returns the task id that owns envRoot, or "" when the
+// directory does not exist or predates the marker. An unreadable marker is an
+// error, not an empty owner: treating it as unowned would hand the caller a
+// licence to delete exactly the directory it could not identify.
+func readEnvRootOwner(envRoot string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(envRoot, envRootOwnerFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// writeEnvRootOwner stamps envRoot as belonging to taskID.
+func writeEnvRootOwner(envRoot, taskID string) error {
+	return os.WriteFile(filepath.Join(envRoot, envRootOwnerFile), []byte(taskID), 0o644)
 }

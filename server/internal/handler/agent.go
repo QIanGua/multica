@@ -801,14 +801,23 @@ func relativeWorkDir(workDir, workspaceID, taskID string) string {
 	return basename(normalized)
 }
 
-// taskDirSegment mirrors execenv.taskKey — the full UUID with dashes
-// stripped. Kept inline here so the agent handler has zero imports from the
-// daemon package (which would create an unwanted cycle between handler and
-// daemon). It must NOT truncate: the daemon stopped truncating because an
-// 8-char UUIDv7 prefix is shared by every task created within ~65.5s (#7326),
-// and this reconstruction only matches while both sides agree.
+// taskDirSegmentLen and taskDirSegment mirror execenv.taskKeyLen /
+// execenv.taskKey — the LAST 12 hex chars of the task id. Kept inline here so
+// the agent handler has zero imports from the daemon package (which would
+// create an unwanted cycle between handler and daemon).
+//
+// It must keep taking the TAIL. A UUIDv7's leading hex chars are timestamp
+// bits shared by every task created within ~65.5s (#7326); the daemon stopped
+// reading from that end, and this reconstruction only matches while both sides
+// agree.
+const taskDirSegmentLen = 12
+
 func taskDirSegment(uuid string) string {
-	return strings.ReplaceAll(uuid, "-", "")
+	s := strings.ReplaceAll(uuid, "-", "")
+	if len(s) > taskDirSegmentLen {
+		return s[len(s)-taskDirSegmentLen:]
+	}
+	return s
 }
 
 // homeDirPattern matches the well-known per-user home layouts on macOS,

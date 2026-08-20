@@ -1782,12 +1782,22 @@ func sanitizeName(name string) string {
 	return s
 }
 
-// taskKey returns the git-safe branch segment identifying a task. It keeps the
-// whole id: a UUIDv7's leading 8 hex chars only advance every ~65.5s, so a
-// truncated segment gave two concurrently created tasks the same branch name
-// (#7326). Mirrors execenv.taskKey.
+// taskKeyLen mirrors execenv.taskKeyLen — see that constant for why the
+// segment is short: a branch name becomes a path under .git/refs/heads/ inside
+// the task checkout, and Windows enforces MAX_PATH there.
+const taskKeyLen = 12
+
+// taskKey returns the git-safe branch segment identifying a task: the LAST
+// taskKeyLen hex chars of the id. Mirrors execenv.taskKey — a UUIDv7's LEADING
+// 8 hex chars are timestamp bits that only advance every ~65.5s, so taking the
+// front gave two concurrently created tasks the same branch name (#7326). The
+// tail is random.
 func taskKey(uuid string) string {
-	return strings.ReplaceAll(uuid, "-", "")
+	s := strings.ReplaceAll(uuid, "-", "")
+	if len(s) > taskKeyLen {
+		return s[len(s)-taskKeyLen:]
+	}
+	return s
 }
 
 // shortID returns the first 8 characters of a UUID string (dashes stripped).
