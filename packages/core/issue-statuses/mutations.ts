@@ -13,12 +13,27 @@ import type {
 /**
  * Catalog mutations (MUL-6243).
  *
- * Every write here installs what the server returned — the row, or for reorder
- * the whole list — and does NOT invalidate the catalog on success. The refresh
- * is the `issue_status:changed` realtime event, which reaches the writing tab
- * as well as every other one, so a catalog edit costs each client exactly ONE
- * catalog read. Invalidating here too would make the admin who did the writing
- * the only client that reads it twice. (MUL-6458)
+ * No mutation invalidates the catalog on success. The refresh is the
+ * `issue_status:changed` realtime event, which reaches the writing tab as well
+ * as every other one, so a catalog edit costs each client exactly ONE catalog
+ * read. Invalidating here too would make the admin who did the writing the
+ * only client that reads it twice. (MUL-6458)
+ *
+ * That refetch is what CONVERGES the cache, and it is ordered correctly by
+ * construction: the event is published after the write commits, so the refetch
+ * it triggers can only read post-commit state.
+ *
+ * Which is why no mutation writes its RESPONSE BODY into the cache. A response
+ * is authoritative for the row as of that write, not as of now — and the two
+ * channels are independent, so a slow response can land after a refetch that
+ * already picked up someone else's later write and quietly roll the catalog
+ * back to a state nothing will correct. Every local write below is instead
+ * something that stays true no matter what else has landed in between:
+ *
+ * - an optimistic field patch (rename, recolor, reorder),
+ * - an insert of a row nobody else can have seen yet (create),
+ * - a monotonic flag (archive — there is no unarchive endpoint, and the server
+ *   refuses to edit an archived row, so setting it can never be stale).
  *
  * On FAILURE the invalidate stays, and it is not symmetry for its own sake: a
  * 409 usually means this client's catalog is the stale thing — someone else
@@ -29,34 +44,55 @@ function useCatalogCache() {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   const listKey = issueStatusKeys.list(wsId);
+
+  const writeStatuses = (
+    update: (statuses: IssueStatusEntry[]) => IssueStatusEntry[] | null,
+    totalDelta = 0,
+  ) => {
+    qc.setQueryData<ListIssueStatusesResponse>(listKey, (old) => {
+      if (!old) return old;
+      const statuses = update(old.statuses);
+      if (!statuses) return old;
+      return {
+        ...old,
+        statuses: statuses.sort(compareIssueStatusEntries),
+        total: old.total + totalDelta,
+      };
+    });
+  };
+
   return {
     qc,
     listKey,
     /**
-     * Writes one authoritative entry into the cached catalog, inserting it when
-     * this client has not seen it before.
+     * Adds a freshly created status to the cached catalog.
      *
-     * Always re-sorted: `position` and `category` decide where a row renders,
-     * so a create (or a position change) that appended to the end would leave
-     * the list in an order the server does not agree with until the next fetch.
+     * Skipped when the id is already there, which is not just a duplicate
+     * guard: the only way this client can already hold the row is a refetch
+     * that read it back — possibly after someone else edited it — so the copy
+     * in the cache is never older than the one in this response.
+     *
+     * Sorted, because `position` and `category` decide where a row renders and
+     * appending would put a new In Review status below the Done rows.
      */
-    putEntry: (entry: IssueStatusEntry) => {
+    insertEntry: (entry: IssueStatusEntry) => {
       // A response that failed schema validation degrades to an empty stub
       // (`parseWithFallback`). Writing it would put a blank row in the picker;
       // leaving the cache alone lets the realtime refetch supply the truth.
       if (!entry?.id) return;
-      qc.setQueryData<ListIssueStatusesResponse>(listKey, (old) => {
-        if (!old) return old;
-        const known = old.statuses.some((s) => s.id === entry.id);
-        const statuses = known
-          ? old.statuses.map((s) => (s.id === entry.id ? entry : s))
-          : [...old.statuses, entry];
-        return {
-          ...old,
-          statuses: statuses.sort(compareIssueStatusEntries),
-          total: known ? old.total : old.total + 1,
-        };
-      });
+      writeStatuses(
+        (statuses) =>
+          statuses.some((s) => s.id === entry.id) ? null : [...statuses, entry],
+        1,
+      );
+    },
+    /** Applies a field patch to one cached row, leaving the rest of it alone. */
+    patchEntry: (id: string, patch: Partial<IssueStatusEntry>) => {
+      writeStatuses((statuses) =>
+        statuses.some((s) => s.id === id)
+          ? statuses.map((s) => (s.id === id ? { ...s, ...patch } : s))
+          : null,
+      );
     },
     invalidate: () => {
       qc.invalidateQueries({ queryKey: issueStatusKeys.all(wsId) });
@@ -65,10 +101,10 @@ function useCatalogCache() {
 }
 
 export function useCreateIssueStatus() {
-  const { putEntry, invalidate } = useCatalogCache();
+  const { insertEntry, invalidate } = useCatalogCache();
   return useMutation({
     mutationFn: (data: CreateIssueStatusRequest) => api.createIssueStatus(data),
-    onSuccess: putEntry,
+    onSuccess: insertEntry,
     onError: invalidate,
   });
 }
@@ -78,30 +114,26 @@ export function useCreateIssueStatus() {
  * Without it, dragging a row to reorder would snap back for the round-trip.
  */
 export function useUpdateIssueStatus() {
-  const { qc, listKey, putEntry, invalidate } = useCatalogCache();
+  const { qc, listKey, patchEntry, invalidate } = useCatalogCache();
   return useMutation({
     mutationFn: ({ id, ...data }: { id: string } & UpdateIssueStatusRequest) =>
       api.updateIssueStatus(id, data),
     onMutate: async ({ id, ...data }) => {
       await qc.cancelQueries({ queryKey: listKey });
       const previous = qc.getQueryData<ListIssueStatusesResponse>(listKey);
-      qc.setQueryData<ListIssueStatusesResponse>(listKey, (old) =>
-        old
-          ? {
-              ...old,
-              statuses: old.statuses.map((s) => (s.id === id ? { ...s, ...data } : s)),
-            }
-          : old,
-      );
+      patchEntry(id, data);
       return { previous };
     },
-    // A rename or recolor deliberately does NOT invalidate the issues scope.
-    // An issue row stores the status KEY; its name and color are resolved from
-    // this catalog at render time (`useStatusLabel`, `colorOf`), so no cached
-    // issue field can go stale here — refreshing the catalog is what repaints
-    // the boards. The old invalidate refetched every board, list and table in
-    // the workspace to change one word. (MUL-6458)
-    onSuccess: putEntry,
+    // Nothing on success. The optimistic patch already shows the change, the
+    // realtime refetch settles it, and installing the response snapshot here
+    // is exactly what could roll a concurrent edit back (see the note above).
+    //
+    // A rename also deliberately does NOT invalidate the issues scope. An issue
+    // row stores the status KEY; its name and color are resolved from this
+    // catalog at render time (`useStatusLabel`, `colorOf`), so no cached issue
+    // field can go stale here — refreshing the catalog is what repaints the
+    // boards. The old invalidate refetched every board, list and table in the
+    // workspace to change one word. (MUL-6458)
     onError: (_err, _vars, ctx) => {
       if (ctx?.previous) qc.setQueryData(listKey, ctx.previous);
       invalidate();
@@ -115,13 +147,21 @@ export function useUpdateIssueStatus() {
  * would read as success.
  */
 export function useArchiveIssueStatus() {
-  const { putEntry, invalidate } = useCatalogCache();
+  const { patchEntry, invalidate } = useCatalogCache();
   return useMutation({
     mutationFn: (id: string) => api.archiveIssueStatus(id),
-    // The archived row is kept in the cache, not dropped: issues still sitting
-    // on it resolve their name, color and category through it. `activeStatuses`
-    // is what hides it from pickers.
-    onSuccess: putEntry,
+    // Only `archived_at`, never the whole returned row. Archiving is terminal —
+    // there is no unarchive, and the server refuses to edit an archived status
+    // — so the flag stays true whatever else landed in the cache meanwhile,
+    // while a full snapshot would revert a rename that raced this archive.
+    //
+    // The row itself stays: issues still sitting on it resolve their name,
+    // color and category through it. `activeStatuses` is what hides it from
+    // pickers.
+    onSuccess: (entry) => {
+      if (!entry?.id) return;
+      patchEntry(entry.id, { archived_at: entry.archived_at });
+    },
     onError: invalidate,
   });
 }
@@ -167,16 +207,10 @@ export function useReorderIssueStatuses() {
       );
       return { previous };
     },
-    // Reorder answers with the FULL catalog, already in the server's order, so
-    // the whole response replaces the optimistic list rather than being merged
-    // row by row.
-    onSuccess: (response) => {
-      // A workspace always has its 7 built-ins, so an empty list is never a
-      // real catalog — it is the schema fallback. Keeping the optimistic order
-      // and letting the realtime refetch settle it beats blanking the picker.
-      if (response.statuses.length === 0) return;
-      qc.setQueryData<ListIssueStatusesResponse>(listKey, response);
-    },
+    // Reorder answers with the FULL catalog, and that is precisely why the
+    // response is not installed: a whole-table snapshot that arrives late
+    // overwrites every row, so ONE slow reorder response would roll back every
+    // concurrent edit the refetch had already picked up.
     onError: (_err, _vars, ctx) => {
       if (ctx?.previous) qc.setQueryData(listKey, ctx.previous);
       invalidate();
