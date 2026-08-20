@@ -29,20 +29,32 @@ import { useT } from "../i18n";
 
 const MAX_HANDOFF_NOTE = 2000;
 
-// i18next inlines {{name}} into the sentence, but the actor's position varies by
-// language ("{{name}} 会…" vs "Once assigned, {{name}} will…" vs "{{name}}'s
-// leader…"). Fence the name with a sentinel so we can bold just that span at
-// render time without splitting copy into per-language prefix/suffix keys.
-const NAME_FENCE = "\u0000";
+// i18next inlines {{name}} / {{status}} into the sentence, but their position
+// varies by language ("{{name}} 会…" vs "Once assigned, {{name}} will…" vs
+// "{{name}}'s leader…"). Fence each one with a sentinel so we can bold just
+// those spans at render time without splitting copy into per-language
+// prefix/suffix keys. Bolding is also what marks a custom status name as a
+// status rather than an ordinary word ("Move this issue to Later.").
+const FENCE = "\u0000";
 
-function boldName(text: string): ReactNode {
-  const parts = text.split(NAME_FENCE);
-  if (parts.length !== 3) return text;
+const fenced = (value: string) => `${FENCE}${value}${FENCE}`;
+
+function boldFenced(text: string): ReactNode {
+  const parts = text.split(FENCE);
+  // Every fenced span contributes one odd-indexed part; an unfenced string is
+  // a single part and renders as-is.
+  if (parts.length < 3) return text;
   return (
     <>
-      {parts[0]}
-      <span className="font-semibold text-foreground">{parts[1]}</span>
-      {parts[2]}
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <span key={i} className="font-semibold text-foreground">
+            {part}
+          </span>
+        ) : (
+          part
+        ),
+      )}
     </>
   );
 }
@@ -229,20 +241,18 @@ export function RunConfirmModal({
   // conditional, so the copy names no run count. The promotion names the
   // status it is moving to by its workspace label — a custom status is only
   // recognisable by the name its admin gave it.
-  const headline: ReactNode = boldName(
+  const headline: ReactNode = boldFenced(
     isPromote
       ? t(($) => $.run_confirm.promote_single, {
-          name: `${NAME_FENCE}${assigneeName}${NAME_FENCE}`,
-          status: statusLabel(d.status ?? ""),
+          name: fenced(assigneeName),
+          status: fenced(statusLabel(d.status ?? "")),
         })
       : issueIds.length > 1
         ? t(($) => $.run_confirm.assign_batch, {
-            name: `${NAME_FENCE}${assigneeName}${NAME_FENCE}`,
+            name: fenced(assigneeName),
             count: issueIds.length,
           })
-        : t(($) => $.run_confirm.assign_single, {
-            name: `${NAME_FENCE}${assigneeName}${NAME_FENCE}`,
-          }),
+        : t(($) => $.run_confirm.assign_single, { name: fenced(assigneeName) }),
   );
 
   return (
