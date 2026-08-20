@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -253,26 +254,28 @@ func TestFailTaskAndRerunConcurrently_NeverStrandsRunningTask(t *testing.T) {
 	}
 }
 
-// TestPromoteDueDeferred_SkipsWhenPendingSlotOccupied covers the deferred half of
-// the slot contention. runtime_offline and provider_network's final attempt arm
-// their retry as a 'deferred' row, which is NOT covered by
-// idx_one_pending_task_per_issue_agent_v2 — so it can be created alongside a
-// manual rerun (rerun clears the slot, the retry commits, the rerun's enqueue
-// then succeeds because deferred does not conflict).
+// TestPromoteDueDeferred_CancelsSupersededRetry pins the product invariant this
+// PR exists to protect: one rerun click means exactly ONE more run.
 //
-// Promotion is where that pair becomes a problem: flipping the deferred row to
-// 'queued' collides with the rerun already holding the slot, and since the claim
-// loop promotes before it claims, the resulting error blocked every claim on the
-// runtime — starving the very rerun the operator asked for.
-func TestPromoteDueDeferred_SkipsWhenPendingSlotOccupied(t *testing.T) {
+// runtime_offline and provider_network's final attempt arm their retry as a
+// 'deferred' row, which is outside idx_one_pending_task_per_issue_agent_v2 — so
+// it survives alongside a manual rerun (the rerun clears the slot, the retry
+// commits, the rerun's enqueue then succeeds because deferred does not conflict).
+//
+// Merely declining to promote it is not enough. The rerun eventually starts
+// running and stops occupying the queued slot, at which point the stale retry
+// would promote and run the agent a SECOND time — duplicate comments, duplicate
+// side effects, duplicate cost, and no error anywhere to show for it. The retry
+// is superseded, so it is cancelled outright.
+func TestPromoteDueDeferred_CancelsSupersededRetry(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
 
-	runtimeID := dbfx.Runtime(t, "promote-fence-runtime")
-	agentID := dbfx.Agent(t, "promote-fence-agent", runtimeID)
-	issueID := dbfx.Issue(t, "deferred retry meets manual rerun", testutil.Cols{
+	runtimeID := dbfx.Runtime(t, "promote-supersede-runtime")
+	agentID := dbfx.Agent(t, "promote-supersede-agent", runtimeID)
+	issueID := dbfx.Issue(t, "deferred retry superseded by rerun", testutil.Cols{
 		"assignee_type": "agent",
 		"assignee_id":   agentID,
 	})
@@ -280,51 +283,88 @@ func TestPromoteDueDeferred_SkipsWhenPendingSlotOccupied(t *testing.T) {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
 	})
 
-	// The manual rerun holds the single queued slot.
-	rerunID := dbfx.Task(t, agentID, testutil.Cols{
-		"issue_id":   issueID,
-		"runtime_id": runtimeID,
-		"status":     "queued",
+	failedID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id": issueID, "runtime_id": runtimeID, "status": "failed", "failure_reason": "runtime_offline",
 	})
-	// The deferred retry armed by the old task's runtime_offline failure, already due.
-	deferredID := dbfx.Task(t, agentID, testutil.Cols{
-		"issue_id":   issueID,
-		"runtime_id": runtimeID,
-		"status":     "deferred",
-		"fire_at":    testutil.Raw("now() - interval '1 minute'"),
+	// The manual rerun the operator asked for.
+	rerunID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id": issueID, "runtime_id": runtimeID, "status": "queued",
+	})
+	// The retry armed by the old failure, already due.
+	retryID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":         issueID,
+		"runtime_id":       runtimeID,
+		"status":           "deferred",
+		"fire_at":          testutil.Raw("now() - interval '1 minute'"),
+		"retry_of_task_id": failedID,
 	})
 
-	promoted, err := testHandler.TaskService.Queries.PromoteDueDeferredTasksForRuntime(ctx, db.PromoteDueDeferredTasksForRuntimeParams{
-		RuntimeID:        parseUUID(runtimeID),
-		RuntimeStaleSecs: 300,
-	})
-	if err != nil {
-		t.Fatalf("promotion must not fail while the slot is occupied (it would block every claim on this runtime): %v", err)
+	if err := testHandler.TaskService.PromoteDueDeferredTasksForRuntime(ctx, parseUUID(runtimeID)); err != nil {
+		t.Fatalf("promotion must not fail while the slot is occupied: %v", err)
 	}
-	for _, p := range promoted {
-		if uuidToString(p.ID) == deferredID {
-			t.Fatal("the deferred retry must not be promoted into an occupied slot")
-		}
-	}
-	if got := taskStatusByID(t, deferredID); got != "deferred" {
-		t.Fatalf("deferred retry should stay deferred until the slot frees, got %q", got)
+	if got := taskStatusByID(t, retryID); got != "cancelled" {
+		t.Fatalf("the superseded retry must be cancelled, got %q", got)
 	}
 	if got := taskStatusByID(t, rerunID); got != "queued" {
 		t.Fatalf("the manual rerun must be untouched, got %q", got)
 	}
 
-	// Once the rerun leaves the slot, the retry is free to promote — nothing was lost.
+	// The rerun starts and then finishes, freeing the slot. The retry must stay
+	// dead — this is the exact point at which it used to come back and run again.
 	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed' WHERE id = $1`, rerunID); err != nil {
 		t.Fatalf("free the slot: %v", err)
 	}
-	if _, err := testHandler.TaskService.Queries.PromoteDueDeferredTasksForRuntime(ctx, db.PromoteDueDeferredTasksForRuntimeParams{
-		RuntimeID:        parseUUID(runtimeID),
-		RuntimeStaleSecs: 300,
-	}); err != nil {
+	if err := testHandler.TaskService.PromoteDueDeferredTasksForRuntime(ctx, parseUUID(runtimeID)); err != nil {
 		t.Fatalf("second promotion: %v", err)
 	}
-	if got := taskStatusByID(t, deferredID); got != "queued" {
-		t.Fatalf("deferred retry should promote once the slot is free, got %q", got)
+	if got := taskStatusByID(t, retryID); got != "cancelled" {
+		t.Fatalf("a superseded retry must never come back after the rerun finishes, got %q", got)
+	}
+}
+
+// TestPromoteDueDeferred_LeavesNonRetryDeferredRowsAlone bounds the cancellation
+// above. Assignee-fallback escalations are deferred rows that are SUPPOSED to
+// coexist with an active primary task — they own their own fire_at lifecycle and
+// exist precisely to fire when the primary goes quiet. Cancelling those would
+// silently disable escalation, so the sweep is scoped to auto-retry clones.
+//
+// The index fence still applies to them: they stay deferred while the slot is
+// occupied rather than colliding on promotion.
+func TestPromoteDueDeferred_LeavesNonRetryDeferredRowsAlone(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	runtimeID := dbfx.Runtime(t, "promote-escalation-runtime")
+	agentID := dbfx.Agent(t, "promote-escalation-agent", runtimeID)
+	issueID := dbfx.Issue(t, "escalation survives an active primary", testutil.Cols{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+	})
+
+	primaryID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id": issueID, "runtime_id": runtimeID, "status": "queued",
+	})
+	escalationID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":               issueID,
+		"runtime_id":             runtimeID,
+		"status":                 "deferred",
+		"fire_at":                testutil.Raw("now() - interval '1 minute'"),
+		"escalation_for_task_id": primaryID,
+	})
+
+	if err := testHandler.TaskService.PromoteDueDeferredTasksForRuntime(ctx, parseUUID(runtimeID)); err != nil {
+		t.Fatalf("promotion: %v", err)
+	}
+	if got := taskStatusByID(t, escalationID); got != "deferred" {
+		t.Fatalf("an escalation must be neither cancelled nor promoted into an occupied slot, got %q", got)
+	}
+	if got := taskStatusByID(t, primaryID); got != "queued" {
+		t.Fatalf("primary must be untouched, got %q", got)
 	}
 }
 
@@ -423,5 +463,70 @@ func TestFailTaskAndRerunConcurrently_NonAssigneeTarget(t *testing.T) {
 		}
 
 		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 AND id <> $2`, issueID, sourceTaskID)
+	}
+}
+
+// TestPromoteDueDeferred_ToleratesConcurrentUncommittedEnqueue covers the one
+// window the in-query NOT EXISTS fence cannot: an enqueue that has not committed
+// yet is invisible to it, so promotion still walks into the unique index and
+// waits on the other transaction's lock, receiving 23505 once it commits.
+//
+// The fix is tolerance rather than prevention. This is a self-healing blip — the
+// next tick sees the committed row and skips cleanly — so the only thing that
+// must hold is that one contended row does not fail the claim call. Before that
+// tolerance, the single-runtime path returned the error outright and the batch
+// path failed the claim for every runtime in the set.
+func TestPromoteDueDeferred_ToleratesConcurrentUncommittedEnqueue(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	runtimeID := dbfx.Runtime(t, "promote-uncommitted-runtime")
+	agentID := dbfx.Agent(t, "promote-uncommitted-agent", runtimeID)
+	issueID := dbfx.Issue(t, "promotion meets an uncommitted enqueue", testutil.Cols{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+	})
+
+	// A due deferred row with no visible competitor: neither the supersede sweep
+	// nor the promotion fence has any reason to leave it alone.
+	dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   issueID,
+		"runtime_id": runtimeID,
+		"status":     "deferred",
+		"fire_at":    testutil.Raw("now() - interval '1 minute'"),
+	})
+
+	// A second connection inserts the competing queued row and holds it open, so
+	// it is invisible to promotion's fence but still owns the index entry.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin holder tx: %v", err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, 'queued', 0)
+	`, agentID, runtimeID, issueID); err != nil {
+		t.Fatalf("insert uncommitted competitor: %v", err)
+	}
+
+	// Commit the competitor shortly after promotion starts, so promotion is
+	// already blocked on the index and is handed 23505 when the lock releases.
+	committed := make(chan error, 1)
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		committed <- tx.Commit(context.Background())
+	}()
+
+	if err := testHandler.TaskService.PromoteDueDeferredTasksForRuntime(ctx, parseUUID(runtimeID)); err != nil {
+		t.Fatalf("a single contended row must not fail the claim: %v", err)
+	}
+	if err := <-committed; err != nil {
+		t.Fatalf("commit competitor: %v", err)
 	}
 }

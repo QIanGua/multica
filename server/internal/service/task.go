@@ -3342,11 +3342,18 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	// MarkEmpty from a prior idle poll would short-circuit the runtime and the
 	// promoted task would sit unclaimed until the empty key's TTL. Also emits
 	// the deferred→queued UI event and the enqueue analytics sample.
+	s.cancelSupersededDeferredRetries(ctx, uniqueIDs)
 	promoted, err := s.Queries.PromoteDueDeferredTasksForRuntimes(ctx, db.PromoteDueDeferredTasksForRuntimesParams{
 		RuntimeIds:       uniqueIDs,
 		RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
 	})
-	if err != nil {
+	if isDuplicatePendingTaskErr(err) {
+		// Same tolerance as the single-runtime path, and it matters more here:
+		// one contended row would otherwise fail the claim for EVERY runtime in
+		// the batch. Promote nothing this tick and let the claim continue.
+		slog.Info("promote deferred tasks (batch): slot taken by a concurrent enqueue, skipping this tick")
+		promoted = nil
+	} else if err != nil {
 		return nil, fmt.Errorf("promote deferred tasks: %w", err)
 	}
 	for _, task := range promoted {
@@ -3473,11 +3480,48 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	return claimed, nil
 }
 
+// cancelSupersededDeferredRetries drops deferred auto-retry rows that an active
+// task already supersedes, so a single rerun click still produces exactly one
+// more run. Runs immediately before promotion — promotion is the moment a stale
+// retry would otherwise become claimable. Best-effort: a failure here must not
+// stop the claim loop, it just leaves the row for the next tick.
+func (s *TaskService) cancelSupersededDeferredRetries(ctx context.Context, runtimeIDs []pgtype.UUID) {
+	if len(runtimeIDs) == 0 {
+		return
+	}
+	cancelled, err := s.Queries.CancelSupersededDeferredRetriesForRuntimes(ctx, runtimeIDs)
+	if err != nil {
+		slog.Warn("cancel superseded deferred retries failed", "error", err)
+		return
+	}
+	for _, task := range cancelled {
+		slog.Info("deferred auto-retry cancelled: superseded by an active task",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(task.IssueID),
+			"agent_id", util.UUIDToString(task.AgentID),
+		)
+		s.captureTaskCancelled(ctx, task)
+		s.ReconcileAgentStatus(ctx, task.AgentID)
+		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+	}
+}
+
 func (s *TaskService) PromoteDueDeferredTasksForRuntime(ctx context.Context, runtimeID pgtype.UUID) error {
+	s.cancelSupersededDeferredRetries(ctx, []pgtype.UUID{runtimeID})
 	tasks, err := s.Queries.PromoteDueDeferredTasksForRuntime(ctx, db.PromoteDueDeferredTasksForRuntimeParams{
 		RuntimeID:        runtimeID,
 		RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
 	})
+	if isDuplicatePendingTaskErr(err) {
+		// The NOT EXISTS fence inside the query cannot see an enqueue that has
+		// not committed yet, so a rerun landing in the same instant still
+		// collides here. One row losing its slot must not fail the whole claim:
+		// the row stays deferred and the next tick — by which time the rerun is
+		// visible — skips it cleanly. Costs one poll interval, never a stall.
+		slog.Info("promote due deferred tasks: slot taken by a concurrent enqueue, skipping this tick",
+			"runtime_id", util.UUIDToString(runtimeID))
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("promote due deferred tasks: %w", err)
 	}
