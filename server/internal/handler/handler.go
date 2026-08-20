@@ -115,6 +115,10 @@ type Config struct {
 	// frontend/CORS origin allowlist so split app/api self-hosted deployments
 	// can frame API-hosted PDFs without allowing arbitrary third-party frames.
 	AttachmentFrameAncestors []string
+	// PluginSurfaceOrigin is the dedicated, cookie-free browser origin that
+	// routes /plugin-surfaces/* back to this server. It must not be the app/API
+	// origin: the route serves stored third-party JavaScript as HTML.
+	PluginSurfaceOrigin string
 	// LLM* configure the basic LLM API layer (MUL-4238). They back the
 	// server-internal LLM helpers in pkg/llm (e.g. chat title generation).
 	// The generic OpenAI-compatible passthrough endpoints were removed in
@@ -361,6 +365,9 @@ type Handler struct {
 	// error rather than silently storing plaintext. Wired in
 	// cmd/server/router.go after New.
 	VCSSecretBox *secretbox.Box
+	// PluginSurfaceTokens seal short-lived launch claims. Nil disables surface
+	// launches; wired from a domain-separated MULTICA_PLUGIN_SECRET_KEY at boot.
+	PluginSurfaceTokens *secretbox.Box
 	// PRRefresh drives the GitHub API snapshot pipeline for PR cards (MUL-5265):
 	// webhook / page-visit / TTL triggers → authenticated GraphQL fetch →
 	// head-SHA-guarded atomic snapshot write. Always non-nil, but inert (every
