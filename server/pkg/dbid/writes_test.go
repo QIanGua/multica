@@ -126,12 +126,12 @@ func TestEveryV7ParamsLiteralSetsAnIDAndImportsDBID(t *testing.T) {
 			found[selector.Sel.Name]++
 			if !compositeLiteralSetsField(literal, field) {
 				position := fset.Position(literal.Pos())
-				t.Errorf("%s:%d: %s literal does not set %s",
+				t.Errorf("%s:%d: %s literal does not set %s; mint it with dbid.NewV7()",
 					path, position.Line, selector.Sel.Name, field)
 			}
 			if !importsDBID {
 				position := fset.Position(literal.Pos())
-				t.Errorf("%s:%d: %s literal is in a file that does not import %s",
+				t.Errorf("%s:%d: %s literal is in a file that does not import %s; add the import and call dbid.NewV7()",
 					path, position.Line, selector.Sel.Name, dbidImportPath)
 			}
 			return true
