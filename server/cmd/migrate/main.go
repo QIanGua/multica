@@ -238,6 +238,11 @@ var concurrentIndexCleanups = map[string]string{
 	"361_issue_last_activity_index":                             "idx_issue_workspace_last_activity",
 	"363_plugin_invocation_installation_index":                  "idx_plugin_invocation_installation_created",
 	"364_plugin_invocation_created_at_index":                    "idx_plugin_invocation_created_at",
+	"377_plugin_package_workspace_key_index":                    "idx_plugin_package_workspace_key",
+	"378_plugin_package_version_unique_index":                   "idx_plugin_package_version_unique",
+	"379_plugin_package_version_package_index":                  "idx_plugin_package_version_package",
+	"380_plugin_package_file_path_index":                        "idx_plugin_package_file_path",
+	"381_plugin_installation_package_version_index":             "idx_plugin_installation_package_version",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction
