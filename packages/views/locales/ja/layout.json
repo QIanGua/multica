@@ -29,6 +29,7 @@
   },
   "help": {
     "trigger": "ヘルプ",
+    "download_desktop": "デスクトップ版をダウンロード",
     "docs": "ドキュメント",
     "changelog": "変更ログ",
     "discord": "Discord",
