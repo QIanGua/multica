@@ -296,7 +296,7 @@ export function createZhDict(allowSignup: boolean): LandingDict {
       {
         version: "0.4.31",
         date: "2026-08-20",
-        title: "更顺畅的智能体任务、更安全的自动化、可靠的 Windows 构建",
+        title: "移出待办池前的启动确认、Webhook 事件筛选、Windows 构建修复",
         changes: [],
         improvements: [
           "网页端的帮助菜单现在能直接找到桌面端下载。",

@@ -296,7 +296,7 @@ export function createEnDict(allowSignup: boolean): LandingDict {
       {
         version: "0.4.31",
         date: "2026-08-20",
-        title: "Smoother agent runs, safer automation, and reliable Windows builds",
+        title: "Run confirmation before leaving backlog, Webhook event filters, and Windows build fixes",
         changes: [],
         improvements: [
           "The web Help menu now makes the desktop app easier to find.",

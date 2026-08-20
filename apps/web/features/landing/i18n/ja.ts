@@ -272,7 +272,7 @@ export function createJaDict(allowSignup: boolean): LandingDict {
         {
           version: "0.4.31",
           date: "2026-08-20",
-          title: "スムーズなエージェント実行、安全な自動化、安定した Windows ビルド",
+          title: "バックログ移動前の実行確認、Webhook イベントフィルター、Windows ビルド修正",
           changes: [],
           improvements: [
             "Web のヘルプメニューからデスクトップ版をすぐに見つけられます。",

@@ -271,7 +271,7 @@ export function createKoDict(allowSignup: boolean): LandingDict {
         {
           version: "0.4.31",
           date: "2026-08-20",
-          title: "더 원활한 에이전트 실행, 안전한 자동화, 안정적인 Windows 빌드",
+          title: "백로그 이동 전 실행 확인, Webhook 이벤트 필터, Windows 빌드 수정",
           changes: [],
           improvements: [
             "웹 도움말 메뉴에서 데스크톱 앱을 바로 찾을 수 있습니다.",
