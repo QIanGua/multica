@@ -294,14 +294,10 @@ export function createEnDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
-        version: "0.5.0",
+        version: "0.4.31",
         date: "2026-08-20",
-        title: "Telegram agents, Dim runtime, and safer agent runs",
+        title: "Smoother agent runs, safer automation, and reliable Windows builds",
         changes: [],
-        features: [
-          "Connect a Telegram bot so agents can handle messages and reply in private chats, groups, and topics.",
-          "You can now run agents with the Dim CLI.",
-        ],
         improvements: [
           "The web Help menu now makes the desktop app easier to find.",
           "You can confirm an agent run before moving an assigned Issue out of backlog.",

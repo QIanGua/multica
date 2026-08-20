@@ -269,18 +269,14 @@ export function createKoDict(allowSignup: boolean): LandingDict {
       },
       entries: [
         {
-          version: "0.5.0",
+          version: "0.4.31",
           date: "2026-08-20",
-          title: "Telegram 에이전트, Dim 런타임, 더 안전한 에이전트 실행",
+          title: "더 원활한 에이전트 실행, 안전한 자동화, 안정적인 Windows 빌드",
           changes: [],
-          features: [
-            "Telegram 봇을 연결해 에이전트가 메시지를 처리하고 답장하게 할 수 있습니다.",
-            "Dim CLI로 에이전트를 실행할 수 있습니다.",
-          ],
           improvements: [
             "웹 도움말 메뉴에서 데스크톱 앱을 바로 찾을 수 있습니다.",
-            "에이전트가 맡은 Issue를 backlog에서 옮기기 전에 실행을 확인할 수 있습니다.",
-            "webhook 이벤트 필터를 더 쉽게 추가하고 제거할 수 있습니다.",
+            "에이전트가 맡은 Issue를 백로그에서 옮기기 전에 실행을 확인할 수 있습니다.",
+            "Webhook 이벤트 필터를 더 쉽게 추가하고 제거할 수 있습니다.",
             "/ 입력 시 정확히 일치하는 스킬이 먼저 표시됩니다.",
           ],
           fixes: [

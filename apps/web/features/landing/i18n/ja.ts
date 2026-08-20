@@ -270,18 +270,14 @@ export function createJaDict(allowSignup: boolean): LandingDict {
       },
       entries: [
         {
-          version: "0.5.0",
+          version: "0.4.31",
           date: "2026-08-20",
-          title: "Telegram エージェント、Dim ランタイム、より安全なエージェント実行",
+          title: "スムーズなエージェント実行、安全な自動化、安定した Windows ビルド",
           changes: [],
-          features: [
-            "Telegram ボットを接続して、エージェントにメッセージ対応と返信を任せられます。",
-            "Dim CLI でエージェントを実行できるようになりました。",
-          ],
           improvements: [
             "Web のヘルプメニューからデスクトップ版をすぐに見つけられます。",
-            "エージェント担当の Issue を backlog から動かす前に、実行を確認できます。",
-            "webhook のイベントフィルターを追加・削除しやすくなりました。",
+            "エージェント担当の Issue をバックログから動かす前に、実行を確認できます。",
+            "Webhook のイベントフィルターを追加・削除しやすくなりました。",
             "/ の入力時に完全一致するスキルが先に表示されます。",
           ],
           fixes: [
