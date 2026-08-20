@@ -252,3 +252,176 @@ func TestFailTaskAndRerunConcurrently_NeverStrandsRunningTask(t *testing.T) {
 		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
 	}
 }
+
+// TestPromoteDueDeferred_SkipsWhenPendingSlotOccupied covers the deferred half of
+// the slot contention. runtime_offline and provider_network's final attempt arm
+// their retry as a 'deferred' row, which is NOT covered by
+// idx_one_pending_task_per_issue_agent_v2 — so it can be created alongside a
+// manual rerun (rerun clears the slot, the retry commits, the rerun's enqueue
+// then succeeds because deferred does not conflict).
+//
+// Promotion is where that pair becomes a problem: flipping the deferred row to
+// 'queued' collides with the rerun already holding the slot, and since the claim
+// loop promotes before it claims, the resulting error blocked every claim on the
+// runtime — starving the very rerun the operator asked for.
+func TestPromoteDueDeferred_SkipsWhenPendingSlotOccupied(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	runtimeID := dbfx.Runtime(t, "promote-fence-runtime")
+	agentID := dbfx.Agent(t, "promote-fence-agent", runtimeID)
+	issueID := dbfx.Issue(t, "deferred retry meets manual rerun", testutil.Cols{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+	})
+
+	// The manual rerun holds the single queued slot.
+	rerunID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   issueID,
+		"runtime_id": runtimeID,
+		"status":     "queued",
+	})
+	// The deferred retry armed by the old task's runtime_offline failure, already due.
+	deferredID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   issueID,
+		"runtime_id": runtimeID,
+		"status":     "deferred",
+		"fire_at":    testutil.Raw("now() - interval '1 minute'"),
+	})
+
+	promoted, err := testHandler.TaskService.Queries.PromoteDueDeferredTasksForRuntime(ctx, db.PromoteDueDeferredTasksForRuntimeParams{
+		RuntimeID:        parseUUID(runtimeID),
+		RuntimeStaleSecs: 300,
+	})
+	if err != nil {
+		t.Fatalf("promotion must not fail while the slot is occupied (it would block every claim on this runtime): %v", err)
+	}
+	for _, p := range promoted {
+		if uuidToString(p.ID) == deferredID {
+			t.Fatal("the deferred retry must not be promoted into an occupied slot")
+		}
+	}
+	if got := taskStatusByID(t, deferredID); got != "deferred" {
+		t.Fatalf("deferred retry should stay deferred until the slot frees, got %q", got)
+	}
+	if got := taskStatusByID(t, rerunID); got != "queued" {
+		t.Fatalf("the manual rerun must be untouched, got %q", got)
+	}
+
+	// Once the rerun leaves the slot, the retry is free to promote — nothing was lost.
+	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed' WHERE id = $1`, rerunID); err != nil {
+		t.Fatalf("free the slot: %v", err)
+	}
+	if _, err := testHandler.TaskService.Queries.PromoteDueDeferredTasksForRuntime(ctx, db.PromoteDueDeferredTasksForRuntimeParams{
+		RuntimeID:        parseUUID(runtimeID),
+		RuntimeStaleSecs: 300,
+	}); err != nil {
+		t.Fatalf("second promotion: %v", err)
+	}
+	if got := taskStatusByID(t, deferredID); got != "queued" {
+		t.Fatalf("deferred retry should promote once the slot is free, got %q", got)
+	}
+}
+
+func taskStatusByID(t *testing.T, id string) string {
+	t.Helper()
+	var status string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT status FROM agent_task_queue WHERE id = $1`, id).Scan(&status); err != nil {
+		t.Fatalf("read task status: %v", err)
+	}
+	return status
+}
+
+// TestFailTaskAndRerunConcurrently_NonAssigneeTarget runs the same race as
+// TestFailTaskAndRerunConcurrently_NeverStrandsRunningTask, but for a rerun whose
+// target is NOT the issue's current agent assignee — a past task re-fired by
+// task_id after the issue was reassigned.
+//
+// That routes the enqueue through enqueueMentionTaskWithCommentPlan, which
+// normalizes the unique violation into the bare ErrDuplicatePendingTask sentinel
+// instead of surfacing the pgconn error. The reclaim branch has to recognise that
+// shape too, otherwise every squad-leader / displaced-agent / mentioned-agent
+// rerun losing this race reports a hard failure to the operator.
+func TestFailTaskAndRerunConcurrently_NonAssigneeTarget(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	runtimeID := dbfx.Runtime(t, "non-assignee-race-runtime")
+	assigneeID := dbfx.Agent(t, "non-assignee-race-current", runtimeID)
+	displacedID := dbfx.Agent(t, "non-assignee-race-displaced", runtimeID)
+	issueID := dbfx.Issue(t, "rerun a displaced agent while it fails", testutil.Cols{
+		"assignee_type": "agent",
+		"assignee_id":   assigneeID,
+	})
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+	})
+
+	// The execution-log row the operator clicks retry on: it belonged to the
+	// displaced agent, so the rerun targets that agent rather than the assignee.
+	sourceTaskID := dbfx.Task(t, displacedID, testutil.Cols{
+		"issue_id":   issueID,
+		"runtime_id": runtimeID,
+		"status":     "completed",
+	})
+
+	const rounds = 15
+	for i := 0; i < rounds; i++ {
+		runningID := dbfx.Task(t, displacedID, testutil.Cols{
+			"issue_id":     issueID,
+			"runtime_id":   runtimeID,
+			"status":       "running",
+			"attempt":      1,
+			"max_attempts": 2,
+		})
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var failErr, rerunErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, failErr = testHandler.TaskService.FailTask(ctx, parseUUID(runningID),
+				"run died", "", "", "", "timeout", false, "", "")
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, rerunErr = testHandler.TaskService.RerunIssue(ctx, parseUUID(issueID), parseUUID(sourceTaskID), pgtype.UUID{}, parseUUID(testUserID), nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		if failErr != nil {
+			t.Fatalf("round %d: FailTask must never abort on slot contention: %v", i, failErr)
+		}
+		if rerunErr != nil {
+			t.Fatalf("round %d: a non-assignee rerun must reclaim the slot, not surface the normalized sentinel: %v", i, rerunErr)
+		}
+		if got := taskStatusByID(t, runningID); got != "failed" {
+			t.Fatalf("round %d: parent must commit as failed, got %q", i, got)
+		}
+
+		var pending int
+		if err := testPool.QueryRow(ctx, `
+			SELECT count(*) FROM agent_task_queue
+			WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched')
+		`, issueID, displacedID).Scan(&pending); err != nil {
+			t.Fatalf("round %d: count successors: %v", i, err)
+		}
+		if pending > 1 {
+			t.Fatalf("round %d: expected at most one runnable successor, found %d", i, pending)
+		}
+
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 AND id <> $2`, issueID, sourceTaskID)
+	}
+}

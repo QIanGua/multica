@@ -605,6 +605,20 @@ func isDuplicatePendingTaskErr(err error) bool {
 	}
 }
 
+// pendingSlotTakenErr reports whether err means "the (issue, agent) pending slot
+// was already occupied when we tried to enqueue".
+//
+// Two shapes reach RerunIssue. The issue-assignee path surfaces the raw unique
+// violation, while enqueueMentionTaskWithCommentPlan normalizes it into the bare
+// ErrDuplicatePendingTask sentinel — and that is the path taken by EVERY rerun
+// whose target is not the issue's current agent assignee: a squad leader, a
+// displaced agent re-fired by task_id, a mentioned agent. Matching only the raw
+// pgconn error meant the reclaim never ran for those, so a system retry winning
+// the slot surfaced as a hard error instead.
+func pendingSlotTakenErr(err error) bool {
+	return isDuplicatePendingTaskErr(err) || errors.Is(err, ErrDuplicatePendingTask)
+}
+
 // applyAttributionFallback applies the workspace's degraded-attribution policy to a
 // resolved attribution whose source came back unattributed (no precise human). A
 // PRECISE attribution passes through untouched (no policy read at all). For an
@@ -4844,7 +4858,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 	// (rerun_of_task_id) so the queued event / daemon claim never sees a NULL
 	// lineage, and it stays distinct from system-retry's retry_of_task_id (§5).
 	task, err := s.enqueueRerunTask(ctx, issue, agentID, triggerCommentID, coalescedCommentIDs, isLeader, squadID, actorUserID, sourceTaskID)
-	if isDuplicatePendingTaskErr(err) {
+	if pendingSlotTakenErr(err) {
 		// The clear above and this enqueue are separate commits, so a system
 		// retry created by a concurrent FailTask can take the pending slot in
 		// between. CreateRetryTask yields the slot when it is already occupied,
