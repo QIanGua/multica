@@ -134,9 +134,13 @@
       "title": "订阅数据可能已经过期",
       "description": "上一次可信快照已经过期，系统正在刷新；所有操作仍由服务端校验。"
     },
+    "snapshot_unknown": {
+      "title": "无法验证订阅数据",
+      "description": "快照到期时间无效。系统正在刷新；依赖套餐的限额暂不可用。"
+    },
     "subscription_notice": {
       "canceling_title": "订阅已安排取消",
-      "canceling_description": "Pro 可使用至 {{date}}，之后这个工作区将转为 Free。",
+      "canceling_description": "此订阅计划于 {{date}} 取消。上方的套餐徽章显示当前实际生效的权限。",
       "canceling_description_without_date": "这个订阅将在当前周期结束时取消。",
       "incomplete_title": "订阅开通尚未完成",
       "incomplete_description": "打开账单管理，完成或检查付款设置。",
@@ -193,6 +197,7 @@
       "autopilots": "成功的自动化执行",
       "autopilots_description": "Free 限额按 UTC 自然月重置；Pro 不限次数。",
       "unlimited": "不限",
+      "unavailable": "暂不可用",
       "per_month": "每月 {{count}} 次",
       "usage_loading": "正在加载自动化用量",
       "usage_label": "自动化额度用量",

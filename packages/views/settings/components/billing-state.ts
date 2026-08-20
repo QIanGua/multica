@@ -18,6 +18,8 @@ export type AutopilotUsageView =
       resetAt: string;
     };
 
+export type BillingSnapshotFreshness = "fresh" | "stale" | "unknown";
+
 /**
  * Quota admission counts completed and reserved runs. Keep reserved work
  * visible so the progress bar matches the server's blocking decision.
@@ -26,7 +28,12 @@ export function resolveAutopilotUsage(
   entitlements: WorkspaceSubscriptionEntitlements,
   usage: AutopilotQuotaUsage | undefined,
   failed: boolean,
+  snapshotFreshness: BillingSnapshotFreshness,
 ): AutopilotUsageView {
+  if (snapshotFreshness !== "fresh") {
+    return { kind: "unavailable" };
+  }
+
   if (
     entitlements.plan === "pro" &&
     entitlements.autopilotRuns === null
@@ -71,13 +78,14 @@ export function resolveAutopilotUsage(
   };
 }
 
-export function isBillingSnapshotExpired(
+export function resolveBillingSnapshotFreshness(
   expiresAt: string | null,
   now: number = Date.now(),
-): boolean {
-  if (!expiresAt) return false;
+): BillingSnapshotFreshness {
+  if (!expiresAt) return "fresh";
   const expiresAtMs = new Date(expiresAt).getTime();
-  return Number.isFinite(expiresAtMs) && expiresAtMs <= now;
+  if (!Number.isFinite(expiresAtMs)) return "unknown";
+  return expiresAtMs <= now ? "stale" : "fresh";
 }
 
 const MANAGED_SUBSCRIPTION_STATUSES = new Set([

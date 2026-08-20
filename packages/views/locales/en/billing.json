@@ -134,9 +134,13 @@
       "title": "Subscription data may be out of date",
       "description": "The last trusted snapshot has expired. We are refreshing it; actions remain guarded by the server."
     },
+    "snapshot_unknown": {
+      "title": "Subscription data cannot be verified",
+      "description": "The snapshot expiration time is invalid. We are refreshing it; plan-dependent limits remain unavailable."
+    },
     "subscription_notice": {
       "canceling_title": "Cancellation is scheduled",
-      "canceling_description": "Pro remains available through {{date}}, then this workspace moves to Free.",
+      "canceling_description": "This subscription is scheduled to cancel on {{date}}. The plan badge above shows the access currently enforced.",
       "canceling_description_without_date": "This subscription is scheduled to cancel at the end of its current period.",
       "incomplete_title": "Subscription setup is incomplete",
       "incomplete_description": "Open billing management to finish or review the payment setup.",
@@ -195,6 +199,7 @@
       "autopilots": "Successful automations",
       "autopilots_description": "The Free allowance resets each UTC calendar month. Pro is unlimited.",
       "unlimited": "Unlimited",
+      "unavailable": "Unavailable",
       "per_month": "{{count}} / month",
       "usage_loading": "Loading automation usage",
       "usage_label": "Automation quota usage",

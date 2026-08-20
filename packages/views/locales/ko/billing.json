@@ -134,9 +134,13 @@
       "title": "구독 정보가 오래되었을 수 있습니다",
       "description": "마지막으로 신뢰할 수 있는 스냅샷이 만료되었습니다. 새로고침 중에도 작업은 서버에서 검증됩니다."
     },
+    "snapshot_unknown": {
+      "title": "구독 정보를 확인할 수 없습니다",
+      "description": "스냅샷 만료 시간이 올바르지 않습니다. 새로고침 중이며 플랜에 따른 한도는 사용할 수 없습니다."
+    },
     "subscription_notice": {
       "canceling_title": "구독 취소가 예정되어 있습니다",
-      "canceling_description": "{{date}}까지 Pro를 사용할 수 있으며 이후 이 워크스페이스는 Free로 전환됩니다.",
+      "canceling_description": "이 구독은 {{date}}에 취소될 예정입니다. 위의 플랜 배지는 현재 적용 중인 액세스를 표시합니다.",
       "canceling_description_without_date": "이 구독은 현재 결제 기간 종료 시 취소될 예정입니다.",
       "incomplete_title": "구독 설정이 완료되지 않았습니다",
       "incomplete_description": "결제 관리를 열어 결제 설정을 완료하거나 확인하세요.",
@@ -193,6 +197,7 @@
       "autopilots": "성공한 자동화",
       "autopilots_description": "Free 한도는 UTC 기준 매월 초기화됩니다. Pro는 무제한입니다.",
       "unlimited": "무제한",
+      "unavailable": "사용할 수 없음",
       "per_month": "월 {{count}}회",
       "usage_loading": "자동화 사용량 불러오는 중",
       "usage_label": "자동화 쿼터 사용량",

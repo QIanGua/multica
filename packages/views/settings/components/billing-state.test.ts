@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { describe, expect, it } from "vitest";
 import type {
   AutopilotQuotaUsage,
@@ -6,7 +8,7 @@ import type {
 } from "@multica/core/types";
 import {
   hasManagedWorkspaceSubscription,
-  isBillingSnapshotExpired,
+  resolveBillingSnapshotFreshness,
   resolveAutopilotUsage,
 } from "./billing-state";
 
@@ -35,7 +37,9 @@ const quotaUsage: AutopilotQuotaUsage = {
 
 describe("resolveAutopilotUsage", () => {
   it("counts reserved runs toward progress and the reached decision", () => {
-    expect(resolveAutopilotUsage(freeEntitlements, quotaUsage, false)).toEqual({
+    expect(
+      resolveAutopilotUsage(freeEntitlements, quotaUsage, false, "fresh"),
+    ).toEqual({
       kind: "metered",
       used: 3,
       reserved: 2,
@@ -51,6 +55,7 @@ describe("resolveAutopilotUsage", () => {
         freeEntitlements,
         { ...quotaUsage, used: 5 },
         false,
+        "fresh",
       ),
     ).toMatchObject({ total: 7, reached: true, progress: 100 });
   });
@@ -61,14 +66,15 @@ describe("resolveAutopilotUsage", () => {
         { ...freeEntitlements, plan: "pro", autopilotRuns: null },
         undefined,
         true,
+        "fresh",
       ),
     ).toEqual({ kind: "unlimited" });
   });
 
   it("does not turn missing or disabled limited usage into zero or unlimited", () => {
-    expect(resolveAutopilotUsage(freeEntitlements, undefined, true)).toEqual({
-      kind: "unavailable",
-    });
+    expect(
+      resolveAutopilotUsage(freeEntitlements, undefined, true, "fresh"),
+    ).toEqual({ kind: "unavailable" });
     expect(
       resolveAutopilotUsage(
         freeEntitlements,
@@ -81,20 +87,41 @@ describe("resolveAutopilotUsage", () => {
           reset_at: null,
         },
         false,
+        "fresh",
       ),
     ).toEqual({ kind: "unavailable" });
   });
+
+  it.each(["stale", "unknown"] as const)(
+    "does not derive unlimited or metered usage from a %s snapshot",
+    (snapshotFreshness) => {
+      expect(
+        resolveAutopilotUsage(
+          { ...freeEntitlements, plan: "pro", autopilotRuns: null },
+          quotaUsage,
+          false,
+          snapshotFreshness,
+        ),
+      ).toEqual({ kind: "unavailable" });
+    },
+  );
 });
 
 describe("billing subscription state", () => {
-  it("treats snapshot expiration as stale without rejecting invalid dates", () => {
-    expect(isBillingSnapshotExpired("2030-01-01T00:00:00Z", 1)).toBe(false);
+  it("distinguishes fresh, stale, and invalid snapshots", () => {
+    expect(resolveBillingSnapshotFreshness(null, 1)).toBe("fresh");
     expect(
-      isBillingSnapshotExpired("2030-01-01T00:00:00Z", 2_000_000_000_000),
-    ).toBe(true);
-    expect(isBillingSnapshotExpired("not-a-date", 2_000_000_000_000)).toBe(
-      false,
-    );
+      resolveBillingSnapshotFreshness("2030-01-01T00:00:00Z", 1),
+    ).toBe("fresh");
+    expect(
+      resolveBillingSnapshotFreshness(
+        "2030-01-01T00:00:00Z",
+        2_000_000_000_000,
+      ),
+    ).toBe("stale");
+    expect(
+      resolveBillingSnapshotFreshness("not-a-date", 2_000_000_000_000),
+    ).toBe("unknown");
   });
 
   it("prefers subscription facts and keeps safe compatibility fallbacks", () => {

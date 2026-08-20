@@ -556,6 +556,33 @@ describe("BillingTab", () => {
     }
   });
 
+  it("keeps Checkout syncing when a stale Pro snapshot cannot confirm activation", () => {
+    vi.useFakeTimers();
+    navigationState.search = "tab=billing&result=success&session_id=cs_test_1";
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+      snapshotExpiresAt: "2000-01-01T00:00:00Z",
+    });
+    try {
+      renderWithI18n(<BillingTab />);
+
+      expect(
+        screen.getByText("Activating your subscription"),
+      ).toBeInTheDocument();
+      expect(screen.queryByText("Pro is active")).not.toBeInTheDocument();
+      expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
+      expect(screen.getByText("Snapshot stale")).toBeInTheDocument();
+      expect(mocks.useQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ refetchInterval: 2_000 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps plan facts visible but hides subscription mutations from members", () => {
     mocks.role = "member";
 
@@ -670,6 +697,37 @@ describe("BillingTab", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Snapshot stale")).toBeInTheDocument();
     expect(screen.queryByText("Inactive")).not.toBeInTheDocument();
+    expect(screen.queryByText("17")).not.toBeInTheDocument();
+    expect(screen.queryByText("5 / 7")).not.toBeInTheDocument();
+    expect(screen.queryByText("7 / month")).not.toBeInTheDocument();
+    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText("Usage is temporarily unavailable"),
+    ).toBeInTheDocument();
+  });
+
+  it("treats an invalid snapshot expiration as unknown and hides Pro limits", () => {
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+      snapshotExpiresAt: "not-a-date",
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(
+      screen.getByText("Subscription data cannot be verified"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Unknown status")).toBeInTheDocument();
+    expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
+    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText("Usage is temporarily unavailable"),
+    ).toBeInTheDocument();
+    expect(mocks.refetch).toHaveBeenCalledOnce();
+    expect(mocks.refetchSummary).toHaveBeenCalledOnce();
   });
 
   it("shows grace and scheduled-cancellation dates from subscription facts", () => {
@@ -690,7 +748,37 @@ describe("BillingTab", () => {
       screen.getByText(/Update your payment method by Feb 15, 2030/),
     ).toBeInTheDocument();
     expect(screen.getByText("Cancellation is scheduled")).toBeInTheDocument();
-    expect(screen.getByText(/Pro remains available through Mar 1, 2030/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/subscription is scheduled to cancel on Mar 1, 2030/),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps cancellation and pending-seat dates on one summary snapshot", () => {
+    Object.assign(mocks.entitlements, {
+      plan: "free",
+      currentPeriodEnd: "2030-03-01T00:00:00Z",
+    });
+    Object.assign(mocks.summary, {
+      entitlement: {
+        ...mocks.entitlements,
+        currentPeriodEnd: "2030-04-01T00:00:00Z",
+      },
+      pendingSeatQuantity: 4,
+      cancelAtPeriodEnd: true,
+      hasStripeCustomer: true,
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(
+      screen.getByText(/subscription is scheduled to cancel on Apr 1, 2030/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/4 seats from Apr 1, 2030/)).toBeInTheDocument();
+    expect(screen.getByText("Mar 1, 2030")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/subscription is scheduled to cancel on Mar 1, 2030/),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Pro remains available/)).not.toBeInTheDocument();
   });
 
   it("shows Pro management and unlimited limits without a second Checkout", () => {

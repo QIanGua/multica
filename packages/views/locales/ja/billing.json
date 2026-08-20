@@ -134,9 +134,13 @@
       "title": "サブスクリプション情報が古い可能性があります",
       "description": "最後の信頼できるスナップショットは期限切れです。更新中も操作はサーバーで検証されます。"
     },
+    "snapshot_unknown": {
+      "title": "サブスクリプション情報を確認できません",
+      "description": "スナップショットの有効期限が無効です。更新中のため、プランに依存する上限は利用できません。"
+    },
     "subscription_notice": {
       "canceling_title": "キャンセルが予定されています",
-      "canceling_description": "{{date}} までは Pro を利用でき、その後このワークスペースは Free に移行します。",
+      "canceling_description": "このサブスクリプションは {{date}} にキャンセルされる予定です。上のプランバッジには現在適用中のアクセス権が表示されます。",
       "canceling_description_without_date": "このサブスクリプションは現在の期間終了時にキャンセルされる予定です。",
       "incomplete_title": "サブスクリプション設定が未完了です",
       "incomplete_description": "請求管理を開き、お支払い設定を完了または確認してください。",
@@ -193,6 +197,7 @@
       "autopilots": "成功した自動化",
       "autopilots_description": "Free の上限は UTC の暦月ごとにリセットされます。Pro は無制限です。",
       "unlimited": "無制限",
+      "unavailable": "利用できません",
       "per_month": "月 {{count}} 回",
       "usage_loading": "自動化の使用量を読み込み中",
       "usage_label": "自動化クォータの使用量",
