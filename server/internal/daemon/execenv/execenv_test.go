@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -6278,7 +6279,7 @@ func TestPrepareRefusesEnvRootOwnedByAnotherTask(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(envRoot, "workdir"), 0o755); err != nil {
 		t.Fatalf("seed env root: %v", err)
 	}
-	if err := writeEnvRootOwner(envRoot, "11111111-2222-3333-4444-555555555555"); err != nil {
+	if err := writeEnvRootOwnerExclusive(envRoot, "11111111-2222-3333-4444-555555555555"); err != nil {
 		t.Fatalf("seed owner: %v", err)
 	}
 	survivor := filepath.Join(envRoot, "workdir", "other-task-work.txt")
@@ -6339,5 +6340,124 @@ func TestPrepareResetsItsOwnEnvRoot(t *testing.T) {
 	defer second.Cleanup(true)
 	if _, statErr := os.Stat(stale); !os.IsNotExist(statErr) {
 		t.Fatalf("rerun did not reset the env root; stale file still present (%v)", statErr)
+	}
+}
+
+// TestPrepareConcurrentSameKeyTasksClaimExclusively is the race the previous
+// ownership check missed. It read the marker, then deleted, then wrote — three
+// steps, so two tasks sharing a taskKey could both observe "no owner", and the
+// slower one would still os.RemoveAll the faster one's live directory.
+//
+// Both ids below end in the same 12 hex chars, so they resolve to one env root.
+// Started together, exactly one must win: the other has to fail without
+// touching the winner's tree.
+func TestPrepareConcurrentSameKeyTasksClaimExclusively(t *testing.T) {
+	t.Parallel()
+	workspacesRoot := t.TempDir()
+	ids := []string{
+		"aaaaaaaa-1111-2222-3333-0123456789ab",
+		"bbbbbbbb-4444-5555-6666-0123456789ab",
+	}
+	if taskKey(ids[0]) != taskKey(ids[1]) {
+		t.Fatalf("fixture ids no longer collide: %q vs %q", taskKey(ids[0]), taskKey(ids[1]))
+	}
+
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	envs := make([]*Environment, len(ids))
+	errs := make([]error, len(ids))
+	for i, id := range ids {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			start.Wait() // release both goroutines into Prepare together
+			envs[i], errs[i] = Prepare(PrepareParams{
+				WorkspacesRoot: workspacesRoot,
+				WorkspaceID:    "ws-race",
+				TaskID:         id,
+				AgentName:      "Racer",
+				Task:           TaskContextForEnv{IssueID: id},
+			}, testLogger())
+		}()
+	}
+	start.Done()
+	done.Wait()
+
+	winner := -1
+	for i := range ids {
+		if errs[i] == nil {
+			if winner >= 0 {
+				t.Fatalf("both tasks claimed the same env root: %s and %s", ids[winner], ids[i])
+			}
+			winner = i
+		}
+	}
+	if winner < 0 {
+		t.Fatalf("neither task started: %v / %v", errs[0], errs[1])
+	}
+	loser := 1 - winner
+	if !strings.Contains(errs[loser].Error(), "env root") {
+		t.Fatalf("loser failed for an unrelated reason: %v", errs[loser])
+	}
+	defer envs[winner].Cleanup(true)
+
+	// The winner's environment must be intact and still its own.
+	if _, err := os.Stat(envs[winner].WorkDir); err != nil {
+		t.Fatalf("winner %s lost its workdir to the loser: %v", ids[winner], err)
+	}
+	owner, err := readEnvRootOwner(envs[winner].RootDir)
+	if err != nil {
+		t.Fatalf("read owner: %v", err)
+	}
+	if owner != ids[winner] {
+		t.Fatalf("env root owner = %q, want the winning task %q", owner, ids[winner])
+	}
+}
+
+// TestClaimEnvRootRefusesUnownedDirectoryWithContent covers the other way the
+// marker can be missing: a directory that holds files but names no task. The
+// marker is written before any content, so this is not a shape Prepare
+// produces — and guessing that it is abandoned would mean deleting work whose
+// owner we could not identify.
+func TestClaimEnvRootRefusesUnownedDirectoryWithContent(t *testing.T) {
+	t.Parallel()
+	envRoot := filepath.Join(t.TempDir(), "ws", "0123456789ab")
+	if err := os.MkdirAll(filepath.Join(envRoot, "workdir"), 0o755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envRoot, "workdir", "work.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if _, err := claimEnvRoot(envRoot, "aaaaaaaa-1111-2222-3333-0123456789ab"); err == nil {
+		t.Fatal("claimEnvRoot took a directory holding files with no owner")
+	} else if !strings.Contains(err.Error(), "names no owning task") {
+		t.Fatalf("error = %v, want it to explain the missing owner", err)
+	}
+	if _, err := os.Stat(filepath.Join(envRoot, "workdir", "work.txt")); err != nil {
+		t.Fatalf("claimEnvRoot deleted the content it refused to claim: %v", err)
+	}
+}
+
+// TestClaimEnvRootAdoptsEmptyDirectory is the self-heal counterpart: a crash
+// between Mkdir and the marker write leaves an empty directory, which holds no
+// work and must not wedge the task forever.
+func TestClaimEnvRootAdoptsEmptyDirectory(t *testing.T) {
+	t.Parallel()
+	envRoot := filepath.Join(t.TempDir(), "ws", "0123456789ab")
+	if err := os.MkdirAll(envRoot, 0o755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	const id = "aaaaaaaa-1111-2222-3333-0123456789ab"
+	fresh, err := claimEnvRoot(envRoot, id)
+	if err != nil {
+		t.Fatalf("claimEnvRoot on an empty directory: %v", err)
+	}
+	if !fresh {
+		t.Fatal("adopting an empty directory should report a fresh claim")
+	}
+	if owner, _ := readEnvRootOwner(envRoot); owner != id {
+		t.Fatalf("owner = %q, want %q", owner, id)
 	}
 }
