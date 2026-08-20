@@ -40,6 +40,8 @@ Assignment does not bypass an agent's Access; when assigning to a squad, the lea
 
 ## Status
 
+Every workspace starts with seven built-in statuses. They are also the seven **categories** — the fixed set of behaviors Multica knows about — so each built-in status names its own category.
+
 | Status | Meaning |
 |---|---|
 | `backlog` | Not starting yet. An issue assigned to an agent only creates a task after it leaves `backlog`. |
@@ -60,6 +62,31 @@ Two changes are made by the system:
 - When a run fails, the issue has no other runs, and no retry is triggered, `in_progress` rolls back to `todo`.
 - When a linked GitHub PR merges with close intent and no other linked PR is still open or draft, the issue becomes `done`.
 </Callout>
+
+### Custom statuses
+
+A workspace owner or admin can add statuses of their own under **Settings → Issue Statuses** — `Code Review`, `QA`, `Rework`. Each new status picks one of the seven categories and inherits that category's behavior in full:
+
+| Category | What every status in it does |
+|---|---|
+| `backlog` | Assigning the issue to an agent does not start a run. |
+| `todo` | Moving the issue here starts the assigned agent. |
+| `in_progress` | Counts as actively worked on: a run that fails with nothing else in flight rolls the issue back to `todo`. |
+| `in_review` | Counts as delivered and waiting on review: it finalizes an [autopilot](/autopilots) run, and past run-failure notifications are archived automatically. |
+| `done` | Counts as finished: it closes out a sub-issue stage and counts toward the parent's progress. |
+| `blocked` | Stalled on something external; nothing resumes on its own. |
+| `cancelled` | No longer pursued, record kept; also terminal for a sub-issue stage. |
+
+So a `Code Review` status in the `in_review` category ends an autopilot run exactly like `in_review` does, and a `Rework` status in the `todo` category starts the assigned agent exactly like `todo` does. The name is what your team reads; the category is what the platform acts on — wherever the rest of this documentation names a status, it is naming the category, and custom statuses inside it are covered too.
+
+Four things follow from that model:
+
+- **A status's category is fixed once the status exists.** Changing it later would silently rewrite what the platform does with every issue already sitting on that status, so the editor keeps it read-only. Choose the behavior first, then name it.
+- **Board columns are categories, not statuses.** Adding a status never adds a column — there is one column per category. A custom status sits in its category's column, and its cards carry a small chip with the status name, so `Code Review` and `QA` stay distinguishable inside In Review.
+- **Built-in statuses are locked.** Their names, colors, and categories cannot be changed, and they cannot be archived — a workspace that never opens the page keeps exactly the board it had.
+- **Archiving retires a status, it does not delete it.** Issues already on it keep it, keep its name and color, and keep behaving the same. It only stops being offered the next time someone sets a status.
+
+Built-in statuses are translated into the interface language; a custom status always shows the name you typed. The API and the CLI address it by its key, derived from the name when you create it: `multica issue status MUL-42 code_review`.
 
 ## Issues and tasks
 
