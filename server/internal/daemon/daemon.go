@@ -6623,6 +6623,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		InitiatorName:                    task.InitiatorName,
 		InitiatorEmail:                   task.InitiatorEmail,
 		WorkspaceContext:                 task.WorkspaceContext,
+		IssueStatuses:                    convertIssueStatusesForEnv(task.IssueStatuses),
+		IssueStatusesOmitted:             task.IssueStatusesOmitted,
 		ConnectedApps:                    task.ConnectedApps,
 	}
 
@@ -8496,6 +8498,17 @@ func repoDataToInfo(repos []RepoData) []repocache.RepoInfo {
 		info[i] = repocache.RepoInfo{URL: r.URL}
 	}
 	return info
+}
+
+func convertIssueStatusesForEnv(statuses []IssueStatusData) []execenv.IssueStatusForEnv {
+	if len(statuses) == 0 {
+		return nil
+	}
+	result := make([]execenv.IssueStatusForEnv, len(statuses))
+	for i, s := range statuses {
+		result[i] = execenv.IssueStatusForEnv{Key: s.Key, Name: s.Name, Category: s.Category, Description: s.Description}
+	}
+	return result
 }
 
 func convertReposForEnv(repos []RepoData) []execenv.RepoContextForEnv {
