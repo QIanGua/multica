@@ -127,6 +127,37 @@ export function issueColumnCategory(
 }
 
 /**
+ * Whether an issue BEHAVES as a given category (MUL-6243).
+ *
+ * The one question every status-coupled product rule actually asks. Comparing
+ * `issue.status` to a built-in key answers it only for a workspace with no
+ * custom statuses: a custom status in the `done` category IS done, and code
+ * that checks `status === "done"` silently disagrees.
+ *
+ * An unresolved custom key answers `false`, and that direction is deliberate —
+ * callers fail safe that way. "Is it done/cancelled?" false keeps a row at full
+ * opacity rather than dimming work that is still open.
+ */
+export function issueBehavesAs(
+  issue: Pick<Issue, "status" | "status_category">,
+  category: IssueStatusCategory,
+): boolean {
+  return issueStatusCategory(issue) === category;
+}
+
+/** True when the issue behaves as any of the given categories. */
+export function issueBehavesAsAny(
+  issue: Pick<Issue, "status" | "status_category">,
+  categories: readonly IssueStatusCategory[],
+): boolean {
+  const resolved = issueStatusCategory(issue);
+  return resolved !== null && categories.includes(resolved);
+}
+
+/** The categories that mean "this issue is closed" — done or cancelled. */
+export const CLOSED_CATEGORIES: readonly IssueStatusCategory[] = ["done", "cancelled"];
+
+/**
  * The `#rrggbb` a surface must paint one catalog entry with, or null when it
  * keeps its category's semantic token.
  *
@@ -201,6 +232,25 @@ export function buildIssueStatusCatalog(
       list.filter((entry) => entry.category === category && !entry.archived_at),
     isLoaded: entries !== undefined,
   };
+}
+
+/**
+ * Whether a status key names a CUSTOM status — i.e. whether a surface that
+ * already shows the CATEGORY still has something left to say (MUL-6243).
+ *
+ * Pure, and takes the catalog the caller already holds, so a row does not open
+ * a second observer to answer the same question it just asked for a colour.
+ */
+export function isCustomStatus(
+  catalog: IssueStatusCatalog,
+  statusKey: string,
+): boolean {
+  const entry = catalog.entryOf(statusKey);
+  if (!entry) return false;
+  // `is_system` is the authority. The key comparison is the backstop for a
+  // server that does not send it — the schema defaults it to false, and a
+  // built-in must stay silent either way.
+  return entry.is_system !== true && statusKey !== catalog.categoryOf(statusKey);
 }
 
 /** One row in the status picker / status filter. */

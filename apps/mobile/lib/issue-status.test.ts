@@ -1,8 +1,13 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { Issue, IssueStatusEntry } from "@multica/core/types";
 import {
   BOARD_CATEGORIES,
+  CLOSED_CATEGORIES,
   buildIssueStatusCatalog,
+  isCustomStatus,
+  issueBehavesAs,
+  issueBehavesAsAny,
   issueColumnCategory,
   issueStatusColor,
   statusOptions,
@@ -180,5 +185,65 @@ describe("statusOptions", () => {
       entry("gate_approved", "done", { archived_at: "2026-01-01T00:00:00Z" }),
     ]);
     expect(statusOptions(c).map((o) => o.key)).not.toContain("gate_approved");
+  });
+});
+
+describe("issueBehavesAs", () => {
+  // The regression: the mention bar dimmed closed issues with
+  // `status === "done"`, so an issue on a custom status in the done category
+  // rendered at full opacity as though the work were still open. A custom
+  // status inherits its category's behavior in full. (MUL-6243)
+  it("treats a custom status in the done category as done", () => {
+    const shipped = issue({ status: "shipped", status_category: "done" });
+    expect(issueBehavesAs(shipped, "done")).toBe(true);
+    expect(issueBehavesAsAny(shipped, CLOSED_CATEGORIES)).toBe(true);
+  });
+
+  it("treats a custom status in the cancelled category as closed", () => {
+    expect(
+      issueBehavesAsAny(issue({ status: "wont_do", status_category: "cancelled" }), CLOSED_CATEGORIES),
+    ).toBe(true);
+  });
+
+  it("still answers for the built-ins", () => {
+    expect(issueBehavesAsAny(issue({ status: "done" }), CLOSED_CATEGORIES)).toBe(true);
+    expect(issueBehavesAsAny(issue({ status: "cancelled" }), CLOSED_CATEGORIES)).toBe(true);
+    expect(issueBehavesAsAny(issue({ status: "in_review" }), CLOSED_CATEGORIES)).toBe(false);
+  });
+
+  // An unresolved custom key fails SAFE: false keeps the row at full opacity
+  // rather than dimming work that may well still be open.
+  it("says no for a status it cannot resolve", () => {
+    expect(issueBehavesAsAny(issue({ status: "qa" }), CLOSED_CATEGORIES)).toBe(false);
+  });
+});
+
+describe("isCustomStatus", () => {
+  // Drives the row chip: a section header already names the category, so the
+  // chip must speak only when the status adds something the header does not.
+  it("is true for a custom status the catalog knows", () => {
+    const c = buildIssueStatusCatalog([entry("qa", "in_review", { name: "QA" })]);
+    expect(isCustomStatus(c, "qa")).toBe(true);
+  });
+
+  it("stays silent for a built-in", () => {
+    const c = buildIssueStatusCatalog([
+      entry("in_review", "in_review", { name: "In Review", is_system: true }),
+    ]);
+    expect(isCustomStatus(c, "in_review")).toBe(false);
+  });
+
+  // Backstop for a server that omits `is_system` — the schema defaults it to
+  // false, and a built-in must stay silent either way.
+  it("stays silent for a built-in row missing is_system", () => {
+    const c = buildIssueStatusCatalog([entry("done", "done", { name: "Done" })]);
+    expect(isCustomStatus(c, "done")).toBe(false);
+  });
+
+  // No catalog means no name to show, so the row renders exactly as it did
+  // before the catalog existed rather than flashing a chip.
+  it("stays silent when the catalog has not landed", () => {
+    expect(isCustomStatus(buildIssueStatusCatalog(undefined), "qa")).toBe(false);
+    expect(isCustomStatus(buildIssueStatusCatalog([]), "qa")).toBe(false);
   });
 });
