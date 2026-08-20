@@ -14,9 +14,8 @@ import (
 
 const (
 	issueWindowErrorCode = "issue_outside_creation_window"
-	// Defensive ceiling for a malformed Cloud payload. Production's expected
-	// limit is three orders of magnitude smaller; failing open is safer than
-	// accepting an effectively unbounded recursive/list query.
+	// Defensive ceiling for a malformed Cloud payload. Failing open is safer
+	// than accepting an effectively unbounded recursive/list query.
 	maxIssueWindowLimit = 1_000_000
 )
 
@@ -59,13 +58,12 @@ func (h *Handler) issueWindowPolicy(ctx context.Context, workspaceID pgtype.UUID
 	}, true
 }
 
-// issueWindowPredicate returns a tenant-scoped SQL predicate for the newest N
+// issueWindowVisibleSetSQL returns the tenant-scoped query for the newest N
 // issues by immutable workspace issue number plus every ancestor needed to
 // render those issues. Ancestors supplement the base N and never expose their
 // other children.
-func issueWindowPredicate(issueAlias, workspaceRef, limitRef string) string {
-	return fmt.Sprintf(`%s.id IN (
-	WITH RECURSIVE issue_window_base AS MATERIALIZED (
+func issueWindowVisibleSetSQL(workspaceRef, limitRef string) string {
+	return fmt.Sprintf(`WITH RECURSIVE issue_window_base AS MATERIALIZED (
 		SELECT id, parent_issue_id
 		FROM issue
 		WHERE workspace_id = %s
@@ -79,8 +77,15 @@ func issueWindowPredicate(issueAlias, workspaceRef, limitRef string) string {
 		JOIN issue_window_visible child ON child.parent_issue_id = parent.id
 		WHERE parent.workspace_id = %s
 	)
-	SELECT id FROM issue_window_visible
-)`, issueAlias, workspaceRef, limitRef, workspaceRef)
+	SELECT id FROM issue_window_visible`, workspaceRef, limitRef, workspaceRef)
+}
+
+func issueWindowIDPredicate(issueIDExpr, workspaceRef, limitRef string) string {
+	return fmt.Sprintf("%s IN (\n\t%s\n)", issueIDExpr, issueWindowVisibleSetSQL(workspaceRef, limitRef))
+}
+
+func issueWindowPredicate(issueAlias, workspaceRef, limitRef string) string {
+	return issueWindowIDPredicate(issueAlias+".id", workspaceRef, limitRef)
 }
 
 // appendIssueWindow applies enforcement to a dynamic issue query. Observe and
@@ -129,6 +134,23 @@ func (h *Handler) visibleIssueIDSet(ctx context.Context, workspaceID pgtype.UUID
 	return visible, rows.Err()
 }
 
+func (h *Handler) issueWindowVisibleIDs(ctx context.Context, workspaceID pgtype.UUID, policy issueWindowPolicy) ([]pgtype.UUID, error) {
+	rows, err := h.DB.Query(ctx, issueWindowVisibleSetSQL("$1", "$2"), workspaceID, policy.limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (h *Handler) recordIssueWindow(action entitlement.Action, surface, result string) {
 	if h.Metrics != nil {
 		h.Metrics.RecordIssueWindowDecision(string(action), surface, result)
@@ -158,6 +180,10 @@ func (h *Handler) observeIssueWindow(ctx context.Context, workspaceID pgtype.UUI
 // authorizeIssueWindow runs only after the issue was loaded inside the caller's
 // workspace. This preserves cross-workspace 404s while returning a product-
 // actionable response for a same-workspace issue outside an enforced window.
+// Once Cloud has supplied a valid enforce policy, a database error is an
+// authorization uncertainty and therefore fails closed. That is deliberately
+// different from an unavailable or malformed Cloud policy, which fails open
+// before any window query runs.
 func (h *Handler) authorizeIssueWindow(w http.ResponseWriter, r *http.Request, issueID, workspaceID pgtype.UUID, surface string) bool {
 	policy, enabled := h.issueWindowPolicy(r.Context(), workspaceID)
 	if !enabled {

@@ -9,13 +9,27 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/entitlement"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 type staticIssueWindowProvider struct {
 	decision entitlement.Decision
+}
+
+type countingIssueWindowDB struct {
+	dbExecutor
+	windowQueries int
+}
+
+func (db *countingIssueWindowDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, "issue_window_base") {
+		db.windowQueries++
+	}
+	return db.dbExecutor.Query(ctx, sql, args...)
 }
 
 func (p staticIssueWindowProvider) Gate(context.Context, uuid.UUID, entitlement.GateName) entitlement.Decision {
@@ -36,11 +50,11 @@ func TestIssueWindowPolicyFailsOpen(t *testing.T) {
 		provider entitlement.Provider
 	}{
 		{name: "nil provider"},
-		{name: "off", provider: issueWindowProvider(entitlement.ActionOff, 1000)},
+		{name: "off", provider: issueWindowProvider(entitlement.ActionOff, 17)},
 		{name: "zero limit", provider: issueWindowProvider(entitlement.ActionEnforce, 0)},
 		{name: "negative limit", provider: issueWindowProvider(entitlement.ActionObserve, -1)},
 		{name: "oversized limit", provider: issueWindowProvider(entitlement.ActionEnforce, maxIssueWindowLimit+1)},
-		{name: "unknown action", provider: issueWindowProvider(entitlement.Action("future"), 1000)},
+		{name: "unknown action", provider: issueWindowProvider(entitlement.Action("future"), 17)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -76,10 +90,35 @@ func TestAppendIssueWindowOnlyEnforces(t *testing.T) {
 		where := appendIssueWindow([]string{"i.workspace_id = $1"}, func(value any) string {
 			args = append(args, value)
 			return "$2"
-		}, issueWindowPolicy{action: action, limit: 1000}, "$1", "i")
+		}, issueWindowPolicy{action: action, limit: 17}, "$1", "i")
 		if len(where) != 1 || len(args) != 1 {
 			t.Fatalf("%s changed the legacy query: where=%v args=%v", action, where, args)
 		}
+	}
+}
+
+func TestIssueTableReusesOneVisibleIDSnapshot(t *testing.T) {
+	counter := &countingIssueWindowDB{dbExecutor: testHandler.DB}
+	h := *testHandler
+	h.DB = counter
+	h.Entitlements = issueWindowProvider(entitlement.ActionEnforce, 1)
+	h.issueTableWindowCache = &issueTableWindowCache{}
+	spec := issueTableQuerySpec{
+		Scope: issueTableScope{Kind: "workspace"},
+		Sort:  issueTableSortRequest{Field: "position", Direction: "asc"},
+	}
+	for range 2 {
+		recorder := httptest.NewRecorder()
+		compiled, ok := h.compileIssueTableQuery(recorder, newRequest(http.MethodPost, "/api/issues/table/rows", nil), spec)
+		if !ok {
+			t.Fatalf("compile table query: %d %s", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(compiled.where, "i.id = ANY(") || strings.Contains(compiled.where, "issue_window_base") {
+			t.Fatalf("table query did not use cached ids: %s", compiled.where)
+		}
+	}
+	if counter.windowQueries != 1 {
+		t.Fatalf("visible window queries = %d, want one per table snapshot", counter.windowQueries)
 	}
 }
 
@@ -255,4 +294,136 @@ func TestIssueCreationWindowObserveDoesNotFilter(t *testing.T) {
 	if len(body.Issues) != 2 || body.Total != 2 {
 		t.Fatalf("observe filtered the list: %#v", body)
 	}
+}
+
+func TestIssueCreationWindowPreservesUnreadInboxSemantics(t *testing.T) {
+	workspaceID := dbfx.Workspace(t, "Inbox issue window", "inbox-window-"+uuid.NewString())
+	dbfx.Member(t, workspaceID, testUserID, "owner")
+	hiddenIssueID := dbfx.Issue(t, "hidden inbox issue", testutil.Cols{"workspace_id": workspaceID, "number": 1})
+	visibleIssueID := dbfx.Issue(t, "visible inbox issue", testutil.Cols{"workspace_id": workspaceID, "number": 2})
+
+	insertInbox := func(title, issueID string, read bool, createdAt string) {
+		t.Helper()
+		dbfx.Insert(t, "inbox_item", testutil.Cols{
+			"workspace_id":   workspaceID,
+			"recipient_type": "member",
+			"recipient_id":   testUserID,
+			"type":           "issue_assigned",
+			"severity":       "info",
+			"issue_id":       issueID,
+			"title":          title,
+			"read":           read,
+			"archived":       false,
+			"created_at":     testutil.Raw(createdAt),
+		})
+	}
+	// The visible issue's newest row is read, so its older unread sibling must
+	// not light the cross-workspace summary (MUL-3695).
+	insertInbox("visible older unread", visibleIssueID, false, "now() - interval '2 minutes'")
+	insertInbox("visible newest read", visibleIssueID, true, "now() - interval '1 minute'")
+	insertInbox("hidden newest unread", hiddenIssueID, false, "now()")
+
+	request := func(path string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-User-ID", testUserID)
+		req.Header.Set("X-Workspace-ID", workspaceID)
+		return req
+	}
+	assertCounts := func(t *testing.T, action entitlement.Action, wantWorkspaceCount, wantSummaryCount int64) {
+		t.Helper()
+		h := *testHandler
+		h.Entitlements = issueWindowProvider(action, 1)
+
+		countRecorder := httptest.NewRecorder()
+		middleware.RequireWorkspaceMember(h.Queries)(http.HandlerFunc(h.CountUnreadInbox)).ServeHTTP(
+			countRecorder,
+			request("/api/inbox/unread-count"),
+		)
+		if countRecorder.Code != http.StatusOK {
+			t.Fatalf("unread count status = %d: %s", countRecorder.Code, countRecorder.Body.String())
+		}
+		var countBody map[string]int64
+		if err := json.NewDecoder(countRecorder.Body).Decode(&countBody); err != nil {
+			t.Fatalf("decode unread count: %v", err)
+		}
+		if countBody["count"] != wantWorkspaceCount {
+			t.Fatalf("unread count = %d, want %d", countBody["count"], wantWorkspaceCount)
+		}
+
+		summaryRecorder := httptest.NewRecorder()
+		h.UnreadInboxSummary(summaryRecorder, request("/api/inbox/unread-summary"))
+		if summaryRecorder.Code != http.StatusOK {
+			t.Fatalf("unread summary status = %d: %s", summaryRecorder.Code, summaryRecorder.Body.String())
+		}
+		var summary []InboxWorkspaceUnreadResponse
+		if err := json.NewDecoder(summaryRecorder.Body).Decode(&summary); err != nil {
+			t.Fatalf("decode unread summary: %v", err)
+		}
+		var got int64
+		for _, row := range summary {
+			if row.WorkspaceID == workspaceID {
+				got = row.Count
+			}
+		}
+		if got != wantSummaryCount {
+			t.Fatalf("unread summary = %d, want %d: %#v", got, wantSummaryCount, summary)
+		}
+	}
+
+	t.Run("observe leaves both legacy responses unchanged", func(t *testing.T) {
+		assertCounts(t, entitlement.ActionObserve, 2, 1)
+	})
+	t.Run("enforce filters hidden issues without reviving older siblings", func(t *testing.T) {
+		assertCounts(t, entitlement.ActionEnforce, 1, 0)
+	})
+}
+
+func TestIssueCreationWindowChildProgressKeepsFullTotals(t *testing.T) {
+	workspaceID := dbfx.Workspace(t, "Progress issue window", "progress-window-"+uuid.NewString())
+	dbfx.Member(t, workspaceID, testUserID, "owner")
+	parentID := dbfx.Issue(t, "progress parent", testutil.Cols{"workspace_id": workspaceID, "number": 100})
+	_ = dbfx.Issue(t, "hidden done child", testutil.Cols{
+		"workspace_id": workspaceID, "number": 1, "parent_issue_id": parentID, "status": "done",
+	})
+	_ = dbfx.Issue(t, "hidden open child", testutil.Cols{
+		"workspace_id": workspaceID, "number": 2, "parent_issue_id": parentID, "status": "todo",
+	})
+	_ = dbfx.Issue(t, "unrelated recent issue", testutil.Cols{"workspace_id": workspaceID, "number": 200})
+	_ = dbfx.Issue(t, "visible open child", testutil.Cols{
+		"workspace_id": workspaceID, "number": 300, "parent_issue_id": parentID, "status": "todo",
+	})
+
+	h := *testHandler
+	h.Entitlements = issueWindowProvider(entitlement.ActionEnforce, 2)
+	req := httptest.NewRequest(http.MethodGet, "/api/issues/child-progress", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", workspaceID)
+	recorder := httptest.NewRecorder()
+	h.ChildIssueProgress(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("child progress status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Progress []struct {
+			ParentIssueID string `json:"parent_issue_id"`
+			Total         int64  `json:"total"`
+			Done          int64  `json:"done"`
+			VisibleTotal  int64  `json:"visible_total"`
+			VisibleDone   int64  `json:"visible_done"`
+			HiddenTotal   int64  `json:"hidden_total"`
+		} `json:"progress"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&body); err != nil {
+		t.Fatalf("decode child progress: %v", err)
+	}
+	for _, progress := range body.Progress {
+		if progress.ParentIssueID != parentID {
+			continue
+		}
+		if progress.Total != 3 || progress.Done != 1 || progress.VisibleTotal != 1 || progress.VisibleDone != 0 || progress.HiddenTotal != 2 {
+			t.Fatalf("child progress = %#v, want full 1/3 and visible 0/1 with 2 hidden", progress)
+		}
+		return
+	}
+	t.Fatalf("visible parent missing from child progress: %#v", body.Progress)
 }

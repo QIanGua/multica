@@ -80,3 +80,10 @@ with `issue_outside_creation_window`; cross-workspace identifiers are resolved
 inside the requested workspace first and remain indistinguishable 404s. The
 bounded `/api/issues/window-usage` probe scans at most `limit + 1` entries from
 the existing unique `(workspace_id, number)` index.
+
+The two failure stages intentionally differ. An unavailable, stale, or
+malformed Cloud decision degrades through `observe` to `off`, so it never
+creates a new read-path dependency. After a valid `enforce` decision exists,
+however, a database failure while evaluating the visible set fails closed: the
+server cannot prove that the requested issue is allowed. `observe` evaluation
+errors remain fail-open and are recorded as telemetry only.

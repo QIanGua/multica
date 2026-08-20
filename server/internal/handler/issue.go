@@ -596,7 +596,7 @@ type searchResult struct {
 // It uses LOWER(column) LIKE for case-insensitive matching compatible with pg_bigm 1.2 GIN indexes.
 // Search patterns are lowercased in Go to avoid redundant LOWER() on the pattern side in SQL.
 // LIKE patterns are pre-built in Go (e.g. "%html%") so pg_bigm can extract bigrams from a single parameter value.
-func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, includeClosed bool, creationWindowLimit ...int64) (string, []any) {
+func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, includeClosed bool, creationWindowLimit *int64) (string, []any) {
 	// Lowercase in Go so SQL only needs LOWER() on the column side.
 	phrase = strings.ToLower(phrase)
 	for i, t := range terms {
@@ -680,8 +680,8 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	if !includeClosed {
 		whereClause += " AND issue_effective_status(i.workspace_id, i.status) NOT IN ('done', 'cancelled')"
 	}
-	if len(creationWindowLimit) > 0 {
-		limitRef := nextArg(creationWindowLimit[0])
+	if creationWindowLimit != nil {
+		limitRef := nextArg(*creationWindowLimit)
 		whereClause = issueWindowPredicate("i", wsParam, limitRef) + " AND " + whereClause
 	}
 
@@ -895,13 +895,11 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	queryNum, hasNum := parseQueryNumber(q)
 	policy, windowEnabled := h.issueWindowPolicy(ctx, wsUUID)
 
-	var sqlQuery string
-	var args []any
+	var creationWindowLimit *int64
 	if windowEnabled && policy.action == entitlement.ActionEnforce {
-		sqlQuery, args = buildSearchQuery(q, terms, queryNum, hasNum, includeClosed, policy.limit)
-	} else {
-		sqlQuery, args = buildSearchQuery(q, terms, queryNum, hasNum, includeClosed)
+		creationWindowLimit = &policy.limit
 	}
+	sqlQuery, args := buildSearchQuery(q, terms, queryNum, hasNum, includeClosed, creationWindowLimit)
 	// Fill placeholder args: $4 = workspace_id, last two = limit, offset
 	args[3] = wsUUID
 	args[len(args)-2] = limit
@@ -2435,18 +2433,27 @@ func (h *Handler) ChildIssueProgress(w http.ResponseWriter, r *http.Request) {
 		ParentIssueID string `json:"parent_issue_id"`
 		Total         int64  `json:"total"`
 		Done          int64  `json:"done"`
+		VisibleTotal  int64  `json:"visible_total"`
+		VisibleDone   int64  `json:"visible_done"`
+		HiddenTotal   int64  `json:"hidden_total"`
 	}
 	policy, windowEnabled := h.issueWindowPolicy(r.Context(), wsUUID)
 	resp := []progressEntry{}
 	if windowEnabled && policy.action == entitlement.ActionEnforce {
-		query := fmt.Sprintf(`SELECT i.parent_issue_id,
+		query := fmt.Sprintf(`WITH visible_issue_ids AS MATERIALIZED (
+			%s
+		)
+		SELECT i.parent_issue_id,
 			COUNT(*)::bigint AS total,
-			COUNT(*) FILTER (WHERE issue_effective_status(i.workspace_id, i.status) IN ('done', 'cancelled'))::bigint AS done
+			COUNT(*) FILTER (WHERE issue_effective_status(i.workspace_id, i.status) IN ('done', 'cancelled'))::bigint AS done,
+			COUNT(child_visible.id)::bigint AS visible_total,
+			COUNT(child_visible.id) FILTER (WHERE issue_effective_status(i.workspace_id, i.status) IN ('done', 'cancelled'))::bigint AS visible_done
 		FROM issue i
+		JOIN visible_issue_ids parent_visible ON parent_visible.id = i.parent_issue_id
+		LEFT JOIN visible_issue_ids child_visible ON child_visible.id = i.id
 		WHERE i.workspace_id = $1
 		  AND i.parent_issue_id IS NOT NULL
-		  AND %s
-		GROUP BY i.parent_issue_id`, issueWindowPredicate("i", "$1", "$2"))
+		GROUP BY i.parent_issue_id`, issueWindowVisibleSetSQL("$1", "$2"))
 		rows, err := h.DB.Query(r.Context(), query, wsUUID, policy.limit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
@@ -2456,11 +2463,12 @@ func (h *Handler) ChildIssueProgress(w http.ResponseWriter, r *http.Request) {
 		for rows.Next() {
 			var parentID pgtype.UUID
 			var entry progressEntry
-			if err := rows.Scan(&parentID, &entry.Total, &entry.Done); err != nil {
+			if err := rows.Scan(&parentID, &entry.Total, &entry.Done, &entry.VisibleTotal, &entry.VisibleDone); err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
 				return
 			}
 			entry.ParentIssueID = uuidToString(parentID)
+			entry.HiddenTotal = entry.Total - entry.VisibleTotal
 			resp = append(resp, entry)
 		}
 		if err := rows.Err(); err != nil {
@@ -2478,6 +2486,8 @@ func (h *Handler) ChildIssueProgress(w http.ResponseWriter, r *http.Request) {
 				ParentIssueID: uuidToString(row.ParentIssueID),
 				Total:         row.Total,
 				Done:          row.Done,
+				VisibleTotal:  row.Total,
+				VisibleDone:   row.Done,
 			})
 		}
 	}

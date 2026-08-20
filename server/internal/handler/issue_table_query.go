@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/entitlement"
+	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -48,7 +50,35 @@ func (h *Handler) beginIssueTableSnapshot(ctx context.Context) (*Handler, pgx.Tx
 	snapshot := *h
 	snapshot.DB = tx
 	snapshot.Queries = db.New(tx)
+	snapshot.issueTableWindowCache = &issueTableWindowCache{}
 	return &snapshot, tx, nil
+}
+
+type issueTableWindowCache struct {
+	workspaceID    pgtype.UUID
+	limit          int64
+	policyRevision int64
+	ids            []pgtype.UUID
+	loaded         bool
+}
+
+func (h *Handler) issueTableVisibleIssueIDs(ctx context.Context, workspaceID pgtype.UUID, policy issueWindowPolicy) ([]pgtype.UUID, error) {
+	cache := h.issueTableWindowCache
+	if cache != nil && cache.loaded && cache.workspaceID == workspaceID && cache.limit == policy.limit && cache.policyRevision == policy.policyRevision {
+		return cache.ids, nil
+	}
+	ids, err := h.issueWindowVisibleIDs(ctx, workspaceID, policy)
+	if err != nil {
+		return nil, err
+	}
+	if cache != nil {
+		cache.workspaceID = workspaceID
+		cache.limit = policy.limit
+		cache.policyRevision = policy.policyRevision
+		cache.ids = ids
+		cache.loaded = true
+	}
+	return ids, nil
 }
 
 func writeIssueTableQueryFailure(w http.ResponseWriter, r *http.Request, message string) {
@@ -641,7 +671,15 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 		where = append(where, "i.parent_issue_id IS NULL")
 	}
 	where = appendIssueTableSearchFilter(where, addArg, spec.Search)
-	if windowEnabled {
+	if windowEnabled && windowPolicy.action == entitlement.ActionEnforce && h.issueTableWindowCache != nil {
+		visibleIDs, err := h.issueTableVisibleIssueIDs(r.Context(), workspaceUUID, windowPolicy)
+		if err != nil {
+			slog.Warn("resolve table issue window failed", append(logger.RequestAttrs(r), "error", err)...)
+			writeIssueTableQueryFailure(w, r, "failed to resolve table issue window")
+			return issueTableSQL{}, false
+		}
+		where = append(where, fmt.Sprintf("i.id = ANY(%s::uuid[])", addArg(visibleIDs)))
+	} else if windowEnabled {
 		where = appendIssueWindow(where, addArg, windowPolicy, "$1", "i")
 	}
 
