@@ -4189,7 +4189,24 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		// Create the retry child atomically with the fail. CreateRetryTask reads
 		// the just-failed parent row (same tx), so it inherits chat_input_task_id
 		// and the bumped chat-retry priority; broadcast/notify happen after commit.
-		if wantRetry {
+		// Checked inside the transaction so a rerun committing concurrently
+		// cannot slip into the slot between this check and the insert.
+		createRetry := wantRetry
+		if createRetry {
+			successor, herr := hasRunnableSuccessor(ctx, qtx, t)
+			if herr != nil {
+				return fmt.Errorf("check runnable successor: %w", herr)
+			}
+			if successor {
+				slog.Info("fail task auto-retry skipped: a successor is already pending",
+					"task_id", util.UUIDToString(taskID),
+					"issue_id", util.UUIDToString(t.IssueID),
+					"agent_id", util.UUIDToString(t.AgentID),
+				)
+				createRetry = false
+			}
+		}
+		if createRetry {
 			child, cerr := qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
 				ID:                   taskID,
 				FireAt:               retryFireAt,
@@ -4491,6 +4508,31 @@ func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 		(t.IssueID.Valid || t.ChatSessionID.Valid)
 }
 
+// hasRunnableSuccessor reports whether another not-yet-started task already
+// occupies the single queued/dispatched slot that
+// idx_one_pending_task_per_issue_agent_v2 allows per (issue, agent).
+//
+// Both auto-retry paths consult this before inserting a retry child. A manual
+// rerun can now be enqueued BEHIND a still-running task instead of cancelling
+// it, so by the time that task fails its slot may already be taken. Inserting
+// the retry anyway violates the unique index; on the FailTask path that insert
+// shares the failure transaction, so the violation would roll the parent's
+// failed status back too and leave the task stuck in 'running'. Skipping is the
+// right answer rather than a workaround: the retry exists to give the issue a
+// runnable successor, and one already exists.
+//
+// Chat / quick-create tasks carry no issue_id, so the index cannot apply to them
+// and their retries can never collide.
+func hasRunnableSuccessor(ctx context.Context, q *db.Queries, task db.AgentTaskQueue) (bool, error) {
+	if !task.IssueID.Valid {
+		return false, nil
+	}
+	return q.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
+		IssueID: task.IssueID,
+		AgentID: task.AgentID,
+	})
+}
+
 // MaybeRetryFailedTask spawns a fresh queued attempt for a recently-failed
 // task when the failure was infrastructure-shaped (daemon crash, runtime
 // went offline, dispatch/run timeout) and the task hasn't exhausted its
@@ -4554,6 +4596,21 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	var retryFireAt pgtype.Timestamptz
 	if delay := retryDelayForAttempt(reason, parent.Attempt); delay > 0 {
 		retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
+	}
+	// Same slot check as FailTask's in-tx path. This one is not sharing a
+	// transaction with the fail, so a collision here would only lose the retry
+	// rather than the failed status — but losing it silently to a unique-violation
+	// log line is worse than skipping deliberately when a successor already exists.
+	if successor, herr := hasRunnableSuccessor(ctx, s.Queries, parent); herr != nil {
+		slog.Warn("task auto-retry: successor check failed; attempting retry anyway",
+			"parent_task_id", util.UUIDToString(parent.ID), "error", herr)
+	} else if successor {
+		slog.Info("task auto-retry skipped: a successor is already pending",
+			"parent_task_id", util.UUIDToString(parent.ID),
+			"issue_id", util.UUIDToString(parent.IssueID),
+			"agent_id", util.UUIDToString(parent.AgentID),
+		)
+		return nil, nil
 	}
 	child, err := s.Queries.CreateRetryTask(ctx, db.CreateRetryTaskParams{
 		ID:                   parent.ID,
