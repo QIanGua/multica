@@ -16,7 +16,7 @@ func TestIssueLastActivityIndexRetirement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	t.Run("fresh install skips retired index build", func(t *testing.T) {
+	t.Run("fresh install builds then retires historical index", func(t *testing.T) {
 		schema, pool := createIssueLastActivityIndexFixture(t, ctx, adminPool)
 		migrationsTable := schema + ".schema_migrations"
 		options := runOptions{
@@ -31,7 +31,7 @@ func TestIssueLastActivityIndexRetirement(t *testing.T) {
 		if err := runMigrations(ctx, pool, options); err != nil {
 			t.Fatalf("apply historical index migration: %v", err)
 		}
-		assertIndexExists(t, pool, schema, "idx_issue_workspace_last_activity", false)
+		assertIndexValidity(t, pool, schema, "idx_issue_workspace_last_activity", true)
 		assertMigrationVersionRecorded(t, ctx, pool, schema, "361_issue_last_activity_index", true)
 
 		options.Files = realMigrationFiles(t, []string{"375_drop_issue_last_activity_index"}, "up")
@@ -40,6 +40,11 @@ func TestIssueLastActivityIndexRetirement(t *testing.T) {
 		}
 		assertIndexExists(t, pool, schema, "idx_issue_workspace_last_activity", false)
 		assertMigrationVersionRecorded(t, ctx, pool, schema, "375_drop_issue_last_activity_index", true)
+
+		if err := runMigrations(ctx, pool, options); err != nil {
+			t.Fatalf("repeat applied index retirement migration: %v", err)
+		}
+		assertIndexExists(t, pool, schema, "idx_issue_workspace_last_activity", false)
 	})
 
 	t.Run("existing deployment drops index and rollback restores it", func(t *testing.T) {

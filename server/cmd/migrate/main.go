@@ -280,10 +280,6 @@ var preRollbackHooks = func() map[string]preMigrationHook {
 }()
 
 var upMigrationConditions = map[string]migrationCondition{
-	// The recent-activity issue window that migration 361 prepared has not been
-	// enabled. Migration 375 retires its write-heavy serving index, so a fresh
-	// install should not build that index only to drop it a few versions later.
-	"361_issue_last_activity_index": skipMigrationSQL("index retired by migration 375"),
 	// Fresh databases that successfully built the CJK-friendly bigram index do
 	// not need to build the trigram fallback only to remove it at migration 371.
 	"140_comment_content_trgm_index": whenIndexNotUsable(commentContentBigramIndex),
@@ -291,12 +287,6 @@ var upMigrationConditions = map[string]migrationCondition{
 	// fallback only after proving the preferred index has the exact usable shape;
 	// pg_bigm-less self-hosted databases keep trgm and record 371 as a no-op.
 	"371_comment_content_search_index_strategy": whenIndexUsable(commentContentBigramIndex),
-}
-
-func skipMigrationSQL(reason string) migrationCondition {
-	return func(context.Context, *pgxpool.Conn) (bool, string, error) {
-		return false, reason, nil
-	}
 }
 
 func hooksForDirection(direction string) map[string]preMigrationHook {
