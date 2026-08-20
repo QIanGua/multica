@@ -134,21 +134,31 @@ func (h *Handler) visibleIssueIDSet(ctx context.Context, workspaceID pgtype.UUID
 	return visible, rows.Err()
 }
 
-func (h *Handler) issueWindowVisibleIDs(ctx context.Context, workspaceID pgtype.UUID, policy issueWindowPolicy) ([]pgtype.UUID, error) {
-	rows, err := h.DB.Query(ctx, issueWindowVisibleSetSQL("$1", "$2"), workspaceID, policy.limit)
+// issueWindowVisibleIDsUpTo returns the complete visible set only when it fits
+// within maxIDs. The extra row detects ancestor expansion without loading an
+// unbounded UUID slice into the application.
+func (h *Handler) issueWindowVisibleIDsUpTo(ctx context.Context, workspaceID pgtype.UUID, policy issueWindowPolicy, maxIDs int64) ([]pgtype.UUID, bool, error) {
+	query := fmt.Sprintf("SELECT id FROM (\n%s\n) bounded_issue_window LIMIT $3", issueWindowVisibleSetSQL("$1", "$2"))
+	rows, err := h.DB.Query(ctx, query, workspaceID, policy.limit, maxIDs+1)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
-	var ids []pgtype.UUID
+	ids := make([]pgtype.UUID, 0, maxIDs)
 	for rows.Next() {
 		var id pgtype.UUID
 		if err := rows.Scan(&id); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		ids = append(ids, id)
 	}
-	return ids, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if int64(len(ids)) > maxIDs {
+		return nil, false, nil
+	}
+	return ids, true, nil
 }
 
 func (h *Handler) recordIssueWindow(action entitlement.Action, surface, result string) {

@@ -122,6 +122,31 @@ func TestIssueTableReusesOneVisibleIDSnapshot(t *testing.T) {
 	}
 }
 
+func TestIssueTableLargeWindowStaysInPostgres(t *testing.T) {
+	counter := &countingIssueWindowDB{dbExecutor: testHandler.DB}
+	h := *testHandler
+	h.DB = counter
+	h.Entitlements = issueWindowProvider(entitlement.ActionEnforce, issueTableWindowIDCacheLimit+1)
+	h.issueTableWindowCache = &issueTableWindowCache{}
+	spec := issueTableQuerySpec{
+		Scope: issueTableScope{Kind: "workspace"},
+		Sort:  issueTableSortRequest{Field: "position", Direction: "asc"},
+	}
+	for range 2 {
+		recorder := httptest.NewRecorder()
+		compiled, ok := h.compileIssueTableQuery(recorder, newRequest(http.MethodPost, "/api/issues/table/rows", nil), spec)
+		if !ok {
+			t.Fatalf("compile table query: %d %s", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(compiled.where, "issue_window_base") || strings.Contains(compiled.where, "i.id = ANY(") {
+			t.Fatalf("large table window did not stay in PostgreSQL: %s", compiled.where)
+		}
+	}
+	if counter.windowQueries != 0 {
+		t.Fatalf("large table window preloads = %d, want none", counter.windowQueries)
+	}
+}
+
 func TestIssueWindowUsageOffDoesNotNeedDatabase(t *testing.T) {
 	h := &Handler{}
 	req := httptest.NewRequest(http.MethodGet, "/api/issues/window-usage", nil)

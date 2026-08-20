@@ -28,6 +28,9 @@ const (
 	issueTableDefaultPageSize = 50
 	issueTableMaxPageSize     = 100
 	issueTableQueryTimeout    = 8 * time.Second
+	// This is a transport and memory guard, independent of entitlement limits.
+	// Larger visible sets stay in PostgreSQL instead of becoming UUID arrays.
+	issueTableWindowIDCacheLimit = 4_096
 )
 
 func withIssueTableQueryTimeout(r *http.Request) (*http.Request, context.CancelFunc) {
@@ -59,26 +62,33 @@ type issueTableWindowCache struct {
 	limit          int64
 	policyRevision int64
 	ids            []pgtype.UUID
+	useIDs         bool
 	loaded         bool
 }
 
-func (h *Handler) issueTableVisibleIssueIDs(ctx context.Context, workspaceID pgtype.UUID, policy issueWindowPolicy) ([]pgtype.UUID, error) {
+func (h *Handler) issueTableVisibleIssueIDs(ctx context.Context, workspaceID pgtype.UUID, policy issueWindowPolicy) ([]pgtype.UUID, bool, error) {
 	cache := h.issueTableWindowCache
 	if cache != nil && cache.loaded && cache.workspaceID == workspaceID && cache.limit == policy.limit && cache.policyRevision == policy.policyRevision {
-		return cache.ids, nil
+		return cache.ids, cache.useIDs, nil
 	}
-	ids, err := h.issueWindowVisibleIDs(ctx, workspaceID, policy)
-	if err != nil {
-		return nil, err
+	var ids []pgtype.UUID
+	useIDs := policy.limit <= issueTableWindowIDCacheLimit
+	if useIDs {
+		var err error
+		ids, useIDs, err = h.issueWindowVisibleIDsUpTo(ctx, workspaceID, policy, issueTableWindowIDCacheLimit)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	if cache != nil {
 		cache.workspaceID = workspaceID
 		cache.limit = policy.limit
 		cache.policyRevision = policy.policyRevision
 		cache.ids = ids
+		cache.useIDs = useIDs
 		cache.loaded = true
 	}
-	return ids, nil
+	return ids, useIDs, nil
 }
 
 func writeIssueTableQueryFailure(w http.ResponseWriter, r *http.Request, message string) {
@@ -672,13 +682,17 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 	}
 	where = appendIssueTableSearchFilter(where, addArg, spec.Search)
 	if windowEnabled && windowPolicy.action == entitlement.ActionEnforce && h.issueTableWindowCache != nil {
-		visibleIDs, err := h.issueTableVisibleIssueIDs(r.Context(), workspaceUUID, windowPolicy)
+		visibleIDs, useIDs, err := h.issueTableVisibleIssueIDs(r.Context(), workspaceUUID, windowPolicy)
 		if err != nil {
 			slog.Warn("resolve table issue window failed", append(logger.RequestAttrs(r), "error", err)...)
 			writeIssueTableQueryFailure(w, r, "failed to resolve table issue window")
 			return issueTableSQL{}, false
 		}
-		where = append(where, fmt.Sprintf("i.id = ANY(%s::uuid[])", addArg(visibleIDs)))
+		if useIDs {
+			where = append(where, fmt.Sprintf("i.id = ANY(%s::uuid[])", addArg(visibleIDs)))
+		} else {
+			where = appendIssueWindow(where, addArg, windowPolicy, "$1", "i")
+		}
 	} else if windowEnabled {
 		where = appendIssueWindow(where, addArg, windowPolicy, "$1", "i")
 	}
