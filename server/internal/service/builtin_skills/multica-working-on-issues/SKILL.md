@@ -192,13 +192,15 @@ on it. These are the contracts, not advice:
   `StartTask` / `CompleteTask` side effects. The runtime brief asks agents to
   write the state the issue is in whenever their work changes it — not from
   the trigger type or the run's lifecycle, and not gated on being the
-  assignee. A turn that advances the issue's own ask sets `in_progress` as
-  soon as that is known, so the board shows the work while it runs; at the
-  end of the turn the work's state is recorded: delivered the issue's own
-  ask → `in_review`; work continues beyond the turn (dispatched sub-issues,
-  partial delivery) → `in_progress`; stuck → `blocked`. A turn that produces
-  none of the issue's own deliverable — answering a question, reviewing,
-  discussing — writes nothing at either moment; research and design count as
+  assignee. Writes happen whenever the state changes, mid-turn included: a
+  turn that advances the issue's own ask sets `in_progress` as soon as that
+  is known, so the board shows the work while it runs; a blocker is recorded
+  when it is hit; and the turn must not exit with a stale value — delivered
+  the issue's own ask → `in_review`; work continues beyond the turn
+  (dispatched sub-issues, partial delivery) → `in_progress`; stuck →
+  `blocked`. A turn that produces none of the issue's own deliverable —
+  answering a question, reviewing,
+  discussing — writes nothing at any point; research and design count as
   the work when they are what the issue asks for. Questions, discussion, or
   acknowledgements never move the status. Squad leaders:
   dispatching members is not delivery — a dispatch turn leaves the parent
