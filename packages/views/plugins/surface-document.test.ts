@@ -16,11 +16,15 @@ describe("surface connect-src", () => {
       .toEqual(["https://example.com", "https://api.example.com"]);
   });
 
-  it("gives a surface with no net: scope no destination at all", () => {
-    // 'none', and now that is the whole story. While the code loaded from the
-    // author's server, script-src had to name that origin, so a surface could
-    // always reach its author back. The code is ours to serve now, so this
-    // policy names no remote origin of any kind.
+  it("names no remote origin when no net: scope was granted", () => {
+    // While the code loaded from the author's server, script-src had to name
+    // that origin, so a surface could always reach its author back. The code is
+    // ours to serve now, so this policy names no remote origin of any kind.
+    //
+    // That bounds what the DOCUMENT can request. It is not the same claim as
+    // "a surface cannot reach its author": the sandbox still permits the frame
+    // to navigate itself, which no CSP directive covers. See the known gap in
+    // surface-document.ts.
     const csp = buildSurfaceCSP(["issues:read"]);
     expect(csp).toContain("connect-src 'none'");
     expect(csp).toContain("script-src 'unsafe-inline'");
@@ -66,11 +70,22 @@ describe("surface document", () => {
   });
 
   it("fetches nothing to render a surface", () => {
-    // The point of hosting the artifact: no request leaves this frame to load
-    // the plugin, so opening a panel tells the author nothing about who opened
-    // it.
+    // The point of hosting the artifact: rendering the panel issues no request,
+    // so a well-behaved plugin's author learns nothing about who opened it.
     const document = buildSurfaceDocument({ code: "console.log('hi');", grantedScopes: [], theme: {} });
     expect(document).not.toContain("<script src=");
+  });
+
+  it("reports a navigation away so the embedder can drop the bridge", () => {
+    // A sandboxed frame may navigate ITSELF, and the resulting document keeps
+    // the same contentWindow — which is the only identity the bridge has. The
+    // beacon is registered before the plugin's code runs, on an anonymous
+    // listener it holds no reference to, so it cannot be detached.
+    const document = buildSurfaceDocument({ code: "console.log('hi');", grantedScopes: [], theme: {} });
+    expect(document).toContain("pagehide");
+    expect(document).toContain("multica:plugin-surface-navigated");
+    // Registered before the bootstrap hands control to the plugin.
+    expect(document.indexOf("pagehide")).toBeLessThan(document.indexOf("appendChild"));
   });
 
   it("carries code that would otherwise close the script element early", () => {

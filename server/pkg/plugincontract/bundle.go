@@ -251,21 +251,132 @@ func validateSurfaceScript(entry string, content []byte) error {
 	return nil
 }
 
-// findTopLevelImport looks for an unindented `import ...` or `export ...`
-// statement, the shape that turns a surface into a module the host cannot load.
+// findTopLevelImport reports the line of an `import` or `export` STATEMENT — the
+// shape that turns a surface into a module the host cannot load — ignoring
+// anything inside a comment or a string.
 //
-// Deliberately shallow: it reads line starts, not JavaScript. That makes it
-// blind to an import written after leading whitespace, and it will not be fooled
-// into rejecting `foo.import(...)` or a string containing the word. A publish
-// check that is occasionally silent is fine; one that occasionally refuses valid
-// code is not.
+// This refuses a publish, so the bar it has to clear is asymmetric: missing one
+// costs an author a runtime error they can read, while a false positive blocks a
+// legitimate publish with no way around it. A line-prefix scan cannot clear that
+// bar in either direction — it misses `  import x` and `/* c */ import x`, and it
+// rejects a valid file that merely contains the word at the start of a line
+// inside a template literal, which is ordinary in a surface that renders code
+// samples.
+//
+// So this walks the source instead. Where it is imprecise it is imprecise
+// SAFELY: `/` is always read as division rather than a regex, and a `}` inside a
+// template expression pops back to template early. Both mistakes hide code from
+// the scan, which can only cost a detection — never invent one.
+//
+// `import(` is left alone deliberately: dynamic import is legal in a classic
+// script.
 func findTopLevelImport(source string) (int, bool) {
-	for index, line := range strings.Split(source, "\n") {
-		if strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "export ") ||
-			strings.HasPrefix(line, "import{") || strings.HasPrefix(line, "export{") ||
-			strings.HasPrefix(line, "import*") || strings.HasPrefix(line, "export*") {
-			return index + 1, true
+	const (
+		inCode = iota
+		inLineComment
+		inBlockComment
+		inSingle
+		inDouble
+		inTemplate
+	)
+
+	state := inCode
+	// Depth of template literals whose `${ ... }` expression we are inside, so a
+	// nested template does not end its parent early.
+	var templateStack []bool
+	line := 1
+	// Whether only whitespace has been seen, in CODE, since the last newline.
+	// That is what makes this a statement check rather than a word search:
+	// `a.import` and `x = import(y)` are both preceded by something else.
+	atLineStart := true
+
+	for index := 0; index < len(source); index++ {
+		char := source[index]
+		if char == '\n' {
+			line++
+			if state == inLineComment {
+				state = inCode
+			}
+			if state == inCode {
+				atLineStart = true
+			}
+			continue
 		}
+
+		switch state {
+		case inLineComment:
+			continue
+		case inBlockComment:
+			if char == '*' && index+1 < len(source) && source[index+1] == '/' {
+				state = inCode
+				index++
+			}
+			continue
+		case inSingle, inDouble, inTemplate:
+			if char == '\\' {
+				index++
+				continue
+			}
+			if (state == inSingle && char == '\'') || (state == inDouble && char == '"') || (state == inTemplate && char == '`') {
+				state = inCode
+				continue
+			}
+			if state == inTemplate && char == '$' && index+1 < len(source) && source[index+1] == '{' {
+				templateStack = append(templateStack, true)
+				state = inCode
+				index++
+			}
+			continue
+		}
+
+		// inCode from here.
+		switch {
+		case char == '/' && index+1 < len(source) && source[index+1] == '/':
+			state = inLineComment
+			index++
+			continue
+		case char == '/' && index+1 < len(source) && source[index+1] == '*':
+			state = inBlockComment
+			index++
+			continue
+		case char == '\'':
+			state = inSingle
+			atLineStart = false
+			continue
+		case char == '"':
+			state = inDouble
+			atLineStart = false
+			continue
+		case char == '`':
+			state = inTemplate
+			atLineStart = false
+			continue
+		case char == '}' && len(templateStack) > 0:
+			templateStack = templateStack[:len(templateStack)-1]
+			state = inTemplate
+			continue
+		case char == ' ' || char == '\t' || char == '\r':
+			continue
+		}
+
+		if atLineStart {
+			for _, keyword := range []string{"import", "export"} {
+				if !strings.HasPrefix(source[index:], keyword) {
+					continue
+				}
+				rest := source[index+len(keyword):]
+				if rest == "" {
+					continue
+				}
+				// A delimiter, so `exports.foo = …` and `importantThing` do not
+				// match. `(` is excluded on purpose: dynamic import is fine.
+				switch rest[0] {
+				case ' ', '\t', '\r', '\n', '{', '*':
+					return line, true
+				}
+			}
+		}
+		atLineStart = false
 	}
 	return 0, false
 }

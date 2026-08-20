@@ -1,3 +1,17 @@
+-- name: LockPluginPackageKey :exec
+-- Serializes publish, install and delete for one (workspace, plugin key).
+--
+-- Relationships are application-owned by repository policy, so there are no
+-- foreign keys to make "this version still exists" true across statements.
+-- Without this lock the interleaving `delete counts 0 installs` → `install
+-- reads the version` → `delete commits` → `install commits` leaves an
+-- installation pointing at a version that no longer exists, and its panel 404s
+-- forever with nothing in the product able to explain why.
+--
+-- Keyed on the plugin key rather than the package id because publish has no
+-- package id yet — the row it would lock is the one it may be about to create.
+SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));
+
 -- name: CreatePluginPackage :one
 INSERT INTO plugin_package (workspace_id, plugin_key, name, created_by)
 VALUES ($1, $2, $3, $4)

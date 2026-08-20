@@ -220,3 +220,58 @@ func TestParseBundleFromDirMatchesTheUploadPath(t *testing.T) {
 		t.Fatal("a missing surface entry must fail the local publish too")
 	}
 }
+
+// The publish-time module check refuses a publish, so it is asymmetric: missing
+// an import costs the author a readable runtime error, while a false positive
+// blocks a legitimate publish outright. This pins both directions.
+func TestSurfaceEntryModuleDetection(t *testing.T) {
+	refused := map[string]string{
+		"bare import":                  "import { multica } from \"./sdk.js\";\n",
+		"indented import":              "  import { multica } from \"./sdk.js\";\n",
+		"import after a line comment":  "// set up\nimport { multica } from \"./sdk.js\";\n",
+		"import after a block comment": "/* set up */ import { multica } from \"./sdk.js\";\n",
+		"namespace import":             "import * as sdk from \"./sdk.js\";\n",
+		"named export":                 "export { render };\n",
+		"import inside a function":     "function boot() {\n  import { x } from \"./x.js\";\n}\n",
+	}
+	for name, source := range refused {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseDirBundle(t, source); err == nil {
+				t.Fatal("a module-only entry was published; it cannot load as a classic script")
+			}
+		})
+	}
+
+	accepted := map[string]string{
+		// The case the line-prefix version got wrong: a surface that renders a
+		// code sample is ordinary, and refusing it leaves the author stuck.
+		"import inside a template literal": "const help = `\nimport { multica } from \"@multica/plugin-sdk\";\n`;\nconsole.log(help);\n",
+		"import inside a string":           "const help = \"import x from 'y'\";\nconsole.log(help);\n",
+		"import inside a comment":          "// import { x } from \"./x.js\";\nconsole.log(1);\n",
+		// Dynamic import is legal in a classic script.
+		"dynamic import":              "const load = () => import(\"./late.js\");\nload();\n",
+		"a property named import":     "const registry = {};\nregistry.import = 1;\n",
+		"a word starting with export": "const exports = {};\nexports.value = 1;\n",
+		"nested template expression":  "const x = `a${ `b` }c`;\nconsole.log(x);\n",
+	}
+	for name, source := range accepted {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseDirBundle(t, source); err != nil {
+				t.Fatalf("a valid surface entry was refused: %v", err)
+			}
+		})
+	}
+}
+
+func parseDirBundle(t *testing.T, entry string) (plugincontract.Bundle, error) {
+	t.Helper()
+	files := map[string]string{
+		plugincontract.ManifestFilename: bundleManifest,
+		"ui/main.js":                    entry,
+		"skills/pr-review/SKILL.md":     "Read the diff.\n",
+	}
+	return plugincontract.ParseBundleFromDir(func(name string) ([]byte, bool, error) {
+		content, ok := files[name]
+		return []byte(content), ok, nil
+	})
+}
