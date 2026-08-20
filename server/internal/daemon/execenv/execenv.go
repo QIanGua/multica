@@ -318,7 +318,7 @@ func PredictRootDir(workspacesRoot, workspaceID, taskID string) string {
 	if workspacesRoot == "" || workspaceID == "" || taskID == "" {
 		return ""
 	}
-	return filepath.Join(workspacesRoot, workspaceID, shortID(taskID))
+	return filepath.Join(workspacesRoot, workspaceID, taskKey(taskID))
 }
 
 // Prepare creates an isolated execution environment for a task.
@@ -335,7 +335,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		return nil, fmt.Errorf("execenv: task ID is required")
 	}
 
-	envRoot := filepath.Join(params.WorkspacesRoot, params.WorkspaceID, shortID(params.TaskID))
+	envRoot := PredictRootDir(params.WorkspacesRoot, params.WorkspaceID, params.TaskID)
 
 	// Self-heal the root-level daemon marker on every task start so a marker
 	// removed while the daemon runs is restored before the agent spawns. The
@@ -347,7 +347,10 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		logger.Warn("execenv: workspaces root marker not written; fail-closed guard limited to the task workdir", "error", err)
 	}
 
-	// Remove existing env if present (defensive — task IDs are unique).
+	// Remove existing env if present. Safe because the directory segment is the
+	// full task id (see taskKey): the only task that can own this path is this
+	// one, on a rerun. It was NOT safe while the segment was an 8-char prefix —
+	// that made this line delete a live sibling task's env root (#7326).
 	if _, err := os.Stat(envRoot); err == nil {
 		if err := os.RemoveAll(envRoot); err != nil {
 			return nil, fmt.Errorf("execenv: remove existing env: %w", err)

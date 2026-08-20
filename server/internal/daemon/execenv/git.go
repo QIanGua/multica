@@ -183,7 +183,21 @@ func repoNameFromURL(url string) string {
 	return name
 }
 
+// taskKey returns the filesystem- and git-safe segment that identifies a task
+// in a path or branch name. It keeps the WHOLE id (dashes stripped) on purpose.
+//
+// A truncated id is not safe here. Task ids are UUIDv7, whose leading 8 hex
+// chars are the high 32 bits of a 48-bit millisecond timestamp — they only
+// advance once every 2^16 ms (~65.5s). Any two tasks created inside the same
+// window would share a prefix, and therefore an env root, which made Prepare's
+// "remove existing env" step delete a concurrently running task's directory
+// (#7326). Use shortID for logs, never for identity.
+func taskKey(uuid string) string {
+	return strings.ReplaceAll(uuid, "-", "")
+}
+
 // shortID returns the first 8 characters of a UUID string (dashes stripped).
+// Display and logging only — see taskKey for anything that must be unique.
 func shortID(uuid string) string {
 	s := strings.ReplaceAll(uuid, "-", "")
 	if len(s) > 8 {

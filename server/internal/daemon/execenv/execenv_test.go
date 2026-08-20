@@ -41,7 +41,7 @@ func TestShortID(t *testing.T) {
 func TestPredictRootDir(t *testing.T) {
 	t.Parallel()
 	got := PredictRootDir("/root", "ws-uuid", "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-	want := filepath.Join("/root", "ws-uuid", "a1b2c3d4")
+	want := filepath.Join("/root", "ws-uuid", "a1b2c3d4e5f67890abcdef1234567890")
 	if got != want {
 		t.Errorf("PredictRootDir = %q, want %q", got, want)
 	}
@@ -6145,5 +6145,96 @@ func TestEnvironmentCleanupStandardModeRemovesWorkdir(t *testing.T) {
 	// output/logs should remain.
 	if _, err := os.Stat(filepath.Join(env.RootDir, "output")); err != nil {
 		t.Fatalf("output/ removed by partial cleanup: %v", err)
+	}
+}
+
+// TestPredictRootDirDistinctForSharedUUIDv7Prefix is the regression guard for
+// #7326. Task ids are UUIDv7: the first 8 hex chars are the high 32 bits of a
+// 48-bit millisecond timestamp, so they only advance once every 2^16 ms
+// (~65.5s). Every task started inside one such window shares that prefix.
+// While the env root used the prefix, the second task's Prepare deleted the
+// first task's live directory — identity files, worktree and all.
+//
+// The three ids below are the ones from the bug report, ~4.7s apart.
+func TestPredictRootDirDistinctForSharedUUIDv7Prefix(t *testing.T) {
+	t.Parallel()
+	ids := []string{
+		"01a01ec0-e69d-7000-8000-000000000001",
+		"01a01ec0-f014-7000-8000-000000000002",
+		"01a01ec0-f927-7000-8000-000000000003",
+	}
+	seen := make(map[string]string, len(ids))
+	for _, id := range ids {
+		root := PredictRootDir("/root", "ws-uuid", id)
+		if prev, dup := seen[root]; dup {
+			t.Fatalf("tasks %s and %s share env root %q — a truncated task id is back", prev, id, root)
+		}
+		seen[root] = id
+	}
+}
+
+// TestLocalWorktreeBranchDistinctForSharedUUIDv7Prefix covers the same
+// truncation in the branch name: two concurrent tasks for one agent would
+// otherwise both ask git for agent/<name>/<same-prefix>.
+func TestLocalWorktreeBranchDistinctForSharedUUIDv7Prefix(t *testing.T) {
+	t.Parallel()
+	a := fmt.Sprintf("agent/%s/%s", sanitizeName("Reviewer"), taskKey("01a01ec0-e69d-7000-8000-000000000001"))
+	b := fmt.Sprintf("agent/%s/%s", sanitizeName("Reviewer"), taskKey("01a01ec0-f014-7000-8000-000000000002"))
+	if a == b {
+		t.Fatalf("both tasks resolved to branch %q", a)
+	}
+}
+
+// TestPrepareDoesNotDeleteConcurrentTaskEnv is the behavioural half of the
+// #7326 regression. Prepare removes an existing env root before recreating it,
+// which is correct only while that path belongs exclusively to the task being
+// prepared. With an 8-char UUIDv7 prefix it did not: task B's Prepare ran
+// os.RemoveAll over task A's *running* env root, destroying its identity
+// files, worktree and task-scoped config while A was still executing.
+func TestPrepareDoesNotDeleteConcurrentTaskEnv(t *testing.T) {
+	t.Parallel()
+	workspacesRoot := t.TempDir()
+
+	// Same first 8 hex chars — i.e. created inside the same ~65.5s window.
+	const (
+		taskA = "01a01ec0-e69d-7000-8000-000000000001"
+		taskB = "01a01ec0-f014-7000-8000-000000000002"
+	)
+
+	envA, err := Prepare(PrepareParams{
+		WorkspacesRoot: workspacesRoot,
+		WorkspaceID:    "ws-collision",
+		TaskID:         taskA,
+		AgentName:      "Agent A",
+		Task:           TaskContextForEnv{IssueID: taskA},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("Prepare task A: %v", err)
+	}
+	defer envA.Cleanup(true)
+
+	// A marker standing in for everything a live task owns under its env root.
+	marker := filepath.Join(envA.WorkDir, "task-a-work.txt")
+	if err := os.WriteFile(marker, []byte("A"), 0o644); err != nil {
+		t.Fatalf("seed task A work: %v", err)
+	}
+
+	envB, err := Prepare(PrepareParams{
+		WorkspacesRoot: workspacesRoot,
+		WorkspaceID:    "ws-collision",
+		TaskID:         taskB,
+		AgentName:      "Agent B",
+		Task:           TaskContextForEnv{IssueID: taskB},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("Prepare task B: %v", err)
+	}
+	defer envB.Cleanup(true)
+
+	if envA.RootDir == envB.RootDir {
+		t.Fatalf("both tasks share env root %q", envA.RootDir)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("task B's Prepare destroyed task A's live env root: %v", err)
 	}
 }

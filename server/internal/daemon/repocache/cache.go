@@ -829,8 +829,8 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 		return nil, fmt.Errorf("cannot resolve default branch for %s: bare cache at %s has no usable refs (origin/* is empty or ambiguous and bare HEAD has no match). The cache may be corrupted; delete it and retry", params.RepoURL, barePath)
 	}
 
-	// Build branch name: agent/{sanitized-name}/{short-task-id}
-	branchName := fmt.Sprintf("agent/%s/%s", sanitizeName(params.AgentName), shortID(params.TaskID))
+	// Build branch name: agent/{sanitized-name}/{task-id}
+	branchName := fmt.Sprintf("agent/%s/%s", sanitizeName(params.AgentName), taskKey(params.TaskID))
 
 	// Derive directory name from repo URL.
 	dirName := repoNameFromURL(params.RepoURL)
@@ -1782,7 +1782,16 @@ func sanitizeName(name string) string {
 	return s
 }
 
+// taskKey returns the git-safe branch segment identifying a task. It keeps the
+// whole id: a UUIDv7's leading 8 hex chars only advance every ~65.5s, so a
+// truncated segment gave two concurrently created tasks the same branch name
+// (#7326). Mirrors execenv.taskKey.
+func taskKey(uuid string) string {
+	return strings.ReplaceAll(uuid, "-", "")
+}
+
 // shortID returns the first 8 characters of a UUID string (dashes stripped).
+// Display and logging only — see taskKey for anything that must be unique.
 func shortID(uuid string) string {
 	s := strings.ReplaceAll(uuid, "-", "")
 	if len(s) > 8 {
