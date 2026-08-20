@@ -1,15 +1,93 @@
+-- name: CreatePluginPackage :one
+INSERT INTO plugin_package (workspace_id, plugin_key, name, created_by)
+VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- name: UpdatePluginPackageName :one
+-- The display name follows the newest published version. The key never moves:
+-- it is the identity an installation was consented under.
+UPDATE plugin_package
+SET name = $2,
+    updated_at = now()
+WHERE id = $1
+RETURNING *;
+
+-- name: GetWorkspacePluginPackageByKey :one
+SELECT * FROM plugin_package
+WHERE workspace_id = $1 AND plugin_key = $2;
+
+-- name: GetWorkspacePluginPackage :one
+SELECT * FROM plugin_package
+WHERE workspace_id = $1 AND id = $2;
+
+-- name: ListWorkspacePluginPackages :many
+SELECT * FROM plugin_package
+WHERE workspace_id = $1
+ORDER BY name ASC;
+
+-- name: DeletePluginPackage :exec
+DELETE FROM plugin_package WHERE id = $1;
+
+-- name: CreatePluginPackageVersion :one
+-- Published versions are only ever inserted. Nothing updates one, and the
+-- (package_id, version) unique index is what makes a second publish of the same
+-- version a conflict instead of a silent overwrite.
+INSERT INTO plugin_package_version (
+    package_id, workspace_id, version, manifest, digest, size_bytes, published_by
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING *;
+
+-- name: ListPluginPackageVersions :many
+SELECT * FROM plugin_package_version
+WHERE package_id = $1
+ORDER BY created_at DESC;
+
+-- name: GetWorkspacePluginPackageVersion :one
+SELECT * FROM plugin_package_version
+WHERE workspace_id = $1 AND id = $2;
+
+-- name: DeletePluginPackageVersionsByPackage :exec
+DELETE FROM plugin_package_version WHERE package_id = $1;
+
+-- name: CountInstallationsOfPackageVersions :one
+-- Whether any workspace still runs a version of this package. Publishing is
+-- workspace-private, so this is scoped to the same workspace by construction.
+SELECT count(*) FROM plugin_installation
+WHERE package_version_id IN (
+    SELECT id FROM plugin_package_version WHERE package_id = $1
+);
+
+-- name: CreatePluginPackageFile :exec
+INSERT INTO plugin_package_file (version_id, path, content, size_bytes, sha256)
+VALUES ($1, $2, $3, $4, $5);
+
+-- name: GetPluginPackageFile :one
+SELECT * FROM plugin_package_file
+WHERE version_id = $1 AND path = $2;
+
+-- name: ListPluginPackageFilePaths :many
+-- Paths and sizes only: the publisher's file list never needs the bytes.
+SELECT path, size_bytes, sha256 FROM plugin_package_file
+WHERE version_id = $1
+ORDER BY path ASC;
+
+-- name: DeletePluginPackageFilesByPackage :exec
+DELETE FROM plugin_package_file
+WHERE version_id IN (SELECT id FROM plugin_package_version WHERE package_id = $1);
+
 -- name: CreatePluginInstallation :one
 INSERT INTO plugin_installation (
-    workspace_id, plugin_key, source_url, version, manifest, granted_scopes, installed_by
+    workspace_id, plugin_key, package_version_id, version, manifest, granted_scopes, installed_by
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: UpdatePluginInstallationManifest :one
--- Upgrade path: the re-consented manifest snapshot replaces the old one in
--- place. Config values survive on purpose; fields the new manifest dropped are
--- pruned by the service before this runs.
+-- Upgrade path: the installation is re-pointed at another published version and
+-- takes that version's consented manifest snapshot. Config values survive on
+-- purpose; fields the new manifest dropped are pruned by the service before this
+-- runs.
 UPDATE plugin_installation
-SET source_url = $2,
+SET package_version_id = $2,
     version = $3,
     manifest = $4,
     granted_scopes = $5,
