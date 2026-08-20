@@ -30,6 +30,7 @@ import { Text } from "@/components/ui/text";
 import { ActorAvatar } from "@/components/ui/actor-avatar";
 import { PriorityIcon } from "@/components/ui/priority-icon";
 import { StatusIcon } from "@/components/ui/status-icon";
+import { issueColumnCategory } from "@/lib/issue-status";
 
 interface Props {
   issue: Issue;
@@ -42,7 +43,15 @@ export function IssueRow({ issue, onPress, showStatus = false }: Props) {
   return (
     <Pressable onPress={onPress} className="active:bg-secondary px-4 py-3">
       <View className="flex-row items-center gap-3">
-        {showStatus ? <StatusIcon status={issue.status} size={14} /> : null}
+        {/* The glyph is per CATEGORY, so a custom status draws its category's
+            icon rather than falling back to Todo's. (MUL-6243) */}
+        {showStatus ? (
+          <StatusIcon
+            status={issue.status}
+            category={issueColumnCategory(issue)}
+            size={14}
+          />
+        ) : null}
         <PriorityIcon priority={issue.priority} size={14} />
         <Text className="text-xs text-muted-foreground shrink-0 w-16">
           {issue.identifier}

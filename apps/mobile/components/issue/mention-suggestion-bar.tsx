@@ -30,6 +30,7 @@ import { canAssignAgentToIssue } from "@multica/core/permissions";
 import { Text } from "@/components/ui/text";
 import { ActorAvatar } from "@/components/ui/actor-avatar";
 import { StatusIcon } from "@/components/ui/status-icon";
+import { issueColumnCategory } from "@/lib/issue-status";
 import { memberListOptions } from "@/data/queries/members";
 import { agentListOptions } from "@/data/queries/agents";
 import { squadListOptions } from "@/data/queries/squads";
@@ -368,7 +369,11 @@ export function MentionSuggestionBar({
               )}
             >
               <View className="size-7 items-center justify-center">
-                <StatusIcon status={item.issue.status} size={16} />
+                <StatusIcon
+                  status={item.issue.status}
+                  category={issueColumnCategory(item.issue)}
+                  size={16}
+                />
               </View>
               <Text className="text-sm font-medium text-foreground">
                 {item.issue.identifier}
