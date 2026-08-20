@@ -143,8 +143,8 @@ Contracts:
 - archived squad / archived leader rejected at assign-time (issue.go:2622-2627);
 - pending task dedup is applied (squad.go:1042-1048);
 - parent status is agent-managed: since MUL-6417 the brief's status rule is a
-  single end-of-turn fact judgment (`writeWorkflowIssue`), and the leader
-  variant adds one bullet — dispatching members is not delivery, so a dispatch
+  fact judgment written when the work changes it (`writeWorkflowIssue`), and the
+  leader variant adds one bullet — dispatching members is not delivery, so a dispatch
   turn leaves the parent `in_progress` and `in_review` waits for the re-trigger
   that confirms the overall goal is met. Squad Operating Protocol
   (`squad_briefing.go`) still states the ongoing `in_progress` → later
@@ -236,7 +236,7 @@ Contracts:
   standing "Own the parent issue status" responsibility (present exactly when
   the issue is assigned to this squad) states the same expectation; the system
   comment marks the wrap-up moment. Since MUL-6417 the write itself needs no
-  grant — the brief's end-of-turn fact judgment covers it — but `done` remains
+  grant — the brief's fact judgment covers it — but `done` remains
   human / integration owned.
 
 ## Private Leader Access

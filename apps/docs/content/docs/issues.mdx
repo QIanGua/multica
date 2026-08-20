@@ -52,7 +52,7 @@ Assignment does not bypass an agent's Access; when assigning to a squad, the lea
 
 There is no fixed flow between statuses — members and agents can change them directly.
 
-Agents judge status at the end of a turn, from what the work changed about the issue: delivering what the issue asks for moves it to `in_review`; work that continues beyond the turn keeps it `in_progress`; research, answers, or discussion leave the status untouched. There is no automatic `in_progress` write when a run starts — an in-flight run is already visible on the issue. These updates are written explicitly by the agent through the Multica CLI during the run — the server does not flip issue status when a task starts or completes (apart from the two system exceptions below). `done` is usually a human confirmation, or an integration such as a PR with close intent that merges.
+Agents write the status the issue is in as their work changes it: starting work on what the issue asks for moves it to `in_progress` right away, so the board shows the work while it runs; delivering moves it to `in_review`; work that continues beyond the turn keeps it `in_progress`; research, answers, or discussion leave the status untouched throughout. These updates are written explicitly by the agent through the Multica CLI during the run — the server does not flip issue status when a task starts or completes (apart from the two system exceptions below). `done` is usually a human confirmation, or an integration such as a PR with close intent that merges.
 
 <Callout type="info">
 Two changes are made by the system:

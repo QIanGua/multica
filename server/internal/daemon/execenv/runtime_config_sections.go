@@ -541,17 +541,25 @@ func writeWorkflowAutopilot(b *strings.Builder, ctx TaskContextForEnv) {
 //   - Delivery routes on data: the per-turn message either carries a
 //     triggering comment with this turn's --parent value (reply in that
 //     thread) or it does not (post a new top-level comment).
-//   - Status is judged once, at the END of the turn, from what the work
-//     actually changed about the issue — not from the trigger type, not from
-//     the run lifecycle, and not gated on being the assignee. Lifecycle
-//     writes oscillate under concurrent runs (every run flips its own
-//     open/close pair — the churn MUL-6300's assignee gate existed to stop);
-//     fact writes converge, because agents judging the same fact write the
-//     same value or nothing. The board's in-flight signal is the issue
-//     activity indicator, which renders independently of status, so no
-//     opening in_progress write is needed — and a todo issue the agent was
-//     only asked to research correctly stays todo, which the old
-//     unconditional arc got wrong twice.
+//   - Status is written when the FACT changes, judged from what the work
+//     changes about the issue — not from the trigger type, not from the run
+//     lifecycle, and not gated on being the assignee. Lifecycle writes
+//     oscillate under concurrent runs (every run flips its own open/close
+//     pair — the churn MUL-6300's assignee gate existed to stop); fact
+//     writes converge, because agents judging the same fact write the same
+//     value or nothing. A todo issue the agent was only asked to research
+//     correctly stays todo, which the old unconditional arc got wrong twice.
+//
+// The in_progress moment is the START of work, not the end of the turn: a
+// turn that advances the issue's own ask makes "being worked" true the moment
+// it begins, and the first work turn on a fresh assignment can run for half
+// an hour — judged only at turn end, the board showed todo the whole time
+// (Bohan's post-merge report on MUL-6417). This is the old rule's timing
+// with the fact anchor's conditionality: an ancillary turn still writes
+// nothing at either moment, so the research case and the concurrency
+// convergence are unchanged. The activity indicator still shows the run
+// itself, but columns, filters, and sorting read status — the indicator
+// alone proved not to be the board surface people actually watch.
 //
 // The invariants MUL-6300 pinned survive as consequences instead of gates: a
 // conversational turn changes nothing about the issue's state, so it writes
@@ -598,15 +606,16 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 	}
 	b.WriteString("5. Before exiting, pin or clear a metadata key via `multica issue metadata set`/`delete` only if it clears the bar in `## Issue Metadata`. Most runs write nothing here — that is the expected outcome, not a gap. When in doubt, do not write.\n\n")
 
-	b.WriteString("**Issue status — judge once, at the end of the turn** (skip any status call your Agent Identity forbids)\n\n")
-	b.WriteString("Status reflects the state the ISSUE is in, not your run's lifecycle: a run in flight is already visible on the issue, so do not open with a status write. When your work is done, write the status the issue is now actually in — only if it differs from the current value, whoever the assignee is:\n\n")
+	b.WriteString("**Issue status — write the state the issue is in, whenever it changes** (skip any status call your Agent Identity forbids)\n\n")
+	b.WriteString("Status reflects the state the ISSUE is in, not your run's lifecycle — and it can change when your work STARTS, not only when it ends. Write a status only when the new value differs from the current one, whoever the assignee is:\n\n")
+	b.WriteString("- The moment you know this turn advances what the issue itself asks for — usually right after reading it — set `in_progress`: the board should show the issue being worked while you work, not only after.\n")
 	b.WriteString("- You delivered what the issue itself asks for and it awaits acceptance → `in_review`. Delivering an issue assigned to you — including a sub-issue in a chain or stage — always lands here; stage barriers and parent notifications depend on that signal. `done` stays human.\n")
 	b.WriteString("- The issue's work continues beyond this turn — you dispatched sub-issues, or delivered one part with more underway → `in_progress`.\n")
 	b.WriteString("- You cannot proceed without something you are missing → `blocked`, and post a comment explaining the blocker unless your Agent Identity forbids issue comments.\n")
 	if ctx.IsSquadLeader {
 		b.WriteString("- Squad leader: dispatching members is not delivery — a dispatch turn leaves the parent `in_progress`, and it moves to `in_review` only on the later turn (a member update or stage-barrier re-trigger) where you confirm the overall goal is met.\n")
 	}
-	b.WriteString("- Your turn only researched, answered, reviewed, or discussed — the issue's own state did not move → write nothing. A `todo` issue you were asked to research stays `todo`; questions, discussion, and acknowledgements never touch status. This no-write default is what keeps concurrent runs from flapping the board.\n\n")
+	b.WriteString("- Your turn only researches, answers, reviews, or discusses — the issue's own state never moves → write nothing, at the start or the end. A `todo` issue you were asked to research stays `todo`; questions, discussion, and acknowledgements never touch status. This no-write default is what keeps concurrent runs from flapping the board.\n\n")
 }
 
 // writeSubIssueCreation emits the Sub-issue Creation section.

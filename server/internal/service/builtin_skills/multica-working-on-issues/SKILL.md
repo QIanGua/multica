@@ -190,18 +190,19 @@ on it. These are the contracts, not advice:
   the assigned agent then.
 - **`in_progress` / `in_review`** are agent-managed CLI mutations, not
   `StartTask` / `CompleteTask` side effects. The runtime brief asks agents to
-  judge status once, at the END of a turn, from what the work changed about
-  the issue — not from the trigger type or the run's lifecycle, and not gated
-  on being the assignee: delivered the issue's own ask → `in_review`; work
-  continues beyond the turn (dispatched sub-issues, partial delivery) →
-  `in_progress`; stuck → `blocked`. A turn that only researched, answered,
-  reviewed, or discussed writes nothing — a `todo` issue researched on
-  request stays `todo`, and questions, discussion, or acknowledgements never
-  move the status. There is no opening `in_progress` write; the in-flight
-  run is already visible on the issue. Squad leaders: dispatching members is
-  not delivery — a dispatch turn leaves the parent `in_progress`, and it
-  moves to `in_review` only when a later re-trigger confirms the overall
-  goal is met.
+  write the state the issue is in whenever their work changes it — not from
+  the trigger type or the run's lifecycle, and not gated on being the
+  assignee. A turn that advances the issue's own ask sets `in_progress` as
+  soon as that is known, so the board shows the work while it runs; at the
+  end of the turn the work's state is recorded: delivered the issue's own
+  ask → `in_review`; work continues beyond the turn (dispatched sub-issues,
+  partial delivery) → `in_progress`; stuck → `blocked`. A turn that only
+  researched, answered, reviewed, or discussed writes nothing at either
+  moment — a `todo` issue researched on request stays `todo`, and questions,
+  discussion, or acknowledgements never move the status. Squad leaders:
+  dispatching members is not delivery — a dispatch turn leaves the parent
+  `in_progress`, and it moves to `in_review` only when a later re-trigger
+  confirms the overall goal is met.
 - **`in_review`** is an accepted issue status. Some workflows use it while a PR
   is open and awaiting review; moving to it is an explicit mutation.
 - **`done`** on a child issue posts a system comment on its parent. If a PR

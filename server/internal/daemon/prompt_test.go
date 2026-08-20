@@ -1667,8 +1667,8 @@ func TestBriefCarriesNoModeRouter(t *testing.T) {
 			t.Errorf("brief still references the retired turn-mode split via %q (MUL-6417)\n---\n%s", banned, brief)
 		}
 	}
-	if !strings.Contains(brief, "**Issue status — judge once, at the end of the turn**") {
-		t.Errorf("brief lost the unified end-of-turn status rule\n---\n%s", brief)
+	if !strings.Contains(brief, "**Issue status — write the state the issue is in, whenever it changes**") {
+		t.Errorf("brief lost the unified status rule\n---\n%s", brief)
 	}
 }
 

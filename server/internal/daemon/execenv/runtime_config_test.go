@@ -139,21 +139,24 @@ func TestBriefHasNoParentNotificationGuidance(t *testing.T) {
 	}
 }
 
-// The status rule is a single end-of-turn fact judgment (MUL-6417): no
-// trigger-type modes, no assignee gate, no opening in_progress write. The two
-// invariants MUL-6300 pinned as gates (PR #205, reinforced by Elon's blocking
-// review on PR #2918) survive as consequences of the fact anchor and stay
-// pinned here:
+// The status rule is a fact judgment with two write moments (MUL-6417): no
+// trigger-type modes, no assignee gate. A turn that advances the issue's own
+// ask records in_progress when it STARTS — judged only at turn end, a fresh
+// assignment sat in todo for the whole first work turn (Bohan's post-merge
+// report) — and the end of the turn records the state the work reached. The
+// two invariants MUL-6300 pinned as gates (PR #205, reinforced by Elon's
+// blocking review on PR #2918) survive as consequences of the fact anchor and
+// stay pinned here:
 //
 //   - a purely conversational turn changes nothing about the issue's state,
-//     so it writes nothing;
+//     so it writes nothing — at either moment;
 //   - concurrently triggered agents judging the same fact write the same
 //     value or nothing, so the board cannot flap.
 //
 // The brief must also still carry no unconditional placeholder flip: a bare
 // `multica issue status <this-issue-id> in_review` command would fire on every
 // turn regardless of whether the turn delivered anything.
-func TestStatusRuleIsEndOfTurnFactJudgment(t *testing.T) {
+func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 	t.Parallel()
 	ctx := TaskContextForEnv{
 		IssueID:          "55555555-6666-7777-8888-999999999999",
@@ -166,10 +169,12 @@ func TestStatusRuleIsEndOfTurnFactJudgment(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		// The anchor: issue state, not run lifecycle, judged once at the end.
-		"**Issue status — judge once, at the end of the turn**",
+		// The anchor: issue state, not run lifecycle, written when it changes.
+		"**Issue status — write the state the issue is in, whenever it changes**",
 		"Status reflects the state the ISSUE is in, not your run's lifecycle",
-		"so do not open with a status write",
+		// The start moment: a work turn shows on the board while it runs.
+		"The moment you know this turn advances what the issue itself asks for",
+		"the board should show the issue being worked while you work, not only after",
 		// No assignee gate: the judgment applies to whoever is running.
 		"whoever the assignee is",
 		// Delivery lands in in_review and the ceiling keeps `done` human.
@@ -192,7 +197,9 @@ func TestStatusRuleIsEndOfTurnFactJudgment(t *testing.T) {
 	}
 
 	// The retired gates must not come back: no trigger-type modes, no
-	// assignee-scoped arc, no opening flip.
+	// assignee-scoped arc, no UNCONDITIONAL opening flip (the start moment is
+	// conditional on the turn advancing the issue's ask), and no end-only
+	// timing that hides a long first work turn in todo.
 	for _, banned := range []string{
 		"Turn mode",
 		"Ownership mode",
@@ -200,6 +207,8 @@ func TestStatusRuleIsEndOfTurnFactJudgment(t *testing.T) {
 		"when this issue is assigned to you and this turn does substantive work on it",
 		"set `in_progress` when you start",
 		"Before step 3, run `multica issue status",
+		"judge once, at the end of the turn",
+		"do not open with a status write",
 	} {
 		if strings.Contains(out, banned) {
 			t.Errorf("brief still carries retired status gate %q (MUL-6417)\n---\n%s", banned, out)

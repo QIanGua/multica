@@ -75,9 +75,10 @@ Your responsibilities, in order:
 // the parent's status arc.
 //
 // Since MUL-6417 the runtime brief has no grant routing that consumes this
-// section by name: the unified workflow judges status once, at the end of the
-// turn, from what the work changed, and the leader's only brief-side special
-// case is that a dispatch turn leaves the parent in_progress. This section's
+// section by name: the unified workflow writes status as the work changes it
+// (in_progress when a turn starts advancing the issue's ask, the reached
+// state at turn end), and the leader's only brief-side special case is that a
+// dispatch turn leaves the parent in_progress. This section's
 // job is the owning/guest permission boundary, drawn at the Agent Identity
 // layer (Instruction Precedence puts it above the workflow). The owning
 // leader needs the standing wrap-up instruction below — the @mention-dispatch
