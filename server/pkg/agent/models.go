@@ -267,30 +267,32 @@ func ListModels(ctx context.Context, providerType string, runtimeCmd Command) (C
 	}
 }
 
-// ModelIDsAreProviderQualified reports whether a runtime's catalog IDs carry
-// their own `<provider>/` prefix, which is the precondition for
-// QualifyModelID being able to do anything at all. It is the gate that keeps
-// catalog discovery off the task-start path for every runtime that cannot
-// benefit from it: discovery costs a CLI subprocess with a 15-30s ceiling, and
-// cachedDiscovery deliberately does not memoize empty or fallback results, so
-// an unconditional lookup would make a logged-out or failing runtime pay that
-// ceiling again on every single task (MUL-6471 review).
+// ModelSelectorMustBeProviderQualified reports whether a runtime's CLI
+// refuses a model id that does not carry its `<provider>/` prefix.
 //
-// True only where Model.Provider is literally the ID's own prefix — pi builds
-// `provider + "/" + id`, opencode reads the provider back off the id. Runtimes
-// that expose a bare id alongside a display-name Provider (claude's
-// "anthropic", copilot's "openai", dsh's "DeepSeek" against a
-// `deepseek-official/...` id) can never match and are correctly excluded.
+// This is an execution contract, not a statement about catalog shape. It
+// decides one thing: whether the daemon has to read the runtime catalog before
+// launching a task that pins a model. That read costs a CLI subprocess with a
+// 15-30s ceiling which cachedDiscovery deliberately does not memoize when it
+// comes back empty or as a fallback (#3729, MUL-5549), so a logged-out runtime
+// pays the ceiling on every read — worth spending only where the launch
+// genuinely fails without it (MUL-6471 review).
 //
-// Built-in runtime identities resolve through their protocol family, so a new
-// pi-family or opencode-family fork inherits this from its descriptor entry
-// rather than needing a line here.
-func ModelIDsAreProviderQualified(providerType string) bool {
+// opencode's `run --model` and the DevEco fork of it resolve strictly through
+// `provider/model` and reject anything else — verified against opencode
+// 1.18.14, which answers a bare id with `UnknownError` before any provider
+// call. pi is deliberately absent: its resolver accepts a canonical selector,
+// a bare id, AND an id containing a slash (see buildPiArgs), so a pi task
+// launches correctly without the daemon qualifying anything first.
+//
+// Built-in runtime identities resolve through their protocol family, so a fork
+// inherits the contract from its descriptor entry rather than a name here.
+func ModelSelectorMustBeProviderQualified(providerType string) bool {
 	if desc, ok := BuiltinRuntimeByID(providerType); ok {
 		providerType = desc.ProtocolFamily
 	}
 	switch providerType {
-	case "pi", "opencode":
+	case "opencode", "deveco":
 		return true
 	default:
 		return false

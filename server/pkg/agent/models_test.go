@@ -2045,56 +2045,60 @@ func TestSlashShapedPiModelKeepsItsThinkingCatalog(t *testing.T) {
 	}
 }
 
-// TestModelIDsAreProviderQualifiedMatchesCatalogShape guards the gate against
-// rot. ModelIDsAreProviderQualified decides whether the daemon spends a
-// discovery subprocess at task start, so it must agree with what the catalog
-// producers actually emit rather than with someone's memory of them. Each case
-// runs the real producer and derives the truth from its output: a runtime
-// qualifies exactly when Model.Provider is literally the ID's own prefix.
+// TestModelSelectorMustBeProviderQualifiedIsAnExecutionContract pins what the
+// predicate actually claims: whether a runtime's CLI refuses a model id that
+// carries no provider prefix. It is deliberately NOT a statement about catalog
+// shape — several runtimes (pi, omp, deveco) emit provider-prefixed ids, but
+// only the ones whose CLI *rejects* the unprefixed form justify spending a
+// discovery subprocess before launch.
 //
-// Adding a runtime? Add its producer to the map below: the case then fails
-// until ModelIDsAreProviderQualified agrees with the shape it really emits.
-func TestModelIDsAreProviderQualifiedMatchesCatalogShape(t *testing.T) {
+// The pi entries are the load-bearing ones: buildPiArgs and its tests prove pi
+// resolves a canonical selector, a bare id, and an id containing a slash all
+// on its own, so a pi task must launch without the daemon reading any catalog.
+func TestModelSelectorMustBeProviderQualifiedIsAnExecutionContract(t *testing.T) {
 	t.Parallel()
 
-	ompFixture := `{"models":[{"provider":"anthropic","id":"claude-sonnet-5","selector":"anthropic/claude-sonnet-5","name":"Claude Sonnet 5"}]}`
-	ompModels, err := parseOmpModels([]byte(ompFixture))
-	if err != nil {
-		t.Fatalf("parseOmpModels: %v", err)
+	tests := []struct {
+		provider string
+		want     bool
+		why      string
+	}{
+		{"opencode", true, "run --model resolves strictly through provider/model"},
+		{"deveco", true, "opencode fork with the same --model contract"},
+		{"pi", false, "pi's own resolver accepts bare and slash-shaped ids"},
+		{"omp", false, "pi-family fork, inherits pi's resolver"},
+		{"claude", false, "bare model ids, no provider segment to miss"},
+		{"codex", false, "bare model ids"},
+		{"copilot", false, "bare model ids under a display-name provider"},
+		{"dsh", false, "resolves its own provider-prefixed ids"},
+		{"", false, "unknown provider must not spend discovery"},
 	}
 
-	producers := map[string][]Model{
-		"pi": parsePiModels("provider  model  context\n" +
-			"multica-anthropic  claude/claude-opus-5  128K\n"),
-		"opencode": parseOpenCodeModels("multica-anthropic/claude/claude-opus-5\n" +
-			"opencode/big-pickle\n"),
-		"omp":     ompModels,
-		"claude":  claudeStaticModels(),
-		"codex":   codexStaticModels(),
-		"copilot": copilotStaticModels(),
-		"cursor":  cursorStaticModels(),
-	}
-
-	for provider, models := range producers {
-		t.Run(provider, func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
 			t.Parallel()
-			if len(models) == 0 {
-				t.Fatalf("%s producer returned no models; the fixture no longer parses", provider)
-			}
-			// The catalog is provider-qualified when its entries carry their
-			// own provider as an ID prefix — the only shape QualifyModelID can
-			// act on.
-			qualified := true
-			for _, m := range models {
-				if m.Provider == "" || !strings.HasPrefix(m.ID, m.Provider+"/") {
-					qualified = false
-					break
-				}
-			}
-			if got := ModelIDsAreProviderQualified(provider); got != qualified {
-				t.Errorf("ModelIDsAreProviderQualified(%q) = %v, but its catalog is provider-qualified = %v (models: %+v)",
-					provider, got, qualified, models)
+			if got := ModelSelectorMustBeProviderQualified(tt.provider); got != tt.want {
+				t.Errorf("ModelSelectorMustBeProviderQualified(%q) = %v, want %v (%s)",
+					tt.provider, got, tt.want, tt.why)
 			}
 		})
+	}
+}
+
+// omp is a built-in runtime identity rather than a protocol family, so the
+// predicate must resolve it through its descriptor. This is what keeps "add a
+// fork" a descriptor entry instead of a change here.
+func TestModelSelectorContractFollowsProtocolFamily(t *testing.T) {
+	t.Parallel()
+
+	desc, ok := BuiltinRuntimeByID("omp")
+	if !ok {
+		t.Fatal("omp is no longer a built-in runtime identity; this test needs a new subject")
+	}
+	if desc.ProtocolFamily != "pi" {
+		t.Fatalf("omp protocol family = %q, want pi", desc.ProtocolFamily)
+	}
+	if ModelSelectorMustBeProviderQualified("omp") != ModelSelectorMustBeProviderQualified(desc.ProtocolFamily) {
+		t.Error("omp does not inherit its selector contract from the pi protocol family")
 	}
 }
