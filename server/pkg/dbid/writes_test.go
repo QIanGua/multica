@@ -2,10 +2,14 @@ package dbid
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -76,40 +80,62 @@ func TestV7QueriesBindAnIDWithADatabaseFallback(t *testing.T) {
 	}
 }
 
-// TestEveryV7CallSiteMintsAnID walks the production Go sources and fails if any
-// literal of a converted params struct leaves the id unset. Without this a new
-// call site added later would silently go back to a random v4 id — the
-// COALESCE fallback makes that failure quiet, so it needs a test to stay loud.
-func TestEveryV7CallSiteMintsAnID(t *testing.T) {
-	fields := map[string]*regexp.Regexp{}
+const (
+	dbImportPath   = "github.com/multica-ai/multica/server/pkg/db/generated"
+	dbidImportPath = "github.com/multica-ai/multica/server/pkg/dbid"
+)
+
+// TestEveryV7ParamsLiteralSetsAnIDAndImportsDBID walks production Go sources
+// and fails if a converted params literal leaves its id unset or lives in a file
+// that does not import dbid. The AST-based check deliberately does not prescribe
+// whether the value is an inline dbid.NewV7 call or a local variable, so routine
+// refactors do not weaken this guard by forcing one source spelling.
+func TestEveryV7ParamsLiteralSetsAnIDAndImportsDBID(t *testing.T) {
+	fields := map[string]string{}
 	for _, w := range v7Writes {
-		fields[w.query+"Params"] = regexp.MustCompile(`\b` + w.field + `:\s+dbid\.NewV7\(\)`)
+		fields[w.query+"Params"] = w.field
 	}
 
 	found := map[string]int{}
 	for _, path := range productionGoFiles(t) {
-		src, err := os.ReadFile(path)
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("parse %s: %v", path, err)
 		}
-		text := string(src)
-		for typ, mint := range fields {
-			needle := "." + typ + "{"
-			for i := 0; ; {
-				j := strings.Index(text[i:], needle)
-				if j < 0 {
-					break
-				}
-				at := i + j
-				lit := structLiteral(text[at+len(needle):])
-				found[typ]++
-				if !mint.MatchString(lit) {
-					t.Errorf("%s:%d: %s literal does not mint an id (%s)",
-						path, 1+strings.Count(text[:at], "\n"), typ, mint)
-				}
-				i = at + len(needle)
+
+		dbAliases, importsDBID := relevantImports(t, path, file)
+		ast.Inspect(file, func(node ast.Node) bool {
+			literal, ok := node.(*ast.CompositeLit)
+			if !ok {
+				return true
 			}
-		}
+			selector, ok := literal.Type.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := selector.X.(*ast.Ident)
+			if !ok || !dbAliases[pkg.Name] {
+				return true
+			}
+			field, tracked := fields[selector.Sel.Name]
+			if !tracked {
+				return true
+			}
+
+			found[selector.Sel.Name]++
+			if !compositeLiteralSetsField(literal, field) {
+				position := fset.Position(literal.Pos())
+				t.Errorf("%s:%d: %s literal does not set %s",
+					path, position.Line, selector.Sel.Name, field)
+			}
+			if !importsDBID {
+				position := fset.Position(literal.Pos())
+				t.Errorf("%s:%d: %s literal is in a file that does not import %s",
+					path, position.Line, selector.Sel.Name, dbidImportPath)
+			}
+			return true
+		})
 	}
 
 	for typ := range fields {
@@ -117,6 +143,44 @@ func TestEveryV7CallSiteMintsAnID(t *testing.T) {
 			t.Errorf("no production call site found for %s — was the query removed or renamed?", typ)
 		}
 	}
+}
+
+func relevantImports(t *testing.T, path string, file *ast.File) (map[string]bool, bool) {
+	t.Helper()
+
+	dbAliases := map[string]bool{}
+	importsDBID := false
+	for _, spec := range file.Imports {
+		importPath, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			t.Fatalf("parse import in %s: %v", path, err)
+		}
+		switch importPath {
+		case dbImportPath:
+			name := "db"
+			if spec.Name != nil {
+				name = spec.Name.Name
+			}
+			dbAliases[name] = true
+		case dbidImportPath:
+			importsDBID = true
+		}
+	}
+	return dbAliases, importsDBID
+}
+
+func compositeLiteralSetsField(literal *ast.CompositeLit, field string) bool {
+	for _, element := range literal.Elts {
+		pair, ok := element.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		name, ok := pair.Key.(*ast.Ident)
+		if ok && name.Name == field {
+			return true
+		}
+	}
+	return false
 }
 
 // queryBlock returns the text of one named sqlc query, from its `-- name:`
@@ -143,24 +207,6 @@ func queryBlock(t *testing.T, file, query string) string {
 	}
 	t.Fatalf("query %s not found in %s", query, file)
 	return ""
-}
-
-// structLiteral returns the body of a composite literal whose opening brace has
-// already been consumed, tracking nesting so an inner literal does not end it.
-func structLiteral(after string) string {
-	depth := 1
-	for i, r := range after {
-		switch r {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return after[:i]
-			}
-		}
-	}
-	return after
 }
 
 func productionGoFiles(t *testing.T) []string {

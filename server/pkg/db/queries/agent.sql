@@ -321,7 +321,9 @@ LIMIT 5;
 -- parsing (parseQuickCreateContext short-circuits on IssueID.Valid), so this
 -- key rides harmlessly alongside.
 -- id is minted by the application as a UUIDv7 (pkg/dbid) so consecutive
--- enqueues land together at the right edge of the primary-key B-tree. The
+-- enqueues cluster in a narrow contiguous primary-key range instead of
+-- scattering across the B-tree. On a table with existing v4 ids, that range
+-- is not necessarily the tree's right edge.
 -- COALESCE keeps the column's gen_random_uuid() default reachable, so a caller
 -- that passes no id still inserts — it just gets a random v4, exactly as before.
 -- The same pattern is used by every INSERT listed in pkg/dbid's write table.

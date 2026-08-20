@@ -2,9 +2,9 @@
 //
 // Every id produced here is a UUIDv7 (RFC 9562): a 48-bit big-endian
 // millisecond timestamp followed by random bits. Consecutive inserts therefore
-// land next to each other at the right edge of the primary-key B-tree instead
-// of scattering across it the way random v4 keys do, which is what keeps index
-// maintenance cheap on the append-heavy tables this is used for.
+// cluster in a narrow contiguous key range instead of scattering across the
+// primary-key B-tree the way random v4 keys do. On tables that already contain
+// v4 ids, that range is not necessarily the tree's right edge.
 //
 // Scope and rules of use:
 //
@@ -19,6 +19,11 @@
 //     holds a mix of v4 and v7 ids forever, which Postgres's uuid type and every
 //     parser in this repo accept, and an unset id degrades to today's behaviour
 //     instead of violating NOT NULL.
+//   - The database fallback makes NewV7 suitable only when the id is used solely
+//     as the inserted row's identity. If the application must also use the id as
+//     an object key, filename, correlation id, or any other external reference,
+//     call uuid.NewV7 directly and handle its error instead; otherwise the
+//     database may mint a different id after entropy generation fails.
 //   - A v7 embeds its creation time only to millisecond precision and is only
 //     approximately ordered across writers. It is not a substitute for
 //     created_at and must not be used to derive ordering guarantees.
