@@ -175,13 +175,11 @@ func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 		// The start moment: INSIDE step 3, at the read→work boundary. A run
 		// on MUL-6460 proved a detached status-block bullet does not fire —
 		// the model is walking the numbered list when the condition triggers.
-		"3. If this turn starts producing what the issue itself asks for",
-		// No activity word decides in either direction: research broke it
-		// once (MUL-6460), and Elon's #7295 review caught "review" queued to
-		// break it the same way on a review-the-PR issue. The form list must
-		// include review as work when reviewing is the ask.
-		"a review when reviewing is the ask",
-		"The kind of activity (research, design, planning, review) never decides this",
+		"3. If any part of what this turn will produce is what the issue itself asks for",
+		// Category-scoped skip so a custom in_progress-category status (e.g.
+		// Planning, MUL-6460) already counts as "recorded" once agents can
+		// see the catalog.
+		"already in an `in_progress`-category status",
 		"the board should show the issue being worked while you work, not only after",
 		// No assignee gate: the judgment applies to whoever is running.
 		"whoever the assignee is",
@@ -220,14 +218,41 @@ func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 		// The example that misled the MUL-6460 run: research that IS the
 		// issue's ask pattern-matched an example meant for consult pull-ins.
 		"asked to research stays",
-		// Activity-word skip-lists must not come back in any form — they
-		// are the failure class behind both the research and review cases.
+		// Activity-word lists must not come back in EITHER direction — the
+		// negative lists are the failure class behind the research and
+		// review cases, and the positive form-list ("in whatever form:
+		// code, research, ...") is the same shape read as exhaustive
+		// (J's review on #7295).
 		"A turn that only answers, reviews, or consults",
 		"you only answered a question, reviewed, or discussed",
+		"in whatever form: code, research",
 	} {
 		if strings.Contains(out, banned) {
 			t.Errorf("brief still carries retired status gate %q (MUL-6417)\n---\n%s", banned, out)
 		}
+	}
+
+	// Position is load-bearing, not style (J's review on #7295): a
+	// presence-pin cannot tell WHERE a sentence lives, and both field
+	// incidents came from correct sentences sitting in positions that do
+	// not fire. The two anchors must live INSIDE their numbered steps.
+	var step3, step5 string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "3. ") {
+			step3 = line
+		}
+		if strings.HasPrefix(line, "5. ") {
+			step5 = line
+		}
+	}
+	if !strings.Contains(step3, "set `in_progress` FIRST") {
+		t.Errorf("the start write must be anchored inside step 3\n---\n%s", step3)
+	}
+	if !strings.Contains(step3, "never decides") {
+		t.Errorf("the never-decides guard must live inside step 3, the position that fires\n---\n%s", step3)
+	}
+	if !strings.Contains(step5, "confirm the status still matches") {
+		t.Errorf("the exit-side status check must be anchored inside step 5\n---\n%s", step5)
 	}
 
 	// The squad-leader bullet must not leak into the ordinary path.
