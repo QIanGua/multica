@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"sort"
@@ -19,12 +20,20 @@ import (
 // no assignee before, or was unassigned after.
 const noneMarker = "(none)"
 
+// headerTimelineTruncated mirrors handler.HeaderTimelineTruncated. Declared as
+// a literal rather than imported because the CLI does not depend on the
+// handler package (same convention as the X-Multica-Next-Before cursors in
+// `issue comment list`). Value is a comma-separated kind list: "activity",
+// "comment", or "activity,comment".
+const headerTimelineTruncated = "X-Timeline-Truncated"
+
 var issueTimelineCmd = &cobra.Command{
 	Use:     "timeline <id>",
 	Aliases: []string{"history"},
 	Short:   "Chronological issue history — when status/assignee changed, how long it has been stuck",
-	Long: `Chronological history of an issue: status / priority / assignee / title / date
-changes (from the activity log) merged with comments, oldest first.
+	Long: `Chronological history of an issue: the activity log — status / priority /
+assignee / title / date changes, plus whatever task_completed / task_failed
+records the server already writes — merged with comments, oldest first.
 
 Use it for the questions the current issue fields cannot answer:
 
@@ -37,15 +46,21 @@ current snapshot. This command explains how it got there, which comments alone
 cannot: a status change writes an activity record, never a comment, so a merge
 that flipped the issue to done leaves no trace in the comment stream.
 
-Comments are included by default. For the timing questions above pass
---activity-only to drop comment bodies and keep just the state transitions.
+Comments are included by default. --activity-only drops comment bodies and
+keeps every activity record; to isolate the state transitions behind "how long
+has this been stuck", filter by action instead.
+
+The server caps how far back it will read. When it reports that the response
+was truncated, a warning naming the affected kinds is printed to stderr —
+durations and "first entered <status>" cannot be concluded from a truncated
+read, because the transition you are looking for may be the one that fell off.
 
 Examples:
   # How long has MUL-123 been in its current status?
-  multica issue timeline MUL-123 --activity-only
+  multica issue timeline MUL-123 --action status_changed
 
-  # Status transitions only, as JSON
-  multica issue timeline MUL-123 --action status_changed --output json
+  # Every state change, no comment bodies
+  multica issue timeline MUL-123 --activity-only --output json
 
   # What changed since yesterday?
   multica issue timeline MUL-123 --since 2026-08-19T00:00:00Z`,
@@ -55,8 +70,8 @@ Examples:
 
 func init() {
 	issueTimelineCmd.Flags().String("output", "table", "Output format: table or json")
-	issueTimelineCmd.Flags().Bool("activity-only", false, "Drop comments and return only activity records (status / priority / assignee / title / date changes). Much cheaper to read when you only need to know when something changed.")
-	issueTimelineCmd.Flags().StringSlice("action", nil, "Only return activities with these actions (repeatable or comma-separated). Implies --activity-only, since comments carry no action. Known actions: created, status_changed, priority_changed, assignee_changed, title_changed, description_updated, start_date_changed, due_date_changed, squad_leader_evaluated.")
+	issueTimelineCmd.Flags().Bool("activity-only", false, "Drop comments and return every activity record — including the task_completed / task_failed entries the server already writes, not just field changes. Much cheaper to read than the full timeline; use --action when you want only state transitions.")
+	issueTimelineCmd.Flags().StringSlice("action", nil, "Only return activities with these actions (repeatable or comma-separated). Implies --activity-only, since comments carry no action. Known actions: created, status_changed, priority_changed, assignee_changed, title_changed, description_updated, start_date_changed, due_date_changed, task_completed, task_failed, squad_leader_evaluated.")
 	issueTimelineCmd.Flags().String("since", "", "Only return entries created after this timestamp (RFC3339)")
 	issueTimelineCmd.Flags().Int("tail", 0, "Only return the N most recent entries (applied after every other filter)")
 	issueTimelineCmd.Flags().Bool("full-id", false, "Show full UUIDs in table output")
@@ -86,9 +101,11 @@ func runIssueTimeline(cmd *cobra.Command, args []string) error {
 	// Deliberately sent without limit/before/after/around: the endpoint only
 	// returns the flat oldest-first array when no pagination param is present.
 	var entries []map[string]any
-	if err := client.GetJSON(ctx, "/api/issues/"+url.PathEscape(issueRef.ID)+"/timeline", &entries); err != nil {
+	respHeaders, err := client.GetJSONWithHeaders(ctx, "/api/issues/"+url.PathEscape(issueRef.ID)+"/timeline", &entries)
+	if err != nil {
 		return fmt.Errorf("list issue timeline: %w", err)
 	}
+	warnTimelineTruncated(os.Stderr, respHeaders.Get(headerTimelineTruncated))
 
 	entries = filter.apply(entries)
 
@@ -100,6 +117,22 @@ func runIssueTimeline(cmd *cobra.Command, args []string) error {
 	fullID, _ := cmd.Flags().GetBool("full-id")
 	printIssueTimelineTable(entries, loadActorDisplayLookup(ctx, client), fullID)
 	return nil
+}
+
+// warnTimelineTruncated surfaces the server's truncation signal on stderr, so
+// it never contaminates a piped --output json read.
+//
+// The endpoint caps each kind independently and reports which ones lost rows.
+// Swallowing that makes a partial read look complete, which is precisely wrong
+// for this command's headline question: if the transition that set the current
+// status fell off the back of the window, --action status_changed returns a
+// plausible, shorter, wrong answer to "how long has this been stuck".
+func warnTimelineTruncated(w io.Writer, kinds string) {
+	if kinds == "" {
+		return
+	}
+	fmt.Fprintf(w, "warning: timeline truncated by the server cap (%s): older entries are missing. "+
+		"Durations and \"first entered <status>\" cannot be concluded from this read.\n", kinds)
 }
 
 // timelineFilter narrows a timeline response client-side. The endpoint takes no
@@ -202,13 +235,25 @@ func printIssueTimelineTable(entries []map[string]any, actors actorDisplayLookup
 }
 
 // timelineActor renders an actor as "member:Alice", falling back to a shortened
-// id when the workspace lookup cannot name it (deleted member, system actor).
+// id when the workspace lookup cannot name it (deleted member, foreign id).
 func timelineActor(actorType, actorID string, actors actorDisplayLookup, fullID bool) string {
-	if actorType == "" && actorID == "" {
+	switch {
+	case actorType == "" && actorID == "":
 		return ""
+	case actorID == "":
+		// System-authored activities carry a type with no id, and the lookup
+		// returns nothing for those. A GitHub PR merge flipping the issue to
+		// done is exactly this shape, so leaving the column blank would erase
+		// the actor on the transition this command exists to explain.
+		return actorType
+	case actorType == "":
+		if fullID {
+			return actorID
+		}
+		return truncateID(actorID)
 	}
 	display := actors.actor(actorType, actorID)
-	if !fullID && actorID != "" && strings.HasSuffix(display, ":"+actorID) {
+	if !fullID && strings.HasSuffix(display, ":"+actorID) {
 		return actorType + ":" + truncateID(actorID)
 	}
 	return display

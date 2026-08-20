@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -199,6 +200,11 @@ func TestTimelineDetail(t *testing.T) {
 			want:  "member:abcdefgh → (none)",
 		},
 		{
+			name:  "task_completed carries no from/to and falls back",
+			entry: map[string]any{"type": "activity", "details": map[string]any{"task_id": "t1"}},
+			want:  "task_id=t1",
+		},
+		{
 			name:  "empty details render as blank",
 			entry: map[string]any{"type": "activity", "details": map[string]any{}},
 			want:  "",
@@ -221,6 +227,172 @@ func TestTimelineDetail(t *testing.T) {
 				t.Fatalf("timelineDetail = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// A GitHub PR merge flipping the issue to done publishes with actor type
+// "system" and no actor id (server/internal/handler/github.go). That is the
+// transition this command exists to explain, so the actor must not render
+// blank.
+func TestTimelineActorSystemWithoutIDRendersType(t *testing.T) {
+	var actors actorDisplayLookup
+
+	if got := timelineActor("system", "", actors, false); got != "system" {
+		t.Fatalf("system actor = %q, want %q", got, "system")
+	}
+	if got := timelineActor("", "", actors, false); got != "" {
+		t.Fatalf("empty actor = %q, want empty", got)
+	}
+	if got := timelineActor("member", "abcdefgh1234", actors, false); got != "member:abcdefgh" {
+		t.Fatalf("member actor = %q, want member:abcdefgh", got)
+	}
+	if got := timelineActor("member", "abcdefgh1234", actors, true); got != "member:abcdefgh1234" {
+		t.Fatalf("member actor with --full-id = %q, want the full id", got)
+	}
+}
+
+func TestWarnTimelineTruncated(t *testing.T) {
+	t.Run("silent when the header is absent", func(t *testing.T) {
+		var buf strings.Builder
+		warnTimelineTruncated(&buf, "")
+		if buf.String() != "" {
+			t.Fatalf("warning = %q, want none", buf.String())
+		}
+	})
+
+	t.Run("names the truncated kinds and voids duration claims", func(t *testing.T) {
+		var buf strings.Builder
+		warnTimelineTruncated(&buf, "activity,comment")
+		got := buf.String()
+		for _, want := range []string{"truncated", "activity,comment", "Durations"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("warning %q missing %q", got, want)
+			}
+		}
+	})
+}
+
+// The truncation signal is the difference between "this is the whole history"
+// and "the transition you need may have fallen off the back", so it must
+// survive the round trip — and land on stderr, where it cannot corrupt a piped
+// --output json read.
+func TestRunIssueTimelineReportsTruncationOnStderr(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/MUL-6253":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "issue-uuid", "identifier": "MUL-6253"})
+		case "/api/issues/issue-uuid/timeline":
+			w.Header().Set("X-Timeline-Truncated", "activity")
+			_ = json.NewEncoder(w).Encode(timelineFixture())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := newIssueTimelineTestCmd()
+	_ = cmd.Flags().Set("output", "json")
+
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = outW, errW
+	err := runIssueTimeline(cmd, []string{"MUL-6253"})
+	_ = outW.Close()
+	_ = errW.Close()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	stdout, _ := io.ReadAll(outR)
+	stderr, _ := io.ReadAll(errR)
+	if err != nil {
+		t.Fatalf("runIssueTimeline: %v", err)
+	}
+
+	if !strings.Contains(string(stderr), "truncated") || !strings.Contains(string(stderr), "activity") {
+		t.Fatalf("stderr = %q, want a truncation warning naming the kind", string(stderr))
+	}
+	// stdout must stay valid JSON: the warning belongs on stderr only.
+	var entries []map[string]any
+	if err := json.Unmarshal(stdout, &entries); err != nil {
+		t.Fatalf("stdout is not clean JSON: %v\n%s", err, string(stdout))
+	}
+	if len(entries) != len(timelineFixture()) {
+		t.Fatalf("entries = %d, want %d", len(entries), len(timelineFixture()))
+	}
+}
+
+func TestRunIssueTimelineSilentWhenNotTruncated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/MUL-6253":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "issue-uuid", "identifier": "MUL-6253"})
+		case "/api/issues/issue-uuid/timeline":
+			_ = json.NewEncoder(w).Encode(timelineFixture())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := newIssueTimelineTestCmd()
+	_ = cmd.Flags().Set("output", "json")
+
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = outW, errW
+	err := runIssueTimeline(cmd, []string{"MUL-6253"})
+	_ = outW.Close()
+	_ = errW.Close()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	_, _ = io.ReadAll(outR)
+	stderr, _ := io.ReadAll(errR)
+	if err != nil {
+		t.Fatalf("runIssueTimeline: %v", err)
+	}
+	if len(stderr) != 0 {
+		t.Fatalf("stderr = %q, want nothing when the response is complete", string(stderr))
+	}
+}
+
+// The help text is the discovery surface: this command is deliberately absent
+// from the runtime brief, so an agent only finds it by scanning `issue --help`
+// for the question it is trying to answer. These anchors are the contract.
+func TestIssueTimelineHelpCarriesDiscoveryContract(t *testing.T) {
+	if want := "how long it has been stuck"; !strings.Contains(issueTimelineCmd.Short, want) {
+		t.Errorf("timeline Short missing %q, got: %s", want, issueTimelineCmd.Short)
+	}
+
+	for _, want := range []string{
+		// Points back at the authoritative current state, so nobody
+		// reconstructs "now" from history.
+		"issue get",
+		"authoritative",
+		// Why comments alone cannot answer this.
+		"never a comment",
+		// The truncation caveat must be discoverable, not just printed.
+		"truncated",
+	} {
+		if !strings.Contains(issueTimelineCmd.Long, want) {
+			t.Errorf("timeline Long missing %q, got:\n%s", want, issueTimelineCmd.Long)
+		}
+	}
+
+	// The action list must stay honest about what the server actually writes;
+	// omitting the task events is what made the first cut of this command
+	// misdescribe --activity-only.
+	help := issueTimelineCmd.Flags().FlagUsages()
+	for _, want := range []string{"task_completed", "task_failed", "status_changed", "Implies --activity-only"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("timeline rendered flag help missing %q, got:\n%s", want, help)
+		}
 	}
 }
 
