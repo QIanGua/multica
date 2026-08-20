@@ -6078,6 +6078,20 @@ func (d *Daemon) startTaskPrepareLeaseExtender(ctx context.Context, task Task, t
 	}
 }
 
+// isUnderWorkspacesRoot reports whether path lives inside the daemon's
+// workspaces root. Used to keep env-root bookkeeping away from user-supplied
+// local_directory paths, which sit outside it.
+func isUnderWorkspacesRoot(workspacesRoot, path string) bool {
+	if workspacesRoot == "" || path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(workspacesRoot), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func (d *Daemon) prepareExecutionEnvironment(ctx context.Context, params execenv.PrepareParams) (*execenv.Environment, error) {
 	if d.executionEnvironmentCommand == nil {
 		// Focused runTask tests construct a zero-valued Daemon and keep setup
@@ -6471,14 +6485,39 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 
+	// Claim the env root HERE, in the daemon parent, and hold it for the whole
+	// task run — the same lifetime as unmarkActiveEnvRoot above.
+	//
+	// It cannot be claimed inside preparation: production preparation runs in a
+	// short-lived helper process (prepareExecutionEnvironment ->
+	// PrepareIsolated), so a lock taken there dies with the helper and the
+	// *os.File cannot cross its JSON response back to us. Claiming there would
+	// leave the agent running with no protection at all — which is exactly the
+	// re-dispatch window this guards.
+	envClaim, err := execenv.ClaimEnvRoot(d.cfg.WorkspacesRoot, task.WorkspaceID, task.ID)
+	if err != nil {
+		return TaskResult{}, fmt.Errorf("claim execution environment: %w", err)
+	}
+	defer envClaim.Release()
+
+	// A task continuing in a prior task's workdir excludes on THAT root
+	// instead. Identity there belongs to the earlier task, so this is the
+	// exclusion half of a claim only. Guarded to managed roots: for a
+	// local_directory task PriorWorkDir is the user's own directory, and its
+	// parent is no place to be writing lock files.
+	if task.PriorWorkDir != "" {
+		priorRoot := filepath.Dir(task.PriorWorkDir)
+		if priorRoot != envClaim.RootDir() && isUnderWorkspacesRoot(d.cfg.WorkspacesRoot, priorRoot) {
+			priorClaim, err := execenv.LockEnvRootForReuse(priorRoot)
+			if err != nil {
+				return TaskResult{}, fmt.Errorf("claim prior execution environment: %w", err)
+			}
+			defer priorClaim.Release()
+		}
+	}
+
 	// Try to reuse the workdir from a previous task on the same (agent, issue) pair.
 	var env *execenv.Environment
-	// Hold the env root's execution lock for exactly this task run, mirroring
-	// unmarkActiveEnvRoot above. Nothing calls Environment.Cleanup in
-	// production — the GC reclaims env roots on its own schedule — so without
-	// this the lock would survive the task and fail-close every later dispatch
-	// of it until the daemon restarted.
-	defer func() { env.ReleaseLock() }()
 	// For a built-in codex task, use the version paired with the resolved path
 	// so an in-place upgrade can't leave the sandbox policy on the old version
 	// (MUL-4486). A custom codex runtime skips the self-heal, so resolvedVersion
@@ -6730,11 +6769,14 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if env == nil {
 		var err error
 		prepParams := execenv.PrepareParams{
-			WorkspacesRoot:        d.cfg.WorkspacesRoot,
-			Profile:               d.cfg.Profile,
-			WorkspaceID:           task.WorkspaceID,
-			TaskID:                task.ID,
-			AgentName:             agentName,
+			WorkspacesRoot: d.cfg.WorkspacesRoot,
+			Profile:        d.cfg.Profile,
+			WorkspaceID:    task.WorkspaceID,
+			TaskID:         task.ID,
+			AgentName:      agentName,
+			// This run already holds the claim (envClaim above) and the reset
+			// it implies; preparation must not try to take it again.
+			EnvRootPreclaimed:     true,
 			Provider:              provider,
 			CodexVersion:          codexVersion,
 			OpenclawBin:           openclawBin,

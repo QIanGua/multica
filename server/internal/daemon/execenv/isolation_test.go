@@ -258,3 +258,98 @@ func TestRehydratePreparationErrorUnknownKind(t *testing.T) {
 		t.Errorf("preparationErrorKind(timeout) = %q, want %q", kind, preparationErrorKindOpenclawCLITimeout)
 	}
 }
+
+// TestPrepareIsolatedKeepsTheClaimWithTheParent is the production-path
+// regression. Every real daemon prepares through PrepareIsolated, and the
+// helper is a short-lived child process: a lock taken inside it is released by
+// the kernel the instant it exits, and *os.File cannot travel back through the
+// helper's JSON response. An env-root claim taken during preparation therefore
+// protects nothing by the time the agent runs — the in-process Prepare tests
+// cannot see this, because there the "helper" never exits.
+//
+// The parent takes the claim and keeps it, so a second execution of the same
+// task must still be refused after PrepareIsolated has returned.
+func TestPrepareIsolatedKeepsTheClaimWithTheParent(t *testing.T) {
+	t.Parallel()
+	workspacesRoot := t.TempDir()
+	const (
+		workspaceID = "ws-isolated"
+		taskID      = "01a01ec0-e69d-7000-8000-0123456789ab"
+	)
+
+	claim, err := ClaimEnvRoot(workspacesRoot, workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("parent claim: %v", err)
+	}
+	defer claim.Release()
+
+	env, err := PrepareIsolated(context.Background(), preparationHelperTestCommand(), PrepareParams{
+		WorkspacesRoot:    workspacesRoot,
+		WorkspaceID:       workspaceID,
+		TaskID:            taskID,
+		AgentName:         "Isolated",
+		EnvRootPreclaimed: true,
+		Task:              TaskContextForEnv{IssueID: taskID},
+	}, nil)
+	if err != nil {
+		t.Fatalf("PrepareIsolated: %v", err)
+	}
+	if env == nil || env.WorkDir == "" {
+		t.Fatal("PrepareIsolated returned no environment")
+	}
+
+	// The helper has exited. If the claim had been taken inside it, the lock
+	// would be gone and this second claim would succeed.
+	if second, err := ClaimEnvRoot(workspacesRoot, workspaceID, taskID); err == nil {
+		second.Release()
+		t.Fatal("production PrepareIsolated returned without retaining the execution lock")
+	}
+
+	// And releasing it must hand the env root back for a later dispatch.
+	claim.Release()
+	next, err := ClaimEnvRoot(workspacesRoot, workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("env root stayed locked after release: %v", err)
+	}
+	next.Release()
+}
+
+// TestLockEnvRootForReuseExcludesConcurrentContinuations covers the other
+// production path: a task with a PriorWorkDir continues in an EARLIER task's
+// env root via ReuseIsolated, and Reuse takes no claim of its own. Identity
+// there belongs to the earlier task, so only the exclusion half applies — but
+// two continuations still must not refresh and run one directory at once.
+func TestLockEnvRootForReuseExcludesConcurrentContinuations(t *testing.T) {
+	t.Parallel()
+	priorRoot := filepath.Join(t.TempDir(), "ws", "0123456789ab")
+	if err := os.MkdirAll(filepath.Join(priorRoot, "workdir"), 0o755); err != nil {
+		t.Fatalf("seed prior root: %v", err)
+	}
+
+	first, err := LockEnvRootForReuse(priorRoot)
+	if err != nil {
+		t.Fatalf("first continuation: %v", err)
+	}
+	if first == nil {
+		t.Fatal("expected a claim for an existing prior root")
+	}
+
+	if second, err := LockEnvRootForReuse(priorRoot); err == nil {
+		second.Release()
+		t.Fatal("two continuations locked the same prior workdir at once")
+	}
+
+	first.Release()
+	again, err := LockEnvRootForReuse(priorRoot)
+	if err != nil {
+		t.Fatalf("prior root stayed locked after release: %v", err)
+	}
+	again.Release()
+
+	// A missing root is not an error — the caller falls through to a fresh
+	// Prepare, and there is nothing to exclude on.
+	missing, err := LockEnvRootForReuse(filepath.Join(t.TempDir(), "absent"))
+	if err != nil || missing != nil {
+		t.Fatalf("missing prior root: claim=%v err=%v, want nil/nil", missing, err)
+	}
+}
