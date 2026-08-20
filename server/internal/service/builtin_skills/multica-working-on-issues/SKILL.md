@@ -196,10 +196,11 @@ on it. These are the contracts, not advice:
   soon as that is known, so the board shows the work while it runs; at the
   end of the turn the work's state is recorded: delivered the issue's own
   ask → `in_review`; work continues beyond the turn (dispatched sub-issues,
-  partial delivery) → `in_progress`; stuck → `blocked`. A turn that only
-  researched, answered, reviewed, or discussed writes nothing at either
-  moment — a `todo` issue researched on request stays `todo`, and questions,
-  discussion, or acknowledgements never move the status. Squad leaders:
+  partial delivery) → `in_progress`; stuck → `blocked`. A turn that produces
+  none of the issue's own deliverable — answering a question, reviewing,
+  discussing — writes nothing at either moment; research and design count as
+  the work when they are what the issue asks for. Questions, discussion, or
+  acknowledgements never move the status. Squad leaders:
   dispatching members is not delivery — a dispatch turn leaves the parent
   `in_progress`, and it moves to `in_review` only when a later re-trigger
   confirms the overall goal is met.

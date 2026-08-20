@@ -37,7 +37,7 @@ While executing, the agent can:
 
 What it can actually do is still limited by the agent's configuration, the runtime environment, and your permission to run it.
 
-During the run, the agent manages the issue's status by judging what its work changes: starting on the issue's own ask moves it to `in_progress` right away, delivery moves it to `in_review`, work continuing beyond the turn keeps it `in_progress`, and research or discussion leaves the status untouched — these actions appear under the agent's identity in the timeline. Task lifecycle and issue status are separate: a task completing does not by itself change the issue status.
+During the run, the agent manages the issue's status by judging what its work changes: starting on the issue's own ask moves it to `in_progress` right away, delivery moves it to `in_review`, work continuing beyond the turn keeps it `in_progress`, and consultation or discussion leaves the status untouched — these actions appear under the agent's identity in the timeline. Task lifecycle and issue status are separate: a task completing does not by itself change the issue status.
 
 When the assignee is a [squad](/squads), the same rule applies: Multica enqueues the leader, and dispatching members is not delivery — a dispatch turn leaves the parent issue `in_progress`, and the leader only moves it to `in_review` once the overall goal is met.
 

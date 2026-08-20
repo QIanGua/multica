@@ -172,8 +172,13 @@ func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 		// The anchor: issue state, not run lifecycle, written when it changes.
 		"**Issue status — write the state the issue is in, whenever it changes**",
 		"Status reflects the state the ISSUE is in, not your run's lifecycle",
-		// The start moment: a work turn shows on the board while it runs.
-		"The moment you know this turn advances what the issue itself asks for",
+		// The start moment: INSIDE step 3, at the read→work boundary. A run
+		// on MUL-6460 proved a detached status-block bullet does not fire —
+		// the model is walking the numbered list when the condition triggers.
+		"3. If this turn's work advances what the issue itself asks for",
+		// Research/design ARE the work when they are the ask — the MUL-6460
+		// turn (investigate + design proposal) must not read as ancillary.
+		"including research or design when that IS the ask",
 		"the board should show the issue being worked while you work, not only after",
 		// No assignee gate: the judgment applies to whoever is running.
 		"whoever the assignee is",
@@ -183,11 +188,11 @@ func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 		// research: stage barriers and parent notifications key off the
 		// delivery write.
 		"stage barriers and parent notifications depend on that signal",
-		// Invariant 1: conversation does not move the board...
+		// Invariant 1: conversation does not move the board. Ancillary is
+		// defined by OUTPUT (no part of the issue's own deliverable), not by
+		// activity words like "research" that also describe real work.
 		"questions, discussion, and acknowledgements never touch status",
-		// ...and a research-only ask leaves a todo issue in todo — the case
-		// the old unconditional arc got wrong twice (MUL-6417).
-		"A `todo` issue you were asked to research stays `todo`",
+		"Your turn produced none of the issue's own deliverable",
 		// Invariant 2: concurrent agents converge instead of flapping.
 		"This no-write default is what keeps concurrent runs from flapping the board",
 	} {
@@ -209,6 +214,9 @@ func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 		"Before step 3, run `multica issue status",
 		"judge once, at the end of the turn",
 		"do not open with a status write",
+		// The example that misled the MUL-6460 run: research that IS the
+		// issue's ask pattern-matched an example meant for consult pull-ins.
+		"asked to research stays",
 	} {
 		if strings.Contains(out, banned) {
 			t.Errorf("brief still carries retired status gate %q (MUL-6417)\n---\n%s", banned, out)
@@ -387,7 +395,7 @@ func TestIssueWorkflowHonorsAgentIdentity(t *testing.T) {
 		// MUL-5442 (carried through MUL-6417): the forbids-clause is stated
 		// once on the status-rule header instead of once per status bullet.
 		"skip any status call your Agent Identity forbids",
-		"Complete the task within your Agent Identity boundaries",
+		"complete the task within your Agent Identity boundaries",
 		// Step 3 keeps only what the enumeration cannot express: a
 		// delegation-only role stops once the delegation is delivered.
 		"If your role is delegation-only, perform the allowed delegation work and stop once that outcome is delivered",
