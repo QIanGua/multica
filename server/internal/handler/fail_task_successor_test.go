@@ -2,10 +2,14 @@ package handler
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // TestFailTask_SkipsAutoRetryWhenManualRerunAlreadyQueued covers the interaction
@@ -115,5 +119,136 @@ func failTaskSuccessorCase(t *testing.T, failureReason string) {
 	}
 	if successors[0] != uuidToString(rerun.ID) {
 		t.Fatalf("the surviving successor should be the manual rerun %s, got %s", uuidToString(rerun.ID), successors[0])
+	}
+}
+
+// TestCreateRetryTask_YieldsPendingSlotInsteadOfRaising is the deterministic half
+// of the concurrency contract. The successor pre-check in FailTask takes no lock
+// (a plain count under READ COMMITTED), so a rerun can always commit between that
+// check and the retry insert. What makes the failure transaction safe regardless
+// of interleaving is the insert itself: ON CONFLICT DO NOTHING yields the slot
+// rather than raising 23505 and aborting the caller's transaction.
+//
+// Asserting pgx.ErrNoRows here — not a unique violation — is what proves the
+// enclosing transaction can never be poisoned by losing the race.
+func TestCreateRetryTask_YieldsPendingSlotInsteadOfRaising(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	runtimeID := dbfx.Runtime(t, "retry-yield-runtime")
+	agentID := dbfx.Agent(t, "retry-yield-agent", runtimeID)
+	issueID := dbfx.Issue(t, "retry yields the pending slot", testutil.Cols{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+	})
+
+	// A failed parent that is otherwise a perfectly good retry candidate.
+	parentID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":       issueID,
+		"runtime_id":     runtimeID,
+		"status":         "failed",
+		"failure_reason": "timeout",
+		"attempt":        1,
+		"max_attempts":   2,
+	})
+	// Someone else already holds the single queued/dispatched slot.
+	dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   issueID,
+		"runtime_id": runtimeID,
+		"status":     "queued",
+	})
+
+	_, err := testHandler.TaskService.Queries.CreateRetryTask(ctx, db.CreateRetryTaskParams{ID: parseUUID(parentID)})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("CreateRetryTask against an occupied slot must yield (pgx.ErrNoRows), got %v", err)
+	}
+}
+
+// TestFailTaskAndRerunConcurrently_NeverStrandsRunningTask forces the interleaving
+// the successor pre-check cannot prevent: FailTask and RerunIssue racing for the
+// same (issue, agent) slot on two separate connections, released together from a
+// barrier so the rerun can commit inside FailTask's transaction window.
+//
+// The invariants must hold no matter who wins:
+//   - FailTask never returns an error (its transaction is never aborted by the
+//     retry insert), so the parent's failure always commits.
+//   - The parent ends 'failed', never stranded back in 'running'.
+//   - At most one runnable successor exists, since the unique index allows one.
+func TestFailTaskAndRerunConcurrently_NeverStrandsRunningTask(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	runtimeID := dbfx.Runtime(t, "rerun-race-runtime")
+	agentID := dbfx.Agent(t, "rerun-race-agent", runtimeID)
+	issueID := dbfx.Issue(t, "rerun races auto-retry", testutil.Cols{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+	})
+
+	const rounds = 15
+	for i := 0; i < rounds; i++ {
+		runningID := dbfx.Task(t, agentID, testutil.Cols{
+			"issue_id":     issueID,
+			"runtime_id":   runtimeID,
+			"status":       "running",
+			"attempt":      1,
+			"max_attempts": 2,
+		})
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var failErr, rerunErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, failErr = testHandler.TaskService.FailTask(ctx, parseUUID(runningID),
+				"run died", "", "", "", "timeout", false, "", "")
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, rerunErr = testHandler.TaskService.RerunIssue(ctx, parseUUID(issueID), pgtype.UUID{}, pgtype.UUID{}, parseUUID(testUserID), nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		if failErr != nil {
+			t.Fatalf("round %d: FailTask must never abort on slot contention: %v", i, failErr)
+		}
+		if rerunErr != nil {
+			t.Fatalf("round %d: RerunIssue must reclaim the slot rather than surface a conflict: %v", i, rerunErr)
+		}
+
+		var status string
+		if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, runningID).Scan(&status); err != nil {
+			t.Fatalf("round %d: read parent: %v", i, err)
+		}
+		if status != "failed" {
+			t.Fatalf("round %d: parent must commit as failed, got %q (stranded)", i, status)
+		}
+
+		var pending int
+		if err := testPool.QueryRow(ctx, `
+			SELECT count(*) FROM agent_task_queue
+			WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched')
+		`, issueID, agentID).Scan(&pending); err != nil {
+			t.Fatalf("round %d: count successors: %v", i, err)
+		}
+		if pending > 1 {
+			t.Fatalf("round %d: the unique index allows one runnable successor, found %d", i, pending)
+		}
+
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
 	}
 }

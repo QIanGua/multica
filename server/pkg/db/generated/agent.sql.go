@@ -2706,6 +2706,9 @@ SELECT
 FROM agent_task_queue p
 WHERE p.id = $1
   AND lock_task_owner_rows(p.agent_id, p.issue_id, p.runtime_id)
+ON CONFLICT (issue_id, agent_id) WHERE status IN ('queued', 'dispatched')
+       OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
+DO NOTHING
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir
 `
 
@@ -2721,6 +2724,22 @@ type CreateRetryTaskParams struct {
 // locks the owners' workspace rows in the writer's own transaction and returns
 // false once they are gone, so this statement writes no row instead of stranding
 // a task in a workspace that has just been deleted (MUL-5999).
+//
+// Fenced against slot contention too: ON CONFLICT DO NOTHING yields the single
+// queued/dispatched slot idx_one_pending_task_per_issue_agent_v2 allows per
+// (issue, agent) rather than raising 23505. A manual rerun may now be enqueued
+// behind a still-running task, and it can commit at any point — including
+// between a caller's "is a successor already pending?" check and this insert,
+// since that check takes no lock. Raising here would abort the caller's
+// transaction, and on the FailTask path that transaction also carries the
+// parent's failed status, so the failure would roll back and leave the task
+// stuck in 'running'. Yielding instead makes the policy explicit: whoever
+// already holds the slot keeps it, and a deliberate human rerun therefore wins
+// over an automatic retry.
+//
+// Both fences surface the same way — zero rows, i.e. pgx.ErrNoRows from this
+// :one query. Callers must treat that as "no retry was created" and still commit
+// their own work, NOT as a failure.
 // Clones a parent task into a fresh queued attempt. Carries forward the
 // agent's resume context (session_id/work_dir) so the child can continue
 // the conversation when the backend supports it. Resume-unsafe failures are

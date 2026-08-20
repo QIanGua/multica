@@ -4189,8 +4189,14 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		// Create the retry child atomically with the fail. CreateRetryTask reads
 		// the just-failed parent row (same tx), so it inherits chat_input_task_id
 		// and the bumped chat-retry priority; broadcast/notify happen after commit.
-		// Checked inside the transaction so a rerun committing concurrently
-		// cannot slip into the slot between this check and the insert.
+		// This check is an optimisation, NOT the safety mechanism. It is a plain
+		// count at READ COMMITTED and takes no lock, so a rerun can always commit
+		// between it and the insert below; it only saves the work when a
+		// successor is already visible and gives the skip a readable log line.
+		// Correctness under that race belongs to CreateRetryTask's
+		// ON CONFLICT DO NOTHING, which yields the slot instead of raising and so
+		// can never abort this transaction — which also carries the parent's
+		// failed status.
 		createRetry := wantRetry
 		if createRetry {
 			successor, herr := hasRunnableSuccessor(ctx, qtx, t)
@@ -4214,10 +4220,24 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 				RuntimeMcpOverlay:    retryOverlay.Overlay,
 				RuntimeConnectedApps: retryOverlay.ConnectedApps,
 			})
-			if cerr != nil {
+			switch {
+			case cerr == nil:
+				retried = &child
+			case errors.Is(cerr, pgx.ErrNoRows):
+				// The statement wrote nothing: either the owning workspace was
+				// torn down mid-flight, or a rerun took the pending slot after
+				// the unlocked check above (ON CONFLICT DO NOTHING). Neither is
+				// a reason to abort — this transaction still owns the parent's
+				// failed status, and losing that would leave the task stuck in
+				// 'running'. Record the failure and move on without a retry.
+				slog.Info("fail task auto-retry not created: no row written",
+					"task_id", util.UUIDToString(taskID),
+					"issue_id", util.UUIDToString(t.IssueID),
+					"agent_id", util.UUIDToString(t.AgentID),
+				)
+			default:
 				return fmt.Errorf("create retry task: %w", cerr)
 			}
-			retried = &child
 		}
 
 		// A terminal non-retried chat failure is a visible assistant outcome.
@@ -4514,12 +4534,13 @@ func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 //
 // Both auto-retry paths consult this before inserting a retry child. A manual
 // rerun can now be enqueued BEHIND a still-running task instead of cancelling
-// it, so by the time that task fails its slot may already be taken. Inserting
-// the retry anyway violates the unique index; on the FailTask path that insert
-// shares the failure transaction, so the violation would roll the parent's
-// failed status back too and leave the task stuck in 'running'. Skipping is the
-// right answer rather than a workaround: the retry exists to give the issue a
-// runnable successor, and one already exists.
+// it, so by the time that task fails its slot may already be taken, and the
+// retry exists to give the issue a runnable successor that already exists.
+//
+// This is advisory only: the query takes no lock, so a rerun committing after it
+// returns is always possible. CreateRetryTask's ON CONFLICT DO NOTHING is what
+// makes losing that race harmless. Skipping early just avoids pointless work and
+// records why no retry was made.
 //
 // Chat / quick-create tasks carry no issue_id, so the index cannot apply to them
 // and their retries can never collide.
@@ -4597,10 +4618,9 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	if delay := retryDelayForAttempt(reason, parent.Attempt); delay > 0 {
 		retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
 	}
-	// Same slot check as FailTask's in-tx path. This one is not sharing a
-	// transaction with the fail, so a collision here would only lose the retry
-	// rather than the failed status — but losing it silently to a unique-violation
-	// log line is worse than skipping deliberately when a successor already exists.
+	// Same advisory slot check as FailTask's path, for the same reason: skip the
+	// work when a successor is already visible. Losing the race is handled by
+	// CreateRetryTask yielding the slot, which this caller reads as "no retry".
 	if successor, herr := hasRunnableSuccessor(ctx, s.Queries, parent); herr != nil {
 		slog.Warn("task auto-retry: successor check failed; attempting retry anyway",
 			"parent_task_id", util.UUIDToString(parent.ID), "error", herr)
@@ -4619,6 +4639,16 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
 		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Workspace torn down, or the pending slot was taken between the check
+		// above and this insert. Same contract as FailTask's path: no retry, no
+		// error.
+		slog.Info("task auto-retry not created: no row written",
+			"parent_task_id", util.UUIDToString(parent.ID),
+			"reason", reason,
+		)
+		return nil, nil
+	}
 	if err != nil {
 		slog.Warn("task auto-retry failed",
 			"parent_task_id", util.UUIDToString(parent.ID),
@@ -4787,22 +4817,26 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 	// asking an agent for another pass silently killed the pass it was still
 	// working on; interrupting an in-flight run is what CancelTask /
 	// `multica issue cancel-task` is for.
-	cancelled, err := s.Queries.CancelPendingTasksByIssueAndAgent(ctx, db.CancelPendingTasksByIssueAndAgentParams{
-		IssueID: issueID,
-		AgentID: agentID,
-	})
-	if err != nil {
-		slog.Warn("rerun: cancel pending tasks failed",
-			"issue_id", util.UUIDToString(issueID),
-			"agent_id", util.UUIDToString(agentID),
-			"error", err,
-		)
+	clearPendingSlot := func() int {
+		cancelled, cerr := s.Queries.CancelPendingTasksByIssueAndAgent(ctx, db.CancelPendingTasksByIssueAndAgentParams{
+			IssueID: issueID,
+			AgentID: agentID,
+		})
+		if cerr != nil {
+			slog.Warn("rerun: cancel pending tasks failed",
+				"issue_id", util.UUIDToString(issueID),
+				"agent_id", util.UUIDToString(agentID),
+				"error", cerr,
+			)
+		}
+		for _, t := range cancelled {
+			s.captureTaskCancelled(ctx, t)
+			s.ReconcileAgentStatus(ctx, t.AgentID)
+			s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+		}
+		return len(cancelled)
 	}
-	for _, t := range cancelled {
-		s.captureTaskCancelled(ctx, t)
-		s.ReconcileAgentStatus(ctx, t.AgentID)
-		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
-	}
+	cancelledCount := clearPendingSlot()
 
 	// A manual rerun is a NEW direct_human trigger attributed to the rerunning
 	// member, not the original run's human (MUL-4302 §5); actorUserID carries them.
@@ -4810,6 +4844,23 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 	// (rerun_of_task_id) so the queued event / daemon claim never sees a NULL
 	// lineage, and it stays distinct from system-retry's retry_of_task_id (§5).
 	task, err := s.enqueueRerunTask(ctx, issue, agentID, triggerCommentID, coalescedCommentIDs, isLeader, squadID, actorUserID, sourceTaskID)
+	if isDuplicatePendingTaskErr(err) {
+		// The clear above and this enqueue are separate commits, so a system
+		// retry created by a concurrent FailTask can take the pending slot in
+		// between. CreateRetryTask yields the slot when it is already occupied,
+		// but it cannot yield to a row that does not exist yet, so a retry
+		// committing inside this window gets there first. Clear once more and
+		// retry: the deliberate human action is the one that should hold the
+		// slot. Bounded to a single extra attempt — a second collision would mean
+		// something is enqueueing in a loop, which is worth surfacing rather than
+		// spinning on.
+		slog.Info("issue rerun: pending slot taken concurrently, reclaiming",
+			"issue_id", util.UUIDToString(issueID),
+			"agent_id", util.UUIDToString(agentID),
+		)
+		cancelledCount += clearPendingSlot()
+		task, err = s.enqueueRerunTask(ctx, issue, agentID, triggerCommentID, coalescedCommentIDs, isLeader, squadID, actorUserID, sourceTaskID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -4819,7 +4870,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		"agent_id", util.UUIDToString(agentID),
 		"source_task_id", util.UUIDToString(sourceTaskID),
 		"is_leader", isLeader,
-		"cancelled_pending", len(cancelled),
+		"cancelled_pending", cancelledCount,
 	)
 	return &task, nil
 }
