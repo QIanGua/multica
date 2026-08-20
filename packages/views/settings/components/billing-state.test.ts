@@ -7,8 +7,8 @@ import type {
   WorkspaceSubscriptionSummary,
 } from "@multica/core/types";
 import {
+  canPurchaseWorkspaceSubscription,
   hasManagedWorkspaceSubscription,
-  resolveBillingSnapshotFreshness,
   resolveAutopilotUsage,
 } from "./billing-state";
 
@@ -38,7 +38,7 @@ const quotaUsage: AutopilotQuotaUsage = {
 describe("resolveAutopilotUsage", () => {
   it("counts reserved runs toward progress and the reached decision", () => {
     expect(
-      resolveAutopilotUsage(freeEntitlements, quotaUsage, false, "fresh"),
+      resolveAutopilotUsage(freeEntitlements, quotaUsage, false, false),
     ).toEqual({
       kind: "metered",
       used: 3,
@@ -55,7 +55,7 @@ describe("resolveAutopilotUsage", () => {
         freeEntitlements,
         { ...quotaUsage, used: 5 },
         false,
-        "fresh",
+        false,
       ),
     ).toMatchObject({ total: 7, reached: true, progress: 100 });
   });
@@ -66,14 +66,14 @@ describe("resolveAutopilotUsage", () => {
         { ...freeEntitlements, plan: "pro", autopilotRuns: null },
         undefined,
         true,
-        "fresh",
+        true,
       ),
     ).toEqual({ kind: "unlimited" });
   });
 
   it("does not turn missing or disabled limited usage into zero or unlimited", () => {
     expect(
-      resolveAutopilotUsage(freeEntitlements, undefined, true, "fresh"),
+      resolveAutopilotUsage(freeEntitlements, undefined, true, false),
     ).toEqual({ kind: "unavailable" });
     expect(
       resolveAutopilotUsage(
@@ -87,43 +87,35 @@ describe("resolveAutopilotUsage", () => {
           reset_at: null,
         },
         false,
-        "fresh",
+        false,
       ),
     ).toEqual({ kind: "unavailable" });
   });
 
-  it.each(["stale", "unknown"] as const)(
-    "does not derive unlimited or metered usage from a %s snapshot",
-    (snapshotFreshness) => {
-      expect(
-        resolveAutopilotUsage(
-          { ...freeEntitlements, plan: "pro", autopilotRuns: null },
-          quotaUsage,
-          false,
-          snapshotFreshness,
-        ),
-      ).toEqual({ kind: "unavailable" });
-    },
-  );
+  it("keeps authoritative metered usage independent of entitlement unlimited", () => {
+    expect(
+      resolveAutopilotUsage(
+        { ...freeEntitlements, plan: "pro", autopilotRuns: null },
+        quotaUsage,
+        false,
+        false,
+      ),
+    ).toMatchObject({ kind: "metered", total: 5, limit: 7 });
+  });
+
+  it("does not derive unlimited when the entitlement fact is not trusted", () => {
+    expect(
+      resolveAutopilotUsage(
+        { ...freeEntitlements, plan: "pro", autopilotRuns: null },
+        undefined,
+        true,
+        false,
+      ),
+    ).toEqual({ kind: "unavailable" });
+  });
 });
 
 describe("billing subscription state", () => {
-  it("distinguishes fresh, stale, and invalid snapshots", () => {
-    expect(resolveBillingSnapshotFreshness(null, 1)).toBe("fresh");
-    expect(
-      resolveBillingSnapshotFreshness("2030-01-01T00:00:00Z", 1),
-    ).toBe("fresh");
-    expect(
-      resolveBillingSnapshotFreshness(
-        "2030-01-01T00:00:00Z",
-        2_000_000_000_000,
-      ),
-    ).toBe("stale");
-    expect(
-      resolveBillingSnapshotFreshness("not-a-date", 2_000_000_000_000),
-    ).toBe("unknown");
-  });
-
   it("prefers subscription facts and keeps safe compatibility fallbacks", () => {
     const summary = {
       entitlement: freeEntitlements,
@@ -141,12 +133,42 @@ describe("billing subscription state", () => {
     );
     expect(
       hasManagedWorkspaceSubscription(
-        { ...freeEntitlements, status: "past_due" },
+        { ...freeEntitlements, status: "incomplete_expired" },
         undefined,
       ),
     ).toBe(true);
     expect(hasManagedWorkspaceSubscription(freeEntitlements, undefined)).toBe(
       false,
     );
+  });
+
+  it.each([
+    ["inactive", true],
+    ["canceled", true],
+    ["incomplete_expired", true],
+    ["active", false],
+    ["trialing", false],
+    ["past_due", false],
+    ["incomplete", false],
+    ["paused", false],
+    ["unpaid", false],
+    ["future_status", false],
+  ])("allows a Free workspace in %s to purchase: %s", (status, expected) => {
+    expect(
+      canPurchaseWorkspaceSubscription({
+        ...freeEntitlements,
+        status,
+      }),
+    ).toBe(expected);
+  });
+
+  it("never offers Checkout while Pro is currently enforced", () => {
+    expect(
+      canPurchaseWorkspaceSubscription({
+        ...freeEntitlements,
+        plan: "pro",
+        status: "active",
+      }),
+    ).toBe(false);
   });
 });

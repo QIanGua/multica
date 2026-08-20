@@ -18,74 +18,61 @@ export type AutopilotUsageView =
       resetAt: string;
     };
 
-export type BillingSnapshotFreshness = "fresh" | "stale" | "unknown";
-
 /**
  * Quota admission counts completed and reserved runs. Keep reserved work
- * visible so the progress bar matches the server's blocking decision.
+ * visible so the progress bar matches the server's blocking decision. A
+ * complete metered response is authoritative independently of entitlement
+ * state; only the unlimited fallback comes from the entitlement response.
  */
 export function resolveAutopilotUsage(
   entitlements: WorkspaceSubscriptionEntitlements,
   usage: AutopilotQuotaUsage | undefined,
   failed: boolean,
-  snapshotFreshness: BillingSnapshotFreshness,
+  allowEntitlementUnlimited: boolean,
 ): AutopilotUsageView {
-  if (snapshotFreshness !== "fresh") {
-    return { kind: "unavailable" };
+  if (!failed && usage !== undefined && usage.action !== "off") {
+    const { used, reserved, limit, reset_at: resetAt } = usage;
+    if (
+      used !== null &&
+      reserved !== null &&
+      limit !== null &&
+      resetAt !== null &&
+      used >= 0 &&
+      reserved >= 0 &&
+      limit >= 0 &&
+      Number.isFinite(used) &&
+      Number.isFinite(reserved) &&
+      Number.isFinite(limit)
+    ) {
+      const total = used + reserved;
+      const reached = total >= limit;
+      const progress =
+        limit === 0
+          ? 100
+          : Math.min(100, Math.max(0, (total / limit) * 100));
+
+      return {
+        kind: "metered",
+        used,
+        reserved,
+        total,
+        limit,
+        progress,
+        reached,
+        resetAt,
+      };
+    }
   }
 
   if (
+    allowEntitlementUnlimited &&
     entitlements.plan === "pro" &&
     entitlements.autopilotRuns === null
   ) {
     return { kind: "unlimited" };
   }
 
-  if (
-    failed ||
-    !usage ||
-    usage.action === "off" ||
-    usage.used === null ||
-    usage.reserved === null ||
-    usage.limit === null ||
-    usage.reset_at === null ||
-    usage.used < 0 ||
-    usage.reserved < 0 ||
-    usage.limit < 0 ||
-    !Number.isFinite(usage.used) ||
-    !Number.isFinite(usage.reserved) ||
-    !Number.isFinite(usage.limit)
-  ) {
-    return { kind: "unavailable" };
-  }
-
-  const total = usage.used + usage.reserved;
-  const reached = total >= usage.limit;
-  const progress =
-    usage.limit === 0
-      ? 100
-      : Math.min(100, Math.max(0, (total / usage.limit) * 100));
-
-  return {
-    kind: "metered",
-    used: usage.used,
-    reserved: usage.reserved,
-    total,
-    limit: usage.limit,
-    progress,
-    reached,
-    resetAt: usage.reset_at,
-  };
-}
-
-export function resolveBillingSnapshotFreshness(
-  expiresAt: string | null,
-  now: number = Date.now(),
-): BillingSnapshotFreshness {
-  if (!expiresAt) return "fresh";
-  const expiresAtMs = new Date(expiresAt).getTime();
-  if (!Number.isFinite(expiresAtMs)) return "unknown";
-  return expiresAtMs <= now ? "stale" : "fresh";
+  return { kind: "unavailable" };
 }
 
 const MANAGED_SUBSCRIPTION_STATUSES = new Set([
@@ -94,8 +81,15 @@ const MANAGED_SUBSCRIPTION_STATUSES = new Set([
   "past_due",
   "canceled",
   "incomplete",
+  "incomplete_expired",
   "paused",
   "unpaid",
+]);
+
+const PURCHASABLE_SUBSCRIPTION_STATUSES = new Set([
+  "inactive",
+  "canceled",
+  "incomplete_expired",
 ]);
 
 /**
@@ -111,5 +105,19 @@ export function hasManagedWorkspaceSubscription(
     summary?.billedSeats !== null && summary?.billedSeats !== undefined ||
     entitlements.plan === "pro" ||
     MANAGED_SUBSCRIPTION_STATUSES.has(entitlements.status)
+  );
+}
+
+/**
+ * Checkout creates a new subscription. Cloud accepts an existing record only
+ * after cancellation or incomplete setup expiry; every other known status may
+ * still represent a live or recoverable subscription and stays in Portal.
+ */
+export function canPurchaseWorkspaceSubscription(
+  entitlements: WorkspaceSubscriptionEntitlements,
+): boolean {
+  return (
+    entitlements.plan === "free" &&
+    PURCHASABLE_SUBSCRIPTION_STATUSES.has(entitlements.status)
   );
 }

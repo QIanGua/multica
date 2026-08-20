@@ -85,7 +85,6 @@
       "incomplete_expired": "Setup expired",
       "paused": "Paused",
       "unpaid": "Unpaid",
-      "stale": "Snapshot stale",
       "unknown": "Unknown status"
     },
     "load_failed": {
@@ -127,16 +126,8 @@
     },
     "past_due": {
       "title": "Payment needs attention",
-      "description": "Open the Billing Portal to update your payment method and keep Pro access.",
+      "description": "Open the Billing Portal to update your payment method. The plan badge above shows the access currently available.",
       "grace_description": "Update your payment method by {{date}} to keep Pro access."
-    },
-    "snapshot_stale": {
-      "title": "Subscription data may be out of date",
-      "description": "The last trusted snapshot has expired. We are refreshing it; actions remain guarded by the server."
-    },
-    "snapshot_unknown": {
-      "title": "Subscription data cannot be verified",
-      "description": "The snapshot expiration time is invalid. We are refreshing it; plan-dependent limits remain unavailable."
     },
     "subscription_notice": {
       "canceling_title": "Cancellation is scheduled",

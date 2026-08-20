@@ -42,6 +42,8 @@ const mocks = vi.hoisted(() => ({
   usagePending: false,
   usageFetching: false,
   usageError: false,
+  entitlementsDataUpdatedAt: 0,
+  entitlementsFetchedAfterMount: false,
   entitlements: {
     workspaceId: "workspace-1",
     plan: "free",
@@ -170,6 +172,8 @@ describe("BillingTab", () => {
     mocks.usagePending = false;
     mocks.usageFetching = false;
     mocks.usageError = false;
+    mocks.entitlementsDataUpdatedAt = 0;
+    mocks.entitlementsFetchedAfterMount = false;
     Object.assign(mocks.entitlements, {
       plan: "free",
       status: "inactive",
@@ -235,6 +239,8 @@ describe("BillingTab", () => {
       }
       return {
         data: mocks.entitlements,
+        dataUpdatedAt: mocks.entitlementsDataUpdatedAt,
+        isFetchedAfterMount: mocks.entitlementsFetchedAfterMount,
         isPending: false,
         isError: false,
         refetch: mocks.refetch,
@@ -556,16 +562,18 @@ describe("BillingTab", () => {
     }
   });
 
-  it("keeps Checkout syncing when a stale Pro snapshot cannot confirm activation", () => {
+  it("keeps Checkout syncing until Pro is fetched after the return callback", () => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00Z"));
     navigationState.search = "tab=billing&result=success&session_id=cs_test_1";
     Object.assign(mocks.entitlements, {
       plan: "pro",
       status: "active",
       issueWindow: null,
       autopilotRuns: null,
-      snapshotExpiresAt: "2000-01-01T00:00:00Z",
     });
+    mocks.entitlementsDataUpdatedAt = Date.now() - 1;
+    mocks.entitlementsFetchedAfterMount = true;
     try {
       renderWithI18n(<BillingTab />);
 
@@ -574,10 +582,40 @@ describe("BillingTab", () => {
       ).toBeInTheDocument();
       expect(screen.queryByText("Pro is active")).not.toBeInTheDocument();
       expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
-      expect(screen.getByText("Snapshot stale")).toBeInTheDocument();
+      expect(screen.getByText("Unavailable")).toBeInTheDocument();
+      expect(screen.getByText("5 / 7")).toBeInTheDocument();
       expect(mocks.useQuery).toHaveBeenCalledWith(
         expect.objectContaining({ refetchInterval: 2_000 }),
       );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("confirms Pro after an entitlement fetch newer than the return callback", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00Z"));
+    navigationState.search = "tab=billing&result=success&session_id=cs_test_1";
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+    });
+    Object.assign(mocks.usage, {
+      action: "off",
+      used: null,
+      reserved: null,
+      limit: null,
+      reset_at: null,
+    });
+    mocks.entitlementsDataUpdatedAt = Date.now() + 1;
+    mocks.entitlementsFetchedAfterMount = true;
+    try {
+      renderWithI18n(<BillingTab />);
+
+      expect(screen.getByText("Pro is active")).toBeInTheDocument();
+      expect(screen.getAllByText("Unlimited")).toHaveLength(2);
     } finally {
       vi.useRealTimers();
     }
@@ -601,7 +639,18 @@ describe("BillingTab", () => {
 
   it("renders authoritative subscription seat facts", () => {
     Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
       currentPeriodEnd: "2030-02-01T00:00:00Z",
+    });
+    Object.assign(mocks.usage, {
+      action: "off",
+      used: null,
+      reserved: null,
+      limit: null,
+      reset_at: null,
     });
     Object.assign(mocks.summary, {
       billingInterval: "month",
@@ -687,54 +736,12 @@ describe("BillingTab", () => {
     expect(screen.getByText(title)).toBeInTheDocument();
   });
 
-  it("warns when the trusted entitlement snapshot has expired", () => {
-    mocks.entitlements.snapshotExpiresAt = "2000-01-01T00:00:00Z";
-
-    renderWithI18n(<BillingTab />);
-
-    expect(
-      screen.getByText("Subscription data may be out of date"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("Snapshot stale")).toBeInTheDocument();
-    expect(screen.queryByText("Inactive")).not.toBeInTheDocument();
-    expect(screen.queryByText("17")).not.toBeInTheDocument();
-    expect(screen.queryByText("5 / 7")).not.toBeInTheDocument();
-    expect(screen.queryByText("7 / month")).not.toBeInTheDocument();
-    expect(screen.getByText("Unavailable")).toBeInTheDocument();
-    expect(
-      screen.getByText("Usage is temporarily unavailable"),
-    ).toBeInTheDocument();
-  });
-
-  it("treats an invalid snapshot expiration as unknown and hides Pro limits", () => {
-    Object.assign(mocks.entitlements, {
-      plan: "pro",
-      status: "active",
-      issueWindow: null,
-      autopilotRuns: null,
-      snapshotExpiresAt: "not-a-date",
-    });
-
-    renderWithI18n(<BillingTab />);
-
-    expect(
-      screen.getByText("Subscription data cannot be verified"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("Unknown status")).toBeInTheDocument();
-    expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
-    expect(screen.getByText("Unavailable")).toBeInTheDocument();
-    expect(
-      screen.getByText("Usage is temporarily unavailable"),
-    ).toBeInTheDocument();
-    expect(mocks.refetch).toHaveBeenCalledOnce();
-    expect(mocks.refetchSummary).toHaveBeenCalledOnce();
-  });
-
   it("shows grace and scheduled-cancellation dates from subscription facts", () => {
     Object.assign(mocks.entitlements, {
       plan: "pro",
       status: "past_due",
       currentPeriodEnd: "2030-03-01T00:00:00Z",
+      snapshotExpiresAt: "2030-02-15T00:00:00Z",
     });
     Object.assign(mocks.summary, {
       graceUntil: "2030-02-15T00:00:00Z",
@@ -751,6 +758,34 @@ describe("BillingTab", () => {
     expect(
       screen.getByText(/subscription is scheduled to cancel on Mar 1, 2030/),
     ).toBeInTheDocument();
+  });
+
+  it("stops deriving Pro access after the summary grace deadline", () => {
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "past_due",
+      issueWindow: null,
+      autopilotRuns: null,
+    });
+    mocks.summary.graceUntil = "2000-01-01T00:00:00Z";
+    Object.assign(mocks.usage, {
+      action: "off",
+      used: null,
+      reserved: null,
+      limit: null,
+      reset_at: null,
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
+    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Open the Billing Portal to update your payment method. The plan badge above shows the access currently available.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/keep Pro access/)).not.toBeInTheDocument();
   });
 
   it("keeps cancellation and pending-seat dates on one summary snapshot", () => {
@@ -774,7 +809,8 @@ describe("BillingTab", () => {
       screen.getByText(/subscription is scheduled to cancel on Apr 1, 2030/),
     ).toBeInTheDocument();
     expect(screen.getByText(/4 seats from Apr 1, 2030/)).toBeInTheDocument();
-    expect(screen.getByText("Mar 1, 2030")).toBeInTheDocument();
+    expect(screen.getByText("Apr 1, 2030")).toBeInTheDocument();
+    expect(screen.queryByText("Mar 1, 2030")).not.toBeInTheDocument();
     expect(
       screen.queryByText(/subscription is scheduled to cancel on Mar 1, 2030/),
     ).not.toBeInTheDocument();
@@ -789,6 +825,13 @@ describe("BillingTab", () => {
       autopilotRuns: null,
       currentPeriodEnd: "2026-09-13T00:00:00Z",
       version: 3,
+    });
+    Object.assign(mocks.usage, {
+      action: "off",
+      used: null,
+      reserved: null,
+      limit: null,
+      reset_at: null,
     });
 
     renderWithI18n(<BillingTab />);
@@ -808,33 +851,55 @@ describe("BillingTab", () => {
     );
   });
 
-  it("keeps the billing portal available for a canceled Pro period", () => {
-    Object.assign(mocks.entitlements, {
-      plan: "pro",
-      status: "canceled",
-      currentPeriodEnd: "2026-09-13T00:00:00Z",
-      version: 4,
-    });
+  it.each(["canceled", "incomplete_expired"])(
+    "keeps management and self-service repurchase available for %s Free",
+    (status) => {
+      Object.assign(mocks.entitlements, {
+        plan: "free",
+        status,
+        currentPeriodEnd: "2026-09-13T00:00:00Z",
+        version: 4,
+      });
+      Object.assign(mocks.summary, {
+        billedSeats: 3,
+        hasStripeCustomer: true,
+      });
 
-    renderWithI18n(<BillingTab />);
+      renderWithI18n(<BillingTab />);
 
-    expect(
-      screen.getByRole("button", { name: "Manage billing" }),
-    ).toBeInTheDocument();
-  });
+      expect(
+        screen.getByRole("button", { name: "Manage billing" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Upgrade to Pro" }),
+      ).toBeInTheDocument();
+      expect(mocks.useQuery).toHaveBeenCalledWith(
+        expect.objectContaining({
+          queryKey: ["workspace-subscriptions", "workspace-1", "prices"],
+          enabled: true,
+        }),
+      );
+    },
+  );
 
   it("keeps payment recovery available when past-due grace has resolved to Free", () => {
     Object.assign(mocks.entitlements, {
       plan: "free",
       status: "past_due",
-      snapshotExpiresAt: "2026-09-01T00:00:00Z",
+      snapshotExpiresAt: null,
       version: 4,
     });
+    mocks.summary.graceUntil = "2000-01-01T00:00:00Z";
 
     renderWithI18n(<BillingTab />);
 
     expect(screen.getByText("Payment needs attention")).toBeInTheDocument();
-    expect(screen.queryByText("Sep 1, 2026")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Open the Billing Portal to update your payment method. The plan badge above shows the access currently available.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/keep Pro access/)).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Manage billing" }),
     ).toBeInTheDocument();

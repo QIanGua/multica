@@ -85,7 +85,6 @@
       "incomplete_expired": "設定期限切れ",
       "paused": "一時停止中",
       "unpaid": "未払い",
-      "stale": "スナップショット期限切れ",
       "unknown": "不明なステータス"
     },
     "load_failed": {
@@ -127,16 +126,8 @@
     },
     "past_due": {
       "title": "お支払い方法の確認が必要です",
-      "description": "Pro を継続するには Billing Portal でお支払い方法を更新してください。",
+      "description": "Billing Portal でお支払い方法を更新してください。上のプランバッジには現在利用できるアクセス権が表示されます。",
       "grace_description": "Pro を継続するには {{date}} までにお支払い方法を更新してください。"
-    },
-    "snapshot_stale": {
-      "title": "サブスクリプション情報が古い可能性があります",
-      "description": "最後の信頼できるスナップショットは期限切れです。更新中も操作はサーバーで検証されます。"
-    },
-    "snapshot_unknown": {
-      "title": "サブスクリプション情報を確認できません",
-      "description": "スナップショットの有効期限が無効です。更新中のため、プランに依存する上限は利用できません。"
     },
     "subscription_notice": {
       "canceling_title": "キャンセルが予定されています",

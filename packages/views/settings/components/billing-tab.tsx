@@ -59,8 +59,8 @@ import {
   SettingsTab,
 } from "./settings-layout";
 import {
+  canPurchaseWorkspaceSubscription,
   hasManagedWorkspaceSubscription,
-  resolveBillingSnapshotFreshness,
   resolveAutopilotUsage,
 } from "./billing-state";
 
@@ -235,11 +235,18 @@ function BillingTabContent() {
   const [returnState, setReturnState] = useState<{
     workspaceId: string | null;
     result: WorkspaceBillingReturnResult | null;
-  }>({ workspaceId: wsId || null, result: returnResultParam });
-  const returnResult =
-    returnState.workspaceId === null || returnState.workspaceId === wsId
-      ? returnState.result
-      : null;
+    observedAt: number | null;
+  }>(() => ({
+    workspaceId: wsId || null,
+    result: returnResultParam,
+    observedAt: returnResultParam === "success" ? Date.now() : null,
+  }));
+  const returnStateMatchesWorkspace =
+    returnState.workspaceId === null || returnState.workspaceId === wsId;
+  const returnResult = returnStateMatchesWorkspace ? returnState.result : null;
+  const returnObservedAt = returnStateMatchesWorkspace
+    ? returnState.observedAt
+    : null;
   const [interval, setInterval] =
     useState<WorkspaceSubscriptionInterval>("month");
   const [checkoutConfirmOpen, setCheckoutConfirmOpen] = useState(false);
@@ -272,7 +279,11 @@ function BillingTabContent() {
   useEffect(() => {
     if (!callbackKey || consumedCallbackKeyRef.current === callbackKey) return;
     consumedCallbackKeyRef.current = callbackKey;
-    setReturnState({ workspaceId: wsId || null, result: returnResultParam });
+    setReturnState({
+      workspaceId: wsId || null,
+      result: returnResultParam,
+      observedAt: returnResultParam === "success" ? Date.now() : null,
+    });
     if (returnResultParam === "cancel") checkoutIntentRef.current = null;
 
     const params = new URLSearchParams(navigation.searchParams);
@@ -304,11 +315,12 @@ function BillingTabContent() {
     refetchInterval: isSyncingCheckout ? 2_000 : false,
   });
   const entitlements = entitlementQuery.data;
-  const snapshotFreshness = entitlements
-    ? resolveBillingSnapshotFreshness(entitlements.snapshotExpiresAt)
-    : "unknown";
-  const isFreshPro =
-    entitlements?.plan === "pro" && snapshotFreshness === "fresh";
+  const isCheckoutProConfirmed =
+    returnResult === "success" &&
+    returnObservedAt !== null &&
+    entitlements?.plan === "pro" &&
+    entitlementQuery.isFetchedAfterMount &&
+    entitlementQuery.dataUpdatedAt >= returnObservedAt;
   const summaryQuery = useQuery({
     ...workspaceSubscriptionSummaryOptions(wsId),
     refetchInterval: isSyncingCheckout ? 2_000 : false,
@@ -320,8 +332,9 @@ function BillingTabContent() {
   const hasManagedSubscription = entitlements
     ? hasManagedWorkspaceSubscription(entitlements, summaryQuery.data)
     : false;
-  const canUpgrade =
-    entitlements?.plan === "free" && !hasManagedSubscription;
+  const canUpgrade = entitlements
+    ? canPurchaseWorkspaceSubscription(entitlements)
+    : false;
   const pricesQuery = useQuery({
     ...workspaceSubscriptionPricesOptions(wsId),
     enabled: wsId.length > 0 && canUpgrade,
@@ -333,29 +346,25 @@ function BillingTabContent() {
   const refetchSummary = summaryQuery.refetch;
 
   useEffect(() => {
-    if (isSyncingCheckout && isFreshPro) {
+    if (isSyncingCheckout && isCheckoutProConfirmed) {
       setIsSyncingCheckout(false);
       setSyncTimedOut(false);
       checkoutIntentRef.current = null;
     }
-  }, [isFreshPro, isSyncingCheckout]);
+  }, [isCheckoutProConfirmed, isSyncingCheckout]);
 
   useEffect(() => {
-    const expiresAt = entitlements?.snapshotExpiresAt;
-    if (!expiresAt) return;
-    const expiresAtMs = new Date(expiresAt).getTime();
-    if (Number.isNaN(expiresAtMs)) {
-      void refetchEntitlements();
-      void refetchSummary();
-      return;
-    }
-    const delay = Math.max(0, expiresAtMs - Date.now()) + 100;
+    const graceUntil = summaryQuery.data?.graceUntil;
+    if (!graceUntil) return;
+    const graceUntilMs = new Date(graceUntil).getTime();
+    if (Number.isNaN(graceUntilMs)) return;
+    const delay = Math.max(0, graceUntilMs - Date.now()) + 100;
     const timeout = window.setTimeout(() => {
       void refetchEntitlements();
       void refetchSummary();
     }, Math.min(delay, 2_147_000_000));
     return () => window.clearTimeout(timeout);
-  }, [entitlements?.snapshotExpiresAt, refetchEntitlements, refetchSummary]);
+  }, [refetchEntitlements, refetchSummary, summaryQuery.data?.graceUntil]);
 
   const planLabel = (plan: string) => {
     switch (plan) {
@@ -540,12 +549,24 @@ function BillingTabContent() {
     );
   }
 
-  const periodEnd = formatDate(entitlements.currentPeriodEnd, locale);
   const summaryPeriodEnd = formatDate(
     summaryQuery.data?.entitlement.currentPeriodEnd ?? null,
     locale,
   );
-  const graceUntil = formatDate(summaryQuery.data?.graceUntil ?? null, locale);
+  const graceUntilValue = summaryQuery.data?.graceUntil ?? null;
+  const graceUntil = formatDate(graceUntilValue, locale);
+  const graceUntilMs = graceUntilValue
+    ? new Date(graceUntilValue).getTime()
+    : Number.NaN;
+  const hasActiveProGrace =
+    entitlements.plan === "pro" &&
+    entitlements.status === "past_due" &&
+    Number.isFinite(graceUntilMs) &&
+    graceUntilMs > Date.now();
+  const canUseEntitlementUnlimited =
+    entitlements.plan === "pro" &&
+    (entitlements.status !== "past_due" || hasActiveProGrace) &&
+    (returnResult !== "success" || isCheckoutProConfirmed);
   const actualSeats = summaryQuery.data?.actualSeats ?? entitlements.seats;
   const billedSeats = summaryQuery.data?.billedSeats;
   const pendingSeatQuantity = summaryQuery.data?.pendingSeatQuantity;
@@ -553,7 +574,7 @@ function BillingTabContent() {
     entitlements,
     quotaUsageQuery.data,
     quotaUsageQuery.isError,
-    snapshotFreshness,
+    canUseEntitlementUnlimited,
   );
   const quotaResetAt =
     quotaUsage.kind === "metered"
@@ -613,7 +634,7 @@ function BillingTabContent() {
 
       {returnResult === "success" ? (
         <Alert>
-          {isFreshPro ? (
+          {isCheckoutProConfirmed ? (
             <CheckCircle2 />
           ) : (
             <Loader2
@@ -625,36 +646,16 @@ function BillingTabContent() {
             />
           )}
           <AlertTitle>
-            {isFreshPro
+            {isCheckoutProConfirmed
               ? t(($) => $.workspace.return.active_title)
               : t(($) => $.workspace.return.syncing_title)}
           </AlertTitle>
           <AlertDescription>
-            {isFreshPro
+            {isCheckoutProConfirmed
               ? t(($) => $.workspace.return.active_description)
               : syncTimedOut
                 ? t(($) => $.workspace.return.timeout_description)
                 : t(($) => $.workspace.return.syncing_description)}
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {snapshotFreshness === "stale" ? (
-        <Alert>
-          <RefreshCw />
-          <AlertTitle>{t(($) => $.workspace.snapshot_stale.title)}</AlertTitle>
-          <AlertDescription>
-            {t(($) => $.workspace.snapshot_stale.description)}
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {snapshotFreshness === "unknown" ? (
-        <Alert>
-          <RefreshCw />
-          <AlertTitle>{t(($) => $.workspace.snapshot_unknown.title)}</AlertTitle>
-          <AlertDescription>
-            {t(($) => $.workspace.snapshot_unknown.description)}
           </AlertDescription>
         </Alert>
       ) : null}
@@ -686,7 +687,7 @@ function BillingTabContent() {
           <AlertCircle />
           <AlertTitle>{t(($) => $.workspace.past_due.title)}</AlertTitle>
           <AlertDescription>
-            {graceUntil
+            {hasActiveProGrace && graceUntil
               ? t(($) => $.workspace.past_due.grace_description, {
                   date: graceUntil,
                 })
@@ -789,18 +790,8 @@ function BillingTabContent() {
               <Badge variant={planBadgeVariant(entitlements.plan)}>
                 {planLabel(entitlements.plan)}
               </Badge>
-              <Badge
-                variant={
-                  snapshotFreshness !== "fresh"
-                    ? "outline"
-                    : statusBadgeVariant(entitlements.status)
-                }
-              >
-                {snapshotFreshness === "stale"
-                  ? t(($) => $.workspace.status.stale)
-                  : snapshotFreshness === "unknown"
-                    ? t(($) => $.workspace.status.unknown)
-                    : statusLabel(entitlements.status)}
+              <Badge variant={statusBadgeVariant(entitlements.status)}>
+                {statusLabel(entitlements.status)}
               </Badge>
             </div>
           </SettingsRow>
@@ -828,12 +819,12 @@ function BillingTabContent() {
               </span>
             </SettingsRow>
           ) : null}
-          {periodEnd ? (
+          {summaryPeriodEnd ? (
             <SettingsRow
               label={t(($) => $.workspace.current.period_end)}
               description={t(($) => $.workspace.current.period_end_description)}
             >
-              <span className="tabular-nums">{periodEnd}</span>
+              <span className="tabular-nums">{summaryPeriodEnd}</span>
             </SettingsRow>
           ) : null}
         </SettingsCard>
@@ -994,11 +985,11 @@ function BillingTabContent() {
             description={t(($) => $.workspace.limits.issues_description)}
           >
             <span className="tabular-nums">
-              {snapshotFreshness !== "fresh"
-                ? t(($) => $.workspace.limits.unavailable)
-                : entitlements.issueWindow === null
+              {entitlements.issueWindow === null
+                ? canUseEntitlementUnlimited
                   ? t(($) => $.workspace.limits.unlimited)
-                  : numberFormatter.format(entitlements.issueWindow)}
+                  : t(($) => $.workspace.limits.unavailable)
+                : numberFormatter.format(entitlements.issueWindow)}
             </span>
           </SettingsRow>
           <SettingsRow
@@ -1054,8 +1045,7 @@ function BillingTabContent() {
               </div>
             ) : (
               <div className="flex flex-col gap-2 sm:items-end">
-                {snapshotFreshness === "fresh" &&
-                entitlements.autopilotRuns !== null ? (
+                {entitlements.autopilotRuns !== null ? (
                   <span className="tabular-nums">
                     {t(($) => $.workspace.limits.per_month, {
                       count: entitlements.autopilotRuns,

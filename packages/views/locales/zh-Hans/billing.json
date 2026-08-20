@@ -85,7 +85,6 @@
       "incomplete_expired": "开通已过期",
       "paused": "已暂停",
       "unpaid": "未付款",
-      "stale": "快照已过期",
       "unknown": "未知状态"
     },
     "load_failed": {
@@ -127,16 +126,8 @@
     },
     "past_due": {
       "title": "付款信息需要处理",
-      "description": "打开 Billing Portal 更新付款方式，以继续使用 Pro。",
+      "description": "打开 Billing Portal 更新付款方式。上方的套餐徽章显示当前可用权限。",
       "grace_description": "请在 {{date}} 前更新付款方式，以继续使用 Pro。"
-    },
-    "snapshot_stale": {
-      "title": "订阅数据可能已经过期",
-      "description": "上一次可信快照已经过期，系统正在刷新；所有操作仍由服务端校验。"
-    },
-    "snapshot_unknown": {
-      "title": "无法验证订阅数据",
-      "description": "快照到期时间无效。系统正在刷新；依赖套餐的限额暂不可用。"
     },
     "subscription_notice": {
       "canceling_title": "订阅已安排取消",
