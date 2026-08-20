@@ -72,11 +72,15 @@ func TestRealtimeRelayRedisURLFromEnvFallsBackToSharedRedis(t *testing.T) {
 }
 
 func TestShardedRelayConfigFromEnvDerivesSafeRetention(t *testing.T) {
+	t.Setenv("REALTIME_RELAY_STREAM_MAXLEN", "")
 	t.Setenv("REALTIME_RELAY_REPLAY_GRACE", "20m")
 	t.Setenv("REALTIME_RELAY_TRIM_HORIZON", "")
 	t.Setenv("REALTIME_RELAY_STREAM_TTL", "")
 
 	cfg := shardedRelayConfigFromEnv()
+	if cfg.StreamMaxLen != 2000 {
+		t.Fatalf("stream max len = %d, want 2000", cfg.StreamMaxLen)
+	}
 	if cfg.TrimHorizon != 40*time.Minute {
 		t.Fatalf("trim horizon = %s, want 40m", cfg.TrimHorizon)
 	}

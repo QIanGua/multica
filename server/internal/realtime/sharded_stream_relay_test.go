@@ -18,8 +18,8 @@ func TestShardedStreamRelayConfigDefaults(t *testing.T) {
 	if relay.config.Shards != defaultShardedRelayShards {
 		t.Fatalf("expected default shard count %d, got %d", defaultShardedRelayShards, relay.config.Shards)
 	}
-	if relay.config.StreamMaxLen != defaultShardedRelayStreamMaxLen {
-		t.Fatalf("expected default stream max len %d, got %d", defaultShardedRelayStreamMaxLen, relay.config.StreamMaxLen)
+	if relay.config.StreamMaxLen != 2000 {
+		t.Fatalf("expected default stream max len 2000, got %d", relay.config.StreamMaxLen)
 	}
 	if relay.config.ReadCount != defaultShardedRelayReadCount {
 		t.Fatalf("expected default read count %d, got %d", defaultShardedRelayReadCount, relay.config.ReadCount)

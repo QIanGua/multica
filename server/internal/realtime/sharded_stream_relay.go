@@ -16,10 +16,10 @@ import (
 
 const (
 	defaultShardedRelayShards = 8
-	// At the measured baseline of roughly 1 KiB per relay entry, 8192 entries
-	// across each of eight shards estimates about 64 MiB instead of the former
+	// At the measured baseline of roughly 1 KiB per relay entry, 2000 entries
+	// across each of eight shards estimates about 16 MiB instead of the former
 	// ~800 MiB default. Operators can tune this from observed entry sizes.
-	defaultShardedRelayStreamMaxLen = 8192
+	defaultShardedRelayStreamMaxLen = 2000
 	defaultShardedRelayReadCount    = 128
 	defaultShardedRelayReadBlock    = 5 * time.Second
 	defaultShardedRelayReplayGrace  = 5 * time.Minute
