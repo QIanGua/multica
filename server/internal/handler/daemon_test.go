@@ -4116,3 +4116,93 @@ func TestIssueGCChecksReportCategoryNotRawCustomStatus(t *testing.T) {
 		}
 	})
 }
+
+// Every installed daemon calls the batch endpoint on a timer, with up to
+// maxIssueGCBatchSize ids per request. Resolving each row through the
+// package-level issuestatus.Effective meant one GetIssueStatusEntryByKey per
+// CUSTOM status in the batch — turning the endpoint that exists to replace
+// per-issue requests into a per-issue query generator the moment a workspace
+// enables custom statuses.
+//
+// A request-scoped Resolver reads the catalog lazily and at most once, so the
+// cost is flat in the number of custom rows and still zero when there are none.
+func TestBatchIssueGCCheckReadsCatalogOnceForManyCustomStatuses(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	gateApproved := createTestCustomStatus(t, "gc_batch_gate", issuestatus.Done)
+	humanReview := createTestCustomStatus(t, "gc_batch_review", issuestatus.InReview)
+
+	// Several issues across two custom statuses, plus a built-in one: enough
+	// that a per-key resolver would be visibly worse than a single read.
+	ids := []string{
+		dbfx.Issue(t, "gc-batch-custom-1", testutil.Cols{"status": gateApproved.Key, "priority": "medium", "number": 92601}),
+		dbfx.Issue(t, "gc-batch-custom-2", testutil.Cols{"status": gateApproved.Key, "priority": "medium", "number": 92602}),
+		dbfx.Issue(t, "gc-batch-custom-3", testutil.Cols{"status": humanReview.Key, "priority": "medium", "number": 92603}),
+		dbfx.Issue(t, "gc-batch-custom-4", testutil.Cols{"status": humanReview.Key, "priority": "medium", "number": 92604}),
+		dbfx.Issue(t, "gc-batch-builtin", testutil.Cols{"status": "done", "priority": "medium", "number": 92605}),
+	}
+
+	counter := withCountingCatalog(t)
+	req := newDaemonTokenRequest("POST", "/api/daemon/workspaces/"+testWorkspaceID+"/issues/gc-check",
+		map[string]any{"issue_ids": ids}, testWorkspaceID, "legit-daemon")
+	req = withURLParam(req, "workspaceId", testWorkspaceID)
+
+	var resp struct {
+		Issues []struct {
+			ID     string `json:"id"`
+			Found  bool   `json:"found"`
+			Status string `json:"status"`
+		} `json:"issues"`
+	}
+	testutil.Call(t, testHandler.BatchIssueGCCheck, req).Want(http.StatusOK).JSON(&resp)
+
+	// The answers still have to be right — a resolver that reads nothing would
+	// also score zero on the counters below.
+	byID := map[string]string{}
+	for _, issue := range resp.Issues {
+		byID[issue.ID] = issue.Status
+	}
+	for _, id := range ids[:2] {
+		if byID[id] != issuestatus.Done {
+			t.Fatalf("issue %s reported %q, want %q", id, byID[id], issuestatus.Done)
+		}
+	}
+	for _, id := range ids[2:4] {
+		if byID[id] != issuestatus.InReview {
+			t.Fatalf("issue %s reported %q, want %q", id, byID[id], issuestatus.InReview)
+		}
+	}
+
+	if counter.keyReads != 0 {
+		t.Errorf("per-key catalog lookups = %d, want 0 — the batch is resolving one status at a time", counter.keyReads)
+	}
+	if counter.entryReads != 1 {
+		t.Errorf("catalog reads = %d, want exactly 1 for the whole batch", counter.entryReads)
+	}
+}
+
+// The common case pays nothing: with no custom status in the batch the resolver
+// never loads the catalog at all.
+func TestBatchIssueGCCheckReadsNoCatalogForBuiltInStatuses(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ids := []string{
+		dbfx.Issue(t, "gc-batch-builtin-1", testutil.Cols{"status": "done", "priority": "medium", "number": 92611}),
+		dbfx.Issue(t, "gc-batch-builtin-2", testutil.Cols{"status": "in_progress", "priority": "medium", "number": 92612}),
+	}
+
+	counter := withCountingCatalog(t)
+	req := newDaemonTokenRequest("POST", "/api/daemon/workspaces/"+testWorkspaceID+"/issues/gc-check",
+		map[string]any{"issue_ids": ids}, testWorkspaceID, "legit-daemon")
+	req = withURLParam(req, "workspaceId", testWorkspaceID)
+	testutil.Call(t, testHandler.BatchIssueGCCheck, req).Want(http.StatusOK)
+
+	if counter.entryReads != 0 || counter.keyReads != 0 {
+		t.Fatalf("built-in batch read the catalog (%d entry, %d key), want 0 — a built-in key IS its own category",
+			counter.entryReads, counter.keyReads)
+	}
+}
