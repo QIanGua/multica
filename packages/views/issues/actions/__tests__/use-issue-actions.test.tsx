@@ -204,77 +204,41 @@ describe("useIssueActions", () => {
     expect(mockOpenModal).not.toHaveBeenCalled();
   });
 
-  it("assigning an agent to an issue parked in a CUSTOM backlog-category status applies directly", () => {
-    // "Is it parked?" is a category question. Comparing the raw key answered it
-    // only for workspaces with no custom statuses, so an issue sitting in
-    // `later` popped a confirm promising a run the server would never start.
-    const parked = { ...mockIssue, status: "later", status_category: "backlog" } as Issue;
-    const { result } = renderHook(() => useIssueActions(parked), { wrapper });
-
-    act(() => {
-      result.current.updateField({ assignee_type: "agent", assignee_id: "agent-1" });
-    });
-
-    expect(mockUpdateMutate).toHaveBeenCalledWith(
-      { id: "issue-1", assignee_type: "agent", assignee_id: "agent-1" },
-      expect.any(Object),
-    );
-    expect(mockOpenModal).not.toHaveBeenCalled();
-  });
-
-  // Promotion out of backlog is the other write that starts a run, so it gets
-  // the same confirmation — for every Todo-category status alike (MUL-6463).
-  it.each([
-    ["built-in todo", "backlog", "todo"],
-    ["custom Todo-category status", "backlog", "rework"],
-    ["custom backlog-category status", "later", "rework"],
-    ["a non-todo category that still starts a run", "backlog", "in_progress"],
-  ])("promoting an agent-owned issue (%s) routes through the run-confirm modal", (_label, from, to) => {
+  // Which writes need confirming is decided by runConfirmIntent, whose matrix
+  // (parked / unresolvable categories, every promotion target) is canonical in
+  // ../run-confirm-gate.test.ts. These two only prove the hook routes on it.
+  it("promoting an agent-owned parked issue routes through the run-confirm modal", () => {
     const parked = {
       ...mockIssue,
-      status: from,
+      status: "backlog",
       assignee_type: "agent",
       assignee_id: "agent-1",
     } as Issue;
     const { result } = renderHook(() => useIssueActions(parked), { wrapper });
 
     act(() => {
-      result.current.updateField({ status: to });
+      result.current.updateField({ status: "rework" });
     });
 
     expect(mockOpenModal).toHaveBeenCalledWith("issue-run-confirm", {
       issueIds: ["issue-1"],
       mode: "promote",
-      status: to,
+      status: "rework",
       assigneeType: "agent",
       assigneeId: "agent-1",
     });
     expect(mockUpdateMutate).not.toHaveBeenCalled();
   });
 
-  it.each([
-    // No owner: nothing to hand the issue to, so nothing to confirm.
-    ["unowned", { status: "backlog" }, "todo"],
-    // A member assignee never produces a run.
-    ["member-owned", { status: "backlog", assignee_type: "member", assignee_id: "user-1" }, "todo"],
-    // Not parked: the run already started (or never will) — no new run here.
-    ["already active", { status: "todo", assignee_type: "agent", assignee_id: "agent-1" }, "in_progress"],
-    // Closing an issue never starts a run, whatever it was parked in.
-    ["promoted to done", { status: "backlog", assignee_type: "agent", assignee_id: "agent-1" }, "done"],
-    // Backlog → backlog is a re-park, not a promotion.
-    ["parked deeper", { status: "backlog", assignee_type: "agent", assignee_id: "agent-1" }, "later"],
-  ])("a status change that starts no run (%s) applies directly", (_label, issueFields, to) => {
-    const { result } = renderHook(
-      () => useIssueActions({ ...mockIssue, ...issueFields } as Issue),
-      { wrapper },
-    );
+  it("a status change that starts no run applies directly", () => {
+    const { result } = renderHook(() => useIssueActions(mockIssue), { wrapper });
 
     act(() => {
-      result.current.updateField({ status: to });
+      result.current.updateField({ status: "in_progress" });
     });
 
     expect(mockUpdateMutate).toHaveBeenCalledWith(
-      { id: "issue-1", status: to },
+      { id: "issue-1", status: "in_progress" },
       expect.any(Object),
     );
     expect(mockOpenModal).not.toHaveBeenCalled();
