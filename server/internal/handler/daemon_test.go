@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -4034,4 +4035,84 @@ func TestAckTaskCancelled(t *testing.T) {
 	if stopped != 1 {
 		t.Errorf("Stopped. rows after second ack = %d, want 1", stopped)
 	}
+}
+
+// The daemon GC decides whether a task workdir can be reclaimed by testing the
+// issue status against the terminal set — `gc.go:509` compares it to
+// "done"/"cancelled", and `isKnownIssueStatus` is a hardcoded switch over the 7
+// built-ins. Neither knows custom statuses exist, and it must stay that way: an
+// installed daemon has no database, and daemons predating MUL-6243 keep running
+// against upgraded servers.
+//
+// So the normalization is the SERVER's job. Both gc-check endpoints resolve the
+// stored key to its category before answering. Without that:
+//
+//   - an issue parked on a `done`-category custom status is never terminal, so
+//     its workdir is retained forever, and
+//   - `isKnownIssueStatus` rejects the raw key, silently disabling the
+//     GCCompletedTaskTTL full-cleanup path for that issue.
+func TestIssueGCChecksReportCategoryNotRawCustomStatus(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	// A custom status whose category is terminal, and one whose category is not.
+	gateApproved := createTestCustomStatus(t, "gc_gate_approved", issuestatus.Done)
+	humanReview := createTestCustomStatus(t, "gc_human_review", issuestatus.InReview)
+
+	doneID := dbfx.Issue(t, "gc-check-custom-done", testutil.Cols{
+		"status": gateApproved.Key, "priority": "medium", "number": 92501,
+	})
+	openID := dbfx.Issue(t, "gc-check-custom-open", testutil.Cols{
+		"status": humanReview.Key, "priority": "medium", "number": 92502,
+	})
+
+	t.Run("batch endpoint", func(t *testing.T) {
+		req := newDaemonTokenRequest("POST", "/api/daemon/workspaces/"+testWorkspaceID+"/issues/gc-check",
+			map[string]any{"issue_ids": []string{doneID, openID}}, testWorkspaceID, "legit-daemon")
+		req = withURLParam(req, "workspaceId", testWorkspaceID)
+
+		var resp struct {
+			Issues []struct {
+				ID     string `json:"id"`
+				Found  bool   `json:"found"`
+				Status string `json:"status"`
+			} `json:"issues"`
+		}
+		testutil.Call(t, testHandler.BatchIssueGCCheck, req).Want(http.StatusOK).JSON(&resp)
+
+		byID := map[string]string{}
+		for _, issue := range resp.Issues {
+			if !issue.Found {
+				t.Fatalf("issue %s not found", issue.ID)
+			}
+			byID[issue.ID] = issue.Status
+		}
+		// The category, never the stored key — the daemon's terminal test is a
+		// literal string comparison and has no way to resolve one.
+		if byID[doneID] != issuestatus.Done {
+			t.Errorf("done-category custom status reported as %q, want %q — the daemon would keep this workdir forever",
+				byID[doneID], issuestatus.Done)
+		}
+		if byID[openID] != issuestatus.InReview {
+			t.Errorf("in_review-category custom status reported as %q, want %q",
+				byID[openID], issuestatus.InReview)
+		}
+	})
+
+	// The per-issue endpoint is the fallback older daemons still call, so it
+	// carries the same obligation.
+	t.Run("legacy per-issue endpoint", func(t *testing.T) {
+		req := newDaemonTokenRequest("GET", "/api/daemon/issues/"+doneID+"/gc-check", nil, testWorkspaceID, "legit-daemon")
+		req = withURLParam(req, "issueId", doneID)
+
+		var resp struct {
+			Status string `json:"status"`
+		}
+		testutil.Call(t, testHandler.GetIssueGCCheck, req).Want(http.StatusOK).JSON(&resp)
+
+		if resp.Status != issuestatus.Done {
+			t.Errorf("status = %q, want %q", resp.Status, issuestatus.Done)
+		}
+	})
 }
