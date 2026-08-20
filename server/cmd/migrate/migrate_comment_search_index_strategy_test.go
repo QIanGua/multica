@@ -137,6 +137,72 @@ func TestCommentSearchIndexStrategyChoosesOneUsableIndexPerEnvironment(t *testin
 	}
 }
 
+func TestCommentContentBigramRequirementMatchesRealPGBigm(t *testing.T) {
+	adminPool := openTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	var available bool
+	if err := adminPool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_available_extensions
+			WHERE name = 'pg_bigm'
+		)
+	`).Scan(&available); err != nil {
+		t.Fatalf("inspect pg_bigm availability: %v", err)
+	}
+	if !available {
+		t.Skip("Postgres does not provide pg_bigm; install it to run the real-opclass integration test")
+	}
+	if _, err := adminPool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS pg_bigm"); err != nil {
+		t.Fatalf("install pg_bigm test dependency: %v", err)
+	}
+
+	suffix := fmt.Sprintf("%d_%d", time.Now().UnixNano(), rand.Uint32())
+	schema := "migrate_comment_bigm_" + suffix
+	schemaIdent := pgx.Identifier{schema}.Sanitize()
+	if _, err := adminPool.Exec(ctx, "CREATE SCHEMA "+schemaIdent); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if _, err := adminPool.Exec(cleanupCtx, "DROP SCHEMA IF EXISTS "+schemaIdent+" CASCADE"); err != nil {
+			t.Logf("drop schema %s: %v", schema, err)
+		}
+	})
+
+	pool := openTestPoolWithSearchPath(t, schema+", public")
+	if _, err := pool.Exec(ctx, `CREATE TABLE comment (
+		id BIGSERIAL PRIMARY KEY,
+		content TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create comment fixture: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE INDEX idx_comment_content_bigm
+		ON comment USING gin (LOWER(content) gin_bigm_ops)`); err != nil {
+		t.Fatalf("create real pg_bigm fixture index: %v", err)
+	}
+
+	requirement := commentContentBigramIndex
+	requirement.IndexRegclass = schema + ".idx_comment_content_bigm"
+	requirement.TableRegclass = schema + ".comment"
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire connection: %v", err)
+	}
+	defer conn.Release()
+
+	usable, err := indexIsUsable(ctx, conn, requirement)
+	if err != nil {
+		t.Fatalf("inspect real pg_bigm index: %v", err)
+	}
+	if !usable {
+		t.Fatal("production pg_bigm requirement did not match a real gin_bigm_ops index")
+	}
+}
+
 func assertMigrationVersionRecorded(
 	t *testing.T,
 	ctx context.Context,

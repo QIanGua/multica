@@ -303,6 +303,8 @@ func conditionsForDirection(direction string) map[string]migrationCondition {
 	if direction == "up" {
 		return upMigrationConditions
 	}
+	// Rollbacks intentionally ignore environment gates: they restore the
+	// portable pre-migration schema regardless of which up SQL actually ran.
 	return nil
 }
 
@@ -369,6 +371,7 @@ func indexIsUsable(ctx context.Context, conn *pgxpool.Conn, requirement usableIn
 		FROM pg_class idx
 		LEFT JOIN pg_index i ON i.indexrelid = idx.oid
 		LEFT JOIN pg_am am ON am.oid = idx.relam
+		-- pg_index.indclass is an int2vector, whose subscripts start at zero.
 		LEFT JOIN pg_opclass opc ON opc.oid = i.indclass[0]
 		WHERE idx.oid = to_regclass($1)
 	`,
