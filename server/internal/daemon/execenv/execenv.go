@@ -1106,9 +1106,9 @@ func (env *Environment) Cleanup(removeAll bool) error {
 	}
 	// Drop the execution lock first. Until it is released the env root still
 	// reads as "a live execution owns this", which would make a legitimate
-	// rerun fail closed.
-	releaseEnvRootLock(env.lockFile)
-	env.lockFile = nil
+	// rerun fail closed. The daemon also defers ReleaseLock for the task run;
+	// both paths are idempotent.
+	env.ReleaseLock()
 
 	if env.LocalDirectory {
 		// Never touch the user's directory. RootDir is the daemon's own
@@ -1175,7 +1175,7 @@ func claimEnvRoot(envRoot, taskID string) (lockFile *os.File, reset bool, err er
 		return nil, false, fmt.Errorf("create env root %s: %w", envRoot, err)
 	}
 
-	lockFile, err = os.OpenFile(filepath.Join(envRoot, envRootLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	lockFile, err = openEnvRootLockFile(filepath.Join(envRoot, envRootLockFile))
 	if err != nil {
 		return nil, false, fmt.Errorf("open env root lock for %s: %w", envRoot, err)
 	}
@@ -1224,6 +1224,20 @@ func claimEnvRoot(envRoot, taskID string) (lockFile *os.File, reset bool, err er
 		return nil, false, err
 	}
 	return lockFile, false, nil
+}
+
+// ReleaseLock drops the env root's execution lock. The daemon defers this for
+// the duration of a task run: the lock's lifetime is the EXECUTION, not this
+// value. Cleanup is not the right place on its own — production never calls it
+// (the GC reclaims env roots later), so a lock released only there would be
+// held until the daemon exits and would fail-closed every legitimate rerun of
+// that task. Safe on nil and safe to call twice.
+func (env *Environment) ReleaseLock() {
+	if env == nil || env.lockFile == nil {
+		return
+	}
+	releaseEnvRootLock(env.lockFile)
+	env.lockFile = nil
 }
 
 // releaseEnvRootLock drops the execution lock and closes the file. Safe on nil.

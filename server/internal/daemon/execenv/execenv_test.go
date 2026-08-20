@@ -6329,8 +6329,7 @@ func TestPrepareResetsItsOwnEnvRoot(t *testing.T) {
 	// End the first execution. A rerun only reaches the reset path once the
 	// previous execution has released the env root; an overlapping one is
 	// refused, which TestPrepareRefusesOverlappingExecutionOfSameTask covers.
-	releaseEnvRootLock(first.lockFile)
-	first.lockFile = nil
+	first.ReleaseLock()
 
 	second, err := Prepare(PrepareParams{
 		WorkspacesRoot: workspacesRoot,
@@ -6541,8 +6540,7 @@ func TestPrepareResetsAfterPriorExecutionEnded(t *testing.T) {
 	}
 	// The execution ends without tearing the directory down — a crash, from the
 	// next execution's point of view.
-	releaseEnvRootLock(first.lockFile)
-	first.lockFile = nil
+	first.ReleaseLock()
 
 	second, err := prepareSameTask(t, workspacesRoot, taskID)
 	if err != nil {
@@ -6582,5 +6580,34 @@ func TestClaimEnvRootRepairsTornOwnerMarker(t *testing.T) {
 	defer releaseEnvRootLock(lock)
 	if owner, _ := readEnvRootOwner(envRoot); owner != id {
 		t.Fatalf("owner = %q, want the repairing task %q", owner, id)
+	}
+}
+
+// TestReleaseLockFreesEnvRootForALaterDispatch pins the lifetime rule that
+// Windows CI surfaced: the lock belongs to the task EXECUTION, and nothing in
+// production calls Environment.Cleanup — the GC reclaims env roots on its own
+// schedule. A lock released only by Cleanup would therefore be held until the
+// daemon exited, fail-closing every later dispatch of that task and, on
+// Windows, pinning the directory against removal. The daemon defers
+// ReleaseLock for the task run; this covers the contract it relies on.
+func TestReleaseLockFreesEnvRootForALaterDispatch(t *testing.T) {
+	t.Parallel()
+	workspacesRoot := t.TempDir()
+	const taskID = "01a01ec0-e69d-7000-8000-0123456789ab"
+
+	first, err := prepareSameTask(t, workspacesRoot, taskID)
+	if err != nil {
+		t.Fatalf("first execution: %v", err)
+	}
+	first.ReleaseLock()
+	first.ReleaseLock() // idempotent: Cleanup may release the same lock again
+
+	second, err := prepareSameTask(t, workspacesRoot, taskID)
+	if err != nil {
+		t.Fatalf("later dispatch was refused after the lock was released: %v", err)
+	}
+	// Cleanup must stay safe on an already-released lock.
+	if err := second.Cleanup(true); err != nil {
+		t.Fatalf("cleanup after release: %v", err)
 	}
 }

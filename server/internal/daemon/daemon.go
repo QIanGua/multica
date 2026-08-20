@@ -6473,6 +6473,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 
 	// Try to reuse the workdir from a previous task on the same (agent, issue) pair.
 	var env *execenv.Environment
+	// Hold the env root's execution lock for exactly this task run, mirroring
+	// unmarkActiveEnvRoot above. Nothing calls Environment.Cleanup in
+	// production — the GC reclaims env roots on its own schedule — so without
+	// this the lock would survive the task and fail-close every later dispatch
+	// of it until the daemon restarted.
+	defer func() { env.ReleaseLock() }()
 	// For a built-in codex task, use the version paired with the resolved path
 	// so an in-place upgrade can't leave the sandbox policy on the old version
 	// (MUL-4486). A custom codex runtime skips the self-heal, so resolvedVersion

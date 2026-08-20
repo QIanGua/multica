@@ -15,6 +15,34 @@ import (
 // Windows releases the lock when the handle closes, including on abnormal
 // process termination, giving the same crash-safe liveness answer as flock on
 // unix — see the unix build of this file for why that property matters.
+// openEnvRootLockFile opens (creating if needed) the lock file with
+// FILE_SHARE_DELETE, which os.OpenFile does not request.
+//
+// Without it Windows refuses to delete a file that anyone still has open, so a
+// held lock would pin the whole env root: the GC could not reclaim the
+// directory, and neither could a test's temp-dir teardown. Unix already allows
+// unlinking an open file, and this is what makes Windows behave the same. The
+// lock coordinates executions; it is not meant to pin the directory.
+func openEnvRootLockFile(path string) (*os.File, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	h, err := windows.CreateFile(
+		p,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_ALWAYS,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(h), path), nil
+}
+
 func lockFileExclusiveNonBlocking(f *os.File) (ok bool, err error) {
 	overlapped := new(windows.Overlapped)
 	err = windows.LockFileEx(
