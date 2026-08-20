@@ -167,7 +167,10 @@ func (s *contextCapturingContendedLeaseStore) ListHeldWSLeases(_ context.Context
 }
 
 func (s *contextCapturingContendedLeaseStore) TryAcquireWSLease(ctx context.Context, _ AcquireLeaseParams) error {
-	s.acquireCtx <- ctx
+	select {
+	case s.acquireCtx <- ctx:
+	default:
+	}
 	return ErrLeaseNotAcquired
 }
 
@@ -425,6 +428,8 @@ func TestSupervisorCancelsChildContextAfterContendedAcquire(t *testing.T) {
 		sup.wg.Wait()
 	}()
 
+	// Start one supervisor directly so the test observes exactly one lease
+	// attempt; Run would continue sweeping and could start another attempt.
 	sup.startSupervisor(parentCtx, inst)
 	var acquireCtx context.Context
 	select {
@@ -440,6 +445,9 @@ func TestSupervisorCancelsChildContextAfterContendedAcquire(t *testing.T) {
 		}
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("supervisor returned after lease contention without cancelling its child context")
+	}
+	if got := atomic.LoadInt32(&builds); got != 0 {
+		t.Fatalf("contended lease should not build a channel, builds=%d", got)
 	}
 }
 
