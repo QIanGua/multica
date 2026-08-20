@@ -29,7 +29,7 @@
   },
   "help": {
     "trigger": "Help",
-    "download_desktop": "Download Desktop",
+    "download_desktop": "Desktop app",
     "docs": "Docs",
     "changelog": "Change log",
     "discord": "Discord",

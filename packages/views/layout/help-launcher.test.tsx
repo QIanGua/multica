@@ -108,7 +108,7 @@ describe("HelpLauncher", () => {
   // through the marketing site. The Help menu is the persistent home for it.
   it("links to the download page on web", () => {
     render(<HelpLauncher />);
-    const link = screen.getByRole("link", { name: /Download Desktop/ });
+    const link = screen.getByRole("link", { name: /Desktop app/ });
     expect(link).toHaveAttribute("href", "https://multica.ai/download");
   });
 
@@ -117,7 +117,7 @@ describe("HelpLauncher", () => {
   it("hides the download entry inside the desktop shell", () => {
     vi.mocked(isDesktopShell).mockReturnValue(true);
     render(<HelpLauncher />);
-    expect(screen.queryByText("Download Desktop")).not.toBeInTheDocument();
+    expect(screen.queryByText("Desktop app")).not.toBeInTheDocument();
     // The rest of the menu is unaffected by the gate.
     expect(screen.getByText("Docs")).toBeInTheDocument();
   });
