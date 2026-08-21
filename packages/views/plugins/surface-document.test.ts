@@ -33,11 +33,11 @@ describe("plugin surface frame document", () => {
     expect(document).toContain("event.source !== child.contentWindow");
     expect(document).toContain("data.version !== 2");
     expect(document).toContain("data.challenge !== config.bridgeToken");
-    expect(document).toContain("|| used || !event.ports[0]");
-    expect(document).toContain("used = true");
+    expect(document).toContain('state !== "launching"');
+    expect(document).toContain('state = "connected"');
   });
 
-  it("withholds the port when frame-src blocks a first-line navigation", () => {
+  it("uses terminal state instead of guessing when CSP reports navigation", () => {
     const document = buildSurfaceFrameDocument({
       url: "https://plugin-content.example.test/plugin-surfaces/opaque-token",
       bridgeToken: "one-use-proof",
@@ -45,8 +45,8 @@ describe("plugin surface frame document", () => {
 
     expect(document).toContain("securitypolicyviolation");
     expect(document).toContain("multica:plugin-surface-navigation-blocked");
-    expect(document).toContain("}, 50);");
-    expect(document.indexOf("if (blocked || !pendingPort)")).toBeLessThan(document.indexOf("parent.postMessage({\n        type:"));
+    expect(document).toContain('if (state === "terminal") return');
+    expect(document).not.toContain("setTimeout(");
   });
 
   it("never interpolates the launch URL or proof into executable source", () => {

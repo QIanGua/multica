@@ -31,7 +31,7 @@ test.describe("plugin surface browser boundary", () => {
     await expect.poll(() => page.evaluate(() => (window as unknown as { bridgeCount: number }).bridgeCount)).toBe(1);
   });
 
-  test("a first-line external navigation sends no request and receives no bridge", async ({ page }) => {
+  test("a first-line external navigation sends no request and cannot retain a bridge", async ({ page }) => {
     let attackerRequests = 0;
     await page.route("https://plugin-content.example.test/**", async (route) => {
       await route.fulfill({
@@ -41,12 +41,15 @@ test.describe("plugin surface browser boundary", () => {
         },
         body: `<!doctype html><script>
           const channel = new MessageChannel();
+          channel.port2.onmessage = () => channel.port2.postMessage("still-alive");
           parent.postMessage({
             type: "multica:plugin-bridge-connect",
             version: 2,
             challenge: "proof"
           }, "*", [channel.port1]);
           location.replace("https://attacker.example.test/stolen");
+          const blockedUntil = performance.now() + 150;
+          while (performance.now() < blockedUntil) {}
         </script>`,
       });
     });
@@ -59,16 +62,26 @@ test.describe("plugin surface browser boundary", () => {
       url: "https://plugin-content.example.test/plugin-surfaces/opaque",
       bridgeToken: "proof",
     });
-    await page.setContent(`<script>window.bridgeCount = 0; window.blockedCount = 0; addEventListener("message", event => {
-      if (event.data?.type === "multica:plugin-bridge-connect") window.bridgeCount += 1;
-      if (event.data?.type === "multica:plugin-surface-navigation-blocked") window.blockedCount += 1;
+    await page.setContent(`<script>window.bridgeCount = 0; window.blockedCount = 0; window.bridgeReply = false; addEventListener("message", event => {
+      if (event.data?.type === "multica:plugin-bridge-connect" && event.ports[0]) {
+        window.bridgeCount += 1;
+        window.bridgePort = event.ports[0];
+        window.bridgePort.onmessage = () => { window.bridgeReply = true; };
+        window.bridgePort.start();
+      }
+      if (event.data?.type === "multica:plugin-surface-navigation-blocked") {
+        window.blockedCount += 1;
+        window.bridgePort?.close();
+      }
     });</script><iframe id="host" sandbox="allow-scripts allow-same-origin"></iframe>`);
     await page.locator("#host").evaluate((frame, srcdoc) => {
       (frame as HTMLIFrameElement).srcdoc = srcdoc as string;
     }, wrapper);
 
     await expect.poll(() => page.evaluate(() => (window as unknown as { blockedCount: number }).blockedCount)).toBe(1);
-    expect(await page.evaluate(() => (window as unknown as { bridgeCount: number }).bridgeCount)).toBe(0);
+    await page.evaluate(() => (window as unknown as { bridgePort?: MessagePort }).bridgePort?.postMessage("ping"));
+    await page.waitForTimeout(100);
+    expect(await page.evaluate(() => (window as unknown as { bridgeReply: boolean }).bridgeReply)).toBe(false);
     expect(attackerRequests).toBe(0);
   });
 
