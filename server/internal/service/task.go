@@ -51,6 +51,10 @@ type TaskService struct {
 	// goes through the DB. Wired in router.go from the shared Redis
 	// client.
 	EmptyClaim *EmptyClaimCache
+	// ReclaimCheck schedules the next time a runtime can plausibly contain a
+	// stale dispatched task. It removes the unconditional reclaim UPDATE from
+	// idle claim polls while missing/error states preserve the DB fallback.
+	ReclaimCheck *ReclaimCheckCache
 	// Composio computes the per-task MCP overlay (Stage 3 of the Composio
 	// epic, MUL-3721) — the integration's "current user's connected apps
 	// → MCP session URL" hook called from each Enqueue* path. Optional: a
@@ -177,6 +181,40 @@ const (
 	claimResponseRecoveryWindow = 90 * time.Second
 	prepareLeaseDuration        = 45 * time.Second
 )
+
+func taskReclaimCheckAfter(task db.AgentTaskQueue) time.Time {
+	if !task.DispatchedAt.Valid {
+		return time.Time{}
+	}
+	checkAfter := task.DispatchedAt.Time.Add(claimResponseRecoveryWindow)
+	if task.PrepareLeaseExpiresAt.Valid && task.PrepareLeaseExpiresAt.Time.After(checkAfter) {
+		checkAfter = task.PrepareLeaseExpiresAt.Time
+	}
+	return checkAfter
+}
+
+func (s *TaskService) trackTaskForReclaim(task db.AgentTaskQueue) {
+	if !task.RuntimeID.Valid || task.Status != "dispatched" {
+		return
+	}
+	s.ReclaimCheck.Track(
+		context.Background(),
+		util.UUIDToString(task.RuntimeID),
+		util.UUIDToString(task.ID),
+		taskReclaimCheckAfter(task),
+	)
+}
+
+func (s *TaskService) forgetTaskReclaim(task db.AgentTaskQueue) {
+	if !task.RuntimeID.Valid || !task.ID.Valid {
+		return
+	}
+	s.ReclaimCheck.Forget(
+		context.Background(),
+		util.UUIDToString(task.RuntimeID),
+		util.UUIDToString(task.ID),
+	)
+}
 
 // buildCommentTriggerSummary fetches the comment content and truncates
 // it for storage on the task row. Returns an invalid pgtype.Text when
@@ -3084,6 +3122,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 	if claimed == nil {
 		return nil, nil
 	}
+	s.trackTaskForReclaim(*claimed)
 
 	slog.Info("task claimed", "task_id", util.UUIDToString(claimed.ID), "agent_id", util.UUIDToString(agentID))
 	s.captureTaskDispatched(ctx, *claimed)
@@ -3144,27 +3183,34 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		return nil, err
 	}
 
-	// Check this before EmptyClaim: a lost claim response moves the task out of
-	// `queued`, so the empty-queued cache cannot represent recoverability.
-	stale, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
-		RuntimeID:         runtimeID,
-		ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
-		PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
-		RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
-	})
-	if err == nil {
-		outcome = "reclaimed_dispatched"
-		claimedFlag = true
-		slog.Info("stale dispatched task reclaimed",
-			"task_id", util.UUIDToString(stale.ID),
-			"runtime_id", runtimeKey,
-			"agent_id", util.UUIDToString(stale.AgentID),
-		)
-		return &stale, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		outcome = "error_reclaim_dispatched"
-		return nil, fmt.Errorf("reclaim stale dispatched task: %w", err)
+	// Keep stale-response recovery before EmptyClaim because the queued-only
+	// cache cannot represent dispatched work. ReclaimCheck independently skips
+	// the UPDATE until a task hint or bounded DB backstop is due.
+	checkStarted := time.Now()
+	if due := s.ReclaimCheck.DueRuntimeIDs(ctx, []string{runtimeKey}, checkStarted); len(due) > 0 {
+		stale, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
+			RuntimeID:         runtimeID,
+			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+			PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
+		})
+		if err == nil {
+			s.ReclaimCheck.MarkChecked(ctx, due, checkStarted, false)
+			s.trackTaskForReclaim(stale)
+			outcome = "reclaimed_dispatched"
+			claimedFlag = true
+			slog.Info("stale dispatched task reclaimed",
+				"task_id", util.UUIDToString(stale.ID),
+				"runtime_id", runtimeKey,
+				"agent_id", util.UUIDToString(stale.AgentID),
+			)
+			return &stale, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			outcome = "error_reclaim_dispatched"
+			return nil, fmt.Errorf("reclaim stale dispatched task: %w", err)
+		}
+		s.ReclaimCheck.MarkChecked(ctx, due, checkStarted, true)
 	}
 
 	if s.EmptyClaim.IsEmpty(ctx, runtimeKey) {
@@ -3293,6 +3339,7 @@ func (s *TaskService) RequeueTaskAfterClaimFailure(ctx context.Context, task db.
 	if err != nil {
 		return nil, fmt.Errorf("requeue task after claim failure: %w", err)
 	}
+	s.forgetTaskReclaim(requeued)
 	s.ReconcileAgentStatus(ctx, requeued.AgentID)
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, requeued)
 	s.notifyTaskAvailable(requeued)
@@ -3380,18 +3427,41 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		s.NotifyTaskEnqueued(ctx, task)
 	}
 
-	// 2. Reclaim lost-response dispatched tasks across the set, up to maxTasks.
-	reclaimed, err := s.Queries.ReclaimStaleDispatchedTasksForRuntimes(ctx, db.ReclaimStaleDispatchedTasksForRuntimesParams{
-		RuntimeIds:        uniqueIDs,
-		ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
-		PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
-		RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
-		MaxTasks:          int32(maxTasks),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("reclaim stale dispatched tasks: %w", err)
+	// 2. Reclaim lost-response dispatched tasks only for runtimes whose task
+	// schedule or bounded DB backstop is due. A nil/missing/failed cache returns
+	// the complete runtime set and preserves the historical query path.
+	runtimeKeys := make([]string, 0, len(uniqueIDs))
+	for _, rid := range uniqueIDs {
+		runtimeKeys = append(runtimeKeys, util.UUIDToString(rid))
+	}
+	checkStarted := time.Now()
+	dueKeys := s.ReclaimCheck.DueRuntimeIDs(ctx, runtimeKeys, checkStarted)
+	dueSet := make(map[string]struct{}, len(dueKeys))
+	for _, key := range dueKeys {
+		dueSet[key] = struct{}{}
+	}
+	dueIDs := make([]pgtype.UUID, 0, len(dueSet))
+	for _, rid := range uniqueIDs {
+		if _, ok := dueSet[util.UUIDToString(rid)]; ok {
+			dueIDs = append(dueIDs, rid)
+		}
+	}
+	var reclaimed []db.AgentTaskQueue
+	if len(dueIDs) > 0 {
+		reclaimed, err = s.Queries.ReclaimStaleDispatchedTasksForRuntimes(ctx, db.ReclaimStaleDispatchedTasksForRuntimesParams{
+			RuntimeIds:        dueIDs,
+			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+			PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
+			MaxTasks:          int32(maxTasks),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("reclaim stale dispatched tasks: %w", err)
+		}
+		s.ReclaimCheck.MarkChecked(ctx, dueKeys, checkStarted, len(reclaimed) < maxTasks)
 	}
 	for i := range reclaimed {
+		s.trackTaskForReclaim(reclaimed[i])
 		claimed = append(claimed, reclaimed[i])
 		slog.Info("stale dispatched task reclaimed (batch)",
 			"task_id", util.UUIDToString(reclaimed[i].ID),
@@ -3581,6 +3651,7 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID) (*db.Ag
 	if err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
+	s.forgetTaskReclaim(task)
 	s.cancelDeferredEscalationsForTask(ctx, task.ID)
 
 	slog.Info("task started", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
@@ -3648,6 +3719,11 @@ func (s *TaskService) ExtendTaskPrepareLease(ctx context.Context, taskID, runtim
 	if err != nil {
 		return nil, fmt.Errorf("extend task prepare lease: %w", err)
 	}
+	if task.Status == "dispatched" {
+		s.trackTaskForReclaim(task)
+	} else {
+		s.forgetTaskReclaim(task)
+	}
 	return &task, nil
 }
 
@@ -3667,6 +3743,7 @@ func (s *TaskService) MarkTaskWaitingLocalDirectory(ctx context.Context, taskID 
 	if err != nil {
 		return nil, fmt.Errorf("mark task waiting_local_directory: %w", err)
 	}
+	s.forgetTaskReclaim(task)
 
 	slog.Info("task waiting_local_directory",
 		"task_id", util.UUIDToString(task.ID),
@@ -6003,6 +6080,7 @@ func (s *TaskService) NotifyTaskEnqueued(ctx context.Context, task db.AgentTaskQ
 // is not available; the hint only means that a queued successor may have
 // become claimable because an agent-capacity or serialization barrier cleared.
 func (s *TaskService) NotifyTaskFinished(task db.AgentTaskQueue) {
+	s.forgetTaskReclaim(task)
 	s.notifyRuntimeMayHaveWork(task.RuntimeID, "")
 }
 
@@ -6012,6 +6090,7 @@ func (s *TaskService) NotifyTaskFinished(task db.AgentTaskQueue) {
 func (s *TaskService) notifyTasksFinished(tasks []db.AgentTaskQueue) {
 	seen := make(map[string]struct{}, len(tasks))
 	for _, task := range tasks {
+		s.forgetTaskReclaim(task)
 		if !task.RuntimeID.Valid {
 			continue
 		}

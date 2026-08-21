@@ -1140,6 +1140,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// task. Returns nil when rdb is nil — TaskService treats that
 	// as "no cache, always hit DB" (existing behavior).
 	h.TaskService.EmptyClaim = service.NewEmptyClaimCache(rdb)
+	// Stale-dispatch reclaim has a separate schedule because an empty queued
+	// verdict cannot represent a claim response lost after commit. Missing or
+	// failed Redis state keeps the historical PostgreSQL fallback.
+	h.TaskService.ReclaimCheck = service.NewReclaimCheckCache(rdb)
 
 	// Wire WS heartbeat after stores are finalized so the WS path uses the
 	// same (possibly Redis-backed) stores as the HTTP path.
