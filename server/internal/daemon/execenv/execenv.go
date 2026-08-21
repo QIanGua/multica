@@ -1228,51 +1228,51 @@ var ErrEnvRootBusy = errors.New("env root is held by a running execution")
 // continuations of the same task still must not refresh and run the same
 // directory at once.
 //
-// Every path component is resolved through an os.Root pinned at
-// workspacesRoot, which is the daemon's own directory, and Root refuses any
-// component that resolves outside it. That is what makes this safe to call on
-// a path the daemon derived from task input: validating the path first and
-// then opening it by name leaves a window where the validated directory is
-// renamed away and a symlink to somewhere else is dropped in its place, and an
-// ordinary open would follow it and create the lock file out there. Resolution
-// through the Root cannot leave the tree no matter when the swap lands.
+// wsRoot must be a Root the CALLER opened before it validated anything, and
+// rel the env root's path within it. Both matter:
 //
-// It returns the locked directory's FileInfo so the caller can confirm the
-// directory it is about to USE is the same one that got locked; Root still
-// follows symlinks that stay inside the tree, so "locked A, reused B" has to be
-// ruled out by identity, not by containment.
+//   - Opening the Root here, from a name the caller validated a moment ago,
+//     would re-resolve that name. Renaming the whole workspaces root aside and
+//     leaving a symlink to a look-alike tree in its place would have os.Root
+//     faithfully pin the replacement — Root guarantees you cannot escape the
+//     tree it opened, not that it opened the tree you meant.
+//   - Every operation below goes through ONE sub-Root pinned on the env root,
+//     so the directory whose identity is returned and the directory the lock
+//     file is created in cannot be two different directories. Resolving rel
+//     twice from wsRoot would allow exactly that: A on the first resolution,
+//     B on the second.
 //
-// Returns a nil claim and no error when envRoot is missing, and ErrEnvRootBusy
-// when another execution holds it — both mean "fall back to a fresh Prepare".
-func LockEnvRootForReuse(workspacesRoot, envRoot string) (*EnvRootClaim, os.FileInfo, error) {
-	if workspacesRoot == "" || envRoot == "" {
-		return nil, nil, nil
-	}
-	rel, err := filepath.Rel(workspacesRoot, envRoot)
-	if err != nil || !filepath.IsLocal(rel) {
+// It returns that directory's FileInfo so the caller can confirm it is the one
+// validation approved; Root still follows symlinks that stay inside the tree,
+// so "locked A, reused B" has to be ruled out by identity, not containment.
+//
+// Returns a nil claim and no error when the env root is missing, and
+// ErrEnvRootBusy when another execution holds it — both mean "fall back to a
+// fresh Prepare".
+func LockEnvRootForReuse(wsRoot *os.Root, rel, envRoot string) (*EnvRootClaim, os.FileInfo, error) {
+	if wsRoot == nil || rel == "" || !filepath.IsLocal(rel) {
 		return nil, nil, fmt.Errorf("execenv: env root %s is not inside the workspaces root", envRoot)
 	}
 
-	root, err := os.OpenRoot(workspacesRoot)
-	if err != nil {
-		return nil, nil, fmt.Errorf("execenv: open workspaces root: %w", err)
-	}
-	// The lock file's descriptor keeps the lock alive; the Root is only needed
-	// to resolve it safely.
-	defer root.Close()
-
-	info, err := root.Stat(rel)
+	// Pin the env root itself. From here on nothing is resolved by name again.
+	envRootHandle, err := wsRoot.OpenRoot(rel)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil, nil
 		}
+		return nil, nil, fmt.Errorf("execenv: open env root %s: %w", envRoot, err)
+	}
+	defer envRootHandle.Close()
+
+	info, err := envRootHandle.Stat(".")
+	if err != nil {
 		return nil, nil, fmt.Errorf("execenv: inspect env root %s: %w", envRoot, err)
 	}
 	if !info.IsDir() {
 		return nil, nil, nil
 	}
 
-	lock, err := root.OpenFile(filepath.Join(rel, envRootLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	lock, err := envRootHandle.OpenFile(envRootLockFile, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, nil, fmt.Errorf("execenv: open env root lock for %s: %w", envRoot, err)
 	}

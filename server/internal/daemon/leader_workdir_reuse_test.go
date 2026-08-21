@@ -463,7 +463,7 @@ func TestLockReusablePriorEnvRootNeverWritesOutsideWorkspacesRoot(t *testing.T) 
 			d := &Daemon{logger: discardLogger()}
 			d.cfg.WorkspacesRoot = workspacesRoot
 
-			claim, _, ok := d.lockReusablePriorEnvRoot(Task{
+			claim, _, _, ok := d.lockReusablePriorEnvRoot(Task{
 				ID:           "01a01ec0-e69d-7000-8000-0123456789ab",
 				WorkspaceID:  "ws-1",
 				AgentID:      "agent-1",
@@ -527,7 +527,7 @@ func TestLockReusablePriorEnvRootLocksAValidatedRoot(t *testing.T) {
 	d := &Daemon{logger: discardLogger()}
 	d.cfg.WorkspacesRoot = root
 
-	claim, canonical, ok := d.lockReusablePriorEnvRoot(task, nil, "")
+	claim, canonical, _, ok := d.lockReusablePriorEnvRoot(task, nil, "")
 	if !ok {
 		t.Fatal("a fully provenanced managed workdir was refused for reuse")
 	}
@@ -553,13 +553,13 @@ func TestLockReusablePriorEnvRootLocksAValidatedRoot(t *testing.T) {
 	}
 
 	// A concurrent continuation of the same task must not get the same root.
-	if second, _, ok := d.lockReusablePriorEnvRoot(task, nil, ""); ok {
+	if second, _, _, ok := d.lockReusablePriorEnvRoot(task, nil, ""); ok {
 		second.Release()
 		t.Fatal("two continuations locked the same prior workdir at once")
 	}
 
 	claim.Release()
-	again, _, ok := d.lockReusablePriorEnvRoot(task, nil, "")
+	again, _, _, ok := d.lockReusablePriorEnvRoot(task, nil, "")
 	if !ok {
 		t.Fatal("prior workdir stayed locked after release")
 	}
@@ -604,7 +604,7 @@ func TestLockReusablePriorEnvRootSurvivesRetargetAfterValidation(t *testing.T) {
 	}
 	t.Cleanup(func() { reuseLockTestHook = nil })
 
-	claim, _, ok := d.lockReusablePriorEnvRoot(task, nil, "")
+	claim, _, _, ok := d.lockReusablePriorEnvRoot(task, nil, "")
 	if claim != nil {
 		claim.Release()
 	}
@@ -650,7 +650,7 @@ func TestLockReusablePriorEnvRootRejectsIdentitySwap(t *testing.T) {
 	}
 	t.Cleanup(func() { reuseLockTestHook = nil })
 
-	claim, used, ok := d.lockReusablePriorEnvRoot(task, nil, "")
+	claim, used, _, ok := d.lockReusablePriorEnvRoot(task, nil, "")
 	if claim != nil {
 		claim.Release()
 	}
@@ -672,4 +672,164 @@ func sameDir(t *testing.T, a, b string) bool {
 		return false
 	}
 	return os.SameFile(ai, bi)
+}
+
+// TestLockReusablePriorEnvRootSurvivesWorkspacesRootSwap covers the subtler
+// half of the pinning problem. os.Root guarantees you cannot escape the tree
+// it opened — it does not guarantee it opened the tree you meant. Opening the
+// workspaces root from a name AFTER validation would let the whole root be
+// renamed aside and a symlink to a look-alike tree left behind: Root then
+// faithfully pins the replacement, and the lock file is created out there.
+//
+// Pinning the root before any validation runs is what makes that ordering
+// impossible.
+func execenvLockForTest(wsRoot *os.Root, rel, envRoot string) (*execenv.EnvRootClaim, os.FileInfo, error) {
+	return execenv.LockEnvRootForReuse(wsRoot, rel, envRoot)
+}
+
+func TestLockReusablePriorEnvRootSurvivesWorkspacesRootSwap(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "workspaces")
+	outside := filepath.Join(base, "outside")
+
+	workDir := filepath.Join(root, "ws-leader", "0123456789ab", "workdir")
+	writeLeaderTaskMarker(t, workDir, "agent-leader", "issue-leader")
+	writeLeaderManagedEnvProvenance(t, workDir, "ws-leader", "issue-leader", "agent-leader")
+
+	// A look-alike tree with the same relative shape, outside the root.
+	decoy := filepath.Join(outside, "ws-leader", "0123456789ab")
+	if err := os.MkdirAll(decoy, 0o755); err != nil {
+		t.Fatalf("seed decoy: %v", err)
+	}
+
+	task := leaderReuseTestTask("task-rootswap")
+	task.PriorWorkDir = workDir
+
+	d := &Daemon{logger: discardLogger()}
+	d.cfg.WorkspacesRoot = root
+
+	reuseLockTestHook = func() {
+		if err := os.Rename(root, root+"-moved"); err != nil {
+			t.Fatalf("move the workspaces root aside: %v", err)
+		}
+		if err := os.Symlink(outside, root); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+	t.Cleanup(func() { reuseLockTestHook = nil })
+
+	claim, _, _, ok := d.lockReusablePriorEnvRoot(task, nil, "")
+	if claim != nil {
+		claim.Release()
+	}
+	if ok {
+		t.Fatal("reuse was accepted after the workspaces root itself was replaced")
+	}
+	if locks := findTaskLocks(t, outside); len(locks) > 0 {
+		t.Fatalf("OpenRoot pinned the replacement tree and wrote the lock outside: %v", locks)
+	}
+}
+
+// TestLockEnvRootForReuseTakesIdentityAndLockFromOneHandle pins that the
+// directory whose identity is reported and the directory the lock file lands
+// in are the same one. Resolving the env root's relative path twice from the
+// workspaces Root — once to stat, once to create — would let it be A on the
+// first resolution and B on the second, reporting A's identity while holding
+// B's lock. Both now come from a single sub-Root pinned on the env root.
+func TestLockEnvRootForReuseTakesIdentityAndLockFromOneHandle(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	rel := filepath.Join("ws-leader", "0123456789ab")
+	envRoot := filepath.Join(root, rel)
+	if err := os.MkdirAll(envRoot, 0o755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	wsRoot, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatalf("open workspaces root: %v", err)
+	}
+	defer wsRoot.Close()
+
+	claim, info, err := execenvLockForTest(wsRoot, rel, envRoot)
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	if claim == nil || info == nil {
+		t.Fatal("expected a claim and the locked directory identity")
+	}
+	defer claim.Release()
+
+	// The reported identity must be the directory the lock file is actually in.
+	lockDirInfo, err := os.Stat(filepath.Dir(findTaskLocks(t, root)[0]))
+	if err != nil {
+		t.Fatalf("stat lock dir: %v", err)
+	}
+	if !os.SameFile(info, lockDirInfo) {
+		t.Fatal("reported identity is not the directory holding the lock file")
+	}
+}
+
+// TestRunTaskDeclinesReuseWhenTheClaimedDirectoryIsSwappedBeforeUse covers the
+// last window: the claim is settled, and only THEN does Reuse resolve the
+// prior workdir by name. A file descriptor cannot cross into the preparation
+// helper process, so a name is the only thing that can be handed over — which
+// means this window cannot be closed by pinning alone. What it can be is
+// detected: the environment Reuse produced is checked back against the
+// directory the lock is held on, so a substitution ends the run in a fresh
+// environment instead of executing in a directory nothing holds.
+func TestRunTaskDeclinesReuseWhenTheClaimedDirectoryIsSwappedBeforeUse(t *testing.T) {
+	d, argsFile, cleanup := newLeaderReuseTestDaemon(t)
+	defer cleanup()
+	_ = argsFile
+
+	first := leaderReuseTestTask("task-first")
+	firstResult, err := d.runTask(context.Background(), first, "claude", 0, d.logger)
+	if err != nil {
+		t.Fatalf("first runTask: %v", err)
+	}
+	envRoot := filepath.Dir(firstResult.WorkDir)
+
+	// Swap the claimed directory for an equally valid one after the claim is
+	// settled and before Reuse opens it by name.
+	var swapped bool
+	reuseBeforeUseTestHook = func() {
+		if swapped {
+			return
+		}
+		swapped = true
+		// The replacement must be one Reuse would happily accept, or the test
+		// passes because Reuse declined on its own merits rather than because
+		// the identity check caught the substitution.
+		replacement := envRoot + "-replacement"
+		replacementWorkDir := filepath.Join(replacement, "workdir")
+		writeLeaderTaskMarker(t, replacementWorkDir, "agent-leader", "issue-leader")
+		writeLeaderManagedEnvProvenance(t, replacementWorkDir, "ws-leader", "issue-leader", "agent-leader")
+		if err := os.Rename(envRoot, envRoot+"-moved"); err != nil {
+			t.Fatalf("move claimed dir aside: %v", err)
+		}
+		if err := os.Rename(replacement, envRoot); err != nil {
+			t.Fatalf("install replacement: %v", err)
+		}
+	}
+	t.Cleanup(func() { reuseBeforeUseTestHook = nil })
+
+	second := leaderReuseTestTask("task-second")
+	second.PriorSessionID = firstResult.SessionID
+	second.PriorWorkDir = firstResult.WorkDir
+	secondResult, err := d.runTask(context.Background(), second, "claude", 0, d.logger)
+	if err != nil {
+		t.Fatalf("second runTask: %v", err)
+	}
+	if !swapped {
+		t.Fatal("the swap hook never ran; the test proved nothing")
+	}
+	// envRoot's NAME now resolves to the replacement, so a run that reused it
+	// lands there. Compare the env root the second task actually ran in.
+	if sameDir(t, filepath.Dir(secondResult.WorkDir), envRoot) {
+		t.Fatal("ran in the substituted directory instead of declining to a fresh environment")
+	}
+	if secondResult.WorkDir == "" {
+		t.Fatal("second task produced no environment at all")
+	}
 }
