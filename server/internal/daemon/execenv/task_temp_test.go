@@ -209,8 +209,8 @@ func TestLockTaskTempDirPublishesAnAlreadyHeldMarker(t *testing.T) {
 
 // TestPruneTaskTempDirsSpareDirMidClaim covers the window itself: a directory
 // whose owner has taken the claim but not yet published it must survive a sweep
-// under EVERY legacy setting — disabled, and enabled with a TTL far larger than
-// the directory's age, which is the only way a positive TTL can be configured.
+// under every legacy setting, including ones whose TTL the directory has
+// already outlived. Age must play no part in what protects it.
 func TestPruneTaskTempDirsSpareDirMidClaim(t *testing.T) {
 	for _, legacyTTL := range []time.Duration{0, time.Nanosecond, time.Millisecond, time.Hour, 72 * time.Hour} {
 		t.Run(legacyTTL.String(), func(t *testing.T) {
@@ -327,5 +327,61 @@ func TestPruneTaskTempDirsLegacyBranchNeedsContent(t *testing.T) {
 	}
 	if _, err := os.Stat(empty); err != nil {
 		t.Fatalf("empty legacy dir was reclaimed on age: %v", err)
+	}
+}
+
+// TestPruneTaskTempDirsRechecksLockBeforeRemoving is the TOCTOU regression: the
+// sweep's legacy decision is several separate observations, and a directory can
+// finish publishing in the middle of them. The barrier below reproduces exactly
+// that interleaving — sweep classifies the directory as legacy, then the owner
+// publishes its marker and the task writes — and the sweep must notice before
+// it removes anything.
+//
+// Age deliberately cannot save this one: `now` is far past the TTL, and the
+// write inside the barrier would normally refresh the directory's mtime, which
+// is precisely the implicit timing crutch this pins against.
+func TestPruneTaskTempDirsRechecksLockBeforeRemoving(t *testing.T) {
+	base := t.TempDir()
+	dir := makeTaskTempDir(t, base, "publishing-mid-sweep", false)
+	// Content at the top of the sweep, so the legacy branch's content and age
+	// gates both pass and it commits to removing this directory.
+	if err := os.WriteFile(filepath.Join(dir, "payload"), make([]byte, 1024), 0o600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	var lock *os.File
+	barrierRuns := 0
+	taskTempSweepBeforeRecheck = func(swept string) {
+		if swept != dir {
+			return
+		}
+		barrierRuns++
+		// The owner wins the race: it publishes, and its task starts writing.
+		var err error
+		if lock, err = LockTaskTempDir(dir); err != nil {
+			t.Errorf("LockTaskTempDir() at the barrier: %v", err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(dir, "task-output"), []byte("live"), 0o600); err != nil {
+			t.Errorf("task write at the barrier: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		taskTempSweepBeforeRecheck = nil
+		ReleaseTaskTempLock(lock)
+	})
+
+	removed, _ := PruneTaskTempDirs(base, time.Hour, time.Now().Add(72*time.Hour), testLogger())
+	if barrierRuns != 1 {
+		t.Fatalf("barrier ran %d times, want 1 — the sweep never reached the removal decision", barrierRuns)
+	}
+	if removed != 0 {
+		t.Fatalf("sweep removed %d dirs after the owner published mid-decision, want 0", removed)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "task-output")); err != nil {
+		t.Fatalf("sweep destroyed a live task's temp dir: %v", err)
+	}
+	if got := classifyTaskTempDir(dir, testLogger()); got != taskTempInUse {
+		t.Fatalf("classify = %v, want taskTempInUse", got)
 	}
 }

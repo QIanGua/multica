@@ -16,6 +16,11 @@ import (
 // shared /tmp holding other programs' files — is never at risk.
 const TaskTempDirPrefix = "multica-task-"
 
+// taskTempLockClaimFile is the name the marker is locked under before being
+// renamed into place, so .task_lock never exists unlocked while its owner is
+// still starting up.
+const taskTempLockClaimFile = envRootLockFile + ".claiming"
+
 // LockTaskTempDir takes the temp directory's execution lock and returns the
 // held file; the caller owns it for the lifetime of the task run.
 //
@@ -28,10 +33,6 @@ const TaskTempDirPrefix = "multica-task-"
 // different daemon sharing the same temp base, which no in-memory active set
 // could ever see, and including a live task in this very process, because a
 // lock is held by an open file description rather than by a process.
-// The marker is claimed under this name and renamed into place only once it is
-// held, so .task_lock never exists unlocked while its owner is starting up.
-const taskTempLockClaimFile = envRootLockFile + ".claiming"
-
 func LockTaskTempDir(dir string) (*os.File, error) {
 	// Lock the marker under a name the sweep does not read, then publish it
 	// with a rename. Creating .task_lock first and locking it second would
@@ -224,6 +225,26 @@ func PruneTaskTempDirs(base string, legacyTTL time.Duration, now time.Time, logg
 			if newest.IsZero() || now.Sub(newest) <= legacyTTL {
 				continue
 			}
+			// Everything above is a series of separate observations, not one
+			// snapshot: the classify that said "legacy" happened before the
+			// content walk, and the owner may have finished publishing in
+			// between — leaving a held .task_lock this branch has not looked
+			// at, on a directory whose task is now writing to it.
+			//
+			// Re-reading the classification here closes that, and closes it
+			// completely rather than narrowing it. Content is only ever there
+			// because a task was handed this path, which happens only after
+			// LockTaskTempDir has returned and therefore after the marker is
+			// published and held. So content observed at the top plus no
+			// marker seen here means no live task owns this directory — and a
+			// task cannot appear afterwards either, since MkdirTemp only ever
+			// hands out a fresh empty directory under a new name.
+			if taskTempSweepBeforeRecheck != nil {
+				taskTempSweepBeforeRecheck(dir)
+			}
+			if classifyTaskTempDir(dir, logger) != taskTempLegacy {
+				continue
+			}
 		}
 
 		_, size := dirStat(dir)
@@ -253,6 +274,11 @@ func PruneTaskTempDirs(base string, legacyTTL time.Duration, now time.Time, logg
 	}
 	return removed, bytesFreed
 }
+
+// taskTempSweepBeforeRecheck is a test seam, nil in production. The sweep's
+// correctness depends on what can happen BETWEEN its decision and its removal,
+// and that interleaving cannot be produced reliably from the outside.
+var taskTempSweepBeforeRecheck func(dir string)
 
 // taskTempDirHoldsContent reports whether dir holds anything a task put there,
 // as opposed to only the lock files this package maintains. It is what
