@@ -285,6 +285,7 @@ describe("BillingTab", () => {
       actualSeats: 3,
       action: "none",
     });
+    mocks.refetchSummary.mockResolvedValue({ data: mocks.summary });
     mocks.previewSeats.mockResolvedValue({
       currentSeats: 5,
       additionalSeats: 1,
@@ -800,6 +801,76 @@ describe("BillingTab", () => {
 
   it("refreshes and retries a preview after Stripe seat capacity changes", async () => {
     const user = userEvent.setup();
+    let resolveSummaryRefresh!: (value: { data: typeof mocks.summary }) => void;
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+    });
+    Object.assign(mocks.summary, {
+      actualSeats: 4,
+      usedSeats: 4,
+      billedSeats: 5,
+      reservedSeats: 0,
+      purchaseVersion: 9,
+      hasStripeCustomer: true,
+    });
+    mocks.refetchSummary.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSummaryRefresh = resolve;
+      }),
+    );
+    mocks.previewSeats
+      .mockRejectedValueOnce(
+        new ApiError("conflict", 409, "Conflict", {
+          code: "seat_capacity_changed",
+        }),
+      )
+      .mockResolvedValueOnce({
+        currentSeats: 4,
+        additionalSeats: 1,
+        resultingSeats: 5,
+        purchaseVersion: 10,
+        currency: "usd",
+        prorationAmount: 250,
+        nextInvoiceAmount: 5000,
+        quotedAt: "2030-01-01T00:00:00Z",
+      });
+
+    renderWithI18n(<BillingTab />);
+    await user.click(screen.getByRole("button", { name: "Add seats" }));
+
+    await waitFor(() => expect(mocks.refetchSummary).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Updating estimate...",
+    );
+    expect(
+      screen.queryByText("Could not update estimate"),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      Object.assign(mocks.summary, {
+        billedSeats: 4,
+        purchaseVersion: 10,
+      });
+      resolveSummaryRefresh({ data: mocks.summary });
+    });
+
+    await waitFor(
+      () => expect(mocks.previewSeats).toHaveBeenCalledTimes(2),
+      { timeout: 3_000 },
+    );
+    expect(await screen.findByText("$2.50")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "The estimate is temporarily unavailable. Retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not retry when the refreshed seat summary is unchanged", async () => {
+    const user = userEvent.setup();
     Object.assign(mocks.entitlements, {
       plan: "pro",
       status: "active",
@@ -823,20 +894,18 @@ describe("BillingTab", () => {
     renderWithI18n(<BillingTab />);
     await user.click(screen.getByRole("button", { name: "Add seats" }));
 
-    await waitFor(
-      () => expect(mocks.previewSeats).toHaveBeenCalledTimes(2),
-      { timeout: 3_000 },
-    );
-    expect(mocks.refetchSummary).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText("$2.50")).toBeInTheDocument();
     expect(
-      screen.queryByText(
-        "The estimate is temporarily unavailable. Retry in a moment.",
+      await screen.findByText(
+        "The seat count in Stripe does not match the billing record. Contact support before retrying this purchase.",
+        {},
+        { timeout: 3_000 },
       ),
-    ).not.toBeInTheDocument();
+    ).toBeInTheDocument();
+    expect(mocks.previewSeats).toHaveBeenCalledTimes(1);
+    expect(mocks.refetchSummary).toHaveBeenCalledTimes(1);
   });
 
-  it("stops retrying when the refreshed seat preview still conflicts", async () => {
+  it("does not refresh again when the retried preview still conflicts", async () => {
     const user = userEvent.setup();
     Object.assign(mocks.entitlements, {
       plan: "pro",
@@ -852,6 +921,13 @@ describe("BillingTab", () => {
       purchaseVersion: 9,
       hasStripeCustomer: true,
     });
+    mocks.refetchSummary.mockImplementationOnce(async () => {
+      Object.assign(mocks.summary, {
+        billedSeats: 4,
+        purchaseVersion: 10,
+      });
+      return { data: mocks.summary };
+    });
     mocks.previewSeats.mockRejectedValue(
       new ApiError("conflict", 409, "Conflict", {
         code: "seat_capacity_changed",
@@ -861,15 +937,13 @@ describe("BillingTab", () => {
     renderWithI18n(<BillingTab />);
     await user.click(screen.getByRole("button", { name: "Add seats" }));
 
-    await waitFor(
-      () =>
-        expect(
-          screen.getByText(
-            "The estimate is temporarily unavailable. Retry in a moment.",
-          ),
-        ).toBeInTheDocument(),
-      { timeout: 3_000 },
-    );
+    expect(
+      await screen.findByText(
+        "The seat count in Stripe does not match the billing record. Contact support before retrying this purchase.",
+        {},
+        { timeout: 3_000 },
+      ),
+    ).toBeInTheDocument();
     expect(mocks.previewSeats).toHaveBeenCalledTimes(2);
     expect(mocks.refetchSummary).toHaveBeenCalledTimes(1);
   });
