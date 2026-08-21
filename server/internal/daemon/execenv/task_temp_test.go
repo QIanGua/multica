@@ -91,13 +91,24 @@ func TestPruneTaskTempDirsReclaimsUnlockedDirImmediately(t *testing.T) {
 
 // TestPruneTaskTempDirsLegacyDirsFallBackToTTL covers directories left by a
 // daemon predating the lock: nothing recorded liveness for them, so age is the
-// only signal available.
+// only signal available. They carry task content — that is both what makes them
+// worth reclaiming and what distinguishes them from a directory mid-publication
+// (see TestPruneTaskTempDirsLegacyBranchNeedsContent).
 func TestPruneTaskTempDirsLegacyDirsFallBackToTTL(t *testing.T) {
 	const legacyTTL = 72 * time.Hour
 
+	legacyDir := func(t *testing.T, base string) string {
+		t.Helper()
+		dir := makeTaskTempDir(t, base, "legacy", false)
+		if err := os.WriteFile(filepath.Join(dir, "payload"), make([]byte, 1024), 0o600); err != nil {
+			t.Fatalf("write payload: %v", err)
+		}
+		return dir
+	}
+
 	t.Run("young legacy dir is kept", func(t *testing.T) {
 		base := t.TempDir()
-		dir := makeTaskTempDir(t, base, "legacy", false)
+		dir := legacyDir(t, base)
 		if removed, _ := PruneTaskTempDirs(base, legacyTTL, time.Now(), testLogger()); removed != 0 {
 			t.Fatalf("prune removed %d young legacy dirs, want 0", removed)
 		}
@@ -108,7 +119,7 @@ func TestPruneTaskTempDirsLegacyDirsFallBackToTTL(t *testing.T) {
 
 	t.Run("legacy dir past the TTL is reclaimed", func(t *testing.T) {
 		base := t.TempDir()
-		dir := makeTaskTempDir(t, base, "legacy", false)
+		dir := legacyDir(t, base)
 		if removed, _ := PruneTaskTempDirs(base, legacyTTL, time.Now().Add(legacyTTL+time.Hour), testLogger()); removed != 1 {
 			t.Fatalf("prune removed %d expired legacy dirs, want 1", removed)
 		}
@@ -119,7 +130,7 @@ func TestPruneTaskTempDirsLegacyDirsFallBackToTTL(t *testing.T) {
 
 	t.Run("zero TTL disables the legacy branch", func(t *testing.T) {
 		base := t.TempDir()
-		dir := makeTaskTempDir(t, base, "legacy", false)
+		dir := legacyDir(t, base)
 		if removed, _ := PruneTaskTempDirs(base, 0, time.Now().Add(10*365*24*time.Hour), testLogger()); removed != 0 {
 			t.Fatalf("prune removed %d legacy dirs with the TTL disabled, want 0", removed)
 		}
@@ -201,7 +212,7 @@ func TestLockTaskTempDirPublishesAnAlreadyHeldMarker(t *testing.T) {
 // under EVERY legacy setting — disabled, and enabled with a TTL far larger than
 // the directory's age, which is the only way a positive TTL can be configured.
 func TestPruneTaskTempDirsSpareDirMidClaim(t *testing.T) {
-	for _, legacyTTL := range []time.Duration{0, time.Hour, 72 * time.Hour} {
+	for _, legacyTTL := range []time.Duration{0, time.Nanosecond, time.Millisecond, time.Hour, 72 * time.Hour} {
 		t.Run(legacyTTL.String(), func(t *testing.T) {
 			base := t.TempDir()
 			dir := filepath.Join(base, TaskTempDirPrefix+"claiming")
@@ -218,7 +229,12 @@ func TestPruneTaskTempDirsSpareDirMidClaim(t *testing.T) {
 			}
 			t.Cleanup(func() { releaseLockFile(claim) })
 
-			if removed, _ := PruneTaskTempDirs(base, legacyTTL, time.Now(), testLogger()); removed != 0 {
+			// now is pushed past the TTL on purpose: what protects this state
+			// must not be that it is younger than the TTL, because legacyTTL
+			// accepts any duration and an owner can stall between MkdirTemp
+			// and the rename.
+			now := time.Now().Add(legacyTTL + time.Second)
+			if removed, _ := PruneTaskTempDirs(base, legacyTTL, now, testLogger()); removed != 0 {
 				t.Fatalf("prune removed %d dirs mid-claim, want 0", removed)
 			}
 			if _, err := os.Stat(dir); err != nil {
@@ -266,4 +282,50 @@ func TestLockTaskTempDirRacesPruneCleanly(t *testing.T) {
 
 	close(stop)
 	<-swept
+}
+
+// TestPruneTaskTempDirsSparesDirBeforeItsClaimExists covers the other half of
+// the publication window — the instant between os.MkdirTemp and the claim file
+// appearing, when the directory is simply empty. Nothing can be locked yet, so
+// the only thing that can protect it is that it holds no task content.
+func TestPruneTaskTempDirsSparesDirBeforeItsClaimExists(t *testing.T) {
+	for _, legacyTTL := range []time.Duration{time.Nanosecond, time.Millisecond, 72 * time.Hour} {
+		t.Run(legacyTTL.String(), func(t *testing.T) {
+			base := t.TempDir()
+			dir, err := os.MkdirTemp(base, TaskTempDirPrefix)
+			if err != nil {
+				t.Fatalf("MkdirTemp(): %v", err)
+			}
+			now := time.Now().Add(legacyTTL + time.Second)
+			if removed, _ := PruneTaskTempDirs(base, legacyTTL, now, testLogger()); removed != 0 {
+				t.Fatalf("prune removed %d dirs before their claim existed, want 0", removed)
+			}
+			if _, err := os.Stat(dir); err != nil {
+				t.Fatalf("prune removed a directory whose owner had not claimed it yet: %v", err)
+			}
+		})
+	}
+}
+
+// TestPruneTaskTempDirsLegacyBranchNeedsContent states the invariant the two
+// tests above depend on, so that relaxing it fails here rather than in a race:
+// the age branch reclaims a leftover holding task content, and nothing else.
+func TestPruneTaskTempDirsLegacyBranchNeedsContent(t *testing.T) {
+	base := t.TempDir()
+	empty := makeTaskTempDir(t, base, "empty-legacy", false)
+	withContent := makeTaskTempDir(t, base, "used-legacy", false)
+	if err := os.WriteFile(filepath.Join(withContent, "payload"), make([]byte, 1024), 0o600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	removed, _ := PruneTaskTempDirs(base, time.Hour, time.Now().Add(48*time.Hour), testLogger())
+	if removed != 1 {
+		t.Fatalf("prune removed %d dirs, want 1 (only the one holding content)", removed)
+	}
+	if _, err := os.Stat(withContent); !os.IsNotExist(err) {
+		t.Fatalf("expired legacy dir with content survived: %v", err)
+	}
+	if _, err := os.Stat(empty); err != nil {
+		t.Fatalf("empty legacy dir was reclaimed on age: %v", err)
+	}
 }

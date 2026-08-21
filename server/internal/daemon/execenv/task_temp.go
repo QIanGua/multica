@@ -42,12 +42,12 @@ func LockTaskTempDir(dir string) (*os.File, error) {
 	// description rather than the name, so the marker becomes visible and
 	// held in the same step.
 	//
-	// Before that rename the directory carries no marker at all, which the
-	// sweep classifies as legacy — and a legacy directory is only ever
-	// reclaimed once it is OLDER than legacyTTL. A directory created
-	// microseconds ago is younger than any positive TTL, and a TTL of 0
-	// disables that branch outright, so there is no configuration in which the
-	// pre-publish state can be swept.
+	// Before that rename the directory carries no published marker, so the
+	// sweep can only reach it through the legacy branch. What keeps it safe
+	// there is not its age — legacyTTL takes any duration, down to a
+	// nanosecond, and a stalled owner can outlast any TTL — but the fact that
+	// it holds no task content yet. The legacy branch reclaims only
+	// directories that do; see taskTempDirHoldsContent.
 	claim := filepath.Join(dir, taskTempLockClaimFile)
 	lock, err := openLockFile(claim)
 	if err != nil {
@@ -203,6 +203,23 @@ func PruneTaskTempDirs(base string, legacyTTL time.Duration, now time.Time, logg
 				legacyKept++
 				continue
 			}
+			// Age is the only signal here, and age cannot tell a pre-lock
+			// leftover from a directory this daemon is in the middle of
+			// publishing: both carry no .task_lock, legacyTTL accepts any
+			// duration down to a nanosecond, and an owner stalled between
+			// MkdirTemp and the rename outlasts any TTL at all. Content can
+			// tell them apart. A directory being published holds nothing but
+			// its own claim file — the task has not been handed the path yet,
+			// so it cannot have written anything — while a leftover worth
+			// reclaiming is by definition one with something in it.
+			//
+			// So this branch never touches a directory with no task content.
+			// The cost is that a pre-lock daemon which crashed before its task
+			// wrote anything leaves an empty directory nothing reclaims; the
+			// alternative is deleting the temp dir of a task that is starting.
+			if !taskTempDirHoldsContent(dir) {
+				continue
+			}
 			newest, _ := dirStat(dir)
 			if newest.IsZero() || now.Sub(newest) <= legacyTTL {
 				continue
@@ -235,6 +252,24 @@ func PruneTaskTempDirs(base string, legacyTTL time.Duration, now time.Time, logg
 		)
 	}
 	return removed, bytesFreed
+}
+
+// taskTempDirHoldsContent reports whether dir holds anything a task put there,
+// as opposed to only the lock files this package maintains. It is what
+// separates a pre-lock leftover from a directory mid-publication, without
+// consulting the clock.
+func taskTempDirHoldsContent(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false // unreadable: not ours to delete
+	}
+	for _, e := range entries {
+		if e.Name() == envRootLockFile || e.Name() == taskTempLockClaimFile {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // classifyTaskTempDir decides what can be proven about one directory.
