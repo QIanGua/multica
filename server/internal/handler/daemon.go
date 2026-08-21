@@ -4400,6 +4400,7 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	slog.Info("task message batch received", "task_id", taskID, "count", len(req.Messages))
 
 	workspaceID := ""
 	if task.IssueID.Valid {
