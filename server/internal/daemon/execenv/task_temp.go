@@ -28,21 +28,48 @@ const TaskTempDirPrefix = "multica-task-"
 // different daemon sharing the same temp base, which no in-memory active set
 // could ever see, and including a live task in this very process, because a
 // lock is held by an open file description rather than by a process.
+// The marker is claimed under this name and renamed into place only once it is
+// held, so .task_lock never exists unlocked while its owner is starting up.
+const taskTempLockClaimFile = envRootLockFile + ".claiming"
+
 func LockTaskTempDir(dir string) (*os.File, error) {
-	lock, err := openLockFile(filepath.Join(dir, envRootLockFile))
+	// Lock the marker under a name the sweep does not read, then publish it
+	// with a rename. Creating .task_lock first and locking it second would
+	// leave a window — however short — in which a concurrent sweep sees a
+	// marker it can lock, concludes the owner is dead, and deletes the
+	// directory out from under a task that is about to start using it. Rename
+	// within one directory is atomic, and the lock rides on the open file
+	// description rather than the name, so the marker becomes visible and
+	// held in the same step.
+	//
+	// Before that rename the directory carries no marker at all, which the
+	// sweep classifies as legacy — and a legacy directory is only ever
+	// reclaimed once it is OLDER than legacyTTL. A directory created
+	// microseconds ago is younger than any positive TTL, and a TTL of 0
+	// disables that branch outright, so there is no configuration in which the
+	// pre-publish state can be swept.
+	claim := filepath.Join(dir, taskTempLockClaimFile)
+	lock, err := openLockFile(claim)
 	if err != nil {
 		return nil, fmt.Errorf("open task temp dir lock for %s: %w", dir, err)
 	}
 	locked, err := lockFileExclusiveNonBlocking(lock)
 	if err != nil {
 		lock.Close()
+		_ = os.Remove(claim)
 		return nil, fmt.Errorf("lock task temp dir %s: %w", dir, err)
 	}
 	if !locked {
 		// Unreachable in practice: the directory was just created by
 		// os.MkdirTemp under a name nobody else knows yet.
 		lock.Close()
+		_ = os.Remove(claim)
 		return nil, fmt.Errorf("task temp dir %s is already locked", dir)
+	}
+	if err := os.Rename(claim, filepath.Join(dir, envRootLockFile)); err != nil {
+		releaseLockFile(lock)
+		_ = os.Remove(claim)
+		return nil, fmt.Errorf("publish task temp dir lock for %s: %w", dir, err)
 	}
 	return lock, nil
 }
@@ -69,6 +96,11 @@ func ReleaseTaskTempLock(f *os.File) {
 // still lock-bearing, still unlocked, and the next GC cycle takes the lock and
 // retries, however many cycles it takes for the holder to let go.
 //
+// That holds for every way this can fail, not just the content walk. The
+// marker has to be gone before the directory itself can be removed, so when
+// that last removal fails the marker is put back — otherwise the one case
+// where cleanup gets furthest would be the one case that leaks permanently.
+//
 // Callers must release their own lock before calling this — the marker is
 // deleted here, and on Windows removing a file this process still holds open
 // only marks it for deletion, which would then block the directory's removal.
@@ -88,10 +120,23 @@ func RemoveTaskTempDir(dir string) error {
 			return err
 		}
 	}
-	if err := os.Remove(filepath.Join(dir, envRootLockFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	lockPath := filepath.Join(dir, envRootLockFile)
+	if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return os.Remove(dir)
+	if err := os.Remove(dir); err != nil {
+		// The directory outlived its marker: a Windows process holding a handle
+		// to the directory itself, or content an orphaned child recreated after
+		// the sweep above walked past it. Put an unlocked marker back, or the
+		// directory reads as a pre-lock leftover from here on — which, with the
+		// legacy branch disabled by default, means it never gets reclaimed at
+		// all. Restoring it keeps the retry available for the next cycle.
+		if restored, rerr := openLockFile(lockPath); rerr == nil {
+			restored.Close()
+		}
+		return err
+	}
+	return nil
 }
 
 // taskTempVerdict is what a single directory under the temp base is, as far as

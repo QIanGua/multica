@@ -167,3 +167,103 @@ func TestPruneTaskTempDirsMissingBaseIsNotAnError(t *testing.T) {
 		t.Fatalf("prune over a missing base = (%d, %d), want (0, 0)", removed, bytesFreed)
 	}
 }
+
+// TestLockTaskTempDirPublishesAnAlreadyHeldMarker pins the publication order:
+// when LockTaskTempDir returns, .task_lock exists AND is held, with no claim
+// file left behind. If the marker were created first and locked second, a sweep
+// landing in between would lock it, read the owner as dead, and delete the
+// directory a task is about to start using.
+func TestLockTaskTempDirPublishesAnAlreadyHeldMarker(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, TaskTempDirPrefix+"publishing")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("create task temp dir: %v", err)
+	}
+	lock, err := LockTaskTempDir(dir)
+	if err != nil {
+		t.Fatalf("LockTaskTempDir(): %v", err)
+	}
+	t.Cleanup(func() { ReleaseTaskTempLock(lock) })
+
+	if _, err := os.Stat(filepath.Join(dir, envRootLockFile)); err != nil {
+		t.Fatalf("marker not published: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, taskTempLockClaimFile)); !os.IsNotExist(err) {
+		t.Fatalf("claim file left behind, stat err = %v", err)
+	}
+	if got := classifyTaskTempDir(dir, testLogger()); got != taskTempInUse {
+		t.Fatalf("classify = %v, want taskTempInUse", got)
+	}
+}
+
+// TestPruneTaskTempDirsSpareDirMidClaim covers the window itself: a directory
+// whose owner has taken the claim but not yet published it must survive a sweep
+// under EVERY legacy setting — disabled, and enabled with a TTL far larger than
+// the directory's age, which is the only way a positive TTL can be configured.
+func TestPruneTaskTempDirsSpareDirMidClaim(t *testing.T) {
+	for _, legacyTTL := range []time.Duration{0, time.Hour, 72 * time.Hour} {
+		t.Run(legacyTTL.String(), func(t *testing.T) {
+			base := t.TempDir()
+			dir := filepath.Join(base, TaskTempDirPrefix+"claiming")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatalf("create task temp dir: %v", err)
+			}
+			// Exactly the on-disk state between claim and publish.
+			claim, err := openLockFile(filepath.Join(dir, taskTempLockClaimFile))
+			if err != nil {
+				t.Fatalf("open claim: %v", err)
+			}
+			if ok, err := lockFileExclusiveNonBlocking(claim); err != nil || !ok {
+				t.Fatalf("lock claim: ok=%v err=%v", ok, err)
+			}
+			t.Cleanup(func() { releaseLockFile(claim) })
+
+			if removed, _ := PruneTaskTempDirs(base, legacyTTL, time.Now(), testLogger()); removed != 0 {
+				t.Fatalf("prune removed %d dirs mid-claim, want 0", removed)
+			}
+			if _, err := os.Stat(dir); err != nil {
+				t.Fatalf("prune removed a directory whose owner was mid-claim: %v", err)
+			}
+		})
+	}
+}
+
+// TestLockTaskTempDirRacesPruneCleanly is the concurrency regression: a sweep
+// running flat out against tasks publishing their temp dirs must never hand a
+// task a directory that has been deleted underneath it.
+func TestLockTaskTempDirRacesPruneCleanly(t *testing.T) {
+	base := t.TempDir()
+	stop := make(chan struct{})
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				PruneTaskTempDirs(base, 0, time.Now(), testLogger())
+			}
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		dir, err := os.MkdirTemp(base, TaskTempDirPrefix)
+		if err != nil {
+			t.Fatalf("MkdirTemp(): %v", err)
+		}
+		lock, err := LockTaskTempDir(dir)
+		if err != nil {
+			t.Fatalf("LockTaskTempDir() on iteration %d: %v", i, err)
+		}
+		// What the task does next: write into the TMPDIR it was handed.
+		if err := os.WriteFile(filepath.Join(dir, "payload"), []byte("x"), 0o600); err != nil {
+			t.Fatalf("task temp dir vanished under its owner on iteration %d: %v", i, err)
+		}
+		ReleaseTaskTempLock(lock)
+		_ = RemoveTaskTempDir(dir)
+	}
+
+	close(stop)
+	<-swept
+}

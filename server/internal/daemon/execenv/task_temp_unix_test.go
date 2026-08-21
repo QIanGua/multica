@@ -125,3 +125,45 @@ func TestPruneTaskTempDirsFailsClosedOnUnreadableDir(t *testing.T) {
 		t.Fatalf("prune removed an unreadable dir: %v", err)
 	}
 }
+
+// TestRemoveTaskTempDirRestoresMarkerWhenDirCannotBeRemoved is the second
+// failure branch: the contents come away cleanly, the marker is deleted so the
+// directory can go — and then the directory itself cannot be removed. Without
+// restoring the marker this is the worst case of all, because the cleanup that
+// got furthest is the one that leaves a directory nothing can classify again.
+//
+// A read-only BASE blocks removing the directory while still allowing its
+// contents (and marker) to be removed, since unlinking is governed by the
+// parent.
+func TestRemoveTaskTempDirRestoresMarkerWhenDirCannotBeRemoved(t *testing.T) {
+	base := t.TempDir()
+	dir := makeTaskTempDir(t, base, "undeletable", true)
+	if err := os.WriteFile(filepath.Join(dir, "payload"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	if err := os.Chmod(base, 0o555); err != nil {
+		t.Fatalf("chmod base: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(base, 0o700) })
+
+	if err := RemoveTaskTempDir(dir); err == nil {
+		t.Skip("process can unlink through a read-only directory (running as root?)")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("directory unexpectedly removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, envRootLockFile)); err != nil {
+		t.Fatalf("marker was not restored after the directory removal failed: %v", err)
+	}
+	// The restored marker must be unlocked, so the next cycle can claim it.
+	if got := classifyTaskTempDir(dir, testLogger()); got != taskTempDead {
+		t.Fatalf("classify after restore = %v, want taskTempDead", got)
+	}
+
+	if err := os.Chmod(base, 0o700); err != nil {
+		t.Fatalf("restore base perms: %v", err)
+	}
+	if removed, _ := PruneTaskTempDirs(base, 0, time.Now(), testLogger()); removed != 1 {
+		t.Fatalf("next sweep removed %d dirs, want 1", removed)
+	}
+}
