@@ -984,12 +984,14 @@ describe("workspace subscription contract", () => {
       actual_seats: 3,
       billed_seats: 5,
       pending_seat_quantity: 3,
+      used_seats: 3,
       reserved_seats: 2,
-      capacity_version: 11,
+      purchase_version: 11,
       active_seat_purchase: {
         request_id: "22222222-2222-2222-2222-222222222222",
         target_seats: 7,
         status: "submitted",
+        expires_at: "2026-08-21T06:15:00Z",
       },
       cancel_at_period_end: true,
       grace_until: "2026-09-08T00:00:00Z",
@@ -1004,12 +1006,14 @@ describe("workspace subscription contract", () => {
     expect(summary?.billingInterval).toBe("year");
     expect(summary?.billedSeats).toBe(5);
     expect(summary?.pendingSeatQuantity).toBe(3);
+    expect(summary?.usedSeats).toBe(3);
     expect(summary?.reservedSeats).toBe(2);
-    expect(summary?.capacityVersion).toBe(11);
+    expect(summary?.purchaseVersion).toBe(11);
     expect(summary?.activeSeatPurchase).toEqual({
       requestId: "22222222-2222-2222-2222-222222222222",
       targetSeats: 7,
       status: "submitted",
+      expiresAt: "2026-08-21T06:15:00Z",
     });
     expect(summary?.cancelAtPeriodEnd).toBe(true);
     expect(summary?.graceUntil).toBe("2026-09-08T00:00:00Z");
@@ -1027,8 +1031,9 @@ describe("workspace subscription contract", () => {
     expect(summary?.billingInterval).toBeNull();
     expect(summary?.billedSeats).toBeNull();
     expect(summary?.pendingSeatQuantity).toBeNull();
+    expect(summary?.usedSeats).toBe(3);
     expect(summary?.reservedSeats).toBe(0);
-    expect(summary?.capacityVersion).toBeNull();
+    expect(summary?.purchaseVersion).toBeNull();
     expect(summary?.activeSeatPurchase).toBeNull();
     expect(summary?.cancelAtPeriodEnd).toBe(false);
     expect(summary?.graceUntil).toBeNull();
@@ -1139,7 +1144,7 @@ describe("workspace subscription contract", () => {
       current_seats: 5,
       additional_seats: 2,
       resulting_seats: 7,
-      capacity_version: 9,
+      purchase_version: 9,
       currency: "usd",
       proration_amount: 425,
       next_invoice_amount: 14000,
@@ -1152,7 +1157,7 @@ describe("workspace subscription contract", () => {
       currentSeats: 5,
       additionalSeats: 2,
       resultingSeats: 7,
-      capacityVersion: 9,
+      purchaseVersion: 9,
       currency: "usd",
       prorationAmount: 425,
       nextInvoiceAmount: 14000,
@@ -1180,7 +1185,7 @@ describe("workspace subscription contract", () => {
       client.purchaseWorkspaceSeats({
         additionalSeats: 2,
         expectedCurrentSeats: 5,
-        expectedCapacityVersion: 9,
+        expectedPurchaseVersion: 9,
         acceptedProrationAmount: 425,
         currency: "usd",
         idempotencyKey: "seat-request-1",
@@ -1193,7 +1198,7 @@ describe("workspace subscription contract", () => {
         body: JSON.stringify({
           additional_seats: 2,
           expected_current_seats: 5,
-          expected_capacity_version: 9,
+          expected_purchase_version: 9,
           accepted_proration_amount: 425,
           currency: "usd",
           idempotency_key: "seat-request-1",

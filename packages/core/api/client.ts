@@ -1794,7 +1794,7 @@ export class ApiClient {
         body: JSON.stringify({
           additional_seats: data.additionalSeats,
           expected_current_seats: data.expectedCurrentSeats,
-          expected_capacity_version: data.expectedCapacityVersion,
+          expected_purchase_version: data.expectedPurchaseVersion,
           accepted_proration_amount: data.acceptedProrationAmount,
           currency: data.currency,
           idempotency_key: data.idempotencyKey,

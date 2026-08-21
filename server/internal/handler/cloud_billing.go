@@ -73,7 +73,7 @@ type cloudSubscriptionSeatPurchasePreviewRequest struct {
 type cloudSubscriptionSeatPurchaseRequest struct {
 	AdditionalSeats         int    `json:"additional_seats"`
 	ExpectedCurrentSeats    int    `json:"expected_current_seats"`
-	ExpectedCapacityVersion int64  `json:"expected_capacity_version"`
+	ExpectedPurchaseVersion int64  `json:"expected_purchase_version"`
 	AcceptedProrationAmount int64  `json:"accepted_proration_amount"`
 	Currency                string `json:"currency"`
 	IdempotencyKey          string `json:"idempotency_key,omitempty"`
@@ -303,7 +303,7 @@ func (h *Handler) PurchaseCloudWorkspaceSubscriptionSeats(w http.ResponseWriter,
 	if in.AdditionalSeats < 1 || in.ExpectedCurrentSeats < 1 ||
 		in.AdditionalSeats > maxCloudSubscriptionSeats ||
 		in.ExpectedCurrentSeats > maxCloudSubscriptionSeats-in.AdditionalSeats ||
-		in.ExpectedCapacityVersion < 1 || in.AcceptedProrationAmount < 0 || !isASCIICurrency(in.Currency) {
+		in.ExpectedPurchaseVersion < 1 || in.AcceptedProrationAmount < 0 || !isASCIICurrency(in.Currency) {
 		writeError(w, http.StatusBadRequest, "invalid seat purchase confirmation")
 		return
 	}

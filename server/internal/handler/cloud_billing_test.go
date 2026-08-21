@@ -459,7 +459,7 @@ func TestCloudWorkspaceSeatPurchaseForwardsOnlyAdditiveConfirmation(t *testing.T
 		"target_seats":              999,
 		"additional_seats":          2,
 		"expected_current_seats":    5,
-		"expected_capacity_version": 9,
+		"expected_purchase_version": 9,
 		"accepted_proration_amount": 425,
 		"currency":                  "USD",
 		"idempotency_key":           "seat-request-1",
@@ -515,9 +515,9 @@ func TestCloudWorkspaceSeatPurchaseRejectsInvalidOrUnauthorizedRequests(t *testi
 		header string
 	}{
 		{name: "member", role: "member", body: map[string]any{"additional_seats": 1}},
-		{name: "absolute overflow", role: "owner", body: map[string]any{"additional_seats": 2, "expected_current_seats": 9999, "expected_capacity_version": 1, "accepted_proration_amount": 0, "currency": "usd", "idempotency_key": "key"}},
-		{name: "bad currency", role: "owner", body: map[string]any{"additional_seats": 1, "expected_current_seats": 5, "expected_capacity_version": 1, "accepted_proration_amount": 0, "currency": "u$d", "idempotency_key": "key"}},
-		{name: "long key", role: "owner", body: map[string]any{"additional_seats": 1, "expected_current_seats": 5, "expected_capacity_version": 1, "accepted_proration_amount": 0, "currency": "usd"}, header: strings.Repeat("a", 201)},
+		{name: "absolute overflow", role: "owner", body: map[string]any{"additional_seats": 2, "expected_current_seats": 9999, "expected_purchase_version": 1, "accepted_proration_amount": 0, "currency": "usd", "idempotency_key": "key"}},
+		{name: "bad currency", role: "owner", body: map[string]any{"additional_seats": 1, "expected_current_seats": 5, "expected_purchase_version": 1, "accepted_proration_amount": 0, "currency": "u$d", "idempotency_key": "key"}},
+		{name: "long key", role: "owner", body: map[string]any{"additional_seats": 1, "expected_current_seats": 5, "expected_purchase_version": 1, "accepted_proration_amount": 0, "currency": "usd"}, header: strings.Repeat("a", 201)},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

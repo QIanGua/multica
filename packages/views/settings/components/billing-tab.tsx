@@ -29,6 +29,7 @@ import { BILLING_WORKSPACE_SUBSCRIPTIONS_FLAG } from "@multica/core/feature-flag
 import { useCurrentMember } from "@multica/core/permissions";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import type {
+  PurchaseWorkspaceSeatsRequest,
   WorkspaceSeatPurchasePreview,
   WorkspaceSubscriptionInterval,
 } from "@multica/core/types";
@@ -49,6 +50,14 @@ import {
 } from "@multica/ui/components/ui/alert-dialog";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@multica/ui/components/ui/dialog";
 import { Input } from "@multica/ui/components/ui/input";
 import {
   Progress,
@@ -72,6 +81,8 @@ import {
 } from "./billing-state";
 
 const CHECKOUT_SYNC_TIMEOUT_MS = 30_000;
+const SEAT_PURCHASE_POLL_TIMEOUT_MS = 2 * 60_000;
+const SEAT_PURCHASE_PREVIEW_DEBOUNCE_MS = 800;
 
 const STRIPE_ZERO_DECIMAL_CURRENCIES = new Set([
   "BIF",
@@ -264,6 +275,8 @@ function BillingTabContent() {
   const [seatPurchaseError, setSeatPurchaseError] = useState<string | null>(
     null,
   );
+  const [seatPurchasePollingTimedOut, setSeatPurchasePollingTimedOut] =
+    useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [portalUnavailable, setPortalUnavailable] = useState(false);
   const [reconcileMessage, setReconcileMessage] = useState<string | null>(null);
@@ -277,18 +290,24 @@ function BillingTabContent() {
     key: string;
   } | null>(null);
   const portalIntentKeyRef = useRef<string | null>(null);
-  const seatPurchaseIntentKeyRef = useRef<string | null>(null);
+  const seatPurchaseIntentRef = useRef<{
+    wsId: string;
+    key: string;
+    preview: WorkspaceSeatPurchasePreview;
+    request: PurchaseWorkspaceSeatsRequest;
+  } | null>(null);
   const seatPreviewInputRef = useRef("");
   const consumedCallbackKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     checkoutIntentRef.current = null;
     portalIntentKeyRef.current = null;
-    seatPurchaseIntentKeyRef.current = null;
+    seatPurchaseIntentRef.current = null;
     seatPreviewInputRef.current = "";
     setSeatPurchaseOpen(false);
     setSeatPreview(null);
     setSeatPurchaseError(null);
+    setSeatPurchasePollingTimedOut(false);
     setPortalUnavailable(false);
     setActionError(null);
     setReconcileMessage(null);
@@ -345,12 +364,30 @@ function BillingTabContent() {
   const summaryQuery = useQuery({
     ...workspaceSubscriptionSummaryOptions(wsId),
     // Checkout activation and seat additions both finish asynchronously in a
-    // Stripe webhook. Poll only while one of those transitions is visible.
+    // Stripe webhook. Seat polling is bounded so a lost webhook cannot keep a
+    // browser polling forever.
     refetchInterval: (query) =>
-      isSyncingCheckout || query.state.data?.activeSeatPurchase
+      isSyncingCheckout ||
+      (query.state.data?.activeSeatPurchase &&
+        !seatPurchasePollingTimedOut)
         ? 2_000
         : false,
   });
+  const activeSeatPurchaseRequestId =
+    summaryQuery.data?.activeSeatPurchase?.requestId ?? null;
+
+  useEffect(() => {
+    if (!activeSeatPurchaseRequestId) {
+      setSeatPurchasePollingTimedOut(false);
+      return;
+    }
+    setSeatPurchasePollingTimedOut(false);
+    const timeout = window.setTimeout(
+      () => setSeatPurchasePollingTimedOut(true),
+      SEAT_PURCHASE_POLL_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [activeSeatPurchaseRequestId]);
   const summaryUnavailable =
     summaryQuery.isError ||
     (!summaryQuery.isPending && summaryQuery.data == null);
@@ -375,24 +412,32 @@ function BillingTabContent() {
   const previewSeatPurchase = previewSeatPurchaseMutation.mutateAsync;
 
   useEffect(() => {
-    if (!seatPurchaseOpen) {
-      seatPreviewInputRef.current = "";
-      return;
-    }
+    if (!seatPurchaseOpen) return;
     const value = additionalSeatsInput.trim();
     const additionalSeats = /^\d+$/.test(value) ? Number(value) : 0;
     const currentSeats = summaryQuery.data?.billedSeats ?? null;
-    const capacityVersion = summaryQuery.data?.capacityVersion ?? null;
-    const requestKey = `${wsId}:${value}:${currentSeats ?? ""}:${capacityVersion ?? ""}`;
+    const purchaseVersion = summaryQuery.data?.purchaseVersion ?? null;
+    const requestKey = `${wsId}:${value}:${currentSeats ?? ""}:${purchaseVersion ?? ""}`;
     seatPreviewInputRef.current = requestKey;
-    seatPurchaseIntentKeyRef.current = null;
+    const intent = seatPurchaseIntentRef.current;
+    if (
+      intent?.wsId === wsId &&
+      intent.request.additionalSeats === additionalSeats &&
+      intent.request.expectedCurrentSeats === currentSeats &&
+      intent.request.expectedPurchaseVersion === purchaseVersion
+    ) {
+      setSeatPreview(intent.preview);
+      setSeatPurchaseError(null);
+      return;
+    }
+    seatPurchaseIntentRef.current = null;
     setSeatPreview(null);
     setSeatPurchaseError(null);
     if (
       !Number.isSafeInteger(additionalSeats) ||
       additionalSeats < 1 ||
       currentSeats === null ||
-      capacityVersion === null ||
+      purchaseVersion === null ||
       currentSeats + additionalSeats > 10_000
     ) {
       return;
@@ -406,7 +451,7 @@ function BillingTabContent() {
             !preview ||
             preview.additionalSeats !== additionalSeats ||
             preview.currentSeats !== currentSeats ||
-            preview.capacityVersion !== capacityVersion ||
+            preview.purchaseVersion !== purchaseVersion ||
             preview.resultingSeats !== currentSeats + additionalSeats
           ) {
             setSeatPurchaseError(
@@ -426,14 +471,14 @@ function BillingTabContent() {
               : t(($) => $.workspace.seat_purchase.preview_failed),
           );
         });
-    }, 350);
+    }, SEAT_PURCHASE_PREVIEW_DEBOUNCE_MS);
     return () => window.clearTimeout(timeout);
   }, [
     additionalSeatsInput,
     previewSeatPurchase,
     seatPurchaseOpen,
     summaryQuery.data?.billedSeats,
-    summaryQuery.data?.capacityVersion,
+    summaryQuery.data?.purchaseVersion,
     t,
     wsId,
   ]);
@@ -601,19 +646,35 @@ function BillingTabContent() {
     const confirmedPreview = seatPreview;
     if (!confirmedPreview) return;
     setSeatPurchaseError(null);
+    const request: PurchaseWorkspaceSeatsRequest = {
+      additionalSeats: confirmedPreview.additionalSeats,
+      expectedCurrentSeats: confirmedPreview.currentSeats,
+      expectedPurchaseVersion: confirmedPreview.purchaseVersion,
+      acceptedProrationAmount: confirmedPreview.prorationAmount,
+      currency: confirmedPreview.currency,
+      idempotencyKey: "",
+    };
+    const existing = seatPurchaseIntentRef.current;
     const key =
-      seatPurchaseIntentKeyRef.current ??
-      createIdempotencyKey("workspace-seat-purchase", wsId).slice(0, 200);
-    seatPurchaseIntentKeyRef.current = key;
+      existing?.wsId === wsId &&
+      existing.request.additionalSeats === request.additionalSeats &&
+      existing.request.expectedCurrentSeats === request.expectedCurrentSeats &&
+      existing.request.expectedPurchaseVersion ===
+        request.expectedPurchaseVersion &&
+      existing.request.acceptedProrationAmount ===
+        request.acceptedProrationAmount &&
+      existing.request.currency === request.currency
+        ? existing.key
+        : createIdempotencyKey("workspace-seat-purchase", wsId).slice(0, 200);
+    request.idempotencyKey = key;
+    seatPurchaseIntentRef.current = {
+      wsId,
+      key,
+      preview: confirmedPreview,
+      request,
+    };
     try {
-      const response = await purchaseSeatsMutation.mutateAsync({
-        additionalSeats: confirmedPreview.additionalSeats,
-        expectedCurrentSeats: confirmedPreview.currentSeats,
-        expectedCapacityVersion: confirmedPreview.capacityVersion,
-        acceptedProrationAmount: confirmedPreview.prorationAmount,
-        currency: confirmedPreview.currency,
-        idempotencyKey: key,
-      });
+      const response = await purchaseSeatsMutation.mutateAsync(request);
       if (
         !response ||
         response.currentSeats !== confirmedPreview.currentSeats ||
@@ -626,7 +687,7 @@ function BillingTabContent() {
         );
         return;
       }
-      seatPurchaseIntentKeyRef.current = null;
+      seatPurchaseIntentRef.current = null;
       seatPreviewInputRef.current = "";
       setSeatPurchaseOpen(false);
       setSeatPreview(null);
@@ -639,7 +700,7 @@ function BillingTabContent() {
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
         const purchaseErrorCode = errorCode(error);
-        seatPurchaseIntentKeyRef.current = null;
+        seatPurchaseIntentRef.current = null;
         setSeatPreview(null);
         setSeatPurchaseError(
           purchaseErrorCode === "seat_purchase_in_progress"
@@ -649,8 +710,23 @@ function BillingTabContent() {
         await summaryQuery.refetch();
         return;
       }
-      reportActionError(
-        error,
+      if (error instanceof ApiError && error.status === 402) {
+        seatPurchaseIntentRef.current = null;
+        setSeatPreview(null);
+        setSeatPurchaseError(
+          t(($) => $.workspace.seat_purchase.payment_failed),
+        );
+        return;
+      }
+      if (error instanceof ApiError && error.status === 403) {
+        seatPurchaseIntentRef.current = null;
+        reportActionError(
+          error,
+          t(($) => $.workspace.seat_purchase.purchase_failed),
+        );
+        return;
+      }
+      setSeatPurchaseError(
         t(($) => $.workspace.seat_purchase.purchase_failed),
       );
     }
@@ -658,10 +734,16 @@ function BillingTabContent() {
 
   const handleSeatPurchaseOpenChange = (open: boolean) => {
     setSeatPurchaseOpen(open);
-    seatPurchaseIntentKeyRef.current = null;
+    if (!open) return;
     setSeatPurchaseError(null);
+    const intent = seatPurchaseIntentRef.current;
+    if (intent?.wsId === wsId) {
+      setAdditionalSeatsInput(String(intent.request.additionalSeats));
+      setSeatPreview(intent.preview);
+      return;
+    }
+    setAdditionalSeatsInput("1");
     setSeatPreview(null);
-    if (open) setAdditionalSeatsInput("1");
   };
 
   if (entitlementQuery.isPending) {
@@ -728,21 +810,22 @@ function BillingTabContent() {
     (entitlements.status !== "past_due" || hasActiveProGrace) &&
     (returnResult !== "success" || isCheckoutProConfirmed);
   const actualSeats = summaryQuery.data?.actualSeats ?? entitlements.seats;
+  const usedSeats = summaryQuery.data?.usedSeats ?? actualSeats;
   const billedSeats = summaryQuery.data?.billedSeats;
   const pendingSeatQuantity = summaryQuery.data?.pendingSeatQuantity;
   const reservedSeats = summaryQuery.data?.reservedSeats ?? 0;
   const availableSeats =
     billedSeats === null || billedSeats === undefined
       ? null
-      : Math.max(0, billedSeats - actualSeats - reservedSeats);
+      : Math.max(0, billedSeats - usedSeats - reservedSeats);
   const activeSeatPurchase = summaryQuery.data?.activeSeatPurchase ?? null;
   const canAddSeats =
     canManage &&
     hasManagedSubscription &&
     (entitlements.status === "active" || entitlements.status === "trialing") &&
     !summaryQuery.data?.cancelAtPeriodEnd &&
-    summaryQuery.data?.capacityVersion !== null &&
-    summaryQuery.data?.capacityVersion !== undefined &&
+    summaryQuery.data?.purchaseVersion !== null &&
+    summaryQuery.data?.purchaseVersion !== undefined &&
     billedSeats !== null &&
     billedSeats !== undefined &&
     activeSeatPurchase === null;
@@ -1310,14 +1393,22 @@ function BillingTabContent() {
         ) : null}
         {activeSeatPurchase ? (
           <Alert className="mb-3">
-            <Loader2 className="animate-spin motion-reduce:animate-none" />
+            {seatPurchasePollingTimedOut ? (
+              <AlertCircle />
+            ) : (
+              <Loader2 className="animate-spin motion-reduce:animate-none" />
+            )}
             <AlertTitle>
-              {t(($) => $.workspace.seat_purchase.pending_title)}
+              {seatPurchasePollingTimedOut
+                ? t(($) => $.workspace.seat_purchase.delayed_title)
+                : t(($) => $.workspace.seat_purchase.pending_title)}
             </AlertTitle>
             <AlertDescription>
-              {t(($) => $.workspace.seat_purchase.pending_description, {
-                count: activeSeatPurchase.targetSeats,
-              })}
+              {seatPurchasePollingTimedOut
+                ? t(($) => $.workspace.seat_purchase.delayed_description)
+                : t(($) => $.workspace.seat_purchase.pending_description, {
+                    count: activeSeatPurchase.targetSeats,
+                  })}
             </AlertDescription>
           </Alert>
         ) : null}
@@ -1467,19 +1558,19 @@ function BillingTabContent() {
         </SettingsCard>
       </SettingsSection>
 
-      <AlertDialog
+      <Dialog
         open={seatPurchaseOpen}
         onOpenChange={handleSeatPurchaseOpenChange}
       >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
               {t(($) => $.workspace.seat_purchase.title)}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
+            </DialogTitle>
+            <DialogDescription>
               {t(($) => $.workspace.seat_purchase.description)}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
+            </DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
               <label
@@ -1564,14 +1655,18 @@ function BillingTabContent() {
               </div>
             ) : null}
           </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
               className="h-11"
               disabled={purchaseSeatsMutation.isPending}
+              onClick={() => handleSeatPurchaseOpenChange(false)}
             >
               {t(($) => $.workspace.actions.cancel)}
-            </AlertDialogCancel>
-            <AlertDialogAction
+            </Button>
+            <Button
+              type="button"
               className="h-11"
               disabled={
                 !seatPreview ||
@@ -1580,10 +1675,7 @@ function BillingTabContent() {
                 previewSeatPurchaseMutation.isPending ||
                 purchaseSeatsMutation.isPending
               }
-              onClick={(event) => {
-                event.preventDefault();
-                void handleSeatPurchase();
-              }}
+              onClick={() => void handleSeatPurchase()}
             >
               {purchaseSeatsMutation.isPending ? (
                 <Loader2 className="animate-spin motion-reduce:animate-none" />
@@ -1595,10 +1687,10 @@ function BillingTabContent() {
                     count: seatPreview.additionalSeats,
                   })
                 : t(($) => $.workspace.actions.add_seats)}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog
         open={checkoutConfirmOpen}

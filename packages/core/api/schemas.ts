@@ -2382,13 +2382,15 @@ export const WorkspaceSubscriptionSummarySchema = z
     actual_seats: z.number().int().nonnegative(),
     billed_seats: z.number().int().nonnegative().nullable().optional(),
     pending_seat_quantity: z.number().int().nonnegative().nullable().optional(),
+    used_seats: z.number().int().nonnegative().optional().catch(undefined),
     reserved_seats: z.number().int().nonnegative().optional().catch(0),
-    capacity_version: z.number().int().positive().optional().catch(undefined),
+    purchase_version: z.number().int().positive().optional().catch(undefined),
     active_seat_purchase: z
       .object({
         request_id: z.string(),
         target_seats: z.number().int().positive(),
         status: z.enum(["pending", "submitted"]),
+        expires_at: z.string().min(1).optional().catch(undefined),
       })
       .loose()
       .nullable()
@@ -2406,13 +2408,15 @@ export const WorkspaceSubscriptionSummarySchema = z
       actualSeats: value.actual_seats,
       billedSeats: value.billed_seats ?? null,
       pendingSeatQuantity: value.pending_seat_quantity ?? null,
+      usedSeats: value.used_seats ?? value.actual_seats,
       reservedSeats: value.reserved_seats ?? 0,
-      capacityVersion: value.capacity_version ?? null,
+      purchaseVersion: value.purchase_version ?? null,
       activeSeatPurchase: value.active_seat_purchase
         ? {
             requestId: value.active_seat_purchase.request_id,
             targetSeats: value.active_seat_purchase.target_seats,
             status: value.active_seat_purchase.status,
+            expiresAt: value.active_seat_purchase.expires_at ?? null,
           }
         : null,
       cancelAtPeriodEnd: value.cancel_at_period_end ?? false,
@@ -2498,7 +2502,7 @@ export const WorkspaceSeatPurchasePreviewSchema = z
     current_seats: z.number().int().positive(),
     additional_seats: z.number().int().positive(),
     resulting_seats: z.number().int().positive(),
-    capacity_version: z.number().int().positive(),
+    purchase_version: z.number().int().positive(),
     currency: z.string().regex(/^[a-z]{3}$/),
     proration_amount: z.number().int().nonnegative(),
     next_invoice_amount: z.number().int().nonnegative(),
@@ -2510,7 +2514,7 @@ export const WorkspaceSeatPurchasePreviewSchema = z
       currentSeats: value.current_seats,
       additionalSeats: value.additional_seats,
       resultingSeats: value.resulting_seats,
-      capacityVersion: value.capacity_version,
+      purchaseVersion: value.purchase_version,
       currency: value.currency,
       prorationAmount: value.proration_amount,
       nextInvoiceAmount: value.next_invoice_amount,

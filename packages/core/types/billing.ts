@@ -223,10 +223,12 @@ export interface WorkspaceSubscriptionSummary {
   billedSeats: number | null;
   /** A lower quantity already scheduled for the next period, if any. */
   pendingSeatQuantity: number | null;
+  /** Confirmed human members consuming Cloud-owned commercial capacity. */
+  usedSeats: number;
   /** Live pending invitations that reserve purchased capacity. */
   reservedSeats: number;
   /** Null when connected to a Cloud version that predates seat purchases. */
-  capacityVersion: number | null;
+  purchaseVersion: number | null;
   activeSeatPurchase: WorkspaceSeatPurchaseSummary | null;
   cancelAtPeriodEnd: boolean;
   graceUntil: string | null;
@@ -242,6 +244,7 @@ export interface WorkspaceSeatPurchaseSummary {
   requestId: string;
   targetSeats: number;
   status: "pending" | "submitted";
+  expiresAt: string | null;
 }
 
 /** Display-safe subset of a configured Stripe Price. IDs stay server-side. */
@@ -278,7 +281,7 @@ export interface WorkspaceSeatPurchasePreview {
   currentSeats: number;
   additionalSeats: number;
   resultingSeats: number;
-  capacityVersion: number;
+  purchaseVersion: number;
   currency: string;
   /** Estimated immediate proration in Stripe's minor currency unit. */
   prorationAmount: number;
@@ -290,7 +293,7 @@ export interface WorkspaceSeatPurchasePreview {
 export interface PurchaseWorkspaceSeatsRequest {
   additionalSeats: number;
   expectedCurrentSeats: number;
-  expectedCapacityVersion: number;
+  expectedPurchaseVersion: number;
   acceptedProrationAmount: number;
   currency: string;
   idempotencyKey: string;
