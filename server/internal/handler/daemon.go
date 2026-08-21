@@ -4436,13 +4436,6 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Debug, not Info: this fires every 500ms for every running task, so at
-	// Info it is ~2 lines/second/task of pure noise. It was added at Info in
-	// #7371 only so batch sizes could be counted in production while answering
-	// "does a batch ever carry more than one message" (it does, occasionally);
-	// that question is settled, and the level is what keeps the probe available
-	// without the volume.
-	slog.Debug("task message batch received", "task_id", taskID, "count", len(req.Messages))
 
 	// Broadcast reach is deliberately unchanged: only issue- and chat-backed
 	// tasks streamed live messages before, and widening that to autopilot /
