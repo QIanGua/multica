@@ -1705,6 +1705,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			r.Group(func(r chi.Router) {
 				r.Use(middleware.RequireWorkspaceRole(queries, "owner", "admin"))
 				r.Post("/checkout-sessions", h.CreateCloudWorkspaceSubscriptionCheckout)
+				r.Post("/seats/purchase-preview", h.PreviewCloudWorkspaceSubscriptionSeatPurchase)
+				r.Post("/seats/purchases", h.PurchaseCloudWorkspaceSubscriptionSeats)
 				r.Post("/seats/reconcile", h.ReconcileCloudWorkspaceSubscriptionSeats)
 				r.Post("/portal-sessions", h.CreateCloudWorkspaceSubscriptionPortal)
 			})

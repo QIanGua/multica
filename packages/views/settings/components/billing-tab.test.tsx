@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   checkout: vi.fn(),
   portal: vi.fn(),
   reconcile: vi.fn(),
+  previewSeats: vi.fn(),
+  purchaseSeats: vi.fn(),
   refetch: vi.fn(),
   refetchSummary: vi.fn(),
   refetchUsage: vi.fn(),
@@ -61,6 +63,13 @@ const mocks = vi.hoisted(() => ({
     actualSeats: 3,
     billedSeats: null as number | null,
     pendingSeatQuantity: null as number | null,
+    reservedSeats: 0,
+    capacityVersion: null as number | null,
+    activeSeatPurchase: null as {
+      requestId: string;
+      targetSeats: number;
+      status: string;
+    } | null,
     cancelAtPeriodEnd: false,
     graceUntil: null as string | null,
     hasStripeCustomer: false,
@@ -101,6 +110,14 @@ vi.mock("@multica/core/billing", () => ({
   }),
   useReconcileWorkspaceSubscriptionSeats: () => ({
     mutateAsync: mocks.reconcile,
+    isPending: false,
+  }),
+  usePreviewWorkspaceSeatPurchase: () => ({
+    mutateAsync: mocks.previewSeats,
+    isPending: false,
+  }),
+  usePurchaseWorkspaceSeats: () => ({
+    mutateAsync: mocks.purchaseSeats,
     isPending: false,
   }),
 }));
@@ -190,6 +207,9 @@ describe("BillingTab", () => {
       actualSeats: 3,
       billedSeats: null,
       pendingSeatQuantity: null,
+      reservedSeats: 0,
+      capacityVersion: null,
+      activeSeatPurchase: null,
       cancelAtPeriodEnd: false,
       graceUntil: null,
       hasStripeCustomer: false,
@@ -259,6 +279,26 @@ describe("BillingTab", () => {
       billedSeats: 3,
       actualSeats: 3,
       action: "none",
+    });
+    mocks.previewSeats.mockResolvedValue({
+      currentSeats: 5,
+      additionalSeats: 1,
+      resultingSeats: 6,
+      capacityVersion: 9,
+      currency: "usd",
+      prorationAmount: 250,
+      nextInvoiceAmount: 6000,
+      quotedAt: "2030-01-01T00:00:00Z",
+    });
+    mocks.purchaseSeats.mockResolvedValue({
+      requestId: "seat-request-1",
+      currentSeats: 5,
+      additionalSeats: 1,
+      resultingSeats: 6,
+      currency: "usd",
+      prorationAmount: 250,
+      nextInvoiceAmount: 6000,
+      status: "submitted",
     });
     configStore.getState().setFeatureFlags({
       [BILLING_WORKSPACE_SUBSCRIPTIONS_FLAG]: true,
@@ -582,7 +622,7 @@ describe("BillingTab", () => {
       ).toBeInTheDocument();
       expect(screen.queryByText("Pro is active")).not.toBeInTheDocument();
       expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
-      expect(screen.getByText("Unavailable")).toBeInTheDocument();
+      expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
       expect(screen.getByText("5 / 7")).toBeInTheDocument();
       expect(mocks.useQuery).toHaveBeenCalledWith(
         expect.objectContaining({ refetchInterval: 2_000 }),
@@ -657,6 +697,8 @@ describe("BillingTab", () => {
       actualSeats: 4,
       billedSeats: 5,
       pendingSeatQuantity: 4,
+      reservedSeats: 1,
+      capacityVersion: 9,
       hasStripeCustomer: true,
     });
 
@@ -664,8 +706,85 @@ describe("BillingTab", () => {
 
     expect(screen.getByText("Monthly")).toBeInTheDocument();
     expect(screen.getByText("5 seats")).toBeInTheDocument();
+    expect(screen.getByText("1 seat")).toBeInTheDocument();
+    expect(screen.getByText("0 seats")).toBeInTheDocument();
     expect(screen.getByText(/4 seats from Feb 1, 2030/)).toBeInTheDocument();
     expect(screen.getAllByText("4 members")).toHaveLength(2);
+  });
+
+  it("quotes and confirms an additive seat purchase", async () => {
+    const user = userEvent.setup();
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+    });
+    Object.assign(mocks.summary, {
+      actualSeats: 4,
+      billedSeats: 5,
+      reservedSeats: 0,
+      capacityVersion: 9,
+      hasStripeCustomer: true,
+    });
+    mocks.previewSeats.mockImplementation(
+      ({ additionalSeats }: { additionalSeats: number }) =>
+        Promise.resolve({
+          currentSeats: 5,
+          additionalSeats,
+          resultingSeats: 5 + additionalSeats,
+          capacityVersion: 9,
+          currency: "usd",
+          prorationAmount: 250 * additionalSeats,
+          nextInvoiceAmount: 1000 * (5 + additionalSeats),
+          quotedAt: "2030-01-01T00:00:00Z",
+        }),
+    );
+    mocks.purchaseSeats.mockResolvedValue({
+      requestId: "seat-request-2",
+      currentSeats: 5,
+      additionalSeats: 2,
+      resultingSeats: 7,
+      currency: "usd",
+      prorationAmount: 500,
+      nextInvoiceAmount: 7000,
+      status: "submitted",
+    });
+
+    renderWithI18n(<BillingTab />);
+    await user.click(screen.getByRole("button", { name: "Add seats" }));
+
+    await waitFor(() =>
+      expect(mocks.previewSeats).toHaveBeenCalledWith({ additionalSeats: 1 }),
+    );
+    expect(screen.getByText("Estimated charge today")).toBeInTheDocument();
+    expect(screen.getByText("$2.50")).toBeInTheDocument();
+    expect(screen.getByText("$60.00")).toBeInTheDocument();
+
+    const input = screen.getByRole("spinbutton", { name: "Additional seats" });
+    await user.clear(input);
+    await user.type(input, "2");
+    await waitFor(() =>
+      expect(mocks.previewSeats).toHaveBeenLastCalledWith({
+        additionalSeats: 2,
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("$5.00")).toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: "Add 2 seats" }));
+    expect(mocks.purchaseSeats).toHaveBeenCalledWith(
+      expect.objectContaining({
+        additionalSeats: 2,
+        expectedCurrentSeats: 5,
+        expectedCapacityVersion: 9,
+        acceptedProrationAmount: 500,
+        currency: "usd",
+        idempotencyKey: expect.stringContaining(
+          "workspace-seat-purchase-workspace-1-",
+        ),
+      }),
+    );
+    await waitFor(() => expect(mocks.refetchSummary).toHaveBeenCalled());
   });
 
   it("uses completed and reserved runs for the quota decision", () => {
@@ -718,7 +837,7 @@ describe("BillingTab", () => {
       expect(
         screen.getByText("Some seat details are unavailable"),
       ).toBeInTheDocument();
-      expect(screen.getAllByText("Unavailable")).toHaveLength(2);
+      expect(screen.getAllByText("Unavailable")).toHaveLength(4);
     },
   );
 
@@ -779,7 +898,7 @@ describe("BillingTab", () => {
     renderWithI18n(<BillingTab />);
 
     expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
-    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
     expect(
       screen.getByText(
         "Open the Billing Portal to update your payment method. The plan badge above shows the access currently available.",
