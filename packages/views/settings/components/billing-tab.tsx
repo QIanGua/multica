@@ -272,6 +272,7 @@ function BillingTabContent() {
   const [additionalSeatsInput, setAdditionalSeatsInput] = useState("1");
   const [seatPreview, setSeatPreview] =
     useState<WorkspaceSeatPurchasePreview | null>(null);
+  const [seatPreviewRevision, setSeatPreviewRevision] = useState(0);
   const [seatPurchaseError, setSeatPurchaseError] = useState<string | null>(
     null,
   );
@@ -306,6 +307,7 @@ function BillingTabContent() {
     seatPreviewInputRef.current = "";
     setSeatPurchaseOpen(false);
     setSeatPreview(null);
+    setSeatPreviewRevision(0);
     setSeatPurchaseError(null);
     setSeatPurchasePollingTimedOut(false);
     setPortalUnavailable(false);
@@ -417,7 +419,7 @@ function BillingTabContent() {
     const additionalSeats = /^\d+$/.test(value) ? Number(value) : 0;
     const currentSeats = summaryQuery.data?.billedSeats ?? null;
     const purchaseVersion = summaryQuery.data?.purchaseVersion ?? null;
-    const requestKey = `${wsId}:${value}:${currentSeats ?? ""}:${purchaseVersion ?? ""}`;
+    const requestKey = `${wsId}:${value}:${currentSeats ?? ""}:${purchaseVersion ?? ""}:${seatPreviewRevision}`;
     seatPreviewInputRef.current = requestKey;
     const intent = seatPurchaseIntentRef.current;
     if (
@@ -432,7 +434,6 @@ function BillingTabContent() {
     }
     seatPurchaseIntentRef.current = null;
     setSeatPreview(null);
-    setSeatPurchaseError(null);
     if (
       !Number.isSafeInteger(additionalSeats) ||
       additionalSeats < 1 ||
@@ -460,6 +461,7 @@ function BillingTabContent() {
             return;
           }
           setSeatPreview(preview);
+          setSeatPurchaseError(null);
         })
         .catch((error: unknown) => {
           if (seatPreviewInputRef.current !== requestKey) return;
@@ -477,6 +479,7 @@ function BillingTabContent() {
     additionalSeatsInput,
     previewSeatPurchase,
     seatPurchaseOpen,
+    seatPreviewRevision,
     summaryQuery.data?.billedSeats,
     summaryQuery.data?.purchaseVersion,
     t,
@@ -702,12 +705,16 @@ function BillingTabContent() {
         const purchaseErrorCode = errorCode(error);
         seatPurchaseIntentRef.current = null;
         setSeatPreview(null);
-        setSeatPurchaseError(
-          purchaseErrorCode === "seat_purchase_in_progress"
-            ? t(($) => $.workspace.seat_purchase.in_progress)
-            : t(($) => $.workspace.seat_purchase.quote_changed),
-        );
+        if (purchaseErrorCode === "seat_purchase_in_progress") {
+          setSeatPurchaseError(
+            t(($) => $.workspace.seat_purchase.in_progress),
+          );
+          await summaryQuery.refetch();
+          return;
+        }
+        setSeatPurchaseError(t(($) => $.workspace.seat_purchase.quote_changed));
         await summaryQuery.refetch();
+        setSeatPreviewRevision((revision) => revision + 1);
         return;
       }
       if (error instanceof ApiError && error.status === 402) {
@@ -733,6 +740,7 @@ function BillingTabContent() {
   };
 
   const handleSeatPurchaseOpenChange = (open: boolean) => {
+    if (!open && purchaseSeatsMutation.isPending) return;
     setSeatPurchaseOpen(open);
     if (!open) return;
     setSeatPurchaseError(null);
@@ -819,6 +827,10 @@ function BillingTabContent() {
       ? null
       : Math.max(0, billedSeats - usedSeats - reservedSeats);
   const activeSeatPurchase = summaryQuery.data?.activeSeatPurchase ?? null;
+  const activeSeatPurchaseExpiry = formatDateTime(
+    activeSeatPurchase?.expiresAt ?? null,
+    locale,
+  );
   const canAddSeats =
     canManage &&
     hasManagedSubscription &&
@@ -1405,7 +1417,14 @@ function BillingTabContent() {
             </AlertTitle>
             <AlertDescription>
               {seatPurchasePollingTimedOut
-                ? t(($) => $.workspace.seat_purchase.delayed_description)
+                ? activeSeatPurchaseExpiry
+                  ? t(
+                      ($) =>
+                        $.workspace.seat_purchase
+                          .delayed_description_with_expiry,
+                      { date: activeSeatPurchaseExpiry },
+                    )
+                  : t(($) => $.workspace.seat_purchase.delayed_description)
                 : t(($) => $.workspace.seat_purchase.pending_description, {
                     count: activeSeatPurchase.targetSeats,
                   })}
@@ -1419,8 +1438,8 @@ function BillingTabContent() {
           >
             <div className="flex flex-col gap-2 sm:items-end">
               <span className="tabular-nums">
-                {t(($) => $.workspace.current.member_count, {
-                  count: actualSeats,
+                {t(($) => $.workspace.seats.seat_count, {
+                  count: usedSeats,
                 })}
               </span>
               {canManage && hasManagedSubscription ? (
@@ -1593,9 +1612,10 @@ function BillingTabContent() {
                 step={1}
                 value={additionalSeatsInput}
                 disabled={purchaseSeatsMutation.isPending}
-                onChange={(event) =>
-                  setAdditionalSeatsInput(event.currentTarget.value)
-                }
+                onChange={(event) => {
+                  setAdditionalSeatsInput(event.currentTarget.value);
+                  setSeatPurchaseError(null);
+                }}
               />
               <p className="text-caption text-muted-foreground">
                 {t(($) => $.workspace.seat_purchase.additional_hint)}

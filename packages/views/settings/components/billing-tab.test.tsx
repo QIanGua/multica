@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => ({
   summaryFetching: false,
   summaryError: false,
   summaryMalformed: false,
+  purchasePending: false,
   usagePending: false,
   usageFetching: false,
   usageError: false,
@@ -120,7 +121,7 @@ vi.mock("@multica/core/billing", () => ({
   }),
   usePurchaseWorkspaceSeats: () => ({
     mutateAsync: mocks.purchaseSeats,
-    isPending: false,
+    isPending: mocks.purchasePending,
   }),
 }));
 
@@ -188,6 +189,7 @@ describe("BillingTab", () => {
     mocks.summaryFetching = false;
     mocks.summaryError = false;
     mocks.summaryMalformed = false;
+    mocks.purchasePending = false;
     mocks.usagePending = false;
     mocks.usageFetching = false;
     mocks.usageError = false;
@@ -670,7 +672,8 @@ describe("BillingTab", () => {
     renderWithI18n(<BillingTab />);
 
     expect(screen.getByText("Read-only billing access")).toBeInTheDocument();
-    expect(screen.getAllByText("3 members")).toHaveLength(2);
+    expect(screen.getAllByText("3 members")).toHaveLength(1);
+    expect(screen.getByText("3 seats")).toBeInTheDocument();
     expect(screen.getByText("$10.00 per human seat")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Upgrade to Pro" }),
@@ -710,9 +713,10 @@ describe("BillingTab", () => {
 
     expect(screen.getByText("Monthly")).toBeInTheDocument();
     expect(screen.getByText("5 seats")).toBeInTheDocument();
+    expect(screen.getByText("3 seats")).toBeInTheDocument();
     expect(screen.getAllByText("1 seat")).toHaveLength(2);
     expect(screen.getByText(/4 seats from Feb 1, 2030/)).toBeInTheDocument();
-    expect(screen.getAllByText("4 members")).toHaveLength(2);
+    expect(screen.getAllByText("4 members")).toHaveLength(1);
   });
 
   it("quotes and confirms an additive seat purchase", async () => {
@@ -829,6 +833,44 @@ describe("BillingTab", () => {
 
     expect(await screen.findByText(copy)).toBeInTheDocument();
     expect(mocks.refetchSummary).toHaveBeenCalled();
+    if (code === "seat_quote_changed") {
+      await waitFor(() => expect(mocks.previewSeats).toHaveBeenCalledTimes(2));
+    } else {
+      expect(mocks.previewSeats).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("keeps the seat dialog open while purchase submission is pending", async () => {
+    const user = userEvent.setup();
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+    });
+    Object.assign(mocks.summary, {
+      actualSeats: 4,
+      usedSeats: 4,
+      billedSeats: 5,
+      purchaseVersion: 9,
+      hasStripeCustomer: true,
+    });
+
+    const { rerender } = renderWithI18n(<BillingTab />);
+    await user.click(screen.getByRole("button", { name: "Add seats" }));
+    await screen.findByRole("button", { name: "Add 1 seat" });
+
+    mocks.purchasePending = true;
+    rerender(<BillingTab />);
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Add seats" })).toBeInTheDocument();
+
+    mocks.purchasePending = false;
+    rerender(<BillingTab />);
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Add seats" })).not.toBeInTheDocument(),
+    );
   });
 
   it("reuses an unreadable purchase intent after closing and reopening", async () => {
@@ -910,7 +952,7 @@ describe("BillingTab", () => {
       activeSeatPurchase: {
         requestId: "seat-request-pending",
         targetSeats: 7,
-        status: "submitted",
+        status: "pending",
         expiresAt: "2030-01-01T00:15:00Z",
       },
     });
@@ -923,6 +965,15 @@ describe("BillingTab", () => {
       expect(
         screen.getByText("Seat confirmation is taking longer than expected"),
       ).toBeInTheDocument();
+      const formattedExpiry = new Intl.DateTimeFormat("en", {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(new Date("2030-01-01T00:15:00Z"));
+      expect(
+        screen.getByText(
+          `Automatic checking has stopped. If the attempt is still pending after ${formattedExpiry}, refresh seats to release it and request a new quote; contact support before starting another purchase.`,
+        ),
+      ).toBeInTheDocument();
       const summaryOptions = mocks.useQuery.mock.calls
         .map(([options]) => options)
         .filter(
@@ -933,6 +984,30 @@ describe("BillingTab", () => {
       expect(
         summaryOptions.refetchInterval({ state: { data: mocks.summary } }),
       ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not promise an unlock time for a submitted seat purchase", () => {
+    vi.useFakeTimers();
+    Object.assign(mocks.summary, {
+      activeSeatPurchase: {
+        requestId: "seat-request-submitted",
+        targetSeats: 7,
+        status: "submitted",
+        expiresAt: null,
+      },
+    });
+    try {
+      renderWithI18n(<BillingTab />);
+      act(() => vi.advanceTimersByTime(2 * 60_000));
+
+      expect(
+        screen.getByText(
+          "Automatic checking has stopped. The purchase may still complete; check again later or contact support before starting another purchase.",
+        ),
+      ).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }

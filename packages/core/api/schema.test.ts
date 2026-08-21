@@ -991,7 +991,6 @@ describe("workspace subscription contract", () => {
         request_id: "22222222-2222-2222-2222-222222222222",
         target_seats: 7,
         status: "submitted",
-        expires_at: "2026-08-21T06:15:00Z",
       },
       cancel_at_period_end: true,
       grace_until: "2026-09-08T00:00:00Z",
@@ -1013,7 +1012,7 @@ describe("workspace subscription contract", () => {
       requestId: "22222222-2222-2222-2222-222222222222",
       targetSeats: 7,
       status: "submitted",
-      expiresAt: "2026-08-21T06:15:00Z",
+      expiresAt: null,
     });
     expect(summary?.cancelAtPeriodEnd).toBe(true);
     expect(summary?.graceUntil).toBe("2026-09-08T00:00:00Z");

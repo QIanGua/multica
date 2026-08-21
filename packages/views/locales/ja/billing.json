@@ -204,7 +204,7 @@
       "title": "席数",
       "description": "購入済みの席は現在のユーザーメンバーと保留中の招待に使われます。エージェントは席を使用しません。",
       "human_members": "使用中の席",
-      "human_members_description": "現在のユーザーメンバー数です。メンバー変更後に更新できます。",
+      "human_members_description": "購入済みの容量を使用している確認済みユーザーメンバーです。メンバー変更後に更新できます。",
       "billed": "購入済みの席",
       "billed_description": "Stripe で現在購入済みの席数です。",
       "pending_invitations": "保留中の招待",
@@ -246,6 +246,7 @@
       "pending_description_other": "Stripe が {{count}}席へのサブスクリプション更新を確認しています。",
       "delayed_title": "席の確認に時間がかかっています",
       "delayed_description": "自動確認を停止しました。購入はまだ完了する可能性があります。別の購入を始める前に、後でもう一度確認するかサポートへお問い合わせください。",
+      "delayed_description_with_expiry": "自動確認を停止しました。{{date}} を過ぎても保留中の場合は、席数を更新してリクエストを解放し、新しい見積もりを取得してください。別の購入を始める前にサポートへお問い合わせいただくこともできます。",
       "submitted_other": "{{count}}席の購入を送信しました。Stripe の確認後に新しい容量が表示されます。",
       "error_title": "見積もりを更新できません"
     },

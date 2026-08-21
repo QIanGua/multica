@@ -204,7 +204,7 @@
       "title": "席位",
       "description": "已购席位用于当前成员和待接受邀请，智能体不占席位。",
       "human_members": "已用席位",
-      "human_members_description": "当前工作区成员数。成员变化后可刷新对账。",
+      "human_members_description": "已确认占用已购容量的工作区成员。成员变化后可刷新对账。",
       "billed": "已购席位",
       "billed_description": "当前通过 Stripe 购买的席位数量。",
       "pending_invitations": "待接受邀请",
@@ -246,6 +246,7 @@
       "pending_description_other": "Stripe 正在确认订阅更新至 {{count}} 个席位。",
       "delayed_title": "席位确认时间超出预期",
       "delayed_description": "自动检查已停止，购买仍可能完成。开始另一笔购买前，请稍后再查看或联系支持人员。",
+      "delayed_description_with_expiry": "自动检查已停止。若到 {{date}} 仍在等待，请刷新席位以释放本次请求并重新获取报价；开始另一笔购买前也可联系支持人员。",
       "submitted_other": "购买 {{count}} 个席位的请求已提交。Stripe 确认后会显示新容量。",
       "error_title": "无法更新估算金额"
     },

@@ -206,7 +206,7 @@
       "title": "Seats",
       "description": "Purchased seats cover current human members and pending invitations. Agents never use a seat.",
       "human_members": "Used seats",
-      "human_members_description": "Current human members. Refresh after a membership change to reconcile the count.",
+      "human_members_description": "Confirmed human members consuming purchased capacity. Refresh after a membership change to reconcile the count.",
       "billed": "Purchased seats",
       "billed_description": "The seat quantity currently purchased through Stripe.",
       "pending_invitations": "Pending invitations",
@@ -252,6 +252,7 @@
       "pending_description_other": "Stripe is confirming the subscription update to {{count}} seats.",
       "delayed_title": "Seat confirmation is taking longer than expected",
       "delayed_description": "Automatic checking has stopped. The purchase may still complete; check again later or contact support before starting another purchase.",
+      "delayed_description_with_expiry": "Automatic checking has stopped. If the attempt is still pending after {{date}}, refresh seats to release it and request a new quote; contact support before starting another purchase.",
       "submitted_one": "A purchase for {{count}} seat was submitted. The new capacity appears after Stripe confirms it.",
       "submitted_other": "A purchase for {{count}} seats was submitted. The new capacity appears after Stripe confirms it.",
       "error_title": "Could not update the estimate"
