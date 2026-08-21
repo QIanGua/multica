@@ -294,6 +294,30 @@ export function createEnDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
+        version: "0.4.32",
+        date: "2026-08-21",
+        title: "Plugin versions, project views, and workspace seats",
+        changes: [],
+        features: [
+          "Plugin authors can publish versions, and administrators choose exactly which version to install.",
+          "DingTalk bots now show the groups where they are active under the agent that owns them.",
+          "Organize Board and Table views by Project, with grouped columns and sections.",
+          "Workspace owners can add seats from Billing when subscriptions are enabled.",
+        ],
+        improvements: [
+          "Active agent tasks now share updates more efficiently.",
+          "Self-hosted servers recover more reliably when PostgreSQL is temporarily unavailable.",
+          "Telegram setup and replies now appear in English.",
+        ],
+        fixes: [
+          "Starting a manual rerun no longer stops an agent task that is still working.",
+          "Concurrent tasks no longer overwrite each other's local workspaces.",
+          "OpenClaw, Pi, and OpenCode can use configured custom providers reliably.",
+          "Changing workspaces no longer disrupts real-time updates or mentions.",
+          "Autopilot webhook credentials no longer appear in ordinary CLI output.",
+        ],
+      },
+      {
         version: "0.4.31",
         date: "2026-08-20",
         title: "Run confirmation before leaving backlog, Webhook event filters, and Windows build fixes",
