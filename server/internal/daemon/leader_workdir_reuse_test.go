@@ -53,7 +53,10 @@ func TestRunTaskSquadLeaderReusesWorkdirBeforeGCMetaWritten(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second runTask: %v", err)
 	}
-	if secondResult.WorkDir != firstResult.WorkDir {
+	// Compare resolved paths: reuse runs in the canonical directory it locked,
+	// and on macOS the test root itself is a symlink (/tmp -> /private/tmp), so
+	// the two spellings name one directory.
+	if !sameDir(t, secondResult.WorkDir, firstResult.WorkDir) {
 		t.Fatalf("second WorkDir = %q, want reused leader workdir %q", secondResult.WorkDir, firstResult.WorkDir)
 	}
 	args, err := os.ReadFile(argsFile)
@@ -561,4 +564,112 @@ func TestLockReusablePriorEnvRootLocksAValidatedRoot(t *testing.T) {
 		t.Fatal("prior workdir stayed locked after release")
 	}
 	again.Release()
+}
+
+// TestLockReusablePriorEnvRootSurvivesRetargetAfterValidation is the TOCTOU
+// half review found: the canonical path returned by validation is a string,
+// not a handle. Between proving eligibility and opening the lock, the
+// validated env root can be renamed away and a symlink to somewhere outside
+// dropped in its place; an ordinary open follows it and creates .task_lock out
+// there, and no later re-check can undo a write that already happened.
+//
+// The swap is made deterministic with reuseLockTestHook rather than raced.
+func TestLockReusablePriorEnvRootSurvivesRetargetAfterValidation(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "workspaces")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("seed outside: %v", err)
+	}
+
+	workDir := filepath.Join(root, "ws-leader", "0123456789ab", "workdir")
+	writeLeaderTaskMarker(t, workDir, "agent-leader", "issue-leader")
+	writeLeaderManagedEnvProvenance(t, workDir, "ws-leader", "issue-leader", "agent-leader")
+	envRoot := filepath.Dir(workDir)
+
+	task := leaderReuseTestTask("task-retarget")
+	task.PriorWorkDir = workDir
+
+	d := &Daemon{logger: discardLogger()}
+	d.cfg.WorkspacesRoot = root
+
+	// Validation has already passed by the time this runs.
+	reuseLockTestHook = func() {
+		if err := os.Rename(envRoot, envRoot+"-moved"); err != nil {
+			t.Fatalf("retarget rename: %v", err)
+		}
+		if err := os.Symlink(outside, envRoot); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+	t.Cleanup(func() { reuseLockTestHook = nil })
+
+	claim, _, ok := d.lockReusablePriorEnvRoot(task, nil, "")
+	if claim != nil {
+		claim.Release()
+	}
+	if ok {
+		t.Fatal("reuse was accepted after the validated root was retargeted")
+	}
+	if locks := findTaskLocks(t, outside); len(locks) > 0 {
+		t.Fatalf("validated canonical root was retargeted and the lock was written outside: %v", locks)
+	}
+}
+
+// TestLockReusablePriorEnvRootRejectsIdentitySwap is the other half, and the
+// reason comparing canonical path STRINGS is not sufficient. Here the
+// validated root is moved aside and a brand new, equally well-provenanced
+// directory is created at exactly the same path. Every name-based check still
+// agrees — the canonical path is character-for-character what validation
+// returned — but it is a different directory. Accepting it would leave the
+// daemon holding a lock on the old inode while Reuse ran in the new one, i.e.
+// unprotected in a directory another execution may own. Only comparing
+// identity (os.SameFile) can tell them apart.
+func TestLockReusablePriorEnvRootRejectsIdentitySwap(t *testing.T) {
+	root := t.TempDir()
+
+	workDir := filepath.Join(root, "ws-leader", "aaaa56789abc", "workdir")
+	writeLeaderTaskMarker(t, workDir, "agent-leader", "issue-leader")
+	writeLeaderManagedEnvProvenance(t, workDir, "ws-leader", "issue-leader", "agent-leader")
+	envRoot := filepath.Dir(workDir)
+
+	task := leaderReuseTestTask("task-swap")
+	task.PriorWorkDir = workDir
+
+	d := &Daemon{logger: discardLogger()}
+	d.cfg.WorkspacesRoot = root
+
+	// After validation, swap in a different directory at the SAME path, just
+	// as legitimate: same workspace, agent and issue.
+	reuseLockTestHook = func() {
+		if err := os.Rename(envRoot, envRoot+"-moved"); err != nil {
+			t.Fatalf("move the validated root aside: %v", err)
+		}
+		writeLeaderTaskMarker(t, workDir, "agent-leader", "issue-leader")
+		writeLeaderManagedEnvProvenance(t, workDir, "ws-leader", "issue-leader", "agent-leader")
+	}
+	t.Cleanup(func() { reuseLockTestHook = nil })
+
+	claim, used, ok := d.lockReusablePriorEnvRoot(task, nil, "")
+	if claim != nil {
+		claim.Release()
+	}
+	if ok {
+		t.Fatalf("accepted reuse after the validated directory was replaced at the same path (would use %s)", used)
+	}
+}
+
+// sameDir reports whether two paths name the same directory, independent of
+// how they spell it.
+func sameDir(t *testing.T, a, b string) bool {
+	t.Helper()
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
 }

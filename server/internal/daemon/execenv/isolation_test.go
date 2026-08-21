@@ -326,7 +326,7 @@ func TestLockEnvRootForReuseExcludesConcurrentContinuations(t *testing.T) {
 		t.Fatalf("seed prior root: %v", err)
 	}
 
-	first, err := LockEnvRootForReuse(priorRoot)
+	first, _, err := LockEnvRootForReuse(filepath.Dir(filepath.Dir(priorRoot)), priorRoot)
 	if err != nil {
 		t.Fatalf("first continuation: %v", err)
 	}
@@ -334,13 +334,13 @@ func TestLockEnvRootForReuseExcludesConcurrentContinuations(t *testing.T) {
 		t.Fatal("expected a claim for an existing prior root")
 	}
 
-	if second, err := LockEnvRootForReuse(priorRoot); err == nil {
+	if second, _, err := LockEnvRootForReuse(filepath.Dir(filepath.Dir(priorRoot)), priorRoot); err == nil {
 		second.Release()
 		t.Fatal("two continuations locked the same prior workdir at once")
 	}
 
 	first.Release()
-	again, err := LockEnvRootForReuse(priorRoot)
+	again, _, err := LockEnvRootForReuse(filepath.Dir(filepath.Dir(priorRoot)), priorRoot)
 	if err != nil {
 		t.Fatalf("prior root stayed locked after release: %v", err)
 	}
@@ -348,7 +348,8 @@ func TestLockEnvRootForReuseExcludesConcurrentContinuations(t *testing.T) {
 
 	// A missing root is not an error — the caller falls through to a fresh
 	// Prepare, and there is nothing to exclude on.
-	missing, err := LockEnvRootForReuse(filepath.Join(t.TempDir(), "absent"))
+	base := t.TempDir()
+	missing, _, err := LockEnvRootForReuse(base, filepath.Join(base, "absent"))
 	if err != nil || missing != nil {
 		t.Fatalf("missing prior root: claim=%v err=%v, want nil/nil", missing, err)
 	}

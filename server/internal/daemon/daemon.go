@@ -5684,8 +5684,34 @@ func providerNeedsInlineSystemPrompt(provider string) bool {
 // the conversation's session store got mounted (execenv.Environment
 // HermesSessionStore) — and false drops the resume with the same disclosure as
 // a workdir mismatch.
+// sameExistingDir reports whether two paths name the same existing directory.
+// False when either cannot be stat'd, which is the safe answer here: an absent
+// prior workdir means there is nothing to resume from.
+func sameExistingDir(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
+}
+
 func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, envWorkDir string, sessionHomeReachable bool, taskLog *slog.Logger) bool {
-	reused := task.PriorWorkDir != "" && envWorkDir == task.PriorWorkDir && sessionHomeReachable
+	// Compare the directories, not the spelling. Reuse runs in the canonical
+	// path it validated and locked, which need not be character-identical to
+	// the PriorWorkDir the server sent — a symlinked workspaces root is enough
+	// to make them differ. A string compare would then silently drop the prior
+	// session on every follow-up task in that installation.
+	reused := task.PriorWorkDir != "" && sameExistingDir(envWorkDir, task.PriorWorkDir) && sessionHomeReachable
 	if !reused && task.PriorSessionID != "" {
 		taskLog.Info("dropping prior session: session store not reachable from this run",
 			"session_id", task.PriorSessionID,
@@ -6105,6 +6131,14 @@ func (d *Daemon) lockReusablePriorEnvRoot(task Task, localAssignment *localDirec
 		return nil, "", false
 	}
 	priorRoot := filepath.Dir(workDir)
+	// workDir came back through EvalSymlinks, so the root it is measured
+	// against has to be resolved the same way — otherwise a symlinked
+	// workspaces root (macOS /tmp -> /private/tmp, a home on a linked volume)
+	// makes the two look unrelated and every reuse is refused.
+	canonicalWorkspacesRoot, err := filepath.EvalSymlinks(d.cfg.WorkspacesRoot)
+	if err != nil {
+		return nil, "", false
+	}
 	// Already covered by this run's own claim (a task re-dispatched onto its
 	// own directory); taking a second lock on it would only deadlock against
 	// ourselves.
@@ -6112,7 +6146,22 @@ func (d *Daemon) lockReusablePriorEnvRoot(task Task, localAssignment *localDirec
 		return nil, workDir, true
 	}
 
-	claim, err := execenv.LockEnvRootForReuse(priorRoot)
+	// Pin the identity of the directory that just passed validation. Every
+	// later step is checked against THIS, not against whatever the name
+	// resolves to next: a path string cannot tell "the directory I validated"
+	// apart from "a different directory now answering to that name".
+	validatedInfo, err := os.Stat(priorRoot)
+	if err != nil {
+		return nil, "", false
+	}
+
+	// Deterministic seam for the TOCTOU regressions: tests swap the validated
+	// directory here, between proving eligibility and taking the lock.
+	if reuseLockTestHook != nil {
+		reuseLockTestHook()
+	}
+
+	claim, lockedInfo, err := execenv.LockEnvRootForReuse(canonicalWorkspacesRoot, priorRoot)
 	switch {
 	case errors.Is(err, execenv.ErrEnvRootBusy):
 		d.logger.Info("prior workdir is in use by another execution; starting a fresh environment",
@@ -6125,13 +6174,41 @@ func (d *Daemon) lockReusablePriorEnvRoot(task Task, localAssignment *localDirec
 	case claim == nil:
 		return nil, "", false
 	}
+	// The lock has to have landed on the directory validation approved.
+	if !os.SameFile(validatedInfo, lockedInfo) {
+		d.logger.Info("prior workdir changed identity before it could be claimed; starting a fresh environment",
+			"task", shortID(task.ID))
+		claim.Release()
+		return nil, "", false
+	}
 
-	if _, stillOK := shouldReusePriorWorkdir(task, localAssignment, d.cfg.WorkspacesRoot); !stillOK {
+	// Re-validate while holding the lock, and require the answer to be the SAME
+	// directory. Equality of the canonical path is not enough on its own: the
+	// tree can be rearranged so a different-but-equally-valid env root now
+	// answers to that name, which would leave us holding a lock on one
+	// directory while handing another to Reuse. os.SameFile compares identity,
+	// not spelling.
+	recheckedWorkDir, stillOK := shouldReusePriorWorkdir(task, localAssignment, d.cfg.WorkspacesRoot)
+	if !stillOK || recheckedWorkDir != workDir {
+		claim.Release()
+		return nil, "", false
+	}
+	// ...and the directory we are about to hand to Reuse has to be that same
+	// one, so the object locked and the object used cannot diverge.
+	currentInfo, err := os.Stat(filepath.Dir(recheckedWorkDir))
+	if err != nil || !os.SameFile(lockedInfo, currentInfo) {
+		d.logger.Info("prior workdir changed identity while being claimed; starting a fresh environment",
+			"task", shortID(task.ID))
 		claim.Release()
 		return nil, "", false
 	}
 	return claim, workDir, true
 }
+
+// reuseLockTestHook runs between reuse eligibility validation and taking the
+// prior-root lock. Nil outside tests; the TOCTOU regressions use it to make the
+// swap deterministic instead of racing it.
+var reuseLockTestHook func()
 
 func (d *Daemon) prepareExecutionEnvironment(ctx context.Context, params execenv.PrepareParams) (*execenv.Environment, error) {
 	if d.executionEnvironmentCommand == nil {
@@ -6761,16 +6838,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	envReused := false
-	// The canonical path the lock was taken on stays internal: Reuse keeps
-	// receiving task.PriorWorkDir, so the workdir reported to the server and
-	// handed to the next task does not change shape.
-	if priorClaim, _, ok := d.lockReusablePriorEnvRoot(task, localAssignment, envClaim.RootDir()); ok {
+	if priorClaim, priorWorkDir, ok := d.lockReusablePriorEnvRoot(task, localAssignment, envClaim.RootDir()); ok {
 		defer priorClaim.Release()
 		var err error
 		env, err = d.reuseExecutionEnvironment(prepareCtx, execenv.ReuseParams{
-			WorkspacesRoot:        d.cfg.WorkspacesRoot,
-			Profile:               d.cfg.Profile,
-			WorkDir:               task.PriorWorkDir,
+			WorkspacesRoot: d.cfg.WorkspacesRoot,
+			Profile:        d.cfg.Profile,
+			// The canonical path the lock was taken on. Handing Reuse the raw
+			// PriorWorkDir instead would re-resolve it, so the directory we
+			// locked and the directory we use could differ.
+			WorkDir:               priorWorkDir,
 			Provider:              provider,
 			CodexVersion:          codexVersion,
 			ResumeSessionID:       task.PriorSessionID,

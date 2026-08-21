@@ -1228,39 +1228,64 @@ var ErrEnvRootBusy = errors.New("env root is held by a running execution")
 // continuations of the same task still must not refresh and run the same
 // directory at once.
 //
-// This function WRITES a lock file into rootDir, so callers must hand it a
-// path already proven to be a canonical daemon-managed env root. It cannot
-// re-derive that itself: a lexical containment check would accept a symlink
-// pointing anywhere, and creating .task_lock in a user's directory is exactly
-// the outcome the reuse guard exists to avoid.
+// Every path component is resolved through an os.Root pinned at
+// workspacesRoot, which is the daemon's own directory, and Root refuses any
+// component that resolves outside it. That is what makes this safe to call on
+// a path the daemon derived from task input: validating the path first and
+// then opening it by name leaves a window where the validated directory is
+// renamed away and a symlink to somewhere else is dropped in its place, and an
+// ordinary open would follow it and create the lock file out there. Resolution
+// through the Root cannot leave the tree no matter when the swap lands.
 //
-// Returns a nil claim and no error when rootDir is empty or missing, and
-// ErrEnvRootBusy when another execution holds it — both mean "fall back to a
-// fresh Prepare".
-func LockEnvRootForReuse(rootDir string) (*EnvRootClaim, error) {
-	if rootDir == "" {
-		return nil, nil
+// It returns the locked directory's FileInfo so the caller can confirm the
+// directory it is about to USE is the same one that got locked; Root still
+// follows symlinks that stay inside the tree, so "locked A, reused B" has to be
+// ruled out by identity, not by containment.
+//
+// Returns a nil claim and no error when envRoot is missing, and ErrEnvRootBusy
+// when another execution holds it — both mean "fall back to a fresh Prepare".
+func LockEnvRootForReuse(workspacesRoot, envRoot string) (*EnvRootClaim, os.FileInfo, error) {
+	if workspacesRoot == "" || envRoot == "" {
+		return nil, nil, nil
 	}
-	if _, err := os.Stat(rootDir); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("execenv: inspect env root %s: %w", rootDir, err)
+	rel, err := filepath.Rel(workspacesRoot, envRoot)
+	if err != nil || !filepath.IsLocal(rel) {
+		return nil, nil, fmt.Errorf("execenv: env root %s is not inside the workspaces root", envRoot)
 	}
-	lock, err := openEnvRootLockFile(filepath.Join(rootDir, envRootLockFile))
+
+	root, err := os.OpenRoot(workspacesRoot)
 	if err != nil {
-		return nil, fmt.Errorf("execenv: open env root lock for %s: %w", rootDir, err)
+		return nil, nil, fmt.Errorf("execenv: open workspaces root: %w", err)
+	}
+	// The lock file's descriptor keeps the lock alive; the Root is only needed
+	// to resolve it safely.
+	defer root.Close()
+
+	info, err := root.Stat(rel)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("execenv: inspect env root %s: %w", envRoot, err)
+	}
+	if !info.IsDir() {
+		return nil, nil, nil
+	}
+
+	lock, err := root.OpenFile(filepath.Join(rel, envRootLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("execenv: open env root lock for %s: %w", envRoot, err)
 	}
 	locked, err := lockFileExclusiveNonBlocking(lock)
 	if err != nil {
 		lock.Close()
-		return nil, fmt.Errorf("execenv: lock env root %s: %w", rootDir, err)
+		return nil, nil, fmt.Errorf("execenv: lock env root %s: %w", envRoot, err)
 	}
 	if !locked {
 		lock.Close()
-		return nil, fmt.Errorf("execenv: reuse %s: %w", rootDir, ErrEnvRootBusy)
+		return nil, nil, fmt.Errorf("execenv: reuse %s: %w", envRoot, ErrEnvRootBusy)
 	}
-	return &EnvRootClaim{rootDir: rootDir, lock: lock}, nil
+	return &EnvRootClaim{rootDir: envRoot, lock: lock}, info, nil
 }
 
 // envRootOwnerFile records which task an env root belongs to: WHO owns it.
