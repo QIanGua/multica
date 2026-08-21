@@ -146,18 +146,16 @@ describe("PluginPanelSection", () => {
     expect(srcdoc).not.toContain("frame-src https:;");
   });
 
-  it("acknowledges a plugin bootstrap error and shows a useful failure", () => {
+  it("shows a useful plugin bootstrap failure", () => {
     data.installed.plugins = [installation()];
     render(<PluginPanelSection issueId="issue-1" />, { wrapper: Wrapper });
 
     const frame = screen.getByTitle("Hello Panel — Hello") as HTMLIFrameElement;
-    const postMessage = vi.spyOn(frame.contentWindow!, "postMessage");
     const event = new MessageEvent("message", { data: { type: "multica:plugin-surface-error" } });
     Object.defineProperty(event, "source", { value: frame.contentWindow, configurable: true });
     act(() => window.dispatchEvent(event));
 
     expect(screen.getByText("Hello Panel could not load its interface.")).toBeInTheDocument();
-    expect(postMessage).toHaveBeenCalledWith({ type: "multica:plugin-surface-error-ack" }, "*");
   });
 
   it("clears a previous surface failure when the issue changes", () => {
@@ -186,7 +184,12 @@ describe("PluginPanelSection", () => {
     act(() => window.dispatchEvent(event));
     expect(screen.getByText("Hello Panel could not load its interface.")).toBeInTheDocument();
 
-    data.script = { code: "console.log('replacement');", version: "1.0.1", digest: "def" };
+    data.launch = {
+      url: "https://plugin-content.example.test/plugin-surfaces/replacement",
+      bridge_token: "replacement-proof",
+      version: "1.0.1",
+      digest: "def",
+    };
     rerender(<PluginPanelSection issueId="issue-1" />);
     expect(screen.queryByText("Hello Panel could not load its interface.")).not.toBeInTheDocument();
     expect(screen.getByTitle("Hello Panel — Hello").getAttribute("srcdoc")).not.toBe(originalDocument);

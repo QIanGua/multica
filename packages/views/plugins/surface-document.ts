@@ -104,16 +104,14 @@ body { overflow: hidden; background: transparent; }
   child.title = "Plugin content";
   child.setAttribute("sandbox", "allow-scripts");
 
-  var used = false;
-  var blocked = false;
-  var pendingPort = null;
+  var state = "launching";
   var loadCount = 0;
 
   function stopSurface(type) {
-    if (blocked) return;
-    blocked = true;
-    if (pendingPort) pendingPort.close();
-    pendingPort = null;
+    if (state === "terminal") return;
+    state = "terminal";
+    // After connection the host owns the transferred port; this terminal
+    // signal makes it close the bridge and unmount this wrapper.
     parent.postMessage({ type: type }, "*");
   }
 
@@ -137,27 +135,15 @@ body { overflow: hidden; background: transparent; }
     }
     if (data.type !== ${JSON.stringify(SURFACE_BRIDGE_CONNECT_MESSAGE)} ||
         data.version !== ${SURFACE_BRIDGE_PROTOCOL_VERSION} ||
-        data.challenge !== config.bridgeToken || used || !event.ports[0]) return;
+        data.challenge !== config.bridgeToken || state !== "launching" || !event.ports[0]) return;
 
-    used = true;
-    pendingPort = event.ports[0];
-    // Quarantine the port briefly. CSP violation delivery is a separate task
-    // from the child's postMessage; a zero-delay timer can win that race and
-    // briefly hand a first-line location.replace() artifact a live bridge.
-    setTimeout(function () {
-      if (blocked || !pendingPort) {
-        if (pendingPort) pendingPort.close();
-        pendingPort = null;
-        return;
-      }
-      parent.postMessage({
-        type: ${JSON.stringify(SURFACE_BRIDGE_CONNECT_MESSAGE)},
-        version: ${SURFACE_BRIDGE_PROTOCOL_VERSION},
-        challenge: config.bridgeToken
-      }, "*", [pendingPort]);
-      pendingPort = null;
-      config.bridgeToken = "";
-    }, 50);
+    state = "connected";
+    parent.postMessage({
+      type: ${JSON.stringify(SURFACE_BRIDGE_CONNECT_MESSAGE)},
+      version: ${SURFACE_BRIDGE_PROTOCOL_VERSION},
+      challenge: config.bridgeToken
+    }, "*", [event.ports[0]]);
+    config.bridgeToken = "";
   });
 
   child.src = config.url;
