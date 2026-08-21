@@ -1,0 +1,169 @@
+package execenv
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// makeTaskTempDir creates a temp dir the way ensureTaskTempDir does, optionally
+// without the execution lock so a pre-lock daemon's leftovers can be modelled.
+func makeTaskTempDir(t *testing.T, base, suffix string, withLock bool) string {
+	t.Helper()
+	dir := filepath.Join(base, TaskTempDirPrefix+suffix)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("create task temp dir: %v", err)
+	}
+	if withLock {
+		lock, err := LockTaskTempDir(dir)
+		if err != nil {
+			t.Fatalf("LockTaskTempDir(): %v", err)
+		}
+		ReleaseTaskTempLock(lock)
+	}
+	return dir
+}
+
+// TestPruneTaskTempDirsHoldsOffLiveDirThenReclaimsIt is the core contract: a
+// directory whose owner still holds the lock is never removed, and the same
+// sweep reclaims it as soon as that lock is gone.
+//
+// The lock here is held by THIS process, which is the case an in-memory active
+// set would be needed for and the case the lock covers for free: flock and
+// LockFileEx are held by an open file description, not by a process, so the
+// sweep's own probe loses to it exactly as another daemon's would.
+func TestPruneTaskTempDirsHoldsOffLiveDirThenReclaimsIt(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, TaskTempDirPrefix+"live")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("create task temp dir: %v", err)
+	}
+	lock, err := LockTaskTempDir(dir)
+	if err != nil {
+		t.Fatalf("LockTaskTempDir(): %v", err)
+	}
+
+	// legacyTTL 0 so nothing here can be reclaimed on age: the lock is the only
+	// thing under test. `now` is far in the future for the same reason.
+	future := time.Now().Add(365 * 24 * time.Hour)
+	if removed, _ := PruneTaskTempDirs(base, 0, future, testLogger()); removed != 0 {
+		t.Fatalf("prune removed %d dirs while the lock was held, want 0", removed)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("live task temp dir was removed: %v", err)
+	}
+
+	ReleaseTaskTempLock(lock)
+
+	removed, _ := PruneTaskTempDirs(base, 0, future, testLogger())
+	if removed != 1 {
+		t.Fatalf("prune removed %d dirs after the lock was released, want 1", removed)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("task temp dir still present after prune: %v", err)
+	}
+}
+
+// TestPruneTaskTempDirsReclaimsUnlockedDirImmediately pins that age plays no
+// part once liveness is answerable: a directory released seconds ago is gone on
+// the next cycle, no TTL wait. This is what makes the end-of-task RemoveAll
+// failing (the Windows sharing violation in #7364) cost nothing.
+func TestPruneTaskTempDirsReclaimsUnlockedDirImmediately(t *testing.T) {
+	base := t.TempDir()
+	dir := makeTaskTempDir(t, base, "released", true)
+	payload := filepath.Join(dir, "node-compile-cache")
+	if err := os.WriteFile(payload, make([]byte, 4096), 0o600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	removed, bytesFreed := PruneTaskTempDirs(base, 0, time.Now(), testLogger())
+	if removed != 1 {
+		t.Fatalf("prune removed %d dirs, want 1", removed)
+	}
+	if bytesFreed < 4096 {
+		t.Fatalf("prune reported %d bytes freed, want at least 4096", bytesFreed)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("task temp dir still present after prune: %v", err)
+	}
+}
+
+// TestPruneTaskTempDirsLegacyDirsFallBackToTTL covers directories left by a
+// daemon predating the lock: nothing recorded liveness for them, so age is the
+// only signal available.
+func TestPruneTaskTempDirsLegacyDirsFallBackToTTL(t *testing.T) {
+	const legacyTTL = 72 * time.Hour
+
+	t.Run("young legacy dir is kept", func(t *testing.T) {
+		base := t.TempDir()
+		dir := makeTaskTempDir(t, base, "legacy", false)
+		if removed, _ := PruneTaskTempDirs(base, legacyTTL, time.Now(), testLogger()); removed != 0 {
+			t.Fatalf("prune removed %d young legacy dirs, want 0", removed)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("young legacy dir was removed: %v", err)
+		}
+	})
+
+	t.Run("legacy dir past the TTL is reclaimed", func(t *testing.T) {
+		base := t.TempDir()
+		dir := makeTaskTempDir(t, base, "legacy", false)
+		if removed, _ := PruneTaskTempDirs(base, legacyTTL, time.Now().Add(legacyTTL+time.Hour), testLogger()); removed != 1 {
+			t.Fatalf("prune removed %d expired legacy dirs, want 1", removed)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("expired legacy dir still present: %v", err)
+		}
+	})
+
+	t.Run("zero TTL disables the legacy branch", func(t *testing.T) {
+		base := t.TempDir()
+		dir := makeTaskTempDir(t, base, "legacy", false)
+		if removed, _ := PruneTaskTempDirs(base, 0, time.Now().Add(10*365*24*time.Hour), testLogger()); removed != 0 {
+			t.Fatalf("prune removed %d legacy dirs with the TTL disabled, want 0", removed)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("legacy dir was removed with the TTL disabled: %v", err)
+		}
+	})
+}
+
+// TestPruneTaskTempDirsOnlyTouchesOwnDirs guards the blast radius: the temp base
+// is usually a shared /tmp, so anything without our prefix — and the base
+// itself — has to survive a sweep that is otherwise willing to delete on age.
+func TestPruneTaskTempDirsOnlyTouchesOwnDirs(t *testing.T) {
+	base := t.TempDir()
+	foreignDir := filepath.Join(base, "someone-elses-dir")
+	if err := os.Mkdir(foreignDir, 0o700); err != nil {
+		t.Fatalf("create foreign dir: %v", err)
+	}
+	foreignFile := filepath.Join(base, "unrelated.sock")
+	if err := os.WriteFile(foreignFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write foreign file: %v", err)
+	}
+	// A FILE carrying our prefix is not one of our directories either.
+	prefixedFile := filepath.Join(base, TaskTempDirPrefix+"not-a-dir")
+	if err := os.WriteFile(prefixedFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write prefixed file: %v", err)
+	}
+
+	removed, _ := PruneTaskTempDirs(base, time.Hour, time.Now().Add(10*365*24*time.Hour), testLogger())
+	if removed != 0 {
+		t.Fatalf("prune removed %d entries, want 0", removed)
+	}
+	for _, path := range []string{base, foreignDir, foreignFile, prefixedFile} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("prune touched %s: %v", path, err)
+		}
+	}
+}
+
+// TestPruneTaskTempDirsMissingBaseIsNotAnError: the base may not exist yet on a
+// daemon that has never run a task, and a GC cycle must not care.
+func TestPruneTaskTempDirsMissingBaseIsNotAnError(t *testing.T) {
+	removed, bytesFreed := PruneTaskTempDirs(filepath.Join(t.TempDir(), "nope"), time.Hour, time.Now(), testLogger())
+	if removed != 0 || bytesFreed != 0 {
+		t.Fatalf("prune over a missing base = (%d, %d), want (0, 0)", removed, bytesFreed)
+	}
+}
