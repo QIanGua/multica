@@ -394,7 +394,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		lockClaimed = true
 		defer func() {
 			if lockClaimed {
-				releaseEnvRootLock(lockFile)
+				releaseLockFile(lockFile)
 			}
 		}()
 		// reset means this task already owned the directory and the execution
@@ -1186,7 +1186,7 @@ func (c *EnvRootClaim) Release() {
 	if c == nil || c.lock == nil {
 		return
 	}
-	releaseEnvRootLock(c.lock)
+	releaseLockFile(c.lock)
 	c.lock = nil
 }
 
@@ -1208,7 +1208,7 @@ func ClaimEnvRoot(workspacesRoot, workspaceID, taskID string) (*EnvRootClaim, er
 	}
 	if reset {
 		if err := resetEnvRootContents(envRoot); err != nil {
-			releaseEnvRootLock(lock)
+			releaseLockFile(lock)
 			return nil, fmt.Errorf("execenv: reset existing env: %w", err)
 		}
 	}
@@ -1324,7 +1324,7 @@ func claimEnvRoot(envRoot, taskID string) (lockFile *os.File, reset bool, err er
 		return nil, false, fmt.Errorf("create env root %s: %w", envRoot, err)
 	}
 
-	lockFile, err = openEnvRootLockFile(filepath.Join(envRoot, envRootLockFile))
+	lockFile, err = openLockFile(filepath.Join(envRoot, envRootLockFile))
 	if err != nil {
 		return nil, false, fmt.Errorf("open env root lock for %s: %w", envRoot, err)
 	}
@@ -1341,7 +1341,7 @@ func claimEnvRoot(envRoot, taskID string) (lockFile *os.File, reset bool, err er
 	// process or any other, so the checks below cannot race.
 	defer func() {
 		if err != nil {
-			releaseEnvRootLock(lockFile)
+			releaseLockFile(lockFile)
 			lockFile = nil
 		}
 	}()
@@ -1385,12 +1385,12 @@ func (env *Environment) ReleaseLock() {
 	if env == nil || env.lockFile == nil {
 		return
 	}
-	releaseEnvRootLock(env.lockFile)
+	releaseLockFile(env.lockFile)
 	env.lockFile = nil
 }
 
-// releaseEnvRootLock drops the execution lock and closes the file. Safe on nil.
-func releaseEnvRootLock(f *os.File) {
+// releaseLockFile drops the execution lock and closes the file. Safe on nil.
+func releaseLockFile(f *os.File) {
 	if f == nil {
 		return
 	}
