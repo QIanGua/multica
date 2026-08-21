@@ -990,7 +990,7 @@ describe("workspace subscription contract", () => {
       active_seat_purchase: {
         request_id: "22222222-2222-2222-2222-222222222222",
         target_seats: 7,
-        status: "submitted",
+        status: "processing",
       },
       cancel_at_period_end: true,
       grace_until: "2026-09-08T00:00:00Z",
@@ -1011,7 +1011,7 @@ describe("workspace subscription contract", () => {
     expect(summary?.activeSeatPurchase).toEqual({
       requestId: "22222222-2222-2222-2222-222222222222",
       targetSeats: 7,
-      status: "submitted",
+      status: "processing",
       expiresAt: null,
     });
     expect(summary?.cancelAtPeriodEnd).toBe(true);

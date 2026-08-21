@@ -2389,7 +2389,7 @@ export const WorkspaceSubscriptionSummarySchema = z
       .object({
         request_id: z.string(),
         target_seats: z.number().int().positive(),
-        status: z.enum(["pending", "submitted"]),
+        status: z.enum(["pending", "processing", "submitted"]),
         expires_at: z.string().min(1).optional().catch(undefined),
       })
       .loose()

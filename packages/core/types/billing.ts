@@ -243,7 +243,7 @@ export interface WorkspaceSubscriptionSummary {
 export interface WorkspaceSeatPurchaseSummary {
   requestId: string;
   targetSeats: number;
-  status: "pending" | "submitted";
+  status: "pending" | "processing" | "submitted";
   expiresAt: string | null;
 }
 
