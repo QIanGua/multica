@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/tdewolff/parse/v2"
+	"github.com/tdewolff/parse/v2/js"
 )
 
 // A bundle is what an author publishes: the manifest plus every file the
@@ -245,140 +248,34 @@ func validateSurfaceScript(entry string, content []byte) error {
 	if !utf8.Valid(content) {
 		return fmt.Errorf("surface entry %q must be UTF-8 text", entry)
 	}
-	if line, ok := findTopLevelImport(string(content)); ok {
-		return fmt.Errorf("surface entry %q has a top-level import on line %d; a surface is a single script with no module graph, so bundle its dependencies in", entry, line)
+	moduleSyntax, err := parseSurfaceScript(content)
+	if err != nil {
+		return fmt.Errorf("surface entry %q is not valid JavaScript: %w", entry, err)
+	}
+	if moduleSyntax {
+		return fmt.Errorf("surface entry %q has a top-level import or export; a surface is a single classic script with no module graph, so bundle its dependencies in", entry)
 	}
 	return nil
 }
 
-// findTopLevelImport reports the line of an `import` or `export` STATEMENT — the
-// shape that turns a surface into a module the host cannot load — ignoring
-// anything inside a comment or a string.
-//
-// This refuses a publish, so the bar it has to clear is asymmetric: missing one
-// costs an author a runtime error they can read, while a false positive blocks a
-// legitimate publish with no way around it. A line-prefix scan cannot clear that
-// bar in either direction — it misses `  import x` and `/* c */ import x`, and it
-// rejects a valid file that merely contains the word at the start of a line
-// inside a template literal, which is ordinary in a surface that renders code
-// samples.
-//
-// So this walks the source instead. Where it is imprecise it is imprecise
-// SAFELY: `/` is always read as division rather than a regex, and a `}` inside a
-// template expression pops back to template early. Both mistakes hide code from
-// the scan, which can only cost a detection — never invent one.
-//
-// `import(` is left alone deliberately: dynamic import is legal in a classic
-// script.
-func findTopLevelImport(source string) (int, bool) {
-	const (
-		inCode = iota
-		inLineComment
-		inBlockComment
-		inSingle
-		inDouble
-		inTemplate
-	)
-
-	state := inCode
-	// Depth of template literals whose `${ ... }` expression we are inside, so a
-	// nested template does not end its parent early.
-	var templateStack []bool
-	line := 1
-	// Whether only whitespace has been seen, in CODE, since the last newline.
-	// That is what makes this a statement check rather than a word search:
-	// `a.import` and `x = import(y)` are both preceded by something else.
-	atLineStart := true
-
-	for index := 0; index < len(source); index++ {
-		char := source[index]
-		if char == '\n' {
-			line++
-			if state == inLineComment {
-				state = inCode
-			}
-			if state == inCode {
-				atLineStart = true
-			}
-			continue
-		}
-
-		switch state {
-		case inLineComment:
-			continue
-		case inBlockComment:
-			if char == '*' && index+1 < len(source) && source[index+1] == '/' {
-				state = inCode
-				index++
-			}
-			continue
-		case inSingle, inDouble, inTemplate:
-			if char == '\\' {
-				index++
-				continue
-			}
-			if (state == inSingle && char == '\'') || (state == inDouble && char == '"') || (state == inTemplate && char == '`') {
-				state = inCode
-				continue
-			}
-			if state == inTemplate && char == '$' && index+1 < len(source) && source[index+1] == '{' {
-				templateStack = append(templateStack, true)
-				state = inCode
-				index++
-			}
-			continue
-		}
-
-		// inCode from here.
-		switch {
-		case char == '/' && index+1 < len(source) && source[index+1] == '/':
-			state = inLineComment
-			index++
-			continue
-		case char == '/' && index+1 < len(source) && source[index+1] == '*':
-			state = inBlockComment
-			index++
-			continue
-		case char == '\'':
-			state = inSingle
-			atLineStart = false
-			continue
-		case char == '"':
-			state = inDouble
-			atLineStart = false
-			continue
-		case char == '`':
-			state = inTemplate
-			atLineStart = false
-			continue
-		case char == '}' && len(templateStack) > 0:
-			templateStack = templateStack[:len(templateStack)-1]
-			state = inTemplate
-			continue
-		case char == ' ' || char == '\t' || char == '\r':
-			continue
-		}
-
-		if atLineStart {
-			for _, keyword := range []string{"import", "export"} {
-				if !strings.HasPrefix(source[index:], keyword) {
-					continue
-				}
-				rest := source[index+len(keyword):]
-				if rest == "" {
-					continue
-				}
-				// A delimiter, so `exports.foo = …` and `importantThing` do not
-				// match. `(` is excluded on purpose: dynamic import is fine.
-				switch rest[0] {
-				case ' ', '\t', '\r', '\n', '{', '*':
-					return line, true
-				}
-			}
-		}
-		atLineStart = false
+// parseSurfaceScript uses a JavaScript parser rather than recognizing source
+// text by hand. Publishing is the boundary: a false positive blocks an author
+// with no workaround, while a missed import becomes a blank classic-script
+// frame. Lexical details such as regex literals, template expressions,
+// comments between `import` and `(`, and two statements on one line therefore
+// have to follow JavaScript grammar, not a local approximation of it.
+func parseSurfaceScript(source []byte) (bool, error) {
+	ast, err := js.Parse(parse.NewInputBytes(source), js.Options{})
+	if err != nil {
+		return false, err
 	}
-	return 0, false
+	for _, statement := range ast.List {
+		switch statement.(type) {
+		case *js.ImportStmt, *js.ExportStmt:
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func validateSkillFile(entry string, content []byte) error {

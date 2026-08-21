@@ -76,16 +76,21 @@ describe("surface document", () => {
     expect(document).not.toContain("<script src=");
   });
 
-  it("reports a navigation away so the embedder can drop the bridge", () => {
-    // A sandboxed frame may navigate ITSELF, and the resulting document keeps
-    // the same contentWindow — which is the only identity the bridge has. The
-    // beacon is registered before the plugin's code runs, on an anonymous
-    // listener it holds no reference to, so it cannot be detached.
+  it("does not mistake an ordinary host reload for hostile navigation", () => {
+    // pagehide fires for both self-navigation and a host-authored srcDoc reload,
+    // so it cannot be used as a security signal. The real Chromium regression
+    // test reloads the document; this pins that no beacon is generated at all.
     const document = buildSurfaceDocument({ code: "console.log('hi');", grantedScopes: [], theme: {} });
-    expect(document).toContain("pagehide");
-    expect(document).toContain("multica:plugin-surface-navigated");
-    // Registered before the bootstrap hands control to the plugin.
-    expect(document.indexOf("pagehide")).toBeLessThan(document.indexOf("appendChild"));
+    expect(document).not.toContain("pagehide");
+    expect(document).not.toContain("multica:plugin-surface-navigated");
+  });
+
+  it("installs browser error listeners before plugin code runs", () => {
+    const document = buildSurfaceDocument({ code: "throw new Error('boom');", grantedScopes: [], theme: {} });
+    const executeIndex = document.indexOf("document.body.appendChild(element)");
+    expect(document.indexOf('addEventListener("error"')).toBeLessThan(executeIndex);
+    expect(document.indexOf('addEventListener("unhandledrejection"')).toBeLessThan(executeIndex);
+    expect(document).toContain("multica:plugin-surface-error-ack");
   });
 
   it("carries code that would otherwise close the script element early", () => {

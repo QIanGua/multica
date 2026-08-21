@@ -66,18 +66,18 @@ export function buildSurfaceCSP(grantedScopes: string[]): string {
   return [
     "default-src 'none'",
     // Inline only, and no remote origin at all. The surface's code is supplied
-    // by us, so there is nothing left for `script-src` to fetch — which is what
-    // makes `net:` an honest bound on where a surface can send data. Under the
-    // previous model the author's own origin was always in this list, so "this
-    // plugin talks to nobody" was never quite true.
+    // by us, so the generated document has nothing left for `script-src` to
+    // fetch. Under the previous model the author's own origin was always in
+    // this list.
     "script-src 'unsafe-inline'",
     "style-src 'unsafe-inline'",
     // Inline data only. An <img> or webfont URL is the cheapest possible side
     // channel, and a surface that needs artwork inlines it.
     "img-src data: blob:",
     "font-src data:",
-    // With no net: scope this is 'none', and now that means it: a surface with
-    // no net: scope has no way to reach any origin.
+    // With no net: scope, connection APIs in the generated document cannot
+    // reach an origin. Self-navigation is a separate sandbox gap documented
+    // below and tracked outside this change.
     `connect-src ${connect.length > 0 ? connect.join(" ") : "'none'"}`,
     // A sandboxed frame cannot navigate the top level anyway; saying so keeps
     // the policy honest if the sandbox attribute is ever loosened.
@@ -130,11 +130,11 @@ function encodeSurfaceCode(code: string): string {
  * `form-action` govern other things). So a HOSTILE artifact can still run
  * `location.replace("https://author.example/live.html")`, which reaches the
  * author's server once and replaces this document with one whose CSP we do not
- * write. The `pagehide` beacon below reports that so the embedder can drop the
- * bridge, but a beacon is damage control, not a boundary: closing it needs
- * either an embedder `frame-src` policy or a handshake the navigated document
- * cannot complete. Tracked separately; do not describe a surface as unable to
- * reach its author until that lands.
+ * write. Closing it needs either an embedder `frame-src` policy or a handshake
+ * the navigated document cannot complete. Tracked separately; do not describe
+ * a surface as unable to reach its author until that lands. In particular, do
+ * not use lifecycle events from this document as a security signal: a normal
+ * host-driven `srcDoc` reload fires the same events.
  */
 export function buildSurfaceDocument({ code, grantedScopes, theme }: SurfaceDocumentInput): string {
   const csp = buildSurfaceCSP(grantedScopes);
@@ -167,13 +167,41 @@ body {
 <script type="text/plain" id="multica-surface-code">${encodeSurfaceCode(code)}</script>
 <script>
 (function () {
-  // Registered BEFORE the plugin's code runs, and with an anonymous listener it
-  // holds no reference to: the plugin cannot remove it, and assigning
-  // window.onpagehide does not detach it. If this document is navigated away
-  // from, the embedder hears about it and drops the bridge.
-  window.addEventListener("pagehide", function () {
-    parent.postMessage({ type: 'multica:plugin-surface-navigated' }, '*');
+  var errorReportAttempts = 0;
+  var errorReportTimer = null;
+
+  function emitSurfaceError() {
+    parent.postMessage({ type: 'multica:plugin-surface-error' }, '*');
+    errorReportAttempts++;
+    if (errorReportAttempts >= 50 && errorReportTimer !== null) {
+      clearInterval(errorReportTimer);
+      errorReportTimer = null;
+    }
+  }
+
+  function reportSurfaceError() {
+    if (errorReportAttempts > 0) return;
+    emitSurfaceError();
+    if (errorReportAttempts < 50) errorReportTimer = setInterval(emitSurfaceError, 120);
+  }
+
+  // A srcdoc document may execute before the host component's effect attaches
+  // its listener. Repeat a failure until the host acknowledges it, bounded to
+  // the same six-second window as the SDK bridge handshake.
+  window.addEventListener("message", function (event) {
+    if (event.source !== parent) return;
+    if (!event.data || event.data.type !== 'multica:plugin-surface-error-ack') return;
+    errorReportAttempts = 50;
+    if (errorReportTimer !== null) clearInterval(errorReportTimer);
+    errorReportTimer = null;
   });
+
+  // Installed before plugin code executes. Dynamically appending an inline
+  // script does not rethrow its syntax/runtime errors from appendChild; the
+  // browser reports them through these global events instead.
+  window.addEventListener("error", reportSurfaceError);
+  window.addEventListener("unhandledrejection", reportSurfaceError);
+
   try {
     var encoded = document.getElementById("multica-surface-code").textContent;
     var binary = atob(encoded);
@@ -183,9 +211,7 @@ body {
     element.textContent = new TextDecoder().decode(bytes);
     document.body.appendChild(element);
   } catch (error) {
-    // A surface that throws on its first line has no other way to say so — the
-    // frame would just render an empty box.
-    parent.postMessage({ type: 'multica:plugin-surface-error' }, '*');
+    reportSurfaceError();
   }
 })();
 </script>

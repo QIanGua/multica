@@ -136,6 +136,15 @@ func TestParseBundleRejections(t *testing.T) {
 			want: "top-level import",
 		},
 		{
+			name: "surface entry is not valid JavaScript",
+			files: map[string]string{
+				plugincontract.ManifestFilename: bundleManifest,
+				"ui/main.js":                    "const = 1;\n",
+				"skills/pr-review/SKILL.md":     "Read the diff.\n",
+			},
+			want: "not valid JavaScript",
+		},
+		{
 			name: "two manifests",
 			files: map[string]string{
 				"a/" + plugincontract.ManifestFilename: bundleManifest,
@@ -226,13 +235,15 @@ func TestParseBundleFromDirMatchesTheUploadPath(t *testing.T) {
 // blocks a legitimate publish outright. This pins both directions.
 func TestSurfaceEntryModuleDetection(t *testing.T) {
 	refused := map[string]string{
-		"bare import":                  "import { multica } from \"./sdk.js\";\n",
-		"indented import":              "  import { multica } from \"./sdk.js\";\n",
-		"import after a line comment":  "// set up\nimport { multica } from \"./sdk.js\";\n",
-		"import after a block comment": "/* set up */ import { multica } from \"./sdk.js\";\n",
-		"namespace import":             "import * as sdk from \"./sdk.js\";\n",
-		"named export":                 "export { render };\n",
-		"import inside a function":     "function boot() {\n  import { x } from \"./x.js\";\n}\n",
+		"bare import":                    "import { multica } from \"./sdk.js\";\n",
+		"indented import":                "  import { multica } from \"./sdk.js\";\n",
+		"import after a line comment":    "// set up\nimport { multica } from \"./sdk.js\";\n",
+		"import after a block comment":   "/* set up */ import { multica } from \"./sdk.js\";\n",
+		"namespace import":               "import * as sdk from \"./sdk.js\";\n",
+		"named export":                   "export { render };\n",
+		"import after another statement": "const x = 1; import y from \"./y.js\";\n",
+		"export after another statement": "const x = 1; export { x };\n",
+		"import inside a function":       "function boot() {\n  import { x } from \"./x.js\";\n}\n",
 	}
 	for name, source := range refused {
 		t.Run(name, func(t *testing.T) {
@@ -250,6 +261,9 @@ func TestSurfaceEntryModuleDetection(t *testing.T) {
 		"import inside a comment":          "// import { x } from \"./x.js\";\nconsole.log(1);\n",
 		// Dynamic import is legal in a classic script.
 		"dynamic import":              "const load = () => import(\"./late.js\");\nload();\n",
+		"spaced dynamic import":       "const load = () => import (\"./late.js\");\nload();\n",
+		"commented dynamic import":    "const load = () => import /* webpackIgnore */ (\"https://example.com/late.js\");\nload();\n",
+		"regexp containing import":    "const matcher = /import y from ['\"]x['\"]/;\nconsole.log(matcher);\n",
 		"a property named import":     "const registry = {};\nregistry.import = 1;\n",
 		"a word starting with export": "const exports = {};\nexports.value = 1;\n",
 		"nested template expression":  "const x = `a${ `b` }c`;\nconsole.log(x);\n",

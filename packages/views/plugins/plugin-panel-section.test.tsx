@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../locales/en/common.json";
 import enIssues from "../locales/en/issues.json";
@@ -139,5 +139,19 @@ describe("PluginPanelSection", () => {
     const srcdoc = screen.getByTitle("Hello Panel — Hello").getAttribute("srcdoc") ?? "";
     expect(srcdoc).not.toContain("<script src=");
     expect(srcdoc).toContain("script-src 'unsafe-inline'");
+  });
+
+  it("acknowledges a plugin bootstrap error and shows a useful failure", () => {
+    data.installed.plugins = [installation()];
+    render(<PluginPanelSection issueId="issue-1" />, { wrapper: Wrapper });
+
+    const frame = screen.getByTitle("Hello Panel — Hello") as HTMLIFrameElement;
+    const postMessage = vi.spyOn(frame.contentWindow!, "postMessage");
+    const event = new MessageEvent("message", { data: { type: "multica:plugin-surface-error" } });
+    Object.defineProperty(event, "source", { value: frame.contentWindow, configurable: true });
+    act(() => window.dispatchEvent(event));
+
+    expect(screen.getByText("Hello Panel could not load its interface.")).toBeInTheDocument();
+    expect(postMessage).toHaveBeenCalledWith({ type: "multica:plugin-surface-error-ack" }, "*");
   });
 });
