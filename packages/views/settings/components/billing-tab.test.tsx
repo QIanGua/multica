@@ -798,6 +798,82 @@ describe("BillingTab", () => {
     await waitFor(() => expect(mocks.refetchSummary).toHaveBeenCalled());
   });
 
+  it("refreshes and retries a preview after Stripe seat capacity changes", async () => {
+    const user = userEvent.setup();
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+    });
+    Object.assign(mocks.summary, {
+      actualSeats: 4,
+      usedSeats: 4,
+      billedSeats: 5,
+      reservedSeats: 0,
+      purchaseVersion: 9,
+      hasStripeCustomer: true,
+    });
+    mocks.previewSeats.mockRejectedValueOnce(
+      new ApiError("conflict", 409, "Conflict", {
+        code: "seat_capacity_changed",
+      }),
+    );
+
+    renderWithI18n(<BillingTab />);
+    await user.click(screen.getByRole("button", { name: "Add seats" }));
+
+    await waitFor(
+      () => expect(mocks.previewSeats).toHaveBeenCalledTimes(2),
+      { timeout: 3_000 },
+    );
+    expect(mocks.refetchSummary).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("$2.50")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "The estimate is temporarily unavailable. Retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("stops retrying when the refreshed seat preview still conflicts", async () => {
+    const user = userEvent.setup();
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+    });
+    Object.assign(mocks.summary, {
+      actualSeats: 4,
+      usedSeats: 4,
+      billedSeats: 5,
+      reservedSeats: 0,
+      purchaseVersion: 9,
+      hasStripeCustomer: true,
+    });
+    mocks.previewSeats.mockRejectedValue(
+      new ApiError("conflict", 409, "Conflict", {
+        code: "seat_capacity_changed",
+      }),
+    );
+
+    renderWithI18n(<BillingTab />);
+    await user.click(screen.getByRole("button", { name: "Add seats" }));
+
+    await waitFor(
+      () =>
+        expect(
+          screen.getByText(
+            "The estimate is temporarily unavailable. Retry in a moment.",
+          ),
+        ).toBeInTheDocument(),
+      { timeout: 3_000 },
+    );
+    expect(mocks.previewSeats).toHaveBeenCalledTimes(2);
+    expect(mocks.refetchSummary).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     [
       "seat_quote_changed",

@@ -298,6 +298,7 @@ function BillingTabContent() {
     request: PurchaseWorkspaceSeatsRequest;
   } | null>(null);
   const seatPreviewInputRef = useRef("");
+  const seatPreviewCapacityRetryKeyRef = useRef<string | null>(null);
   const consumedCallbackKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -305,6 +306,7 @@ function BillingTabContent() {
     portalIntentKeyRef.current = null;
     seatPurchaseIntentRef.current = null;
     seatPreviewInputRef.current = "";
+    seatPreviewCapacityRetryKeyRef.current = null;
     setSeatPurchaseOpen(false);
     setSeatPreview(null);
     setSeatPreviewRevision(0);
@@ -419,7 +421,14 @@ function BillingTabContent() {
     const additionalSeats = /^\d+$/.test(value) ? Number(value) : 0;
     const currentSeats = summaryQuery.data?.billedSeats ?? null;
     const purchaseVersion = summaryQuery.data?.purchaseVersion ?? null;
-    const requestKey = `${wsId}:${value}:${currentSeats ?? ""}:${purchaseVersion ?? ""}:${seatPreviewRevision}`;
+    const capacityRetryKey = `${wsId}:${value}:${currentSeats ?? ""}:${purchaseVersion ?? ""}`;
+    if (
+      seatPreviewCapacityRetryKeyRef.current !== null &&
+      seatPreviewCapacityRetryKeyRef.current !== capacityRetryKey
+    ) {
+      seatPreviewCapacityRetryKeyRef.current = null;
+    }
+    const requestKey = `${capacityRetryKey}:${seatPreviewRevision}`;
     seatPreviewInputRef.current = requestKey;
     const intent = seatPurchaseIntentRef.current;
     if (
@@ -460,15 +469,45 @@ function BillingTabContent() {
             );
             return;
           }
+          seatPreviewCapacityRetryKeyRef.current = null;
           setSeatPreview(preview);
           setSeatPurchaseError(null);
         })
-        .catch((error: unknown) => {
+        .catch(async (error: unknown) => {
           if (seatPreviewInputRef.current !== requestKey) return;
+          const previewErrorCode =
+            error instanceof ApiError && error.status === 409
+              ? errorCode(error)
+              : null;
+          if (previewErrorCode === "seat_capacity_changed") {
+            if (
+              seatPreviewCapacityRetryKeyRef.current === capacityRetryKey
+            ) {
+              setSeatPurchaseError(
+                t(($) => $.workspace.seat_purchase.preview_failed),
+              );
+              return;
+            }
+            seatPreviewCapacityRetryKeyRef.current = capacityRetryKey;
+            setSeatPurchaseError(
+              t(($) => $.workspace.seat_purchase.quote_changed),
+            );
+            try {
+              await refetchSummary();
+            } catch {
+              if (seatPreviewInputRef.current === requestKey) {
+                setSeatPurchaseError(
+                  t(($) => $.workspace.seat_purchase.preview_failed),
+                );
+              }
+              return;
+            }
+            if (seatPreviewInputRef.current !== requestKey) return;
+            setSeatPreviewRevision((revision) => revision + 1);
+            return;
+          }
           setSeatPurchaseError(
-            error instanceof ApiError &&
-              error.status === 409 &&
-              errorCode(error) === "seat_purchase_in_progress"
+            previewErrorCode === "seat_purchase_in_progress"
               ? t(($) => $.workspace.seat_purchase.in_progress)
               : t(($) => $.workspace.seat_purchase.preview_failed),
           );
@@ -478,6 +517,7 @@ function BillingTabContent() {
   }, [
     additionalSeatsInput,
     previewSeatPurchase,
+    refetchSummary,
     seatPurchaseOpen,
     seatPreviewRevision,
     summaryQuery.data?.billedSeats,
@@ -743,6 +783,7 @@ function BillingTabContent() {
     if (!open && purchaseSeatsMutation.isPending) return;
     setSeatPurchaseOpen(open);
     if (!open) return;
+    seatPreviewCapacityRetryKeyRef.current = null;
     setSeatPurchaseError(null);
     const intent = seatPurchaseIntentRef.current;
     if (intent?.wsId === wsId) {
