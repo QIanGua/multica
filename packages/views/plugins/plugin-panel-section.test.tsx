@@ -154,4 +154,36 @@ describe("PluginPanelSection", () => {
     expect(screen.getByText("Hello Panel could not load its interface.")).toBeInTheDocument();
     expect(postMessage).toHaveBeenCalledWith({ type: "multica:plugin-surface-error-ack" }, "*");
   });
+
+  it("clears a previous surface failure when the issue changes", () => {
+    data.installed.plugins = [installation()];
+    const { rerender } = render(<PluginPanelSection issueId="issue-1" />, { wrapper: Wrapper });
+
+    const frame = screen.getByTitle("Hello Panel — Hello") as HTMLIFrameElement;
+    const event = new MessageEvent("message", { data: { type: "multica:plugin-surface-error" } });
+    Object.defineProperty(event, "source", { value: frame.contentWindow, configurable: true });
+    act(() => window.dispatchEvent(event));
+    expect(screen.getByText("Hello Panel could not load its interface.")).toBeInTheDocument();
+
+    rerender(<PluginPanelSection issueId="issue-2" />);
+    expect(screen.queryByText("Hello Panel could not load its interface.")).not.toBeInTheDocument();
+    expect(screen.getByTitle("Hello Panel — Hello")).toBeInTheDocument();
+  });
+
+  it("clears a previous surface failure when its document changes", () => {
+    data.installed.plugins = [installation()];
+    const { rerender } = render(<PluginPanelSection issueId="issue-1" />, { wrapper: Wrapper });
+
+    const frame = screen.getByTitle("Hello Panel — Hello") as HTMLIFrameElement;
+    const originalDocument = frame.getAttribute("srcdoc");
+    const event = new MessageEvent("message", { data: { type: "multica:plugin-surface-error" } });
+    Object.defineProperty(event, "source", { value: frame.contentWindow, configurable: true });
+    act(() => window.dispatchEvent(event));
+    expect(screen.getByText("Hello Panel could not load its interface.")).toBeInTheDocument();
+
+    data.script = { code: "console.log('replacement');", version: "1.0.1", digest: "def" };
+    rerender(<PluginPanelSection issueId="issue-1" />);
+    expect(screen.queryByText("Hello Panel could not load its interface.")).not.toBeInTheDocument();
+    expect(screen.getByTitle("Hello Panel — Hello").getAttribute("srcdoc")).not.toBe(originalDocument);
+  });
 });

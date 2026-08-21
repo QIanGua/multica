@@ -32,7 +32,6 @@ export function PluginSurfaceFrame({ wsId, installation, surface, issueId, class
   const frameRef = useRef<HTMLIFrameElement>(null);
   const anchorRef = useRef<HTMLDivElement>(null);
   const [height, setHeight] = useState(DEFAULT_HEIGHT);
-  const [failed, setFailed] = useState(false);
 
   // The code comes from us, not from the plugin author's server. It is keyed by
   // the installed version, which is immutable — so this is fetched once and an
@@ -54,6 +53,13 @@ export function PluginSurfaceFrame({ wsId, installation, surface, issueId, class
     if (!script?.code) return null;
     return buildSurfaceDocument({ code: script.code, grantedScopes: installation.granted_scopes, theme });
   }, [script?.code, installation.granted_scopes, theme]);
+
+  // A failure belongs to one rendered document on one issue. Keeping a plain
+  // boolean makes the banner survive an issue change or a version/code reload
+  // even though the replacement iframe is running normally.
+  const surfaceInstance = useMemo(() => ({ issueId, surfaceDocument }), [issueId, surfaceDocument]);
+  const [failedSurfaceInstance, setFailedSurfaceInstance] = useState<typeof surfaceInstance | null>(null);
+  const failed = failedSurfaceInstance === surfaceInstance;
 
   // One bridge per rendered document. srcDoc changing reloads the frame — and
   // therefore restarts the guest's handshake — so the old bridge is finished:
@@ -82,11 +88,11 @@ export function PluginSurfaceFrame({ wsId, installation, surface, issueId, class
       // than rendering blank. Acknowledge it so the guest can stop repeating
       // the signal it started before this effect was guaranteed to be mounted.
       frameRef.current.contentWindow.postMessage({ type: "multica:plugin-surface-error-ack" }, "*");
-      setFailed(true);
+      setFailedSurfaceInstance(surfaceInstance);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, []);
+  }, [surfaceInstance]);
 
   if (!surfaceDocument) {
     return (

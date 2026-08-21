@@ -253,29 +253,56 @@ func validateSurfaceScript(entry string, content []byte) error {
 		return fmt.Errorf("surface entry %q is not valid JavaScript: %w", entry, err)
 	}
 	if moduleSyntax {
-		return fmt.Errorf("surface entry %q has a top-level import or export; a surface is a single classic script with no module graph, so bundle its dependencies in", entry)
+		return fmt.Errorf("surface entry %q has top-level import/export/await or import.meta; a surface is a single classic script with no module graph, so bundle its dependencies in", entry)
 	}
 	return nil
 }
 
 // parseSurfaceScript uses a JavaScript parser rather than recognizing source
 // text by hand. Publishing is the boundary: a false positive blocks an author
-// with no workaround, while a missed import becomes a blank classic-script
-// frame. Lexical details such as regex literals, template expressions,
-// comments between `import` and `(`, and two statements on one line therefore
-// have to follow JavaScript grammar, not a local approximation of it.
+// with no workaround, while missed module-only syntax becomes a broken
+// classic-script frame. Lexical details such as regex literals, template
+// expressions, comments between `import` and `(`, and two statements on one
+// line therefore have to follow JavaScript grammar, not a local approximation
+// of it.
 func parseSurfaceScript(source []byte) (bool, error) {
 	ast, err := js.Parse(parse.NewInputBytes(source), js.Options{})
 	if err != nil {
 		return false, err
 	}
-	for _, statement := range ast.List {
-		switch statement.(type) {
-		case *js.ImportStmt, *js.ExportStmt:
-			return true, nil
+	visitor := &surfaceModuleSyntaxVisitor{}
+	js.Walk(visitor, ast)
+	return visitor.moduleOnly, nil
+}
+
+// tdewolff parses a module grammar at the root, where top-level await and
+// import.meta are valid. Surface entries execute as classic scripts, so walk
+// the parsed tree and reject those constructs explicitly. Await remains valid
+// inside a nested async function; import.meta is module-only at every depth.
+type surfaceModuleSyntaxVisitor struct {
+	functionDepth int
+	moduleOnly    bool
+}
+
+func (v *surfaceModuleSyntaxVisitor) Enter(node js.INode) js.IVisitor {
+	switch node := node.(type) {
+	case *js.ImportStmt, *js.ExportStmt, *js.ImportMetaExpr:
+		v.moduleOnly = true
+	case *js.UnaryExpr:
+		if node.Op == js.AwaitToken && v.functionDepth == 0 {
+			v.moduleOnly = true
 		}
+	case *js.FuncDecl, *js.ArrowFunc:
+		v.functionDepth++
 	}
-	return false, nil
+	return v
+}
+
+func (v *surfaceModuleSyntaxVisitor) Exit(node js.INode) {
+	switch node.(type) {
+	case *js.FuncDecl, *js.ArrowFunc:
+		v.functionDepth--
+	}
 }
 
 func validateSkillFile(entry string, content []byte) error {

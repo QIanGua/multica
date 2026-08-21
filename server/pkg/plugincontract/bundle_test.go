@@ -244,6 +244,8 @@ func TestSurfaceEntryModuleDetection(t *testing.T) {
 		"import after another statement": "const x = 1; import y from \"./y.js\";\n",
 		"export after another statement": "const x = 1; export { x };\n",
 		"import inside a function":       "function boot() {\n  import { x } from \"./x.js\";\n}\n",
+		"top-level await":                "await 1;\n",
+		"import meta":                    "console.log(import.meta.url);\n",
 	}
 	for name, source := range refused {
 		t.Run(name, func(t *testing.T) {
@@ -267,6 +269,8 @@ func TestSurfaceEntryModuleDetection(t *testing.T) {
 		"a property named import":     "const registry = {};\nregistry.import = 1;\n",
 		"a word starting with export": "const exports = {};\nexports.value = 1;\n",
 		"nested template expression":  "const x = `a${ `b` }c`;\nconsole.log(x);\n",
+		"await in an async function":  "async function boot() { await Promise.resolve(); }\nboot();\n",
+		"await in an async arrow":     "const boot = async () => { await Promise.resolve(); };\nboot();\n",
 	}
 	for name, source := range accepted {
 		t.Run(name, func(t *testing.T) {
