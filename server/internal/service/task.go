@@ -3084,7 +3084,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 		}
 
 		t0 = time.Now()
-		reclaimCheckAfter = t0.Add(claimResponseRecoveryWindow)
+		reclaimCheckAfter = t0.Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
 			AgentID:          agentID,
 			RuntimeID:        claimRuntimeID,
@@ -3202,7 +3202,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	// the UPDATE until a task hint or bounded DB backstop is due.
 	checkStarted := time.Now()
 	if due := s.ReclaimCheck.DueRuntimeIDs(ctx, []string{runtimeKey}, checkStarted); len(due) > 0 {
-		reclaimCheckAfter := time.Now().Add(claimResponseRecoveryWindow)
+		reclaimCheckAfter := time.Now().Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		stale, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
 			RuntimeID:         runtimeID,
 			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
@@ -3210,7 +3210,12 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
 		})
 		if err == nil {
-			s.ReclaimCheck.MarkChecked(ctx, []string{runtimeKey}, checkStarted)
+			s.ReclaimCheck.MarkChecked(
+				ctx,
+				[]string{runtimeKey},
+				checkStarted,
+				time.Now().Add(ReclaimCheckRetryInterval),
+			)
 			s.trackTaskForReclaim(stale, reclaimCheckAfter)
 			outcome = "reclaimed_dispatched"
 			claimedFlag = true
@@ -3225,7 +3230,12 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 			outcome = "error_reclaim_dispatched"
 			return nil, fmt.Errorf("reclaim stale dispatched task: %w", err)
 		}
-		s.ReclaimCheck.MarkChecked(ctx, []string{runtimeKey}, checkStarted)
+		s.ReclaimCheck.MarkChecked(
+			ctx,
+			[]string{runtimeKey},
+			checkStarted,
+			time.Now().Add(ReclaimCheckRetryInterval),
+		)
 	}
 
 	if s.EmptyClaim.IsEmpty(ctx, runtimeKey) {
@@ -3456,7 +3466,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	var reclaimed []db.AgentTaskQueue
 	var reclaimCheckAfter time.Time
 	if len(dueKeys) > 0 {
-		reclaimCheckAfter = time.Now().Add(claimResponseRecoveryWindow)
+		reclaimCheckAfter = time.Now().Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		reclaimed, err = s.Queries.ReclaimStaleDispatchedTasksForRuntimes(ctx, db.ReclaimStaleDispatchedTasksForRuntimesParams{
 			RuntimeIds:        uniqueIDs,
 			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
@@ -3470,7 +3480,12 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		// The UPDATE's fixed setup/locking cost dominates array width. Query and
 		// advance the complete machine-level set together so per-runtime backstops
 		// cannot drift into one UPDATE on almost every daemon poll.
-		s.ReclaimCheck.MarkChecked(ctx, runtimeKeys, checkStarted)
+		s.ReclaimCheck.MarkChecked(
+			ctx,
+			runtimeKeys,
+			checkStarted,
+			time.Now().Add(ReclaimCheckRetryInterval),
+		)
 	}
 	for i := range reclaimed {
 		s.trackTaskForReclaim(reclaimed[i], reclaimCheckAfter)
