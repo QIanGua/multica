@@ -1,13 +1,11 @@
 package handler
 
 import (
-	"context"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/multica-ai/multica/server/internal/util"
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 // MUL-6490 / GH #7328 — the authorization chain must survive a cross-issue hop.
@@ -29,88 +27,184 @@ import (
 // that same human. What must stay impossible is SUBSTITUTING a human — falling
 // back to the coordinator's owner, or adopting the target issue's originator —
 // because that borrows a different person's authority. Both directions are pinned
-// below.
+// below, and the three entry points a woken run delegates through are driven
+// through their real handlers: the risk this fix carries is precisely that one
+// entry point resolves the chain differently from another.
 
 // crossIssueChain is the {coordinator, two issues, one running task} shape every
-// case here starts from. issueX is where the coordinator's run lives; issueY is
+// case here starts from. IssueX is where the coordinator's run lives; IssueY is
 // the issue it coordinates on.
 type crossIssueChain struct {
 	CoordinatorID string
 	IssueX        string
 	IssueY        string
-	TaskA         string // the coordinator's running task, on issueX
-	RuntimeID     string
+	TaskA         string // the coordinator's running task, on IssueX
 }
 
 // newCrossIssueChain seeds a coordinator agent owned by ownerUserID with a running
-// task on issueX whose originator is originatorUserID (pass nil for an
+// task on IssueX whose originator is originatorUserID (pass nil for an
 // unattributed run, e.g. a schedule/webhook autopilot dispatch).
 func newCrossIssueChain(t *testing.T, ownerUserID string, originatorUserID any) crossIssueChain {
 	t.Helper()
-	runtimeID := handlerTestRuntimeID(t)
-	coordinator := seedInvocableAgent(t, "MUL-6490 coordinator", ownerUserID, "private")
-	issueX := seedBareIssue(t, coordinator)
-	issueY := seedBareIssue(t, coordinator)
-
-	var taskA string
-	if err := testPool.QueryRow(context.Background(), `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, originator_user_id, accountable_user_id)
-		VALUES ($1, $2, $3, 'running', 0, $4, $4) RETURNING id
-	`, coordinator, runtimeID, issueX, originatorUserID).Scan(&taskA); err != nil {
-		t.Fatalf("seed coordinator task: %v", err)
+	coordinator := seedAllowListedAgent(t, "MUL-6490 coordinator", ownerUserID, "private")
+	issueX := seedChainIssue(t, "MUL-6490 originating issue", coordinator)
+	return crossIssueChain{
+		CoordinatorID: coordinator,
+		IssueX:        issueX,
+		IssueY:        seedChainIssue(t, "MUL-6490 coordinated issue", coordinator),
+		TaskA: dbfx.Task(t, coordinator, testutil.Cols{
+			"runtime_id":          handlerTestRuntimeID(t),
+			"issue_id":            issueX,
+			"status":              "running",
+			"originator_user_id":  originatorUserID,
+			"accountable_user_id": originatorUserID,
+		}),
 	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskA) })
-
-	return crossIssueChain{CoordinatorID: coordinator, IssueX: issueX, IssueY: issueY, TaskA: taskA, RuntimeID: runtimeID}
 }
 
-// seedInvocableAgent creates an agent with the given permission mode. Any
-// memberTargets make it public_to and allow-list exactly those users, which is the
-// minimum-privilege configuration the report ran: "only Bohan may invoke this".
-func seedInvocableAgent(t *testing.T, name, ownerUserID, mode string, memberTargets ...string) string {
+// seedChainIssue inserts an agent-created issue and registers teardown for the
+// rows the HANDLERS will add to it. dbfx removes only what it inserted itself, and
+// these tests exist to make real handlers write comments and enqueue tasks.
+//
+// The number comes from the workspace counter rather than dbfx's MAX(number)+1
+// default: CreateIssue allocates from that counter, so a fixture issue that
+// bypasses it collides with the sub-issue the test asks the real handler to make.
+func seedChainIssue(t *testing.T, title, creatorAgentID string) string {
 	t.Helper()
-	ctx := context.Background()
-	var agentID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent (
-			workspace_id, name, description, runtime_mode, runtime_config,
-			runtime_id, visibility, permission_mode, max_concurrent_tasks, owner_id,
-			instructions, custom_env, custom_args, mcp_config
-		)
-		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'private', $4, 5, $5, '', '{}'::jsonb, '[]'::jsonb, '[]'::jsonb)
-		RETURNING id
-	`, testWorkspaceID, name, handlerTestRuntimeID(t), mode, ownerUserID).Scan(&agentID); err != nil {
-		t.Fatalf("create agent %q: %v", name, err)
-	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID) })
+	issueID := dbfx.Issue(t, title, testutil.Cols{
+		"creator_type": "agent",
+		"creator_id":   creatorAgentID,
+		"number":       nextWorkspaceIssueNumber(t),
+	})
+	dbfx.Cleanup(t, `DELETE FROM comment WHERE issue_id = $1`, issueID)
+	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+	return issueID
+}
 
+// seedAllowListedAgent creates an agent with the given permission mode. Any
+// memberTargets make it public_to and allow-list exactly those users — the
+// minimum-privilege configuration the report ran ("only Bohan may invoke this").
+// The grants are removed explicitly because the project forbids DB cascades, so
+// they would outlive the agent row dbfx deletes.
+func seedAllowListedAgent(t *testing.T, name, ownerUserID, mode string, memberTargets ...string) string {
+	t.Helper()
+	agentID := dbfx.Agent(t, name, handlerTestRuntimeID(t), testutil.Cols{
+		"permission_mode":      mode,
+		"owner_id":             ownerUserID,
+		"max_concurrent_tasks": 5,
+		"instructions":         "",
+		"custom_env":           testutil.Raw("'{}'::jsonb"),
+		"custom_args":          testutil.Raw("'[]'::jsonb"),
+		"mcp_config":           testutil.Raw("'[]'::jsonb"),
+	})
 	for _, target := range memberTargets {
-		if _, err := testPool.Exec(ctx, `
-			INSERT INTO agent_invocation_target (agent_id, target_type, target_id) VALUES ($1, 'member', $2)
-		`, agentID, target); err != nil {
-			t.Fatalf("allow-list %q for agent %q: %v", target, name, err)
-		}
+		dbfx.InsertNoID(t, "agent_invocation_target", testutil.Cols{
+			"agent_id":    agentID,
+			"target_type": "member",
+			"target_id":   target,
+		}, "agent_id = $1 AND target_type = 'member' AND target_id = $2", agentID, target)
 	}
 	return agentID
 }
 
-// agentComments posts a comment through the real HTTP surface as the agent,
-// speaking from taskID — the only way an agent's lineage reaches the comment row.
-// A comment-triggered run must reply under its own trigger, so replyUnder carries
-// that parent; it is empty for a run that has no trigger comment to answer.
-func agentComments(t *testing.T, agentID, taskID, issueID, content, replyUnder string) *httptest.ResponseRecorder {
+// ---- entry points ---------------------------------------------------------
+//
+// The three ways a run delegates. Each goes through the real handler, because the
+// failure this fix repairs is entry-point wiring: the gate and the enqueue used to
+// resolve the chain from different places, and only the wired path shows that.
+
+// agentComments posts a comment as the agent, speaking from taskID — the only way
+// an agent's lineage reaches the comment row. A comment-triggered run must reply
+// under its own trigger, so replyUnder carries that parent; it is empty for a run
+// with no trigger comment to answer.
+func agentComments(t *testing.T, agentID, taskID, issueID, content, replyUnder string) *testutil.Response {
 	t.Helper()
 	body := map[string]any{"content": content}
 	if replyUnder != "" {
 		body["parent_id"] = replyUnder
 	}
-	w := httptest.NewRecorder()
-	r := newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", body)
-	r.Header.Set("X-Agent-ID", agentID)
-	r.Header.Set("X-Task-ID", taskID)
-	r = withURLParam(r, "id", issueID)
-	testHandler.CreateComment(w, r)
-	return w
+	return testutil.Call(t, testHandler.CreateComment, testutil.WithURLParams(
+		asRun(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", body), agentID, taskID),
+		"id", issueID,
+	))
+}
+
+// agentAssigns points an existing issue at targetAgentID through UpdateIssue.
+func agentAssigns(t *testing.T, agentID, taskID, issueID, targetAgentID string) *testutil.Response {
+	t.Helper()
+	return testutil.Call(t, testHandler.UpdateIssue, testutil.WithURLParams(
+		asRun(newRequest(http.MethodPatch, "/api/issues/"+issueID, map[string]any{
+			"assignee_type": "agent",
+			"assignee_id":   targetAgentID,
+		}), agentID, taskID),
+		"id", issueID,
+	))
+}
+
+// agentCreatesSubIssue creates a `todo` sub-issue assigned to targetAgentID, which
+// dispatches that agent immediately — the third way the report saw the chain fail.
+// The title is unique per target so the active-duplicate guard never masks the
+// authorization outcome this asserts.
+func agentCreatesSubIssue(t *testing.T, agentID, taskID, parentIssueID, targetAgentID string) *testutil.Response {
+	t.Helper()
+	resp := testutil.Call(t, testHandler.CreateIssue, asRun(
+		newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+			"title":           "MUL-6490 delegated sub-issue for " + targetAgentID,
+			"status":          "todo",
+			"priority":        "medium",
+			"assignee_type":   "agent",
+			"assignee_id":     targetAgentID,
+			"parent_issue_id": parentIssueID,
+		}), agentID, taskID))
+	if resp.Code == http.StatusCreated {
+		var created struct {
+			ID string `json:"id"`
+		}
+		resp.JSON(&created)
+		dbfx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, created.ID)
+		dbfx.Cleanup(t, `DELETE FROM comment WHERE issue_id = $1`, created.ID)
+		dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, created.ID)
+	}
+	return resp
+}
+
+// asRun makes a request speak as the agent from inside one of its runs. The
+// member headers newRequest sets stay put on purpose: X-User-ID remains a
+// workspace member while the ACTOR is the agent, which is exactly the
+// confused-deputy shape the gate must judge by the chain's human, not the caller's
+// session.
+func asRun(req *http.Request, agentID, taskID string) *http.Request {
+	return testutil.WithHeaders(req, "X-Agent-ID", agentID, "X-Task-ID", taskID)
+}
+
+// ---- reads ----------------------------------------------------------------
+
+// queuedTaskFor returns the queued task for (issue, agent) and its originator.
+// ok is false when the delegation was refused and nothing was enqueued.
+func queuedTaskFor(t *testing.T, issueID, agentID string) (taskID string, originator pgtype.UUID, ok bool) {
+	t.Helper()
+	const where = `FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`
+	if dbfx.Count(t, `SELECT count(*) `+where, issueID, agentID) == 0 {
+		return "", pgtype.UUID{}, false
+	}
+	dbfx.QueryRow(t, `SELECT id, originator_user_id `+where, issueID, agentID).Scan(&taskID, &originator)
+	return taskID, originator, true
+}
+
+func commentSourceTaskOf(t *testing.T, commentID string) pgtype.UUID {
+	t.Helper()
+	var sourceTaskID pgtype.UUID
+	dbfx.QueryRow(t, `SELECT source_task_id FROM comment WHERE id = $1`, commentID).Scan(&sourceTaskID)
+	return sourceTaskID
+}
+
+func lastCommentOn(t *testing.T, issueID string) string {
+	t.Helper()
+	var commentID string
+	dbfx.QueryRow(t,
+		`SELECT id FROM comment WHERE issue_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1`,
+		issueID).Scan(&commentID)
+	return commentID
 }
 
 // triggerCommentOf returns the comment a task was woken by, which is the only
@@ -118,55 +212,13 @@ func agentComments(t *testing.T, agentID, taskID, issueID, content, replyUnder s
 func triggerCommentOf(t *testing.T, taskID string) string {
 	t.Helper()
 	var triggerCommentID pgtype.UUID
-	if err := testPool.QueryRow(context.Background(),
-		`SELECT trigger_comment_id FROM agent_task_queue WHERE id = $1`, taskID).Scan(&triggerCommentID); err != nil {
-		t.Fatalf("read trigger_comment_id: %v", err)
-	}
+	dbfx.QueryRow(t, `SELECT trigger_comment_id FROM agent_task_queue WHERE id = $1`, taskID).Scan(&triggerCommentID)
 	return uuidToString(triggerCommentID)
 }
 
-// queuedTaskFor returns the queued task for (issue, agent) and its originator.
-// ok is false when the delegation was refused and nothing was enqueued.
-func queuedTaskFor(t *testing.T, issueID, agentID string) (taskID string, originator pgtype.UUID, ok bool) {
+func runTo(t *testing.T, taskID string) {
 	t.Helper()
-	rows, err := testPool.Query(context.Background(), `
-		SELECT id, originator_user_id FROM agent_task_queue
-		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
-	`, issueID, agentID)
-	if err != nil {
-		t.Fatalf("query queued task: %v", err)
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		return "", pgtype.UUID{}, false
-	}
-	if err := rows.Scan(&taskID, &originator); err != nil {
-		t.Fatalf("scan queued task: %v", err)
-	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
-	return taskID, originator, true
-}
-
-func commentSourceTaskOf(t *testing.T, commentID string) pgtype.UUID {
-	t.Helper()
-	var sourceTaskID pgtype.UUID
-	if err := testPool.QueryRow(context.Background(),
-		`SELECT source_task_id FROM comment WHERE id = $1`, commentID).Scan(&sourceTaskID); err != nil {
-		t.Fatalf("read comment source_task_id: %v", err)
-	}
-	return sourceTaskID
-}
-
-// lastCommentOn returns the newest comment id on an issue.
-func lastCommentOn(t *testing.T, issueID string) string {
-	t.Helper()
-	var commentID string
-	if err := testPool.QueryRow(context.Background(),
-		`SELECT id FROM comment WHERE issue_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1`, issueID).Scan(&commentID); err != nil {
-		t.Fatalf("read last comment: %v", err)
-	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM comment WHERE id = $1`, commentID) })
-	return commentID
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
 }
 
 func mention(agentID string) string {
@@ -184,7 +236,7 @@ func TestCrossIssueDelegation_OriginatorChainSurvivesTheHop(t *testing.T) {
 	}
 	// bohan owns the coordinator and is the only member on the worker's allow-list.
 	bohan := testUserID
-	worker := seedInvocableAgent(t, "MUL-6490 worker", bohan, "public_to", bohan)
+	worker := seedAllowListedAgent(t, "MUL-6490 worker", bohan, "public_to", bohan)
 
 	for _, tc := range []struct {
 		name  string
@@ -200,9 +252,8 @@ func TestCrossIssueDelegation_OriginatorChainSurvivesTheHop(t *testing.T) {
 				target = chain.IssueY
 			}
 
-			if w := agentComments(t, chain.CoordinatorID, chain.TaskA, target, mention(worker), ""); w.Code != http.StatusCreated {
-				t.Fatalf("CreateComment: got %d, want 201: %s", w.Code, w.Body.String())
-			}
+			agentComments(t, chain.CoordinatorID, chain.TaskA, target, mention(worker), "").
+				Want(http.StatusCreated)
 
 			// The comment must record the run that wrote it. This is the carrier;
 			// a NULL here is the break the report saw.
@@ -219,42 +270,33 @@ func TestCrossIssueDelegation_OriginatorChainSurvivesTheHop(t *testing.T) {
 					uuidToString(originator), originator.Valid, bohan)
 			}
 
-			// The reported symptom was one hop further out: work INSIDE the woken
-			// run. Both gates read the run's own originator, so both recover.
-			t.Run("the woken run can delegate onward", func(t *testing.T) {
-				if _, err := testPool.Exec(context.Background(),
-					`UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID); err != nil {
-					t.Fatalf("advance worker task to running: %v", err)
-				}
-				second := seedInvocableAgent(t, "MUL-6490 second worker", bohan, "public_to", bohan)
+			// A third hop proves the chain keeps travelling rather than surviving
+			// exactly one boundary. Entry-point coverage is in the sibling test.
+			t.Run("the chain continues past the woken run", func(t *testing.T) {
+				runTo(t, taskID)
+				second := seedAllowListedAgent(t, "MUL-6490 second worker", bohan, "public_to", bohan)
 
-				if w := agentComments(t, worker, taskID, target, mention(second), triggerCommentOf(t, taskID)); w.Code != http.StatusCreated {
-					t.Fatalf("onward CreateComment: got %d, want 201: %s", w.Code, w.Body.String())
-				}
+				agentComments(t, worker, taskID, target, mention(second), triggerCommentOf(t, taskID)).
+					Want(http.StatusCreated)
 				if _, _, ok := queuedTaskFor(t, target, second); !ok {
 					t.Fatal("@mention from inside the woken run was refused (invocation_not_allowed)")
-				}
-
-				// The assign gate reads the same originator through a different
-				// resolver, so it is asserted separately rather than assumed.
-				req := newRequest(http.MethodPatch, "/api/issues/"+target, nil)
-				req.Header.Set("X-Agent-ID", worker)
-				req.Header.Set("X-Task-ID", taskID)
-				status, msg := testHandler.validateAssigneePair(context.Background(), req, testWorkspaceID,
-					pgtype.Text{String: "agent", Valid: true}, util.MustParseUUID(second))
-				if status != 0 {
-					t.Fatalf("assigning from inside the woken run was refused: %d %s", status, msg)
 				}
 			})
 		})
 	}
 }
 
-// TestCrossIssueDelegation_NeverSubstitutesAHuman pins the other direction. The
-// chain may be CARRIED across an issue boundary; it may never be REPLACED. Alice
-// triggers a coordinator that Bohan owns, so an owner fallback (the fix the report
-// proposed) would silently upgrade Alice's flow to Bohan's authority.
-func TestCrossIssueDelegation_NeverSubstitutesAHuman(t *testing.T) {
+// TestCrossIssueDelegation_EveryEntryPointJudgesTheSameHuman is the matrix that
+// matters for this fix: {mention, assign, sub-issue} × {bohan's chain, alice's
+// chain, no chain}, all from inside a run woken across an issue boundary.
+//
+// Two things are pinned at once. The chain must be CARRIED — all three entry
+// points recover for the human who started it. And it must never be REPLACED:
+// alice triggers a coordinator that BOHAN owns, so the owner-inheritance fallback
+// the report proposed would silently upgrade alice's flow to bohan's authority.
+// Every entry point resolves the acting human through its own wiring, so a fix
+// that repairs one and not the others is a real outcome this catches.
+func TestCrossIssueDelegation_EveryEntryPointJudgesTheSameHuman(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -264,57 +306,81 @@ func TestCrossIssueDelegation_NeverSubstitutesAHuman(t *testing.T) {
 	// firstHop admits both members, so every case reaches the second hop and the
 	// difference isolates to whose authority the chain carries. secondHop admits
 	// ONLY bohan — it is the agent an owner fallback would wrongly unlock.
-	firstHop := seedInvocableAgent(t, "MUL-6490 shared worker", bohan, "public_to", bohan, alice)
-	secondHop := seedInvocableAgent(t, "MUL-6490 bohan-only worker", bohan, "public_to", bohan)
+	firstHop := seedAllowListedAgent(t, "MUL-6490 shared worker", bohan, "public_to", bohan, alice)
+	secondHop := seedAllowListedAgent(t, "MUL-6490 bohan-only worker", bohan, "public_to", bohan)
 
 	for _, tc := range []struct {
-		name          string
-		originator    any
-		wantSecondHop bool
+		name    string
+		chainOf any
+		admit   bool
 	}{
 		{"bohan's chain reaches a bohan-only agent", bohan, true},
 		{"alice's chain does not become bohan's", alice, false},
-		{"an unattributed chain grants nothing", nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// The coordinator is owned by BOHAN in every case: only the human at the
-			// top of the chain may vary the outcome.
-			chain := newCrossIssueChain(t, bohan, tc.originator)
+			// The coordinator is owned by BOHAN in every case: only the human at
+			// the top of the chain may vary the outcome.
+			chain := newCrossIssueChain(t, bohan, tc.chainOf)
+			agentComments(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, mention(firstHop), "").
+				Want(http.StatusCreated)
 
-			if w := agentComments(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, mention(firstHop), ""); w.Code != http.StatusCreated {
-				t.Fatalf("CreateComment: got %d, want 201: %s", w.Code, w.Body.String())
-			}
 			firstTaskID, originator, ok := queuedTaskFor(t, chain.IssueY, firstHop)
-			if tc.originator == nil {
-				// A member-scoped allow-list has no human to match, so the chain
-				// stops here. That is the correct fail-closed outcome, not the bug.
-				if ok {
-					t.Fatal("an unattributed chain must not satisfy a member-scoped allow-list")
-				}
-				return
-			}
 			if !ok {
 				t.Fatal("first hop was refused although both members are allow-listed")
 			}
-			if uuidToString(originator) != tc.originator.(string) {
-				t.Fatalf("first hop originator = %q, want %q", uuidToString(originator), tc.originator)
+			if uuidToString(originator) != tc.chainOf {
+				t.Fatalf("first hop originator = %q, want %q", uuidToString(originator), tc.chainOf)
 			}
+			runTo(t, firstTaskID)
 
-			if _, err := testPool.Exec(context.Background(),
-				`UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, firstTaskID); err != nil {
-				t.Fatalf("advance first hop to running: %v", err)
-			}
-			if w := agentComments(t, firstHop, firstTaskID, chain.IssueY, mention(secondHop), triggerCommentOf(t, firstTaskID)); w.Code != http.StatusCreated {
-				t.Fatalf("second-hop CreateComment: got %d, want 201: %s", w.Code, w.Body.String())
-			}
-			if _, _, ok := queuedTaskFor(t, chain.IssueY, secondHop); ok != tc.wantSecondHop {
-				if tc.wantSecondHop {
-					t.Fatal("bohan's own chain was refused a bohan-only agent")
+			t.Run("mention", func(t *testing.T) {
+				agentComments(t, firstHop, firstTaskID, chain.IssueY, mention(secondHop),
+					triggerCommentOf(t, firstTaskID)).Want(http.StatusCreated)
+				// A blocked mention is reported in trigger_outcomes, not as an
+				// error status, so the enqueue is what says yes or no.
+				if _, _, got := queuedTaskFor(t, chain.IssueY, secondHop); got != tc.admit {
+					t.Fatalf("mention admitted = %v, want %v", got, tc.admit)
 				}
-				t.Fatal("a chain acting for alice reached a bohan-only agent: a human was substituted")
-			}
+			})
+
+			t.Run("assign", func(t *testing.T) {
+				want := http.StatusForbidden
+				if tc.admit {
+					want = http.StatusOK
+				}
+				resp := agentAssigns(t, firstHop, firstTaskID, chain.IssueY, secondHop).Want(want)
+				if !tc.admit {
+					assertDenialReason(t, resp, "you do not have permission to assign work to this agent")
+				}
+			})
+
+			t.Run("sub-issue", func(t *testing.T) {
+				want := http.StatusForbidden
+				if tc.admit {
+					want = http.StatusCreated
+				}
+				resp := agentCreatesSubIssue(t, firstHop, firstTaskID, chain.IssueY, secondHop).Want(want)
+				if !tc.admit {
+					assertDenialReason(t, resp, "you do not have permission to assign work to this agent")
+				}
+			})
 		})
 	}
+
+	// A chain with no human at its top grants nothing anywhere, which is the
+	// fail-closed side of the same rule: propagation carries a human, it never
+	// invents one. The first hop already stops here, so there is no second hop to
+	// drive — a member-scoped allow-list has nobody to match.
+	t.Run("an unattributed chain grants nothing", func(t *testing.T) {
+		chain := newCrossIssueChain(t, bohan, nil)
+		agentComments(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, mention(firstHop), "").
+			Want(http.StatusCreated)
+		if _, _, ok := queuedTaskFor(t, chain.IssueY, firstHop); ok {
+			t.Fatal("an unattributed chain must not satisfy a member-scoped allow-list")
+		}
+		agentAssigns(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, firstHop).Want(http.StatusForbidden)
+		agentCreatesSubIssue(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, firstHop).Want(http.StatusForbidden)
+	})
 }
 
 // TestCrossIssueDelegation_GateAndStampAgreeOnTheHuman closes the split-brain the
@@ -327,25 +393,22 @@ func TestCrossIssueDelegation_GateAndStampAgreeOnTheHuman(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
-	ctx := context.Background()
 	bohan := testUserID
-	worker := seedInvocableAgent(t, "MUL-6490 agreement worker", bohan, "public_to", bohan)
+	worker := seedAllowListedAgent(t, "MUL-6490 agreement worker", bohan, "public_to", bohan)
 	chain := newCrossIssueChain(t, bohan, bohan)
 
-	if w := agentComments(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, mention(worker), ""); w.Code != http.StatusCreated {
-		t.Fatalf("CreateComment: got %d, want 201: %s", w.Code, w.Body.String())
-	}
+	agentComments(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, mention(worker), "").
+		Want(http.StatusCreated)
 	commentID := lastCommentOn(t, chain.IssueY)
 
 	// What the gate saw at admission time, from the request header.
-	gateReq := newRequest(http.MethodPost, "/api/issues/"+chain.IssueY+"/comments", nil)
-	gateReq.Header.Set("X-Agent-ID", chain.CoordinatorID)
-	gateReq.Header.Set("X-Task-ID", chain.TaskA)
-	fromGate := testHandler.invokeOriginatorFromRequest(gateReq, "agent", chain.CoordinatorID)
+	fromGate := testHandler.invokeOriginatorFromRequest(
+		asRun(newRequest(http.MethodPost, "/api/issues/"+chain.IssueY+"/comments", nil), chain.CoordinatorID, chain.TaskA),
+		"agent", chain.CoordinatorID)
 
 	// What the enqueue path sees afterwards, from the persisted comment.
 	fromStamp := uuidToString(testHandler.TaskService.ResolveOriginatorFromTriggerComment(
-		ctx, util.MustParseUUID(testWorkspaceID), util.MustParseUUID(commentID)))
+		t.Context(), parseUUID(testWorkspaceID), parseUUID(commentID)))
 
 	if fromGate != fromStamp {
 		t.Fatalf("gate resolved %q but the stored chain resolves %q — a run would start with authority the gate never granted",
