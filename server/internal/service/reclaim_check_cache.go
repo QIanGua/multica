@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"strconv"
 	"time"
@@ -13,22 +12,26 @@ import (
 const (
 	reclaimCheckSchedulePrefix = "mul:claim:runtime:reclaim-schedule:"
 	reclaimCheckBackstopPrefix = "mul:claim:runtime:reclaim-backstop:"
-)
 
-// ReclaimCheckCacheTTL is both the steady-state fallback cadence and the TTL
-// for reclaim scheduling hints. It must not exceed the claim response recovery
-// window: if a dispatch-side Redis write is lost, the prior backstop expires no
-// later than the newly dispatched task first becomes reclaimable.
-const ReclaimCheckCacheTTL = claimResponseRecoveryWindow
+	// The backstop remains at or below the PostgreSQL recovery window so a
+	// missed dispatch-side Redis write cannot delay recovery beyond one window.
+	ReclaimCheckBackstopInterval = claimResponseRecoveryWindow
+	// A fresh task's first hint is one recovery window in the future. Keep the
+	// containing ZSET alive for another full window so Redis cannot expire the
+	// hint at the exact instant it first becomes observable as due.
+	ReclaimCheckScheduleTTL = 2 * claimResponseRecoveryWindow
+)
 
 // ReclaimCheckCache keeps the batch/singular claim hot paths from issuing a
 // stale-dispatch UPDATE when no task can possibly be reclaimed yet.
 //
 // Each runtime owns a sorted set of task IDs scored by their earliest known
-// reclaim time. A separate backstop timestamp forces a periodic DB check for
-// cache loss, pre-deployment rows, or a missed write. Missing keys and Redis
-// errors always mean "check PostgreSQL now", so the cache can only reduce load;
-// it is never authoritative for task recovery.
+// reclaim time. A separate last-checked timestamp forces a periodic DB check
+// for cache loss, pre-deployment rows, or a missed write. Task scores and the
+// last-checked timestamp are both application-clock values; PostgreSQL remains
+// authoritative for actual eligibility when the query runs. Missing keys and
+// Redis errors always mean "check PostgreSQL now", so the cache can only reduce
+// load; it is never authoritative for task recovery.
 type ReclaimCheckCache struct {
 	rdb *redis.Client
 }
@@ -52,9 +55,14 @@ func (c *ReclaimCheckCache) bounded(ctx context.Context) (context.Context, conte
 	return context.WithTimeout(ctx, emptyClaimRedisTimeout)
 }
 
-// DueRuntimeIDs returns only runtimes whose earliest task hint or periodic
-// backstop is due. A nil cache, missing backstop, malformed value, or Redis
-// failure returns every input runtime so callers preserve the pre-cache DB path.
+// DueRuntimeIDs returns only runtimes with a task hint added after their last
+// successful DB check and now due, or whose periodic backstop has elapsed. A
+// checked hint stays in the ZSET until a real task transition removes/updates it
+// or the schedule TTL expires, but it cannot retrigger every poll because its
+// score is not newer than the last-checked marker.
+//
+// A nil cache, missing/malformed backstop, or Redis failure fails open. Batch
+// callers treat any due runtime as a reason to query their complete runtime set.
 func (c *ReclaimCheckCache) DueRuntimeIDs(ctx context.Context, runtimeIDs []string, now time.Time) []string {
 	if len(runtimeIDs) == 0 {
 		return nil
@@ -65,52 +73,78 @@ func (c *ReclaimCheckCache) DueRuntimeIDs(ctx context.Context, runtimeIDs []stri
 
 	bctx, cancel := c.bounded(ctx)
 	defer cancel()
-	type runtimeCommands struct {
-		runtimeID string
-		schedule  *redis.ZSliceCmd
-		backstop  *redis.StringCmd
-	}
-	pipe := c.rdb.Pipeline()
-	commands := make([]runtimeCommands, 0, len(runtimeIDs))
+	validRuntimeIDs := make([]string, 0, len(runtimeIDs))
+	backstopKeys := make([]string, 0, len(runtimeIDs))
 	for _, runtimeID := range runtimeIDs {
 		if runtimeID == "" {
 			continue
 		}
-		commands = append(commands, runtimeCommands{
-			runtimeID: runtimeID,
-			schedule:  pipe.ZRangeWithScores(bctx, reclaimCheckScheduleKey(runtimeID), 0, 0),
-			backstop:  pipe.Get(bctx, reclaimCheckBackstopKey(runtimeID)),
-		})
+		validRuntimeIDs = append(validRuntimeIDs, runtimeID)
+		backstopKeys = append(backstopKeys, reclaimCheckBackstopKey(runtimeID))
 	}
-	if _, err := pipe.Exec(bctx); err != nil && !errors.Is(err, redis.Nil) {
-		slog.Warn("reclaim_check_cache: read failed; falling back to DB", "error", err)
+	if len(validRuntimeIDs) == 0 {
+		return nil
+	}
+	backstops, err := c.rdb.MGet(bctx, backstopKeys...).Result()
+	if err != nil {
+		slog.Warn("reclaim_check_cache: backstop read failed; falling back to DB", "error", err)
+		return append([]string(nil), runtimeIDs...)
+	}
+	if len(backstops) != len(validRuntimeIDs) {
+		slog.Warn("reclaim_check_cache: incomplete backstop read; falling back to DB")
 		return append([]string(nil), runtimeIDs...)
 	}
 
 	nowMillis := now.UnixMilli()
-	due := make([]string, 0, len(commands))
-	for _, command := range commands {
-		scheduled, err := command.schedule.Result()
-		if err != nil {
-			slog.Warn("reclaim_check_cache: schedule read failed; falling back to DB", "error", err)
-			return append([]string(nil), runtimeIDs...)
-		}
-		if len(scheduled) > 0 && int64(scheduled[0].Score) <= nowMillis {
-			due = append(due, command.runtimeID)
+	type scheduleCommand struct {
+		runtimeID string
+		count     *redis.IntCmd
+	}
+	due := make([]string, 0, len(validRuntimeIDs))
+	pipe := c.rdb.Pipeline()
+	scheduleCommands := make([]scheduleCommand, 0, len(validRuntimeIDs))
+	for i, runtimeID := range validRuntimeIDs {
+		backstop, ok := backstops[i].(string)
+		if !ok {
+			// A missing or non-string value means this runtime has no trustworthy
+			// successful-check marker.
+			due = append(due, runtimeID)
 			continue
 		}
-
-		backstop, err := command.backstop.Result()
-		if errors.Is(err, redis.Nil) {
-			due = append(due, command.runtimeID)
+		checkedMillis, err := strconv.ParseInt(backstop, 10, 64)
+		if err != nil {
+			due = append(due, runtimeID)
 			continue
 		}
+		nextBackstop := checkedMillis + ReclaimCheckBackstopInterval.Milliseconds()
+		if nextBackstop < checkedMillis || nextBackstop <= nowMillis {
+			due = append(due, runtimeID)
+			continue
+		}
+		scheduleCommands = append(scheduleCommands, scheduleCommand{
+			runtimeID: runtimeID,
+			count: pipe.ZCount(
+				bctx,
+				reclaimCheckScheduleKey(runtimeID),
+				"("+strconv.FormatInt(checkedMillis, 10),
+				strconv.FormatInt(nowMillis, 10),
+			),
+		})
+	}
+	if len(scheduleCommands) == 0 {
+		return due
+	}
+	if _, err := pipe.Exec(bctx); err != nil {
+		slog.Warn("reclaim_check_cache: schedule read failed; falling back to DB", "error", err)
+		return append([]string(nil), runtimeIDs...)
+	}
+	for _, command := range scheduleCommands {
+		count, err := command.count.Result()
 		if err != nil {
-			slog.Warn("reclaim_check_cache: backstop read failed; falling back to DB", "error", err)
+			slog.Warn("reclaim_check_cache: schedule result failed; falling back to DB", "error", err)
 			return append([]string(nil), runtimeIDs...)
 		}
-		backstopMillis, err := strconv.ParseInt(backstop, 10, 64)
-		if err != nil || backstopMillis <= nowMillis {
+		if count > 0 {
 			due = append(due, command.runtimeID)
 		}
 	}
@@ -118,10 +152,23 @@ func (c *ReclaimCheckCache) DueRuntimeIDs(ctx context.Context, runtimeIDs []stri
 }
 
 // Track records the earliest known reclaim time for one dispatched task. ZADD
-// updates the task's score when a prepare lease is extended; multiple tasks on
+// replaces the task's score after a fresh dispatch/reclaim; multiple tasks on
 // one runtime remain independent, avoiding a runtime-level timestamp losing a
 // second task's earlier recovery deadline.
 func (c *ReclaimCheckCache) Track(ctx context.Context, runtimeID, taskID string, checkAfter time.Time) {
+	c.track(ctx, runtimeID, taskID, checkAfter, false)
+}
+
+// TrackLater advances an existing task hint only when a prepare-lease extension
+// protects it beyond its current recovery deadline. It deliberately does not
+// create a missing member: without the initial dispatch deadline, a short lease
+// could schedule an early failed check and delay recovery until the next
+// backstop. Missing state already fails open through that bounded backstop.
+func (c *ReclaimCheckCache) TrackLater(ctx context.Context, runtimeID, taskID string, checkAfter time.Time) {
+	c.track(ctx, runtimeID, taskID, checkAfter, true)
+}
+
+func (c *ReclaimCheckCache) track(ctx context.Context, runtimeID, taskID string, checkAfter time.Time, onlyLater bool) {
 	if c == nil || runtimeID == "" || taskID == "" || checkAfter.IsZero() {
 		return
 	}
@@ -129,8 +176,13 @@ func (c *ReclaimCheckCache) Track(ctx context.Context, runtimeID, taskID string,
 	defer cancel()
 	key := reclaimCheckScheduleKey(runtimeID)
 	pipe := c.rdb.Pipeline()
-	pipe.ZAdd(bctx, key, redis.Z{Score: float64(checkAfter.UnixMilli()), Member: taskID})
-	pipe.Expire(bctx, key, ReclaimCheckCacheTTL)
+	member := redis.Z{Score: float64(checkAfter.UnixMilli()), Member: taskID}
+	if onlyLater {
+		pipe.ZAddArgs(bctx, key, redis.ZAddArgs{XX: true, GT: true, Members: []redis.Z{member}})
+	} else {
+		pipe.ZAdd(bctx, key, member)
+	}
+	pipe.Expire(bctx, key, ReclaimCheckScheduleTTL)
 	if _, err := pipe.Exec(bctx); err != nil {
 		slog.Warn("reclaim_check_cache: track failed; DB fallback remains active", "error", err)
 	}
@@ -150,28 +202,25 @@ func (c *ReclaimCheckCache) Forget(ctx context.Context, runtimeID, taskID string
 	}
 }
 
-// MarkChecked records a successful PostgreSQL reclaim pass. When the UPDATE
-// returned fewer rows than its LIMIT, it exhausted currently eligible rows, so
-// task hints due before the query began can be discarded. Hints added or moved
-// by a concurrent dispatch/lease extension have a later score and survive.
-func (c *ReclaimCheckCache) MarkChecked(ctx context.Context, runtimeIDs []string, checkedThrough time.Time, exhausted bool) {
+// MarkChecked records a successful PostgreSQL reclaim pass for every runtime in
+// the machine-level polling set. It deliberately does not delete task hints:
+// SKIP LOCKED and runtime-health predicates mean a short result cannot prove
+// those tasks no longer need recovery. DueRuntimeIDs ignores scores at or before
+// this marker until the bounded backstop elapses, while newer concurrent hints
+// can still trigger an earlier check.
+func (c *ReclaimCheckCache) MarkChecked(ctx context.Context, runtimeIDs []string, checkedThrough time.Time) {
 	if c == nil || len(runtimeIDs) == 0 {
 		return
 	}
 	bctx, cancel := c.bounded(ctx)
 	defer cancel()
-	nextBackstop := checkedThrough.Add(ReclaimCheckCacheTTL).UnixMilli()
-	maxChecked := strconv.FormatInt(checkedThrough.UnixMilli(), 10)
+	checkedMillis := strconv.FormatInt(checkedThrough.UnixMilli(), 10)
 	pipe := c.rdb.Pipeline()
 	for _, runtimeID := range runtimeIDs {
 		if runtimeID == "" {
 			continue
 		}
-		if exhausted {
-			pipe.ZRemRangeByScore(bctx, reclaimCheckScheduleKey(runtimeID), "-inf", maxChecked)
-		}
-		pipe.Set(bctx, reclaimCheckBackstopKey(runtimeID), strconv.FormatInt(nextBackstop, 10), ReclaimCheckCacheTTL)
-		pipe.Expire(bctx, reclaimCheckScheduleKey(runtimeID), ReclaimCheckCacheTTL)
+		pipe.Set(bctx, reclaimCheckBackstopKey(runtimeID), checkedMillis, ReclaimCheckBackstopInterval)
 	}
 	if _, err := pipe.Exec(bctx); err != nil {
 		slog.Warn("reclaim_check_cache: mark checked failed; falling back to DB", "error", err)

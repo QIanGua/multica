@@ -2,50 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
-	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/redis/go-redis/v9"
 )
-
-func TestTaskReclaimCheckAfter(t *testing.T) {
-	dispatchedAt := time.Date(2026, time.August, 21, 4, 0, 0, 0, time.UTC)
-	tests := []struct {
-		name string
-		task db.AgentTaskQueue
-		want time.Time
-	}{
-		{
-			name: "missing dispatch timestamp has no schedule",
-			task: db.AgentTaskQueue{},
-		},
-		{
-			name: "recovery window",
-			task: db.AgentTaskQueue{
-				DispatchedAt: pgtype.Timestamptz{Time: dispatchedAt, Valid: true},
-			},
-			want: dispatchedAt.Add(claimResponseRecoveryWindow),
-		},
-		{
-			name: "later prepare lease",
-			task: db.AgentTaskQueue{
-				DispatchedAt:          pgtype.Timestamptz{Time: dispatchedAt, Valid: true},
-				PrepareLeaseExpiresAt: pgtype.Timestamptz{Time: dispatchedAt.Add(2 * time.Minute), Valid: true},
-			},
-			want: dispatchedAt.Add(2 * time.Minute),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := taskReclaimCheckAfter(tt.task); !got.Equal(tt.want) {
-				t.Fatalf("taskReclaimCheckAfter() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
 
 func TestReclaimCheckCache_NilFallsBackToEveryRuntime(t *testing.T) {
 	var cache *ReclaimCheckCache
@@ -55,8 +17,9 @@ func TestReclaimCheckCache_NilFallsBackToEveryRuntime(t *testing.T) {
 		t.Fatalf("nil cache due runtimes = %v, want %v", due, runtimes)
 	}
 	cache.Track(context.Background(), "rt-a", "task-a", time.Now())
+	cache.TrackLater(context.Background(), "rt-a", "task-a", time.Now())
 	cache.Forget(context.Background(), "rt-a", "task-a")
-	cache.MarkChecked(context.Background(), runtimes, time.Now(), true)
+	cache.MarkChecked(context.Background(), runtimes, time.Now())
 }
 
 func TestNewReclaimCheckCache_NilRedisReturnsNil(t *testing.T) {
@@ -78,57 +41,116 @@ func TestReclaimCheckCache_RedisFailureFallsBackToEveryRuntime(t *testing.T) {
 	}
 }
 
-func TestReclaimCheckCache_BackstopAndTaskSchedule(t *testing.T) {
+func TestReclaimCheckCache_ProductionWindowHintOutlivesDeadline(t *testing.T) {
 	rdb := newRedisTestClient(t)
 	cache := NewReclaimCheckCache(rdb)
 	ctx := context.Background()
 	now := time.Now()
+	hint := now.Add(claimResponseRecoveryWindow)
 
-	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, now); len(due) != 1 {
-		t.Fatalf("missing cache must fall back to DB, got %v", due)
-	}
-	cache.MarkChecked(ctx, []string{"rt-a"}, now, true)
-	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, now.Add(time.Second)); len(due) != 0 {
-		t.Fatalf("fresh backstop should skip DB, got %v", due)
-	}
+	// Put the backstop after the task hint so this test exercises the schedule,
+	// not the periodic fallback, at the production 90-second distance.
+	cache.MarkChecked(ctx, []string{"rt-a"}, now.Add(30*time.Second))
+	cache.Track(ctx, "rt-a", "task-a", hint)
 
-	cache.Track(ctx, "rt-a", "task-a", now.Add(10*time.Second))
-	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, now.Add(9*time.Second)); len(due) != 0 {
+	ttl, err := rdb.PTTL(ctx, reclaimCheckScheduleKey("rt-a")).Result()
+	if err != nil {
+		t.Fatalf("schedule PTTL: %v", err)
+	}
+	if ttl <= claimResponseRecoveryWindow {
+		t.Fatalf("schedule TTL = %v, must strictly outlive %v hint distance", ttl, claimResponseRecoveryWindow)
+	}
+	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, hint.Add(-time.Millisecond)); len(due) != 0 {
 		t.Fatalf("task must not be checked before its recovery time, got %v", due)
 	}
-	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, now.Add(11*time.Second)); len(due) != 1 {
-		t.Fatalf("task recovery time must override the later backstop, got %v", due)
+	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, hint.Add(time.Millisecond)); len(due) != 1 {
+		t.Fatalf("production-window hint must remain observable when due, got %v", due)
 	}
 }
 
-func TestReclaimCheckCache_LeaseMoveForgetAndExhaustedCleanup(t *testing.T) {
+func TestReclaimCheckCache_CheckedHintIsRetainedWithoutRetriggering(t *testing.T) {
 	rdb := newRedisTestClient(t)
 	cache := NewReclaimCheckCache(rdb)
 	ctx := context.Background()
 	now := time.Now()
 
-	cache.MarkChecked(ctx, []string{"rt-a"}, now, true)
-	cache.Track(ctx, "rt-a", "task-a", now.Add(5*time.Second))
+	cache.MarkChecked(ctx, []string{"rt-a"}, now)
+	cache.Track(ctx, "rt-a", "task-a", now.Add(10*time.Second))
+	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, now.Add(11*time.Second)); len(due) != 1 {
+		t.Fatalf("task-a should trigger its first check, got %v", due)
+	}
+	cache.MarkChecked(ctx, []string{"rt-a"}, now.Add(11*time.Second))
+	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, now.Add(12*time.Second)); len(due) != 0 {
+		t.Fatalf("already-checked hint must not retrigger the next poll, got %v", due)
+	}
+	if _, err := rdb.ZScore(ctx, reclaimCheckScheduleKey("rt-a"), "task-a").Result(); err != nil {
+		t.Fatalf("successful check must retain task hint: %v", err)
+	}
+
+	// A new task added after the check can still trigger before the backstop,
+	// even though the older retained member remains first in score order.
 	cache.Track(ctx, "rt-a", "task-b", now.Add(20*time.Second))
-	// A prepare-lease extension moves the same task rather than adding a second
-	// member, so task-b remains the earliest hint.
-	cache.Track(ctx, "rt-a", "task-a", now.Add(30*time.Second))
 	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, now.Add(21*time.Second)); len(due) != 1 {
-		t.Fatalf("task-b should remain due after task-a lease extension, got %v", due)
+		t.Fatalf("newer task hint should override the backstop, got %v", due)
+	}
+}
+
+func TestReclaimCheckCache_TrackLaterAndForget(t *testing.T) {
+	rdb := newRedisTestClient(t)
+	cache := NewReclaimCheckCache(rdb)
+	ctx := context.Background()
+	now := time.Now()
+
+	cache.Track(ctx, "rt-a", "task-a", now.Add(claimResponseRecoveryWindow))
+	cache.TrackLater(ctx, "rt-a", "task-a", now.Add(prepareLeaseDuration))
+	score, err := rdb.ZScore(ctx, reclaimCheckScheduleKey("rt-a"), "task-a").Result()
+	if err != nil {
+		t.Fatalf("read task score after shorter lease: %v", err)
+	}
+	if got := int64(score); got != now.Add(claimResponseRecoveryWindow).UnixMilli() {
+		t.Fatalf("shorter lease moved hint to %d, want %d", got, now.Add(claimResponseRecoveryWindow).UnixMilli())
 	}
 
-	cache.Forget(ctx, "rt-a", "task-b")
-	if due := cache.DueRuntimeIDs(ctx, []string{"rt-a"}, now.Add(21*time.Second)); len(due) != 0 {
-		t.Fatalf("forgotten task must no longer trigger a check, got %v", due)
+	later := now.Add(claimResponseRecoveryWindow + prepareLeaseDuration)
+	cache.TrackLater(ctx, "rt-a", "task-a", later)
+	score, err = rdb.ZScore(ctx, reclaimCheckScheduleKey("rt-a"), "task-a").Result()
+	if err != nil {
+		t.Fatalf("read task score after later lease: %v", err)
+	}
+	if got := int64(score); got != later.UnixMilli() {
+		t.Fatalf("later lease left hint at %d, want %d", got, later.UnixMilli())
 	}
 
-	cache.Track(ctx, "rt-a", "old-task", now.Add(-time.Second))
-	cache.Track(ctx, "rt-a", "future-task", now.Add(40*time.Second))
-	cache.MarkChecked(ctx, []string{"rt-a"}, now, true)
-	if score, err := rdb.ZScore(ctx, reclaimCheckScheduleKey("rt-a"), "old-task").Result(); err == nil {
-		t.Fatalf("exhausted check retained old task score %v", score)
+	cache.Forget(ctx, "rt-a", "task-a")
+	if _, err := rdb.ZScore(ctx, reclaimCheckScheduleKey("rt-a"), "task-a").Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("forgotten task score error = %v, want redis.Nil", err)
 	}
-	if _, err := rdb.ZScore(ctx, reclaimCheckScheduleKey("rt-a"), "future-task").Result(); err != nil {
-		t.Fatalf("exhausted check removed concurrent/future task: %v", err)
+	cache.TrackLater(ctx, "rt-a", "missing-task", later)
+	if _, err := rdb.ZScore(ctx, reclaimCheckScheduleKey("rt-a"), "missing-task").Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("lease-only missing task score error = %v, want redis.Nil", err)
+	}
+}
+
+func TestReclaimCheckCache_CollectionCheckAlignsBackstops(t *testing.T) {
+	rdb := newRedisTestClient(t)
+	cache := NewReclaimCheckCache(rdb)
+	ctx := context.Background()
+	now := time.Now()
+	runtimes := []string{"rt-a", "rt-b"}
+
+	cache.MarkChecked(ctx, []string{"rt-a"}, now)
+	cache.MarkChecked(ctx, []string{"rt-b"}, now.Add(30*time.Second))
+	if due := cache.DueRuntimeIDs(ctx, runtimes, now.Add(91*time.Second)); len(due) != 1 || due[0] != "rt-a" {
+		t.Fatalf("staggered backstops due = %v, want [rt-a]", due)
+	}
+
+	// ClaimTasksForRuntimes queries the complete set when any member is due and
+	// records that successful pass for the complete set as well.
+	cache.MarkChecked(ctx, runtimes, now.Add(91*time.Second))
+	if due := cache.DueRuntimeIDs(ctx, runtimes, now.Add(150*time.Second)); len(due) != 0 {
+		t.Fatalf("collection backstops drifted after joint check: %v", due)
+	}
+	if due := cache.DueRuntimeIDs(ctx, runtimes, now.Add(182*time.Second)); len(due) != 2 {
+		t.Fatalf("aligned collection backstops due = %v, want both runtimes", due)
 	}
 }

@@ -165,6 +165,59 @@ func TestClaimTasksForRuntimes_MaxTasksCap(t *testing.T) {
 	}
 }
 
+// TestClaimTasksForRuntimes_AnyDueRuntimeChecksTheCompleteSet pins MUL-6486's
+// collection-level reclaim gate. Per-runtime backstops can begin staggered, but
+// one due member must run the single UPDATE over every runtime on that daemon;
+// filtering the SQL array to only the due member both misses recoverable work
+// and lets fixed query overhead drift back toward one call per poll.
+func TestClaimTasksForRuntimes_AnyDueRuntimeChecksTheCompleteSet(t *testing.T) {
+	ctx := context.Background()
+	rdb := newRedisTestClient(t)
+	pool := newTaskClaimRacePool(t)
+	svc := NewTaskService(db.New(pool), pool, nil, events.New())
+	svc.ReclaimCheck = NewReclaimCheckCache(rdb)
+
+	rt1, rt2 := batchClaimFixture(t, ctx, pool)
+	ids := []pgtype.UUID{util.MustParseUUID(rt1), util.MustParseUUID(rt2)}
+
+	var staleTaskID string
+	if err := pool.QueryRow(ctx, `
+		SELECT id FROM agent_task_queue
+		WHERE runtime_id = $1
+		ORDER BY created_at
+		LIMIT 1
+	`, rt2).Scan(&staleTaskID); err != nil {
+		t.Fatalf("load rt2 task: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET status = 'dispatched', dispatched_at = now() - interval '10 minutes',
+		    started_at = NULL, prepare_lease_expires_at = NULL
+		WHERE id = $1
+	`, staleTaskID); err != nil {
+		t.Fatalf("make rt2 task stale: %v", err)
+	}
+
+	now := time.Now()
+	svc.ReclaimCheck.MarkChecked(ctx, []string{rt1}, now.Add(-ReclaimCheckBackstopInterval-time.Second))
+	svc.ReclaimCheck.MarkChecked(ctx, []string{rt2}, now)
+	due := svc.ReclaimCheck.DueRuntimeIDs(ctx, []string{rt1, rt2}, now)
+	if len(due) != 1 || due[0] != rt1 {
+		t.Fatalf("precondition due runtimes = %v, want [%s]", due, rt1)
+	}
+
+	claimed, err := svc.ClaimTasksForRuntimes(ctx, ids, 5)
+	if err != nil {
+		t.Fatalf("batch claim: %v", err)
+	}
+	for _, task := range claimed {
+		if util.UUIDToString(task.ID) == staleTaskID {
+			return
+		}
+	}
+	t.Fatalf("batch claim omitted stale task %s on non-due runtime %s: got %v", staleTaskID, rt2, claimed)
+}
+
 // TestClaimTasksForRuntimes_EmptyInputs guards the trivial short-circuits.
 func TestClaimTasksForRuntimes_EmptyInputs(t *testing.T) {
 	ctx := context.Background()

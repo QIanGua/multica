@@ -182,26 +182,36 @@ const (
 	prepareLeaseDuration        = 45 * time.Second
 )
 
-func taskReclaimCheckAfter(task db.AgentTaskQueue) time.Time {
-	if !task.DispatchedAt.Valid {
-		return time.Time{}
-	}
-	checkAfter := task.DispatchedAt.Time.Add(claimResponseRecoveryWindow)
-	if task.PrepareLeaseExpiresAt.Valid && task.PrepareLeaseExpiresAt.Time.After(checkAfter) {
-		checkAfter = task.PrepareLeaseExpiresAt.Time
-	}
-	return checkAfter
-}
-
-func (s *TaskService) trackTaskForReclaim(task db.AgentTaskQueue) {
-	if !task.RuntimeID.Valid || task.Status != "dispatched" {
+func (s *TaskService) trackTaskForReclaim(task db.AgentTaskQueue, checkAfter time.Time) {
+	if !task.RuntimeID.Valid || !task.ID.Valid || task.Status != "dispatched" {
 		return
 	}
+	// The Redis hint is advisory and intentionally uses an application-clock
+	// elapsed deadline captured beside the DB command. Comparing PostgreSQL's
+	// absolute dispatched_at/lease timestamps with time.Now would mix clocks;
+	// PostgreSQL remains authoritative when the reclaim query actually runs.
+	// A bounded background context lets this best-effort write outlive a request
+	// cancellation without allowing Redis to stall the hot path indefinitely.
 	s.ReclaimCheck.Track(
 		context.Background(),
 		util.UUIDToString(task.RuntimeID),
 		util.UUIDToString(task.ID),
-		taskReclaimCheckAfter(task),
+		checkAfter,
+	)
+}
+
+func (s *TaskService) extendTaskReclaimHint(task db.AgentTaskQueue, checkAfter time.Time) {
+	if !task.RuntimeID.Valid || !task.ID.Valid || task.Status != "dispatched" {
+		return
+	}
+	// Preserve a later initial recovery deadline; a short prepare lease should
+	// only move the hint when repeated extensions actually protect the task for
+	// longer. See trackTaskForReclaim for the clock/context rationale.
+	s.ReclaimCheck.TrackLater(
+		context.Background(),
+		util.UUIDToString(task.RuntimeID),
+		util.UUIDToString(task.ID),
+		checkAfter,
 	)
 }
 
@@ -209,6 +219,8 @@ func (s *TaskService) forgetTaskReclaim(task db.AgentTaskQueue) {
 	if !task.RuntimeID.Valid || !task.ID.Valid {
 		return
 	}
+	// This cleanup is best-effort and uses the cache's bounded timeout; request
+	// cancellation must not make a committed task transition leave a stale hint.
 	s.ReclaimCheck.Forget(
 		context.Background(),
 		util.UUIDToString(task.RuntimeID),
@@ -3036,6 +3048,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 	outcome := "unknown"
 	var getAgentMs, countRunningMs, claimAgentMs, reanchorMs, updateStatusMs, dispatchMs int64
 	var claimed *db.AgentTaskQueue
+	var reclaimCheckAfter time.Time
 	defer func() {
 		s.maybeLogClaimSlow(agentID, outcome, start, getAgentMs, countRunningMs, claimAgentMs, reanchorMs, updateStatusMs, dispatchMs)
 	}()
@@ -3071,6 +3084,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 		}
 
 		t0 = time.Now()
+		reclaimCheckAfter = t0.Add(claimResponseRecoveryWindow)
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
 			AgentID:          agentID,
 			RuntimeID:        claimRuntimeID,
@@ -3122,7 +3136,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 	if claimed == nil {
 		return nil, nil
 	}
-	s.trackTaskForReclaim(*claimed)
+	s.trackTaskForReclaim(*claimed, reclaimCheckAfter)
 
 	slog.Info("task claimed", "task_id", util.UUIDToString(claimed.ID), "agent_id", util.UUIDToString(agentID))
 	s.captureTaskDispatched(ctx, *claimed)
@@ -3188,6 +3202,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	// the UPDATE until a task hint or bounded DB backstop is due.
 	checkStarted := time.Now()
 	if due := s.ReclaimCheck.DueRuntimeIDs(ctx, []string{runtimeKey}, checkStarted); len(due) > 0 {
+		reclaimCheckAfter := time.Now().Add(claimResponseRecoveryWindow)
 		stale, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
 			RuntimeID:         runtimeID,
 			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
@@ -3195,8 +3210,8 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
 		})
 		if err == nil {
-			s.ReclaimCheck.MarkChecked(ctx, due, checkStarted, false)
-			s.trackTaskForReclaim(stale)
+			s.ReclaimCheck.MarkChecked(ctx, []string{runtimeKey}, checkStarted)
+			s.trackTaskForReclaim(stale, reclaimCheckAfter)
 			outcome = "reclaimed_dispatched"
 			claimedFlag = true
 			slog.Info("stale dispatched task reclaimed",
@@ -3210,7 +3225,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 			outcome = "error_reclaim_dispatched"
 			return nil, fmt.Errorf("reclaim stale dispatched task: %w", err)
 		}
-		s.ReclaimCheck.MarkChecked(ctx, due, checkStarted, true)
+		s.ReclaimCheck.MarkChecked(ctx, []string{runtimeKey}, checkStarted)
 	}
 
 	if s.EmptyClaim.IsEmpty(ctx, runtimeKey) {
@@ -3427,29 +3442,23 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		s.NotifyTaskEnqueued(ctx, task)
 	}
 
-	// 2. Reclaim lost-response dispatched tasks only for runtimes whose task
-	// schedule or bounded DB backstop is due. A nil/missing/failed cache returns
-	// the complete runtime set and preserves the historical query path.
+	// 2. Reclaim lost-response dispatched tasks when any runtime's task schedule
+	// or bounded DB backstop is due. The query always receives the complete
+	// machine-level set so per-runtime backstops stay aligned and fixed UPDATE
+	// setup/locking cost is paid at a predictable cadence. A nil/missing/failed
+	// cache preserves the historical query path.
 	runtimeKeys := make([]string, 0, len(uniqueIDs))
 	for _, rid := range uniqueIDs {
 		runtimeKeys = append(runtimeKeys, util.UUIDToString(rid))
 	}
 	checkStarted := time.Now()
 	dueKeys := s.ReclaimCheck.DueRuntimeIDs(ctx, runtimeKeys, checkStarted)
-	dueSet := make(map[string]struct{}, len(dueKeys))
-	for _, key := range dueKeys {
-		dueSet[key] = struct{}{}
-	}
-	dueIDs := make([]pgtype.UUID, 0, len(dueSet))
-	for _, rid := range uniqueIDs {
-		if _, ok := dueSet[util.UUIDToString(rid)]; ok {
-			dueIDs = append(dueIDs, rid)
-		}
-	}
 	var reclaimed []db.AgentTaskQueue
-	if len(dueIDs) > 0 {
+	var reclaimCheckAfter time.Time
+	if len(dueKeys) > 0 {
+		reclaimCheckAfter = time.Now().Add(claimResponseRecoveryWindow)
 		reclaimed, err = s.Queries.ReclaimStaleDispatchedTasksForRuntimes(ctx, db.ReclaimStaleDispatchedTasksForRuntimesParams{
-			RuntimeIds:        dueIDs,
+			RuntimeIds:        uniqueIDs,
 			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
 			PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
 			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
@@ -3458,10 +3467,13 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		if err != nil {
 			return nil, fmt.Errorf("reclaim stale dispatched tasks: %w", err)
 		}
-		s.ReclaimCheck.MarkChecked(ctx, dueKeys, checkStarted, len(reclaimed) < maxTasks)
+		// The UPDATE's fixed setup/locking cost dominates array width. Query and
+		// advance the complete machine-level set together so per-runtime backstops
+		// cannot drift into one UPDATE on almost every daemon poll.
+		s.ReclaimCheck.MarkChecked(ctx, runtimeKeys, checkStarted)
 	}
 	for i := range reclaimed {
-		s.trackTaskForReclaim(reclaimed[i])
+		s.trackTaskForReclaim(reclaimed[i], reclaimCheckAfter)
 		claimed = append(claimed, reclaimed[i])
 		slog.Info("stale dispatched task reclaimed (batch)",
 			"task_id", util.UUIDToString(reclaimed[i].ID),
@@ -3720,7 +3732,11 @@ func (s *TaskService) ExtendTaskPrepareLease(ctx context.Context, taskID, runtim
 		return nil, fmt.Errorf("extend task prepare lease: %w", err)
 	}
 	if task.Status == "dispatched" {
-		s.trackTaskForReclaim(task)
+		// Use the successful response time as a conservative application-clock
+		// approximation of the DB lease start. Scheduling slightly late by query
+		// latency is safer than an early failed check suppressing the hint until
+		// the next backstop.
+		s.extendTaskReclaimHint(task, time.Now().Add(prepareLeaseDuration))
 	} else {
 		s.forgetTaskReclaim(task)
 	}
@@ -6090,10 +6106,10 @@ func (s *TaskService) NotifyTaskFinished(task db.AgentTaskQueue) {
 func (s *TaskService) notifyTasksFinished(tasks []db.AgentTaskQueue) {
 	seen := make(map[string]struct{}, len(tasks))
 	for _, task := range tasks {
-		s.forgetTaskReclaim(task)
 		if !task.RuntimeID.Valid {
 			continue
 		}
+		s.forgetTaskReclaim(task)
 		runtimeKey := util.UUIDToString(task.RuntimeID)
 		if _, ok := seen[runtimeKey]; ok {
 			continue
