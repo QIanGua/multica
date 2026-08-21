@@ -37,7 +37,7 @@ export function PluginSurfaceFrame({ wsId, installation, surface, issueId, class
   // Every mounted frame gets its own launch. The artifact is immutable, but the
   // bridge proof is deliberately neither cacheable nor shareable.
   const { data: launch, isPending, isError } = useQuery(
-    pluginSurfaceLaunchOptions(wsId, installation.id, surface.key, installation.package_version_id, launchInstance),
+    pluginSurfaceLaunchOptions(wsId, installation.id, surface.key, installation.package_version_id, launchInstance, issueId),
   );
 
   const surfaceDocument = useMemo(() => {

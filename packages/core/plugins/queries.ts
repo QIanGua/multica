@@ -31,11 +31,14 @@ export function pluginSurfaceLaunchOptions(
   surfaceKey: string,
   packageVersionId: string,
   launchInstance: string,
+  issueId?: string,
 ) {
   return queryOptions({
     // A launch contains a single-use bridge token. Two mounted panels must not
-    // share one merely because React Query deduplicated their requests.
-    queryKey: [...pluginKeys.all(wsId), installationId, "surface-launch", surfaceKey, packageVersionId, launchInstance] as const,
+    // share one merely because React Query deduplicated their requests. Moving
+    // the same mounted panel to another issue also needs a fresh launch because
+    // the issue-scoped bridge is replaced with it.
+    queryKey: [...pluginKeys.all(wsId), installationId, "surface-launch", surfaceKey, packageVersionId, launchInstance, issueId ?? ""] as const,
     queryFn: () => api.getPluginSurfaceLaunch(wsId, installationId, surfaceKey),
     enabled: wsId.length > 0 && installationId.length > 0 && surfaceKey.length > 0,
     staleTime: 0,

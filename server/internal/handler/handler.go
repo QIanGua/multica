@@ -94,6 +94,10 @@ type Config struct {
 	// the server into minting webhook URLs pointing at an attacker-controlled
 	// host.
 	PublicURL string
+	// AppURL is the browser application's canonical origin, resolved from
+	// MULTICA_APP_URL (falling back to FRONTEND_ORIGIN). It is kept separate
+	// from PublicURL because split app/API deployments use different origins.
+	AppURL string
 	// TrustedProxies are CIDRs whose source IP we trust to set
 	// X-Forwarded-For / X-Real-IP. Empty means "trust nothing": the rate
 	// limiter uses r.RemoteAddr exclusively. Populated via the

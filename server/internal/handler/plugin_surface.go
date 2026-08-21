@@ -70,8 +70,9 @@ func parsePluginSurfaceOrigin(raw string) (*url.URL, error) {
 }
 
 func (h *Handler) pluginSurfaceOriginIsDedicated(origin *url.URL) bool {
-	candidates := make([]string, 0, len(h.cfg.AttachmentFrameAncestors)+1)
+	candidates := make([]string, 0, len(h.cfg.AttachmentFrameAncestors)+2)
 	candidates = append(candidates, h.cfg.PublicURL)
+	candidates = append(candidates, h.cfg.AppURL)
 	candidates = append(candidates, h.cfg.AttachmentFrameAncestors...)
 	for _, candidate := range candidates {
 		appOrigin, err := parsePluginSurfaceOrigin(candidate)
@@ -214,7 +215,7 @@ func (h *Handler) GetPluginSurfaceLaunch(w http.ResponseWriter, r *http.Request)
 // receives no app cookie.
 func (h *Handler) ServePluginSurface(w http.ResponseWriter, r *http.Request) {
 	origin, err := parsePluginSurfaceOrigin(h.cfg.PluginSurfaceOrigin)
-	if err != nil || !strings.EqualFold(r.Host, origin.Host) {
+	if err != nil || !h.pluginSurfaceOriginIsDedicated(origin) || !strings.EqualFold(r.Host, origin.Host) {
 		http.NotFound(w, r)
 		return
 	}
