@@ -4498,9 +4498,17 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 			row.Output = &msg.Output
 		}
 		if msg.Input != nil {
-			if inputJSON, err := json.Marshal(msg.Input); err == nil {
-				row.Input = inputJSON
+			// Fail loud rather than dropping the field: a tool call whose
+			// arguments silently vanish is worse than a 500 the daemon logs,
+			// because the transcript then shows a tool_use with no input and
+			// nothing anywhere records that it was lost.
+			inputJSON, err := json.Marshal(msg.Input)
+			if err != nil {
+				slog.Error("failed to encode task message input", "task_id", taskID, "seq", msg.Seq, "error", err)
+				writeError(w, http.StatusInternalServerError, "failed to persist task message")
+				return
 			}
+			row.Input = inputJSON
 		}
 		rows = append(rows, row)
 	}
@@ -4523,12 +4531,18 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if workspaceID != "" {
-		// RETURNING order follows the jsonb array, but subscribers order by seq
-		// anyway, so the broadcast is driven by the rows Postgres handed back
-		// rather than by the request order.
+		// CreateTaskMessages orders its result by seq, which is the daemon's
+		// own within-batch ordering — so this publishes in the same order the
+		// per-message loop did. A bare INSERT ... RETURNING has no row-order
+		// guarantee, and subscribers render these events as they arrive, so the
+		// ordering lives in the query rather than in the clients.
 		for _, m := range created {
+			// The ordered CTE makes sqlc name the row type after the query
+			// rather than reusing the table model; the columns are the table's,
+			// in order, so the conversion is checked by the compiler and breaks
+			// loudly if the query ever stops returning the whole row.
 			h.publishTask(protocol.EventTaskMessage, workspaceID, "system", "", taskID,
-				taskMessageToPayload(m, taskID, uuidToString(task.IssueID)))
+				taskMessageToPayload(db.TaskMessage(m), taskID, uuidToString(task.IssueID)))
 		}
 	}
 

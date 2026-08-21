@@ -3,151 +3,208 @@ package handler
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
+	"sync"
 	"testing"
+
+	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+// seedBatchTask builds the running, issue-backed task the /messages endpoint
+// needs: requireDaemonTaskAccess resolves the workspace through the issue, and a
+// task with no issue / chat / autopilot link 404s before the body is read.
+func seedBatchTask(t *testing.T, label string) string {
+	t.Helper()
+	agentID := dbfx.Agent(t, label+" agent", handlerTestRuntimeID(t), testutil.Cols{
+		"instructions": "",
+		"custom_env":   testutil.Raw("'{}'::jsonb"),
+		"custom_args":  testutil.Raw("'[]'::jsonb"),
+	})
+	issueID := dbfx.Issue(t, label+" fixture", testutil.Cols{"status": "in_progress"})
+	return dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id": handlerTestRuntimeID(t),
+		"issue_id":   issueID,
+		"status":     "running",
+		"started_at": testutil.Raw("now()"),
+	})
+}
+
+// batchMessagesRequest builds the daemon-authenticated POST the daemon sends,
+// with taskId bound as a chi URL param the way the router does in production.
+func batchMessagesRequest(t *testing.T, taskID string, messages []any) *http.Request {
+	t.Helper()
+	req := testutil.JSONRequest(http.MethodPost,
+		"/api/daemon/tasks/"+taskID+"/messages", map[string]any{"messages": messages})
+	req = testutil.WithURLParams(req, "taskId", taskID)
+	return req.WithContext(middleware.WithDaemonContext(
+		req.Context(), testWorkspaceID, "batch-messages-daemon"))
+}
 
 // TestReportTaskMessagesPersistsWholeBatch covers the multi-message shape of the
 // /messages endpoint after it stopped issuing one INSERT per message. The row
 // count, the seq values, and the NULL/non-NULL split all have to survive the
-// jsonb round trip that CreateTaskMessages does: a tool event carries tool +
-// input + output, a text event carries only content, and everything the daemon
-// omitted must land as SQL NULL rather than an empty string.
+// jsonb round trip CreateTaskMessages does: a tool event carries tool + input +
+// output, a text event carries only content, and everything the daemon omitted
+// must land as SQL NULL rather than an empty string.
 func TestReportTaskMessagesPersistsWholeBatch(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	_, taskID := seedNULTask(t, "batch-messages-agent")
+	taskID := seedBatchTask(t, "batch-messages")
 
-	w := httptest.NewRecorder()
-	req := daemonTaskRequest(t, "/api/daemon/tasks/"+taskID+"/messages", taskID, map[string]any{
-		"messages": []any{
-			map[string]any{"seq": 1, "type": "thinking", "content": "planning"},
-			map[string]any{
-				"seq":    2,
-				"type":   "tool_use",
-				"tool":   "fs_read",
-				"input":  map[string]any{"path": "/etc/hosts", "nested": map[string]any{"depth": 2}},
-				"output": "127.0.0.1 localhost",
-			},
-			map[string]any{"seq": 3, "type": "text", "content": "done"},
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "thinking", "content": "planning"},
+		map[string]any{
+			"seq":    2,
+			"type":   "tool_use",
+			"tool":   "fs_read",
+			"input":  map[string]any{"path": "/etc/hosts", "nested": map[string]any{"depth": 2}},
+			"output": "127.0.0.1 localhost",
 		},
-	})
+		map[string]any{"seq": 3, "type": "text", "content": "done"},
+	})).Want(http.StatusOK)
 
-	testHandler.ReportTaskMessages(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("ReportTaskMessages returned %d, want 200: %s", w.Code, w.Body.String())
-	}
-
-	rows, err := testPool.Query(ctx, `
-		SELECT seq, type, tool, content, output, input::text
-		FROM task_message WHERE task_id = $1 ORDER BY seq ASC`, taskID)
+	stored, err := testHandler.Queries.ListTaskMessages(ctx, util.MustParseUUID(taskID))
 	if err != nil {
-		t.Fatalf("read persisted task messages: %v", err)
+		t.Fatalf("list persisted task messages: %v", err)
 	}
-	defer rows.Close()
-
-	type stored struct {
-		seq                          int32
-		msgType                      string
-		tool, content, output, input *string
-	}
-	var got []stored
-	for rows.Next() {
-		var s stored
-		if err := rows.Scan(&s.seq, &s.msgType, &s.tool, &s.content, &s.output, &s.input); err != nil {
-			t.Fatalf("scan task message: %v", err)
-		}
-		got = append(got, s)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate task messages: %v", err)
-	}
-
-	if len(got) != 3 {
-		t.Fatalf("persisted %d task messages, want 3", len(got))
+	if len(stored) != 3 {
+		t.Fatalf("persisted %d task messages, want 3", len(stored))
 	}
 	for i, want := range []int32{1, 2, 3} {
-		if got[i].seq != want {
-			t.Fatalf("row %d seq = %d, want %d", i, got[i].seq, want)
+		if stored[i].Seq != want {
+			t.Fatalf("row %d seq = %d, want %d", i, stored[i].Seq, want)
 		}
 	}
-	if got[0].msgType != "thinking" || got[0].content == nil || *got[0].content != "planning" {
-		t.Fatalf("thinking row = %+v, want type=thinking content=planning", got[0])
+
+	if stored[0].Type != "thinking" || stored[0].Content.String != "planning" {
+		t.Fatalf("thinking row = %+v, want type=thinking content=planning", stored[0])
 	}
 	// Fields the daemon did not send must be NULL, not "".
-	if got[0].tool != nil || got[0].output != nil || got[0].input != nil {
-		t.Fatalf("thinking row should have NULL tool/output/input, got %+v", got[0])
+	if stored[0].Tool.Valid || stored[0].Output.Valid || stored[0].Input != nil {
+		t.Fatalf("thinking row should have NULL tool/output/input, got %+v", stored[0])
 	}
-	if got[1].tool == nil || *got[1].tool != "fs_read" {
-		t.Fatalf("tool_use row tool = %v, want fs_read", got[1].tool)
+	if stored[1].Tool.String != "fs_read" {
+		t.Fatalf("tool_use row tool = %q, want fs_read", stored[1].Tool.String)
 	}
-	if got[1].output == nil || *got[1].output != "127.0.0.1 localhost" {
-		t.Fatalf("tool_use row output = %v", got[1].output)
+	if stored[1].Output.String != "127.0.0.1 localhost" {
+		t.Fatalf("tool_use row output = %q", stored[1].Output.String)
 	}
-	// The JSONB argument must arrive as an object, not as a string holding JSON.
-	if got[1].input == nil {
-		t.Fatal("tool_use row lost its input JSONB")
+	if stored[1].Content.Valid {
+		t.Fatalf("tool_use row content should be NULL, got %q", stored[1].Content.String)
 	}
+	// The jsonb argument must arrive as an object, not as a string holding JSON,
+	// or `input->>'path'` stops resolving for every consumer of this column.
 	var inputPath string
-	if err := testPool.QueryRow(ctx, `
-		SELECT input->>'path' FROM task_message WHERE task_id = $1 AND seq = 2`, taskID).Scan(&inputPath); err != nil {
-		t.Fatalf("read input->>path: %v", err)
-	}
+	dbfx.QueryRow(t,
+		`SELECT input->>'path' FROM task_message WHERE task_id = $1 AND seq = 2`,
+		taskID).Scan(&inputPath)
 	if inputPath != "/etc/hosts" {
 		t.Fatalf("input->>path = %q, want /etc/hosts", inputPath)
 	}
-	if got[1].content != nil {
-		t.Fatalf("tool_use row content should be NULL, got %q", *got[1].content)
-	}
-	if got[2].msgType != "text" || got[2].content == nil || *got[2].content != "done" {
-		t.Fatalf("text row = %+v, want type=text content=done", got[2])
+	if stored[2].Type != "text" || stored[2].Content.String != "done" {
+		t.Fatalf("text row = %+v, want type=text content=done", stored[2])
 	}
 }
 
-// TestReportTaskMessagesBatchIsAtomic pins the durability property the
-// single-statement insert buys: the batch either lands whole or not at all. The
-// per-message loop it replaced could persist the first rows and then fail,
-// leaving a permanent hole in the transcript — the daemon never retries this
-// endpoint. A duplicate id inside the batch is the cheapest way to make
-// PostgreSQL reject the statement mid-batch.
-func TestReportTaskMessagesBatchIsAtomic(t *testing.T) {
+// TestReportTaskMessagesPublishesInSeqOrder pins the realtime ordering the batch
+// insert has to preserve. The per-message loop it replaced published in request
+// order; `INSERT ... RETURNING` has no row-order guarantee, so the order now
+// comes from CreateTaskMessages' ORDER BY seq. Subscribers render these events
+// as they arrive, so an out-of-order batch is a visible transcript bug.
+//
+// The request deliberately lists the messages out of seq order: if the ORDER BY
+// were dropped, the events would come back in array order and this fails. That
+// also makes seq — the daemon's own counter — the single ordering authority,
+// rather than however the rows happen to land.
+func TestReportTaskMessagesPublishesInSeqOrder(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	taskID := seedBatchTask(t, "batch-order")
+
+	var mu sync.Mutex
+	var gotSeqs []int
+	testHandler.Bus.Subscribe(protocol.EventTaskMessage, func(e events.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		if e.TaskID != taskID {
+			return
+		}
+		if payload, ok := e.Payload.(protocol.TaskMessagePayload); ok {
+			gotSeqs = append(gotSeqs, payload.Seq)
+		}
+	})
+
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 3, "type": "text", "content": "third"},
+		map[string]any{"seq": 1, "type": "text", "content": "first"},
+		map[string]any{"seq": 2, "type": "text", "content": "second"},
+	})).Want(http.StatusOK)
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []int{1, 2, 3}
+	if len(gotSeqs) != len(want) {
+		t.Fatalf("published %v task:message events, want seqs %v", gotSeqs, want)
+	}
+	for i := range want {
+		if gotSeqs[i] != want[i] {
+			t.Fatalf("published seq order = %v, want %v — subscribers render these "+
+				"events in arrival order, so the transcript would show the batch scrambled",
+				gotSeqs, want)
+		}
+	}
+}
+
+// TestCreateTaskMessagesBatchIsAtomic exercises the production query, not a copy
+// of it: a batch that violates the primary key must persist nothing. This is the
+// property the single statement buys over the per-message loop, which could
+// leave a prefix of the batch behind and no way to complete it (the daemon does
+// not retry this endpoint).
+//
+// Note what this does and does not guarantee: the batch is consistent, not
+// complete. A failing batch is now lost whole. Closing that gap needs a retry
+// plus a (task_id, seq) uniqueness rule, which is not part of this change.
+func TestCreateTaskMessagesBatchIsAtomic(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	_, taskID := seedNULTask(t, "batch-atomic-agent")
+	taskID := seedBatchTask(t, "batch-atomic")
 
-	// A NUL in the JSONB input is rejected by the sanitizer, so drive the
-	// failure through a constraint instead: seq is not unique, but the primary
-	// key is, and the handler mints ids itself. Reuse the query directly with a
-	// colliding id to prove the statement is all-or-nothing.
-	dup := "018f0000-0000-7000-8000-000000000001"
-	_, err := testPool.Exec(ctx, `
-		INSERT INTO task_message (id, task_id, seq, type, content)
-		VALUES ($1, $2, 1, 'text', 'first')`, dup, taskID)
-	if err != nil {
+	// The colliding id is inserted first through the single-row query, so the
+	// conflict is on task_message's real primary key.
+	const dupID = "018f0000-0000-7000-8000-000000000001"
+	if _, err := testHandler.Queries.CreateTaskMessage(ctx, db.CreateTaskMessageParams{
+		ID:      util.MustParseUUID(dupID),
+		TaskID:  util.MustParseUUID(taskID),
+		Seq:     1,
+		Type:    "text",
+		Content: strToText("first"),
+	}); err != nil {
 		t.Fatalf("seed conflicting row: %v", err)
 	}
 
-	_, err = testPool.Exec(ctx, `
-		INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output)
-		SELECT m.id, $1::uuid, m.seq, m.type, m.tool, m.content, m.input, m.output
-		FROM jsonb_to_recordset($2::jsonb)
-			AS m(id uuid, seq integer, type text, tool text, content text, input jsonb, output text)`,
-		taskID, `[{"id":"018f0000-0000-7000-8000-000000000002","seq":2,"type":"text","content":"ok"},
-		          {"id":"`+dup+`","seq":3,"type":"text","content":"collides"}]`)
+	_, err := testHandler.Queries.CreateTaskMessages(ctx, db.CreateTaskMessagesParams{
+		TaskID: util.MustParseUUID(taskID),
+		Messages: []byte(`[
+			{"id":"018f0000-0000-7000-8000-000000000002","seq":2,"type":"text","content":"ok"},
+			{"id":"` + dupID + `","seq":3,"type":"text","content":"collides"}
+		]`),
+	})
 	if err == nil {
-		t.Fatal("expected the batch insert to fail on the duplicate id")
+		t.Fatal("CreateTaskMessages accepted a batch with a duplicate primary key")
 	}
 
-	var count int
-	if err := testPool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM task_message WHERE task_id = $1`, taskID).Scan(&count); err != nil {
-		t.Fatalf("count task messages: %v", err)
-	}
+	count := dbfx.Count(t, `SELECT COUNT(*) FROM task_message WHERE task_id = $1`, taskID)
 	if count != 1 {
-		t.Fatalf("task_message rows after failed batch = %d, want 1 (only the seeded row)", count)
+		t.Fatalf("task_message rows after the failed batch = %d, want 1 (only the seeded row) — "+
+			"the batch persisted a prefix instead of rolling back", count)
 	}
 }

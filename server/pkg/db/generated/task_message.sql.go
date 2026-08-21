@@ -55,16 +55,31 @@ func (q *Queries) CreateTaskMessage(ctx context.Context, arg CreateTaskMessagePa
 }
 
 const createTaskMessages = `-- name: CreateTaskMessages :many
-INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output)
-SELECT m.id, $1::uuid, m.seq, m.type, m.tool, m.content, m.input, m.output
-FROM jsonb_to_recordset($2::jsonb)
-    AS m(id uuid, seq integer, type text, tool text, content text, input jsonb, output text)
-RETURNING id, task_id, seq, type, tool, content, input, output, created_at
+WITH inserted AS (
+    INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output)
+    SELECT m.id, $1::uuid, m.seq, m.type, m.tool, m.content, m.input, m.output
+    FROM jsonb_to_recordset($2::jsonb)
+        AS m(id uuid, seq integer, type text, tool text, content text, input jsonb, output text)
+    RETURNING id, task_id, seq, type, tool, content, input, output, created_at
+)
+SELECT id, task_id, seq, type, tool, content, input, output, created_at FROM inserted ORDER BY seq ASC
 `
 
 type CreateTaskMessagesParams struct {
 	TaskID   pgtype.UUID `json:"task_id"`
 	Messages []byte      `json:"messages"`
+}
+
+type CreateTaskMessagesRow struct {
+	ID        pgtype.UUID        `json:"id"`
+	TaskID    pgtype.UUID        `json:"task_id"`
+	Seq       int32              `json:"seq"`
+	Type      string             `json:"type"`
+	Tool      pgtype.Text        `json:"tool"`
+	Content   pgtype.Text        `json:"content"`
+	Input     []byte             `json:"input"`
+	Output    pgtype.Text        `json:"output"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 // Batch variant of CreateTaskMessage: persists a whole daemon-reported batch in
@@ -84,18 +99,27 @@ type CreateTaskMessagesParams struct {
 // (GH #7098) instead of just one row.
 //
 // Atomicity is a deliberate side effect, not just a speedup: the per-message
-// loop this replaces could persist part of a batch and then fail, leaving a
-// permanent hole in the transcript because the daemon does not retry this
-// endpoint. One statement makes the batch all-or-nothing.
-func (q *Queries) CreateTaskMessages(ctx context.Context, arg CreateTaskMessagesParams) ([]TaskMessage, error) {
+// loop this replaces could persist part of a batch and then fail, leaving the
+// transcript with a prefix of the batch and no way to complete it — the daemon
+// does not retry this endpoint. One statement makes the batch all-or-nothing,
+// which buys consistency; a batch that fails is still lost whole, so closing
+// the gap for real needs a retry plus a (task_id, seq) uniqueness rule.
+//
+// The ORDER BY is a contract, not decoration. A bare `INSERT ... RETURNING`
+// has no defined row order, and the caller republishes these rows as realtime
+// events in the order they arrive — the per-row loop this replaces implicitly
+// published in request order, so the ordering has to be restored explicitly or
+// subscribers can see a batch out of order. seq is assigned by the daemon and
+// increases within a batch, so it is the request order.
+func (q *Queries) CreateTaskMessages(ctx context.Context, arg CreateTaskMessagesParams) ([]CreateTaskMessagesRow, error) {
 	rows, err := q.db.Query(ctx, createTaskMessages, arg.TaskID, arg.Messages)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []TaskMessage{}
+	items := []CreateTaskMessagesRow{}
 	for rows.Next() {
-		var i TaskMessage
+		var i CreateTaskMessagesRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TaskID,

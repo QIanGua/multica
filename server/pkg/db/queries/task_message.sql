@@ -21,14 +21,26 @@ RETURNING *;
 -- (GH #7098) instead of just one row.
 --
 -- Atomicity is a deliberate side effect, not just a speedup: the per-message
--- loop this replaces could persist part of a batch and then fail, leaving a
--- permanent hole in the transcript because the daemon does not retry this
--- endpoint. One statement makes the batch all-or-nothing.
-INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output)
-SELECT m.id, sqlc.arg('task_id')::uuid, m.seq, m.type, m.tool, m.content, m.input, m.output
-FROM jsonb_to_recordset(sqlc.arg('messages')::jsonb)
-    AS m(id uuid, seq integer, type text, tool text, content text, input jsonb, output text)
-RETURNING *;
+-- loop this replaces could persist part of a batch and then fail, leaving the
+-- transcript with a prefix of the batch and no way to complete it — the daemon
+-- does not retry this endpoint. One statement makes the batch all-or-nothing,
+-- which buys consistency; a batch that fails is still lost whole, so closing
+-- the gap for real needs a retry plus a (task_id, seq) uniqueness rule.
+--
+-- The ORDER BY is a contract, not decoration. A bare `INSERT ... RETURNING`
+-- has no defined row order, and the caller republishes these rows as realtime
+-- events in the order they arrive — the per-row loop this replaces implicitly
+-- published in request order, so the ordering has to be restored explicitly or
+-- subscribers can see a batch out of order. seq is assigned by the daemon and
+-- increases within a batch, so it is the request order.
+WITH inserted AS (
+    INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output)
+    SELECT m.id, sqlc.arg('task_id')::uuid, m.seq, m.type, m.tool, m.content, m.input, m.output
+    FROM jsonb_to_recordset(sqlc.arg('messages')::jsonb)
+        AS m(id uuid, seq integer, type text, tool text, content text, input jsonb, output text)
+    RETURNING *
+)
+SELECT * FROM inserted ORDER BY seq ASC;
 
 -- name: ListTaskMessages :many
 SELECT * FROM task_message
