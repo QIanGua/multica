@@ -4426,37 +4426,36 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the caller owns this task's workspace.
-	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	// Verify the caller owns this task's workspace. The access check already
+	// resolves the workspace id (it needs it to authorize the daemon), so take
+	// it from there instead of re-running GetIssue / GetChatSession: this
+	// endpoint fires every 500ms for every running task, and that second
+	// lookup was a whole extra query per batch on the hottest write path in
+	// the system (MUL-6523).
+	task, wsID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
 		return
 	}
 	slog.Info("task message batch received", "task_id", taskID, "count", len(req.Messages))
 
+	// Broadcast reach is deliberately unchanged: only issue- and chat-backed
+	// tasks streamed live messages before, and widening that to autopilot /
+	// quick-create tasks is a product decision, not part of this optimization.
 	workspaceID := ""
-	if task.IssueID.Valid {
-		if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
-			workspaceID = uuidToString(issue.WorkspaceID)
-		}
-	}
-	if workspaceID == "" && task.ChatSessionID.Valid {
-		if cs, err := h.Queries.GetChatSession(r.Context(), task.ChatSessionID); err == nil {
-			workspaceID = uuidToString(cs.WorkspaceID)
-		}
+	if task.IssueID.Valid || task.ChatSessionID.Valid {
+		workspaceID = wsID
 	}
 
-	messageIDs := make([]pgtype.UUID, len(req.Messages))
-	for i := range messageIDs {
+	// One row per message, persisted by a single statement below.
+	rows := make([]taskMessageInsert, 0, len(req.Messages))
+	for _, msg := range req.Messages {
 		id, err := uuid.NewV7()
 		if err != nil {
 			slog.Error("failed to generate task message id", "task_id", taskID, "error", err)
 			writeError(w, http.StatusInternalServerError, "failed to persist task message")
 			return
 		}
-		messageIDs[i] = pgtype.UUID{Bytes: [16]byte(id), Valid: true}
-	}
 
-	for i, msg := range req.Messages {
 		// Redact sensitive information before persisting or broadcasting.
 		msg.Content = redact.Text(msg.Content)
 		msg.Output = redact.Text(msg.Output)
@@ -4468,7 +4467,9 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		// binary, or a Windows tool emitting UTF-16 — and this endpoint has no
 		// retry on the daemon side, so an unsanitized batch is silently lost
 		// (GH #7098). Input is a JSONB column, so it needs the deep walk: the
-		// offending byte can sit at any depth of a tool's arguments.
+		// offending byte can sit at any depth of a tool's arguments. The batch
+		// insert makes this non-negotiable: the rows travel to Postgres inside
+		// one jsonb document, and jsonb rejects \u0000 for the WHOLE document.
 		msg.Type = util.SanitizeTextForPostgres(msg.Type)
 		msg.Tool = util.SanitizeTextForPostgres(msg.Tool)
 		msg.Content = util.SanitizeTextForPostgres(msg.Content)
@@ -4479,33 +4480,73 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var inputJSON []byte
+		row := taskMessageInsert{
+			ID:   uuid.UUID(id).String(),
+			Seq:  int32(msg.Seq),
+			Type: msg.Type,
+		}
+		// nil pointers marshal to JSON null, which jsonb_to_recordset turns
+		// into SQL NULL — preserving the empty-string-means-NULL mapping the
+		// per-row pgtype.Text{Valid: x != ""} carried.
+		if msg.Tool != "" {
+			row.Tool = &msg.Tool
+		}
+		if msg.Content != "" {
+			row.Content = &msg.Content
+		}
+		if msg.Output != "" {
+			row.Output = &msg.Output
+		}
 		if msg.Input != nil {
-			inputJSON, _ = json.Marshal(msg.Input)
+			if inputJSON, err := json.Marshal(msg.Input); err == nil {
+				row.Input = inputJSON
+			}
 		}
-		created, createErr := h.Queries.CreateTaskMessage(r.Context(), db.CreateTaskMessageParams{
-			ID:      messageIDs[i],
-			TaskID:  parseUUID(taskID),
-			Seq:     int32(msg.Seq),
-			Type:    msg.Type,
-			Tool:    pgtype.Text{String: msg.Tool, Valid: msg.Tool != ""},
-			Content: pgtype.Text{String: msg.Content, Valid: msg.Content != ""},
-			Input:   inputJSON,
-			Output:  pgtype.Text{String: msg.Output, Valid: msg.Output != ""},
-		})
-		if createErr != nil {
-			slog.Error("failed to create task message", "task_id", taskID, "seq", msg.Seq, "error", createErr)
-			writeError(w, http.StatusInternalServerError, "failed to persist task message")
-			return
-		}
+		rows = append(rows, row)
+	}
 
-		if workspaceID != "" {
+	payload, err := json.Marshal(rows)
+	if err != nil {
+		slog.Error("failed to encode task message batch", "task_id", taskID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to persist task message")
+		return
+	}
+
+	created, err := h.Queries.CreateTaskMessages(r.Context(), db.CreateTaskMessagesParams{
+		TaskID:   parseUUID(taskID),
+		Messages: payload,
+	})
+	if err != nil {
+		slog.Error("failed to create task messages", "task_id", taskID, "count", len(rows), "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to persist task message")
+		return
+	}
+
+	if workspaceID != "" {
+		// RETURNING order follows the jsonb array, but subscribers order by seq
+		// anyway, so the broadcast is driven by the rows Postgres handed back
+		// rather than by the request order.
+		for _, m := range created {
 			h.publishTask(protocol.EventTaskMessage, workspaceID, "system", "", taskID,
-				taskMessageToPayload(created, taskID, uuidToString(task.IssueID)))
+				taskMessageToPayload(m, taskID, uuidToString(task.IssueID)))
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// taskMessageInsert is one element of the jsonb document CreateTaskMessages
+// expands. Field names and types must match the query's AS (...) column list;
+// omitempty on the pointer/raw fields is what turns an absent value into SQL
+// NULL.
+type taskMessageInsert struct {
+	ID      string          `json:"id"`
+	Seq     int32           `json:"seq"`
+	Type    string          `json:"type"`
+	Tool    *string         `json:"tool,omitempty"`
+	Content *string         `json:"content,omitempty"`
+	Output  *string         `json:"output,omitempty"`
+	Input   json.RawMessage `json:"input,omitempty"`
 }
 
 // AckTaskCancelled receives the daemon's acknowledgement that it observed a
