@@ -314,11 +314,11 @@ func TestPrepareIsolatedKeepsTheClaimWithTheParent(t *testing.T) {
 	next.Release()
 }
 
-// TestLockEnvRootForReuseExcludesConcurrentContinuations covers the other
-// production path: a task with a PriorWorkDir continues in an EARLIER task's
-// env root via ReuseIsolated, and Reuse takes no claim of its own. Identity
-// there belongs to the earlier task, so only the exclusion half applies — but
-// two continuations still must not refresh and run one directory at once.
+// TestLockEnvRootForReuseExcludesConcurrentContinuations covers the lock
+// primitive the reuse path is built on. The composed decision — validate the
+// prior workdir, then lock only the canonical root — is pinned by
+// TestLockReusablePriorEnvRoot* in the daemon package, which is where the
+// ordering lives.
 func TestLockEnvRootForReuseExcludesConcurrentContinuations(t *testing.T) {
 	t.Parallel()
 	priorRoot := filepath.Join(t.TempDir(), "ws", "0123456789ab")
@@ -351,5 +351,40 @@ func TestLockEnvRootForReuseExcludesConcurrentContinuations(t *testing.T) {
 	missing, err := LockEnvRootForReuse(filepath.Join(t.TempDir(), "absent"))
 	if err != nil || missing != nil {
 		t.Fatalf("missing prior root: claim=%v err=%v, want nil/nil", missing, err)
+	}
+}
+
+// TestPrepareIsolatedFailsLoudlyWhenPreclaimIsNotDeclared pins what happens if
+// a caller ever holds the claim but forgets EnvRootPreclaimed. Parent and
+// helper then contend for the same lock, and the important property is that
+// this fails immediately and says so, rather than proceeding with preparation
+// that silently believes it is protected.
+func TestPrepareIsolatedFailsLoudlyWhenPreclaimIsNotDeclared(t *testing.T) {
+	t.Parallel()
+	workspacesRoot := t.TempDir()
+	const (
+		workspaceID = "ws-preclaim"
+		taskID      = "01a01ec0-e69d-7000-8000-0123456789ab"
+	)
+
+	claim, err := ClaimEnvRoot(workspacesRoot, workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("parent claim: %v", err)
+	}
+	defer claim.Release()
+
+	_, err = PrepareIsolated(context.Background(), preparationHelperTestCommand(), PrepareParams{
+		WorkspacesRoot: workspacesRoot,
+		WorkspaceID:    workspaceID,
+		TaskID:         taskID,
+		AgentName:      "Forgetful",
+		// EnvRootPreclaimed deliberately left false while the parent holds it.
+		Task: TaskContextForEnv{IssueID: taskID},
+	}, nil)
+	if err == nil {
+		t.Fatal("preparation ran without declaring the parent's claim")
+	}
+	if !strings.Contains(err.Error(), "running execution") {
+		t.Fatalf("error = %v, want it to name the held claim", err)
 	}
 }

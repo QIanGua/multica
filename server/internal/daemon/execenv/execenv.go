@@ -1215,14 +1215,28 @@ func ClaimEnvRoot(workspacesRoot, workspaceID, taskID string) (*EnvRootClaim, er
 	return &EnvRootClaim{rootDir: envRoot, lock: lock}, nil
 }
 
+// ErrEnvRootBusy reports that a live execution already holds an env root. On
+// the reuse path it is a reason to fall back to a fresh Prepare, not to fail
+// the task.
+var ErrEnvRootBusy = errors.New("env root is held by a running execution")
+
 // LockEnvRootForReuse takes the exclusion half of a claim, without the identity
 // half, for a task continuing in a PRIOR task's directory.
 //
 // Reuse adopts another task's env root on purpose, so the owner marker names
 // that earlier task and must not be reinterpreted or overwritten — but two
 // continuations of the same task still must not refresh and run the same
-// directory at once. Returns a nil claim (no error) when rootDir is empty or
-// missing, which is the caller's cue that there is nothing to exclude on.
+// directory at once.
+//
+// This function WRITES a lock file into rootDir, so callers must hand it a
+// path already proven to be a canonical daemon-managed env root. It cannot
+// re-derive that itself: a lexical containment check would accept a symlink
+// pointing anywhere, and creating .task_lock in a user's directory is exactly
+// the outcome the reuse guard exists to avoid.
+//
+// Returns a nil claim and no error when rootDir is empty or missing, and
+// ErrEnvRootBusy when another execution holds it — both mean "fall back to a
+// fresh Prepare".
 func LockEnvRootForReuse(rootDir string) (*EnvRootClaim, error) {
 	if rootDir == "" {
 		return nil, nil
@@ -1244,7 +1258,7 @@ func LockEnvRootForReuse(rootDir string) (*EnvRootClaim, error) {
 	}
 	if !locked {
 		lock.Close()
-		return nil, fmt.Errorf("execenv: env root %s is held by a running execution; refusing to reuse it concurrently", rootDir)
+		return nil, fmt.Errorf("execenv: reuse %s: %w", rootDir, ErrEnvRootBusy)
 	}
 	return &EnvRootClaim{rootDir: rootDir, lock: lock}, nil
 }

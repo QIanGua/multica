@@ -5753,33 +5753,33 @@ func sessionHomeReachable(provider string, env *execenv.Environment, envReused b
 // terminal file raced and dropped the session (MUL-4886). Both proofs this
 // function reads — the env-root provenance and the workdir task-context marker
 // — are written at Prepare time, so neither depends on completion ordering.
-func shouldReusePriorWorkdir(task Task, localAssignment *localDirectoryAssignment, workspacesRoot string) bool {
+func shouldReusePriorWorkdir(task Task, localAssignment *localDirectoryAssignment, workspacesRoot string) (string, bool) {
 	if task.PriorWorkDir == "" || localAssignment != nil {
-		return false
+		return "", false
 	}
 
 	root, err := filepath.EvalSymlinks(workspacesRoot)
 	if err != nil {
-		return false
+		return "", false
 	}
 	workdir, err := filepath.EvalSymlinks(task.PriorWorkDir)
 	if err != nil {
-		return false
+		return "", false
 	}
 	info, err := os.Stat(workdir)
 	if err != nil || !info.IsDir() {
-		return false
+		return "", false
 	}
 	rel, err := filepath.Rel(root, workdir)
 	if err != nil || !filepath.IsLocal(rel) {
-		return false
+		return "", false
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
 	if len(parts) != 3 || parts[0] != task.WorkspaceID || parts[1] == "" || parts[2] != "workdir" {
-		return false
+		return "", false
 	}
 	if task.AgentID == "" || (task.IssueID == "" && task.ChatSessionID == "") {
-		return false
+		return "", false
 	}
 	// Managed-env provenance is written only for non-local resumable envs, so
 	// its presence (plus the workspace/scope/agent match) proves this is a
@@ -5788,12 +5788,12 @@ func shouldReusePriorWorkdir(task Task, localAssignment *localDirectoryAssignmen
 	if err != nil || prov.ManagedBy != execenv.ManagedEnvProvenanceManagedBy ||
 		prov.WorkspaceID != task.WorkspaceID ||
 		prov.AgentID != task.AgentID {
-		return false
+		return "", false
 	}
 
 	data, err := os.ReadFile(filepath.Join(workdir, execenv.TaskContextMarkerRelPath))
 	if err != nil {
-		return false
+		return "", false
 	}
 	var marker struct {
 		ManagedBy     string `json:"managed_by"`
@@ -5802,15 +5802,21 @@ func shouldReusePriorWorkdir(task Task, localAssignment *localDirectoryAssignmen
 		ChatSessionID string `json:"chat_session_id"`
 	}
 	if json.Unmarshal(data, &marker) != nil {
-		return false
+		return "", false
 	}
 	if marker.ManagedBy != execenv.TaskContextMarkerManagedBy || marker.AgentID != task.AgentID {
-		return false
+		return "", false
 	}
 	if task.IssueID != "" {
-		return prov.IssueID == task.IssueID && marker.IssueID == task.IssueID
+		if prov.IssueID != task.IssueID || marker.IssueID != task.IssueID {
+			return "", false
+		}
+		return workdir, true
 	}
-	return prov.ChatSessionID == task.ChatSessionID && marker.ChatSessionID == task.ChatSessionID
+	if prov.ChatSessionID != task.ChatSessionID || marker.ChatSessionID != task.ChatSessionID {
+		return "", false
+	}
+	return workdir, true
 }
 
 // gateCodexResumeToRolloutPresence drops the prior Codex session when its
@@ -6078,18 +6084,53 @@ func (d *Daemon) startTaskPrepareLeaseExtender(ctx context.Context, task Task, t
 	}
 }
 
-// isUnderWorkspacesRoot reports whether path lives inside the daemon's
-// workspaces root. Used to keep env-root bookkeeping away from user-supplied
-// local_directory paths, which sit outside it.
-func isUnderWorkspacesRoot(workspacesRoot, path string) bool {
-	if workspacesRoot == "" || path == "" {
-		return false
+// lockReusablePriorEnvRoot decides whether this task may continue in a prior
+// task's env root and, if so, takes the exclusion lock on it.
+//
+// Order matters and is the point of this function. The lock WRITES a file into
+// the directory, so eligibility has to be proven first:
+// shouldReusePriorWorkdir resolves symlinks, checks the
+// {workspace}/{task}/workdir shape and verifies managed provenance, and only
+// the canonical path it returns is ever opened. Locking on
+// filepath.Dir(task.PriorWorkDir) before that would drop .task_lock into
+// whatever the path happened to point at — a symlink target outside the
+// workspaces root, or a user's own local_directory.
+//
+// The re-check under the lock closes the gap between proving eligibility and
+// acting on it. Declining is always safe: the caller falls back to a fresh
+// Prepare, which costs session continuity, not correctness.
+func (d *Daemon) lockReusablePriorEnvRoot(task Task, localAssignment *localDirectoryAssignment, heldRoot string) (*execenv.EnvRootClaim, string, bool) {
+	workDir, ok := shouldReusePriorWorkdir(task, localAssignment, d.cfg.WorkspacesRoot)
+	if !ok {
+		return nil, "", false
 	}
-	rel, err := filepath.Rel(filepath.Clean(workspacesRoot), filepath.Clean(path))
-	if err != nil {
-		return false
+	priorRoot := filepath.Dir(workDir)
+	// Already covered by this run's own claim (a task re-dispatched onto its
+	// own directory); taking a second lock on it would only deadlock against
+	// ourselves.
+	if priorRoot == heldRoot {
+		return nil, workDir, true
 	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+
+	claim, err := execenv.LockEnvRootForReuse(priorRoot)
+	switch {
+	case errors.Is(err, execenv.ErrEnvRootBusy):
+		d.logger.Info("prior workdir is in use by another execution; starting a fresh environment",
+			"task", shortID(task.ID), "prior_root", filepath.Base(priorRoot))
+		return nil, "", false
+	case err != nil:
+		d.logger.Warn("could not lock prior workdir; starting a fresh environment",
+			"task", shortID(task.ID), "error", err)
+		return nil, "", false
+	case claim == nil:
+		return nil, "", false
+	}
+
+	if _, stillOK := shouldReusePriorWorkdir(task, localAssignment, d.cfg.WorkspacesRoot); !stillOK {
+		claim.Release()
+		return nil, "", false
+	}
+	return claim, workDir, true
 }
 
 func (d *Daemon) prepareExecutionEnvironment(ctx context.Context, params execenv.PrepareParams) (*execenv.Environment, error) {
@@ -6500,22 +6541,6 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	defer envClaim.Release()
 
-	// A task continuing in a prior task's workdir excludes on THAT root
-	// instead. Identity there belongs to the earlier task, so this is the
-	// exclusion half of a claim only. Guarded to managed roots: for a
-	// local_directory task PriorWorkDir is the user's own directory, and its
-	// parent is no place to be writing lock files.
-	if task.PriorWorkDir != "" {
-		priorRoot := filepath.Dir(task.PriorWorkDir)
-		if priorRoot != envClaim.RootDir() && isUnderWorkspacesRoot(d.cfg.WorkspacesRoot, priorRoot) {
-			priorClaim, err := execenv.LockEnvRootForReuse(priorRoot)
-			if err != nil {
-				return TaskResult{}, fmt.Errorf("claim prior execution environment: %w", err)
-			}
-			defer priorClaim.Release()
-		}
-	}
-
 	// Try to reuse the workdir from a previous task on the same (agent, issue) pair.
 	var env *execenv.Environment
 	// For a built-in codex task, use the version paired with the resolved path
@@ -6736,7 +6761,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	envReused := false
-	if shouldReusePriorWorkdir(task, localAssignment, d.cfg.WorkspacesRoot) {
+	// The canonical path the lock was taken on stays internal: Reuse keeps
+	// receiving task.PriorWorkDir, so the workdir reported to the server and
+	// handed to the next task does not change shape.
+	if priorClaim, _, ok := d.lockReusablePriorEnvRoot(task, localAssignment, envClaim.RootDir()); ok {
+		defer priorClaim.Release()
 		var err error
 		env, err = d.reuseExecutionEnvironment(prepareCtx, execenv.ReuseParams{
 			WorkspacesRoot:        d.cfg.WorkspacesRoot,
