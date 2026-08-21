@@ -5389,6 +5389,11 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 		// lock looks for it.
 		reason := assignment.DisplayName()
 		if holder != "" {
+			// Known rough edge: this clause is English and the client renders it
+			// inside a localized "Waiting for {reason}" label, so a zh/ja/ko user
+			// sees mixed script. Fixing it properly means sending the directory
+			// and the holder as separate fields and localizing the join on the
+			// client — worth doing if this hint grows, not for one parenthetical.
 			reason = fmt.Sprintf("%s (held by task %s)", reason, shortID(holder))
 		}
 		taskLog.Info("local_directory: waiting on path mutex", "holder", shortID(holder))
