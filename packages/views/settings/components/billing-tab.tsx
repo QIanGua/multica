@@ -510,6 +510,13 @@ function BillingTabContent() {
             try {
               const refreshed = await refetchSummary();
               if (seatPreviewInputRef.current !== requestKey) return;
+              if (refreshed.isError === true) {
+                setSeatPreviewRefreshing(false);
+                setSeatPurchaseError(
+                  t(($) => $.workspace.seat_purchase.preview_failed),
+                );
+                return;
+              }
               const refreshedSeats = refreshed.data?.billedSeats ?? null;
               const refreshedVersion =
                 refreshed.data?.purchaseVersion ?? null;
