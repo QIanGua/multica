@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -128,6 +129,13 @@ func TestReportTaskMessagesPublishesInSeqOrder(t *testing.T) {
 	}
 	taskID := seedBatchTask(t, "batch-order")
 
+	// The shared bus has no unsubscribe, so a listener registered on it would
+	// outlive this test and keep firing for the rest of the package. Swap in a
+	// bus of this test's own and put the shared one back afterwards.
+	sharedBus := testHandler.Bus
+	testHandler.Bus = events.New()
+	t.Cleanup(func() { testHandler.Bus = sharedBus })
+
 	var mu sync.Mutex
 	var gotSeqs []int
 	testHandler.Bus.Subscribe(protocol.EventTaskMessage, func(e events.Event) {
@@ -178,25 +186,27 @@ func TestCreateTaskMessagesBatchIsAtomic(t *testing.T) {
 	ctx := context.Background()
 	taskID := seedBatchTask(t, "batch-atomic")
 
-	// The colliding id is inserted first through the single-row query, so the
-	// conflict is on task_message's real primary key.
+	// The colliding row is built as a fixture, not through the query under
+	// test: test setup that shares code with the code being exercised can pass
+	// for the wrong reason.
 	const dupID = "018f0000-0000-7000-8000-000000000001"
-	if _, err := testHandler.Queries.CreateTaskMessage(ctx, db.CreateTaskMessageParams{
-		ID:      util.MustParseUUID(dupID),
-		TaskID:  util.MustParseUUID(taskID),
-		Seq:     1,
-		Type:    "text",
-		Content: strToText("first"),
-	}); err != nil {
-		t.Fatalf("seed conflicting row: %v", err)
-	}
+	dbfx.Insert(t, "task_message", testutil.Cols{
+		"id":      dupID,
+		"task_id": taskID,
+		"seq":     1,
+		"type":    "text",
+		"content": "first",
+	})
 
 	_, err := testHandler.Queries.CreateTaskMessages(ctx, db.CreateTaskMessagesParams{
-		TaskID: util.MustParseUUID(taskID),
-		Messages: []byte(`[
-			{"id":"018f0000-0000-7000-8000-000000000002","seq":2,"type":"text","content":"ok"},
-			{"id":"` + dupID + `","seq":3,"type":"text","content":"collides"}
-		]`),
+		TaskID:   util.MustParseUUID(taskID),
+		Ids:      []pgtype.UUID{util.MustParseUUID("018f0000-0000-7000-8000-000000000002"), util.MustParseUUID(dupID)},
+		Seqs:     []int32{2, 3},
+		Types:    []string{"text", "text"},
+		Tools:    []string{"", ""},
+		Contents: []string{"ok", "collides"},
+		Inputs:   []string{"", ""},
+		Outputs:  []string{"", ""},
 	})
 	if err == nil {
 		t.Fatal("CreateTaskMessages accepted a batch with a duplicate primary key")
