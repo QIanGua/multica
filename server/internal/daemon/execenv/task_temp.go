@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -52,15 +53,73 @@ func ReleaseTaskTempLock(f *os.File) {
 	releaseLockFile(f)
 }
 
+// RemoveTaskTempDir removes dir's contents first, then its lock marker, then
+// dir itself — and stops at the first content it cannot remove, leaving the
+// marker behind.
+//
+// That ordering is the whole point, and it is why this is not os.RemoveAll.
+// RemoveAll walks the directory and keeps going after a failure, so a payload
+// Windows will not let go of still costs the .task_lock sitting next to it:
+// the removal fails having deleted exactly the file the NEXT sweep needs to
+// recognise this directory as a lock-bearing one. It would come back as a
+// directory with no marker — indistinguishable from a pre-lock leftover, and
+// so reclaimable only on age, if at all.
+//
+// Leaving the marker means a failed cleanup costs nothing: the directory is
+// still lock-bearing, still unlocked, and the next GC cycle takes the lock and
+// retries, however many cycles it takes for the holder to let go.
+//
+// Callers must release their own lock before calling this — the marker is
+// deleted here, and on Windows removing a file this process still holds open
+// only marks it for deletion, which would then block the directory's removal.
+func RemoveTaskTempDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if e.Name() == envRootLockFile {
+			continue // last, and only once everything else is gone
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(filepath.Join(dir, envRootLockFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Remove(dir)
+}
+
+// taskTempVerdict is what a single directory under the temp base is, as far as
+// this sweep can prove.
+type taskTempVerdict int
+
+const (
+	// taskTempInUse: an execution still holds the lock, or something stopped
+	// this sweep from finding out. Both mean "do not touch" — the sweep fails
+	// closed, since being wrong here deletes a running task's TMPDIR.
+	taskTempInUse taskTempVerdict = iota
+	// taskTempDead: this sweep acquired the lock the owner would still be
+	// holding, so the kernel has already proven that execution is gone.
+	taskTempDead
+	// taskTempLegacy: no lock file at all — left by a daemon predating
+	// LockTaskTempDir, about which nothing can be proven.
+	taskTempLegacy
+)
+
 // PruneTaskTempDirs reclaims per-task temp directories whose owning execution
 // is gone, under the base returned by the daemon's task temp base resolution.
 //
 // These directories are the agent process's TMPDIR. They live outside
 // WorkspacesRoot — the task GC's scan root — so nothing else ever reclaims
-// them: their only other exit is the RemoveAll the daemon defers at the end of
-// runTask, which does not run when the daemon is killed and does not succeed
+// them: their only other exit is the cleanup the daemon defers at the end of
+// runTask, which does not run when the daemon is killed and does not finish
 // when a file inside is still open (the Windows case in #7364). Whatever that
-// call misses accumulates on disk forever.
+// misses accumulates on disk forever.
 //
 // Liveness comes from the lock, not from the clock. A directory is removed
 // only once this sweep has itself acquired the .task_lock its owner would
@@ -75,31 +134,43 @@ func ReleaseTaskTempLock(f *os.File) {
 // closing it properly is a job for process-group teardown, not for the GC.
 //
 // legacyTTL applies to the one case the lock cannot answer: directories left
-// by a daemon predating LockTaskTempDir, which carry no lock file at all
-// (removable once this has shipped for a release or two). For those, age is
-// the only signal available, so they are reclaimed once the newest mtime
-// anywhere inside is older than legacyTTL. Set legacyTTL to 0 to leave them
-// alone entirely.
+// by a daemon predating LockTaskTempDir, which carry no lock file at all. For
+// those, age is the only available signal — and age cannot establish liveness,
+// which is why legacyTTL defaults to 0 (leave them alone) and reclaiming them
+// is an operator's explicit decision. See DefaultGCTaskTempLegacyTTL.
 func PruneTaskTempDirs(base string, legacyTTL time.Duration, now time.Time, logger *slog.Logger) (removed int, bytesFreed int64) {
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		return 0, 0 // missing or unreadable base — nothing to prune
 	}
+	legacyKept := 0
 	for _, e := range entries {
 		if !e.IsDir() || !strings.HasPrefix(e.Name(), TaskTempDirPrefix) {
 			continue
 		}
 		dir := filepath.Join(base, e.Name())
-		dead, size := taskTempDirIsDead(dir, legacyTTL, now)
-		if !dead {
+
+		switch classifyTaskTempDir(dir, logger) {
+		case taskTempInUse:
 			continue
+		case taskTempLegacy:
+			if legacyTTL <= 0 {
+				legacyKept++
+				continue
+			}
+			newest, _ := dirStat(dir)
+			if newest.IsZero() || now.Sub(newest) <= legacyTTL {
+				continue
+			}
 		}
-		if err := os.RemoveAll(dir); err != nil {
-			// Not worth escalating: a directory this cycle could not remove is
-			// retried on the next one, and the lock probe still has to
-			// re-authorise it. This is the whole reason the fix belongs in the
-			// GC rather than in a bounded retry on the task-completion path —
-			// here, failing costs nothing and repeats for free.
+
+		_, size := dirStat(dir)
+		if err := RemoveTaskTempDir(dir); err != nil {
+			// Not worth escalating: the marker is still there, so the next
+			// cycle re-acquires the lock and retries. This is the whole reason
+			// the fix belongs in the GC rather than in a bounded retry on the
+			// task-completion path — here, failing costs nothing and repeats
+			// for free.
 			if logger != nil {
 				logger.Debug("execenv: prune task temp dir failed", "dir", dir, "error", err)
 			}
@@ -108,48 +179,48 @@ func PruneTaskTempDirs(base string, legacyTTL time.Duration, now time.Time, logg
 		removed++
 		bytesFreed += size
 	}
+	if legacyKept > 0 && logger != nil {
+		// Say it plainly rather than reclaiming them silently: these are the
+		// directories this daemon cannot prove anything about, and an operator
+		// who knows no pre-lock daemon is running can opt in.
+		logger.Info("gc: pre-lock task temp dirs left in place",
+			"base", base,
+			"count", legacyKept,
+			"hint", "set MULTICA_GC_TASK_TEMP_LEGACY_TTL to reclaim them on age",
+		)
+	}
 	return removed, bytesFreed
 }
 
-// taskTempDirIsDead reports whether dir's owning execution is provably gone,
-// and how many bytes removing it would reclaim.
-func taskTempDirIsDead(dir string, legacyTTL time.Duration, now time.Time) (dead bool, size int64) {
+// classifyTaskTempDir decides what can be proven about one directory.
+func classifyTaskTempDir(dir string, logger *slog.Logger) taskTempVerdict {
 	lockPath := filepath.Join(dir, envRootLockFile)
 	if _, err := os.Stat(lockPath); err != nil {
-		// No lock file: written by a daemon older than this sweep, so nothing
-		// ever recorded liveness for it. This also covers the microseconds
-		// between os.MkdirTemp and LockTaskTempDir in the current daemon —
-		// harmlessly, since legacyTTL is orders of magnitude wider than that
-		// window.
-		if legacyTTL <= 0 {
-			return false, 0
+		if !errors.Is(err, os.ErrNotExist) {
+			// A directory we cannot even look into is not a directory we may
+			// delete. Another user's temp dir under a shared /tmp lands here.
+			if logger != nil {
+				logger.Debug("execenv: task temp dir lock unreadable; leaving it alone", "dir", dir, "error", err)
+			}
+			return taskTempInUse
 		}
-		newest, size := dirStat(dir)
-		if newest.IsZero() || now.Sub(newest) <= legacyTTL {
-			return false, 0
-		}
-		return true, size
+		return taskTempLegacy
 	}
 
 	lock, err := openLockFile(lockPath)
 	if err != nil {
-		return false, 0
+		return taskTempInUse
 	}
 	locked, err := lockFileExclusiveNonBlocking(lock)
 	if err != nil || !locked {
 		lock.Close()
-		return false, 0
+		return taskTempInUse
 	}
-	// We now hold the lock the owner would still be holding, so the kernel has
-	// already proven that execution is gone.
-	//
-	// Release before removing rather than deleting under the held lock: on
-	// Windows, removing a file that this process still has open only marks it
-	// for deletion, and the parent directory removal then fails until the
-	// handle closes. Dropping it first keeps the removal a plain one. Nothing
-	// can claim the directory in between — its name is random and its owner is
-	// dead — and a second sweep racing us just loses the RemoveAll to ENOENT.
+	// Release immediately: RemoveTaskTempDir deletes this very file, and on
+	// Windows deleting a file this process still has open only marks it for
+	// deletion, which would then block the directory's own removal. Nothing can
+	// claim the directory in between — its name is random and its owner is
+	// dead — and a second sweep racing us just loses the removal to ENOENT.
 	releaseLockFile(lock)
-	_, size = dirStat(dir)
-	return true, size
+	return taskTempDead
 }

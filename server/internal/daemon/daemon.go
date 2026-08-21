@@ -7169,8 +7169,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// in #7364) would otherwise leave the directory pinned until the daemon
 		// exits. Released first, the next GC cycle acquires the lock, sees the
 		// owner is gone and reclaims it. Nothing waits on the task path.
+		//
+		// RemoveTaskTempDir rather than os.RemoveAll so that a cleanup which
+		// fails here leaves the .task_lock marker intact — without it the next
+		// sweep could not tell this directory from a pre-lock leftover.
 		execenv.ReleaseTaskTempLock(taskTempLock)
-		if cerr := os.RemoveAll(taskTempDir); cerr != nil {
+		if cerr := execenv.RemoveTaskTempDir(taskTempDir); cerr != nil {
 			taskLog.Warn("task temp dir cleanup failed", "path", taskTempDir, "error", cerr)
 		}
 	}()
