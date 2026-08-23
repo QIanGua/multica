@@ -35,6 +35,8 @@
   },
   "table_menu": {
     "label": "Edit table",
+    "row_options": "Row options",
+    "column_options": "Column options",
     "add_row_above": "Add row above",
     "add_row_below": "Add row below",
     "delete_row": "Delete row",

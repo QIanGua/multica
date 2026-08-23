@@ -35,6 +35,8 @@
   },
   "table_menu": {
     "label": "表を編集",
+    "row_options": "行の操作",
+    "column_options": "列の操作",
     "add_row_above": "上に行を追加",
     "add_row_below": "下に行を追加",
     "delete_row": "現在の行を削除",

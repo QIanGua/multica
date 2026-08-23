@@ -35,6 +35,8 @@
   },
   "table_menu": {
     "label": "编辑表格",
+    "row_options": "行操作",
+    "column_options": "列操作",
     "add_row_above": "在上方添加一行",
     "add_row_below": "在下方添加一行",
     "delete_row": "删除当前行",

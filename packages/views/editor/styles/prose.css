@@ -302,6 +302,11 @@
   border-radius: var(--radius);
 }
 
+/* Leave room for the editor-only column grips and insertion affordances. */
+.rich-text-editor.ProseMirror .tableWrapper {
+  margin-top: 2rem;
+}
+
 .rich-text-editor table {
   /* `width`, not just `min-width`: Tiptap stamps an inline
      `style="min-width: NNpx"` on its tables, which would override a
