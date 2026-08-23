@@ -3,6 +3,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -10,7 +11,13 @@ import {
 import { createPortal } from "react-dom";
 import { autoUpdate } from "@floating-ui/dom";
 import type { Editor } from "@tiptap/core";
-import { Plus } from "lucide-react";
+import { Columns3, Plus, Rows3, Trash2 } from "lucide-react";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+} from "@multica/ui/components/ui/context-menu";
 import { cn } from "@multica/ui/lib/utils";
 import { useT } from "../i18n";
 
@@ -32,6 +39,11 @@ interface TableGeometry {
   cellRight: number;
   rowTop: number;
   rowBottom: number;
+}
+
+interface TableContextMenuPosition {
+  x: number;
+  y: number;
 }
 
 function shouldShowTableMenu(editor: Editor): boolean {
@@ -158,7 +170,25 @@ function EditorTableMenu({ editor }: { editor: Editor }) {
   );
   const [geometry, setGeometry] = useState<TableGeometry | null>(null);
   const [activeGuide, setActiveGuide] = useState<GuideKind | null>(null);
+  const [contextMenuPosition, setContextMenuPosition] =
+    useState<TableContextMenuPosition | null>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
+
+  const contextMenuAnchor = useMemo(
+    () =>
+      contextMenuPosition
+        ? {
+            getBoundingClientRect: () =>
+              DOMRect.fromRect({
+                x: contextMenuPosition.x,
+                y: contextMenuPosition.y,
+                width: 0,
+                height: 0,
+              }),
+          }
+        : undefined,
+    [contextMenuPosition],
+  );
 
   useEffect(() => {
     const onTransaction = () => {
@@ -197,6 +227,41 @@ function EditorTableMenu({ editor }: { editor: Editor }) {
     updateGeometry();
     return autoUpdate(elements.cell, overlay, updateGeometry);
   }, [elements, visible]);
+
+  useEffect(() => {
+    const editorDom = editor.view.dom;
+    const onContextMenu = (event: MouseEvent) => {
+      if (!editor.isEditable || editor.isDestroyed) return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const cell = target.closest("td, th");
+      if (!(cell instanceof HTMLTableCellElement)) return;
+
+      try {
+        // Put the Tiptap selection inside the cell that was actually clicked.
+        // Table commands operate on selection, and right-click does not move it
+        // consistently across browsers.
+        const cellContentStart = editor.view.posAtDOM(cell, 0);
+        const selectionPosition = Math.min(
+          cellContentStart + 1,
+          editor.state.doc.content.size,
+        );
+        if (!editor.commands.setTextSelection(selectionPosition)) return;
+      } catch {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      setActiveGuide(null);
+      setContextMenuPosition({ x: event.clientX, y: event.clientY });
+    };
+
+    editorDom.addEventListener("contextmenu", onContextMenu);
+    return () => {
+      editorDom.removeEventListener("contextmenu", onContextMenu);
+    };
+  }, [editor]);
 
   useEffect(() => {
     const onBlur = () => {
@@ -239,138 +304,190 @@ function EditorTableMenu({ editor }: { editor: Editor }) {
     [editor],
   );
 
-  if (!visible || !elements || typeof document === "undefined") return null;
+  if (
+    ((!visible || !elements) && !contextMenuPosition) ||
+    typeof document === "undefined"
+  ) {
+    return null;
+  }
 
   const tableWidth = geometry ? geometry.tableRight - geometry.tableLeft : 0;
   const tableHeight = geometry ? geometry.tableBottom - geometry.tableTop : 0;
 
   return createPortal(
-    <div
-      ref={overlayRef}
-      role="toolbar"
-      aria-label={t(($) => $.table_menu.label)}
-      className="pointer-events-none fixed inset-0 z-50"
-    >
-      {geometry && activeGuide?.startsWith("column") && (
+    <>
+      {visible && elements && (
         <div
-          aria-hidden="true"
-          data-table-guide={activeGuide}
-          className="fixed w-0.5 bg-brand shadow-sm"
-          style={{
-            left:
-              (activeGuide === "column-before"
-                ? geometry.cellLeft
-                : geometry.cellRight) - 1,
-            top: geometry.tableTop,
-            height: tableHeight,
-          }}
-        />
-      )}
-      {geometry && activeGuide?.startsWith("row") && (
-        <div
-          aria-hidden="true"
-          data-table-guide={activeGuide}
-          className="fixed h-0.5 bg-brand shadow-sm"
-          style={{
-            left: geometry.tableLeft,
-            top:
-              (activeGuide === "row-before"
-                ? geometry.rowTop
-                : geometry.rowBottom) - 1,
-            width: tableWidth,
-          }}
-        />
+          ref={overlayRef}
+          role="toolbar"
+          aria-label={t(($) => $.table_menu.label)}
+          className="pointer-events-none fixed inset-0 z-50"
+        >
+          {geometry && activeGuide?.startsWith("column") && (
+            <div
+              aria-hidden="true"
+              data-table-guide={activeGuide}
+              className="fixed w-0.5 bg-brand shadow-sm"
+              style={{
+                left:
+                  (activeGuide === "column-before"
+                    ? geometry.cellLeft
+                    : geometry.cellRight) - 1,
+                top: geometry.tableTop,
+                height: tableHeight,
+              }}
+            />
+          )}
+          {geometry && activeGuide?.startsWith("row") && (
+            <div
+              aria-hidden="true"
+              data-table-guide={activeGuide}
+              className="fixed h-0.5 bg-brand shadow-sm"
+              style={{
+                left: geometry.tableLeft,
+                top:
+                  (activeGuide === "row-before"
+                    ? geometry.rowTop
+                    : geometry.rowBottom) - 1,
+                width: tableWidth,
+              }}
+            />
+          )}
+
+          {geometry &&
+            boundaryIsVisible(
+              geometry.cellLeft,
+              geometry.tableLeft,
+              geometry.tableRight,
+            ) && (
+              <BorderInsertionHandle
+                label={t(($) => $.table_menu.add_column_left)}
+                style={{
+                  left: geometry.cellLeft - 6,
+                  top: geometry.tableTop,
+                  width: 12,
+                  height: tableHeight,
+                }}
+                orientation="vertical"
+                active={activeGuide === "column-before"}
+                onActiveChange={(active) =>
+                  setActiveGuide(active ? "column-before" : null)
+                }
+                onAction={() => run((chain) => chain.addColumnBefore())}
+              />
+            )}
+          {geometry &&
+            boundaryIsVisible(
+              geometry.cellRight,
+              geometry.tableLeft,
+              geometry.tableRight,
+            ) && (
+              <BorderInsertionHandle
+                label={t(($) => $.table_menu.add_column_right)}
+                style={{
+                  left: geometry.cellRight - 6,
+                  top: geometry.tableTop,
+                  width: 12,
+                  height: tableHeight,
+                }}
+                orientation="vertical"
+                active={activeGuide === "column-after"}
+                onActiveChange={(active) =>
+                  setActiveGuide(active ? "column-after" : null)
+                }
+                onAction={() => run((chain) => chain.addColumnAfter())}
+              />
+            )}
+          {geometry &&
+            boundaryIsVisible(
+              geometry.rowTop,
+              geometry.tableTop,
+              geometry.tableBottom,
+            ) && (
+              <BorderInsertionHandle
+                label={t(($) => $.table_menu.add_row_above)}
+                style={{
+                  left: geometry.tableLeft,
+                  top: geometry.rowTop - 6,
+                  width: tableWidth,
+                  height: 12,
+                }}
+                orientation="horizontal"
+                active={activeGuide === "row-before"}
+                onActiveChange={(active) =>
+                  setActiveGuide(active ? "row-before" : null)
+                }
+                onAction={() => run((chain) => chain.addRowBefore())}
+              />
+            )}
+          {geometry &&
+            boundaryIsVisible(
+              geometry.rowBottom,
+              geometry.tableTop,
+              geometry.tableBottom,
+            ) && (
+              <BorderInsertionHandle
+                label={t(($) => $.table_menu.add_row_below)}
+                style={{
+                  left: geometry.tableLeft,
+                  top: geometry.rowBottom - 6,
+                  width: tableWidth,
+                  height: 12,
+                }}
+                orientation="horizontal"
+                active={activeGuide === "row-after"}
+                onActiveChange={(active) =>
+                  setActiveGuide(active ? "row-after" : null)
+                }
+                onAction={() => run((chain) => chain.addRowAfter())}
+              />
+            )}
+        </div>
       )}
 
-      {geometry &&
-        boundaryIsVisible(
-          geometry.cellLeft,
-          geometry.tableLeft,
-          geometry.tableRight,
-        ) && (
-          <BorderInsertionHandle
-            label={t(($) => $.table_menu.add_column_left)}
-            style={{
-              left: geometry.cellLeft - 6,
-              top: geometry.tableTop,
-              width: 12,
-              height: tableHeight,
-            }}
-            orientation="vertical"
-            active={activeGuide === "column-before"}
-            onActiveChange={(active) =>
-              setActiveGuide(active ? "column-before" : null)
-            }
-            onAction={() => run((chain) => chain.addColumnBefore())}
-          />
-        )}
-      {geometry &&
-        boundaryIsVisible(
-          geometry.cellRight,
-          geometry.tableLeft,
-          geometry.tableRight,
-        ) && (
-          <BorderInsertionHandle
-            label={t(($) => $.table_menu.add_column_right)}
-            style={{
-              left: geometry.cellRight - 6,
-              top: geometry.tableTop,
-              width: 12,
-              height: tableHeight,
-            }}
-            orientation="vertical"
-            active={activeGuide === "column-after"}
-            onActiveChange={(active) =>
-              setActiveGuide(active ? "column-after" : null)
-            }
-            onAction={() => run((chain) => chain.addColumnAfter())}
-          />
-        )}
-      {geometry &&
-        boundaryIsVisible(
-          geometry.rowTop,
-          geometry.tableTop,
-          geometry.tableBottom,
-        ) && (
-          <BorderInsertionHandle
-            label={t(($) => $.table_menu.add_row_above)}
-            style={{
-              left: geometry.tableLeft,
-              top: geometry.rowTop - 6,
-              width: tableWidth,
-              height: 12,
-            }}
-            orientation="horizontal"
-            active={activeGuide === "row-before"}
-            onActiveChange={(active) =>
-              setActiveGuide(active ? "row-before" : null)
-            }
-            onAction={() => run((chain) => chain.addRowBefore())}
-          />
-        )}
-      {geometry &&
-        boundaryIsVisible(
-          geometry.rowBottom,
-          geometry.tableTop,
-          geometry.tableBottom,
-        ) && (
-          <BorderInsertionHandle
-            label={t(($) => $.table_menu.add_row_below)}
-            style={{
-              left: geometry.tableLeft,
-              top: geometry.rowBottom - 6,
-              width: tableWidth,
-              height: 12,
-            }}
-            orientation="horizontal"
-            active={activeGuide === "row-after"}
-            onActiveChange={(active) =>
-              setActiveGuide(active ? "row-after" : null)
-            }
-            onAction={() => run((chain) => chain.addRowAfter())}
-          />
-        )}
-    </div>,
+      {contextMenuPosition && (
+        <ContextMenu
+          open
+          onOpenChange={(open) => {
+            if (!open) setContextMenuPosition(null);
+          }}
+        >
+          <ContextMenuContent anchor={contextMenuAnchor}>
+            <ContextMenuItem
+              variant="destructive"
+              onClick={() => {
+                setContextMenuPosition(null);
+                run((chain) => chain.deleteRow());
+              }}
+            >
+              <Rows3 />
+              {t(($) => $.table_menu.delete_row)}
+            </ContextMenuItem>
+            <ContextMenuItem
+              variant="destructive"
+              onClick={() => {
+                setContextMenuPosition(null);
+                run((chain) => chain.deleteColumn());
+              }}
+            >
+              <Columns3 />
+              {t(($) => $.table_menu.delete_column)}
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem
+              variant="destructive"
+              onClick={() => {
+                setContextMenuPosition(null);
+                run((chain) => chain.deleteTable());
+              }}
+            >
+              <Trash2 />
+              {t(($) => $.table_menu.delete_table)}
+            </ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>
+      )}
+    </>,
     document.body,
   );
 }

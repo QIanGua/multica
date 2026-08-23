@@ -38,7 +38,10 @@
     "add_row_above": "上に行を追加",
     "add_row_below": "下に行を追加",
     "add_column_left": "左に列を追加",
-    "add_column_right": "右に列を追加"
+    "add_column_right": "右に列を追加",
+    "delete_row": "この行を削除",
+    "delete_column": "この列を削除",
+    "delete_table": "表を削除"
   },
   "image": {
     "view": "画像を表示",

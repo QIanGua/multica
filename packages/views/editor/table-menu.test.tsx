@@ -27,6 +27,9 @@ const labels = {
   add_row_below: "Add row below",
   add_column_left: "Add column left",
   add_column_right: "Add column right",
+  delete_row: "Delete row",
+  delete_column: "Delete column",
+  delete_table: "Delete table",
 };
 
 vi.mock("../i18n", () => ({
@@ -303,6 +306,59 @@ describe("EditorTableMenu", () => {
 
         expect(editor.view.dom.querySelectorAll(selector)).toHaveLength(
           expectedCount,
+        );
+      } finally {
+        editor.destroy();
+      }
+    },
+  );
+
+  it("opens destructive table actions when right-clicking a cell", async () => {
+    const editor = createProductionTableEditor();
+    try {
+      render(<EditorTableMenu editor={editor} />);
+      const cell = editor.view.dom.querySelector("tbody td");
+      if (!cell) throw new Error("Expected a body cell");
+
+      fireEvent.contextMenu(cell, { clientX: 240, clientY: 180 });
+
+      expect(
+        await screen.findByRole("menuitem", { name: "Delete row" }),
+      ).toBeVisible();
+      expect(
+        screen.getByRole("menuitem", { name: "Delete column" }),
+      ).toBeVisible();
+      expect(
+        screen.getByRole("menuitem", { name: "Delete table" }),
+      ).toBeVisible();
+    } finally {
+      editor.destroy();
+    }
+  });
+
+  it.each([
+    ["Delete row", "tr", 1, "AB"],
+    ["Delete column", "tr:first-child > th, tr:first-child > td", 1, "AC"],
+    ["Delete table", "table", 0, ""],
+  ] as const)(
+    "deletes the right-clicked target with the real Tiptap %s command",
+    async (label, selector, expectedCount, expectedText) => {
+      const editor = createProductionTableEditor();
+      try {
+        render(<EditorTableMenu editor={editor} />);
+        const target = editor.view.dom.querySelector(
+          "tbody tr:last-child > td:last-child",
+        );
+        if (!target) throw new Error("Expected the bottom-right table cell");
+
+        fireEvent.contextMenu(target, { clientX: 240, clientY: 180 });
+        fireEvent.click(await screen.findByRole("menuitem", { name: label }));
+
+        expect(editor.view.dom.querySelectorAll(selector)).toHaveLength(
+          expectedCount,
+        );
+        expect(editor.view.dom.querySelector("table")?.textContent ?? "").toBe(
+          expectedText,
         );
       } finally {
         editor.destroy();
