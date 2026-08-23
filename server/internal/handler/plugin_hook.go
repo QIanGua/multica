@@ -28,7 +28,7 @@ type invokePluginHookRequest struct {
 	Input   json.RawMessage `json:"input,omitempty"`
 }
 
-// InvokePluginHook — POST /v1/hooks/{key}
+// InvokePluginHook — POST /api/plugin-bridge/v1/hooks/{key}
 func (h *Handler) InvokePluginHook(w http.ResponseWriter, r *http.Request) {
 	// No scope of its own: a hook is the plugin's own capability, and what it
 	// may do on the way back is bounded by the installation's scopes when the

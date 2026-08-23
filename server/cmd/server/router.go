@@ -106,9 +106,6 @@ func registerPluginActionRoutes(r chi.Router, h *handler.Handler) {
 	r.Get("/storage/{scope}/{key}", h.GetPluginStorage)
 	r.Put("/storage/{scope}/{key}", h.PutPluginStorage)
 	r.Delete("/storage/{scope}/{key}", h.DeletePluginStorage)
-	// ui / manual only. `event` is dispatched by the host off the event bus;
-	// `agent` arrives over MCP rather than this HTTP endpoint.
-	r.Post("/hooks/{key}", h.InvokePluginHook)
 }
 
 func allowedOrigins() []string {
@@ -1419,6 +1416,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
 		r.Route(pluginBridgePrefix, func(r chi.Router) {
 			registerPluginActionRoutes(r, h)
+			// ui / manual only. `event` is dispatched by the host off the event
+			// bus; `agent` arrives over MCP rather than this HTTP endpoint.
+			r.Post("/hooks/{key}", h.InvokePluginHook)
 		})
 	})
 

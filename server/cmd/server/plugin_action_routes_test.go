@@ -42,6 +42,18 @@ func TestPluginActionRouteTrustBoundaries(t *testing.T) {
 			path:       "/api/v1/plugin/context",
 			wantStatus: http.StatusNotFound,
 		},
+		{
+			name:          "public API does not expose person-triggered hooks",
+			path:          "/v1/hooks/summarize",
+			authorization: "Bearer mpi_invalid",
+			wantStatus:    http.StatusNotFound,
+		},
+		{
+			name:          "surface bridge retains person-triggered hooks",
+			path:          "/api/plugin-bridge/v1/hooks/summarize",
+			authorization: "Bearer " + testToken,
+			wantStatus:    http.StatusMethodNotAllowed,
+		},
 	}
 
 	for _, tt := range tests {
