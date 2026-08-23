@@ -112,6 +112,11 @@ export const PluginHookSchema = z.object({
   description: z.string().default(""),
   triggers: z.array(z.string()).default([]),
   events: z.array(z.string()).default([]),
+  schedule: z.object({
+    cron: z.string().default(""),
+    timezone: z.string().default(""),
+    next_run_at: z.string().optional(),
+  }).loose().optional(),
   transport: z.string().default(""),
 }).loose();
 
@@ -190,6 +195,8 @@ export const PluginInvocationSchema = z.object({
   attempt: z.number().default(1),
   latency_ms: z.number().default(0),
   error: z.string().optional(),
+  delivery_id: z.string().optional(),
+  planned_at: z.string().optional(),
   created_at: z.string().default(""),
 }).loose();
 
@@ -234,6 +241,17 @@ export const PluginManifestSummarySchema = z.object({
     name: z.string().default(""),
     url: z.string().optional(),
   }).loose().default({ name: "" }),
+  contributes: z.object({
+    hooks: z.array(z.object({
+      key: z.string().default(""),
+      name: z.string().default(""),
+      triggers: z.array(z.string()).default([]),
+      schedule: z.object({
+        cron: z.string().default(""),
+        timezone: z.string().default(""),
+      }).loose().optional(),
+    }).loose()).default([]),
+  }).loose().optional(),
 }).loose();
 
 export const PluginPreviewSchema = z.object({

@@ -368,6 +368,19 @@
       "upgrade_from": " · 从 v{{version}} 升级",
       "new_scope": "新增"
     },
+    "schedule": {
+      "title": "自动运行计划",
+      "consent_title": "该 Plugin 将自动运行 hook",
+      "consent_description": "安装或升级后会启用以下计划。错过多个时间点时，只补跑最近一次。",
+      "next_run": "下次：{{time}}",
+      "activity_title": "最近投递",
+      "activity_last": "{{status}} · 计划 {{planned}} · 发出 {{actual}} · 第 {{attempt}} 次尝试",
+      "activity_empty": "尚未投递",
+      "frequency_minutes_other": "每 {{count}} 分钟",
+      "frequency_hourly": "每小时第 {{minute}} 分钟",
+      "frequency_daily": "每天 {{hour}}:{{minute}}",
+      "frequency_custom": "自定义周期"
+    },
     "config": {
       "title": "配置",
       "save": "保存",
