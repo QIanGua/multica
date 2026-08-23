@@ -9,18 +9,37 @@ export const runtimeModelsKeys = {
 };
 
 const POLL_INTERVAL_MS = 500;
-// Matched to the server's modelListRunningTimeout (60s), which is how long a
-// claimed request stays answerable. Below that the client abandons requests the
-// server would still have reported on, and the user is shown a generic "timed
-// out" in place of the reason the daemon was about to send — for a hermes that
-// cannot resolve its provider, that reason names the exact command to run
-// (MUL-6606). The budget has to cover a heartbeat pickup (up to 15s) plus the
-// runtime's own discovery, and hermes' failure path alone is ~25s.
+
+// The client must not give up on a request the server still considers live.
+// Those two windows are sequential, not overlapping (server/internal/handler/
+// runtime_models.go):
+//
+//   - pending: measured from CreatedAt, so the daemon has up to 30s to CLAIM
+//     the request off a heartbeat.
+//   - running: measured from RunStartedAt, which PopPending sets at claim
+//     time. Heartbeat pickup happens before the claim and is bounded by the
+//     pending window, so it does not eat into this 60s.
+//
+// A request claimed at 29s that then runs hermes' ~25-40s discovery reports at
+// ~69s — past a 60s client budget, while the server is still holding the record
+// open. The user would be shown a generic client-side "timed out" instead of the
+// reason the daemon was about to deliver, which for hermes names the exact
+// command to run (MUL-6606). Budgeting for the sum removes that whole class of
+// premature give-up, and lets the server's own timeout text ("daemon did not
+// respond within 30 seconds") win instead of ours — it is the more specific of
+// the two.
 //
 // Waiting longer costs the user nothing here: the picker's manual-entry input
 // stays live for the whole poll, so a model ID can be typed and saved without
 // waiting for discovery at all.
-const POLL_TIMEOUT_MS = 60_000;
+const SERVER_PENDING_TIMEOUT_MS = 30_000;
+const SERVER_RUNNING_TIMEOUT_MS = 60_000;
+// Slack for the poll interval, the store's own sweep granularity, and network
+// latency on the final GET — without it the client can still expire in the same
+// tick the server transitions the record.
+const POLL_SLACK_MS = 10_000;
+const POLL_TIMEOUT_MS =
+  SERVER_PENDING_TIMEOUT_MS + SERVER_RUNNING_TIMEOUT_MS + POLL_SLACK_MS;
 
 // How long a LIVE discovery result (one the daemon just produced) is trusted
 // without re-asking. Discovery is a round trip to the user's machine, and a
