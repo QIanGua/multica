@@ -26,9 +26,13 @@ ORDER BY i.created_at DESC;
 -- renders plus, when different, the newest row carrying a comment anchor. The
 -- client already merges those two rows while deduplicating, preserving direct
 -- comment landing without sending every historical notification in the group.
+-- Keep the materialized working set narrow: full row data is joined only for
+-- the final selected ids, not copied for every archived notification scanned.
 WITH eligible_archived AS MATERIALIZED (
-    SELECT i.*,
-           COALESCE(i.issue_id, i.id) AS group_id
+    SELECT i.id,
+           COALESCE(i.issue_id, i.id) AS group_id,
+           i.created_at,
+           i.details
     FROM inbox_item i
     WHERE i.workspace_id = $1
       AND i.recipient_type = $2

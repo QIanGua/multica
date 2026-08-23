@@ -378,8 +378,10 @@ func (q *Queries) GetInboxItemInWorkspace(ctx context.Context, arg GetInboxItemI
 
 const listArchivedInboxItems = `-- name: ListArchivedInboxItems :many
 WITH eligible_archived AS MATERIALIZED (
-    SELECT i.id, i.workspace_id, i.recipient_type, i.recipient_id, i.type, i.severity, i.issue_id, i.title, i.body, i.read, i.archived, i.created_at, i.actor_type, i.actor_id, i.details,
-           COALESCE(i.issue_id, i.id) AS group_id
+    SELECT i.id,
+           COALESCE(i.issue_id, i.id) AS group_id,
+           i.created_at,
+           i.details
     FROM inbox_item i
     WHERE i.workspace_id = $1
       AND i.recipient_type = $2
@@ -471,6 +473,8 @@ type ListArchivedInboxItemsRow struct {
 // renders plus, when different, the newest row carrying a comment anchor. The
 // client already merges those two rows while deduplicating, preserving direct
 // comment landing without sending every historical notification in the group.
+// Keep the materialized working set narrow: full row data is joined only for
+// the final selected ids, not copied for every archived notification scanned.
 func (q *Queries) ListArchivedInboxItems(ctx context.Context, arg ListArchivedInboxItemsParams) ([]ListArchivedInboxItemsRow, error) {
 	rows, err := q.db.Query(ctx, listArchivedInboxItems, arg.WorkspaceID, arg.RecipientType, arg.RecipientID)
 	if err != nil {
