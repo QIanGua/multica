@@ -319,6 +319,11 @@
   line-height: 1.625;
 }
 
+.rich-text-editor th:not(:first-child),
+.rich-text-editor td:not(:first-child) {
+  border-left: 1px solid var(--border);
+}
+
 .rich-text-editor th {
   font-weight: 600;
 }
