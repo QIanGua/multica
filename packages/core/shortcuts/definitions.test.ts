@@ -93,12 +93,12 @@ describe("keyboard shortcut definitions", () => {
     expect(action.allowInEditable).toBe(true);
   });
 
-  it("pairs the left and right sidebar toggles without a default conflict", () => {
+  it("assigns distinct defaults to the left and right sidebar toggles", () => {
     expect(SHORTCUT_ACTION_BY_ID.toggleSidebar.defaultShortcut).toEqual(
       createShortcutChord("B", { primary: true }),
     );
     expect(SHORTCUT_ACTION_BY_ID.toggleRightSidebar.defaultShortcut).toEqual(
-      createShortcutChord("B", { primary: true, shift: true }),
+      createShortcutChord("/", { primary: true }),
     );
     expect(SHORTCUT_ACTION_BY_ID.toggleRightSidebar.allowInEditable).toBe(false);
   });

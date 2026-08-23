@@ -82,7 +82,7 @@ describe("animated right sidebar state", () => {
 });
 
 describe("right sidebar shortcut", () => {
-  it("toggles the visible detail sidebar on Mod+Shift+B", () => {
+  it("toggles the visible detail sidebar on Mod+/", () => {
     configureShortcutPlatform("macos");
     const onToggle = vi.fn();
     const target = document.createElement("div");
@@ -94,9 +94,8 @@ describe("right sidebar shortcut", () => {
       useRightSidebarShortcut(targetRef, onToggle),
     );
     const event = new KeyboardEvent("keydown", {
-      key: "b",
+      key: "/",
       metaKey: true,
-      shiftKey: true,
       cancelable: true,
     });
 
@@ -116,9 +115,8 @@ describe("right sidebar shortcut", () => {
       useRightSidebarShortcut(targetRef, onToggle),
     );
     const event = new KeyboardEvent("keydown", {
-      key: "b",
+      key: "/",
       metaKey: true,
-      shiftKey: true,
       cancelable: true,
     });
 

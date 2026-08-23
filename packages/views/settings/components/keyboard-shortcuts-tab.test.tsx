@@ -35,8 +35,7 @@ describe("KeyboardShortcutsTab", () => {
     expect(within(rightSidebarRecorder).getByTitle("Ctrl")).toHaveTextContent(
       "Ctrl",
     );
-    expect(within(rightSidebarRecorder).getByTitle("Shift")).toBeInTheDocument();
-    expect(within(rightSidebarRecorder).getByTitle("B")).toHaveTextContent("B");
+    expect(within(rightSidebarRecorder).getByTitle("/")).toHaveTextContent("/");
   });
 
   it("records a shortcut and applies it immediately", () => {
