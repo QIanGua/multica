@@ -6,7 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import type { Editor } from "@tiptap/core";
+import { Editor } from "@tiptap/core";
 
 const autoUpdateMock = vi.hoisted(() =>
   vi.fn((_reference: unknown, _floating: unknown, update: () => void) => {
@@ -25,11 +25,8 @@ const labels = {
   column_options: "Column options",
   add_row_above: "Add row above",
   add_row_below: "Add row below",
-  delete_row: "Delete row",
   add_column_left: "Add column left",
   add_column_right: "Add column right",
-  delete_column: "Delete column",
-  delete_table: "Delete table",
 };
 
 vi.mock("../i18n", () => ({
@@ -40,6 +37,7 @@ vi.mock("../i18n", () => ({
 }));
 
 import { EditorTableMenu } from "./table-menu";
+import { createEditorExtensions } from "./extensions";
 
 type EditorEvent = "transaction" | "blur";
 
@@ -86,21 +84,15 @@ function createEditorHarness() {
     focus: vi.fn(),
     addRowBefore: vi.fn(),
     addRowAfter: vi.fn(),
-    deleteRow: vi.fn(),
     addColumnBefore: vi.fn(),
     addColumnAfter: vi.fn(),
-    deleteColumn: vi.fn(),
-    deleteTable: vi.fn(),
     run,
   };
   commands.focus.mockReturnValue(commands);
   commands.addRowBefore.mockReturnValue(commands);
   commands.addRowAfter.mockReturnValue(commands);
-  commands.deleteRow.mockReturnValue(commands);
   commands.addColumnBefore.mockReturnValue(commands);
   commands.addColumnAfter.mockReturnValue(commands);
-  commands.deleteColumn.mockReturnValue(commands);
-  commands.deleteTable.mockReturnValue(commands);
 
   const editor = {
     isDestroyed: false,
@@ -147,6 +139,51 @@ async function renderInTable() {
   render(<EditorTableMenu editor={harness.editor} />);
   await screen.findByRole("toolbar", { name: "Edit table" });
   return harness;
+}
+
+function createProductionTableEditor(): Editor {
+  const element = document.createElement("div");
+  document.body.appendChild(element);
+  const editor = new Editor({
+    element,
+    extensions: createEditorExtensions({
+      placeholder: "",
+      disableMentions: true,
+      enableSlashCommands: false,
+      onUploadFileRef: { current: undefined },
+    }),
+  });
+
+  editor.commands.setContent(
+    ["| A | B |", "| --- | --- |", "| C | D |"].join("\n"),
+    { contentType: "markdown" },
+  );
+
+  let firstCellPosition: number | null = null;
+  editor.state.doc.descendants((node, position) => {
+    if (firstCellPosition !== null) return false;
+    if (node.type.name !== "tableHeader" && node.type.name !== "tableCell") {
+      return true;
+    }
+    firstCellPosition = position;
+    return false;
+  });
+  if (firstCellPosition === null) throw new Error("Expected a parsed table");
+  editor.commands.setTextSelection(firstCellPosition + 2);
+
+  const wrapper = editor.view.dom.querySelector<HTMLElement>(".tableWrapper");
+  const table = wrapper?.querySelector<HTMLTableElement>("table");
+  const row = table?.querySelector<HTMLTableRowElement>("tr");
+  const cell = row?.querySelector<HTMLTableCellElement>("th, td");
+  if (!wrapper || !table || !row || !cell) {
+    throw new Error("Expected rendered production table elements");
+  }
+
+  cell.getBoundingClientRect = () => rect(120, 100, 180, 48);
+  row.getBoundingClientRect = () => rect(100, 100, 360, 48);
+  table.getBoundingClientRect = () => rect(100, 100, 360, 96);
+  wrapper.getBoundingClientRect = () => rect(100, 100, 360, 96);
+  return editor;
 }
 
 describe("EditorTableMenu", () => {
@@ -226,20 +263,50 @@ describe("EditorTableMenu", () => {
   );
 
   it.each([
-    ["Row options", "Delete row", "deleteRow"],
-    ["Column options", "Delete column", "deleteColumn"],
-    ["Edit table", "Delete table", "deleteTable"],
+    ["Add column left", "114px", "100px", "12px", "96px"],
+    ["Add row below", "100px", "142px", "360px", "12px"],
   ] as const)(
-    "keeps destructive %s actions in a labeled menu",
-    async (triggerLabel, itemLabel, command) => {
-      const harness = await renderInTable();
+    "uses the %s border as the complete hover and click target",
+    async (label, left, top, width, height) => {
+      await renderInTable();
 
-      fireEvent.click(screen.getByRole("button", { name: triggerLabel }));
-      fireEvent.click(await screen.findByRole("menuitem", { name: itemLabel }));
+      expect(screen.getByRole("button", { name: label })).toHaveStyle({
+        left,
+        top,
+        width,
+        height,
+      });
+    },
+  );
 
-      expect(harness.commands.focus).toHaveBeenCalledTimes(1);
-      expect(harness.commands[command]).toHaveBeenCalledTimes(1);
-      expect(harness.commands.run).toHaveBeenCalledTimes(1);
+  it("does not render persistent table, row, or column menu buttons", async () => {
+    await renderInTable();
+
+    expect(screen.queryByRole("button", { name: "Edit table" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Row options" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Column options" })).toBeNull();
+    expect(screen.getAllByRole("button")).toHaveLength(4);
+  });
+
+  it.each([
+    ["Add row below", "tr", 3],
+    ["Add column right", "tr:first-child > th, tr:first-child > td", 3],
+  ] as const)(
+    "changes the real Tiptap document when clicking %s",
+    async (label, selector, expectedCount) => {
+      const editor = createProductionTableEditor();
+      try {
+        render(<EditorTableMenu editor={editor} />);
+        await screen.findByRole("toolbar", { name: "Edit table" });
+
+        fireEvent.click(screen.getByRole("button", { name: label }));
+
+        expect(editor.view.dom.querySelectorAll(selector)).toHaveLength(
+          expectedCount,
+        );
+      } finally {
+        editor.destroy();
+      }
     },
   );
 });
