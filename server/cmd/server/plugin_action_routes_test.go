@@ -1,18 +1,23 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"testing"
+
+	publicapiv1 "github.com/multica-ai/multica/server/pkg/publicapi/v1"
 )
 
 func TestPluginActionRouteTrustBoundaries(t *testing.T) {
 	tests := []struct {
 		name          string
+		method        string
 		path          string
 		authorization string
 		wantStatus    int
 		wantHandler   bool
+		wantProblem   bool
 	}{
 		{
 			name:       "public API rejects a missing token before the handler",
@@ -47,6 +52,22 @@ func TestPluginActionRouteTrustBoundaries(t *testing.T) {
 			path:          "/v1/hooks/summarize",
 			authorization: "Bearer mpi_invalid",
 			wantStatus:    http.StatusNotFound,
+			wantProblem:   true,
+		},
+		{
+			name:          "public API empty resource path uses the problem contract",
+			path:          "/v1/issues/",
+			authorization: "Bearer mpi_invalid",
+			wantStatus:    http.StatusNotFound,
+			wantProblem:   true,
+		},
+		{
+			name:          "public API unsupported method uses the problem contract",
+			method:        http.MethodPut,
+			path:          "/v1/context",
+			authorization: "Bearer mpi_invalid",
+			wantStatus:    http.StatusMethodNotAllowed,
+			wantProblem:   true,
 		},
 		{
 			name:          "surface bridge retains person-triggered hooks",
@@ -58,7 +79,11 @@ func TestPluginActionRouteTrustBoundaries(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req, err := http.NewRequest(http.MethodGet, testServer.URL+tt.path, nil)
+			method := tt.method
+			if method == "" {
+				method = http.MethodGet
+			}
+			req, err := http.NewRequest(method, testServer.URL+tt.path, nil)
 			if err != nil {
 				t.Fatalf("build request: %v", err)
 			}
@@ -70,7 +95,7 @@ func TestPluginActionRouteTrustBoundaries(t *testing.T) {
 				t.Fatalf("request failed: %v", err)
 			}
 			defer response.Body.Close()
-			_, _ = io.Copy(io.Discard, response.Body)
+			body, _ := io.ReadAll(response.Body)
 
 			if tt.wantHandler {
 				if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusNotFound {
@@ -80,6 +105,18 @@ func TestPluginActionRouteTrustBoundaries(t *testing.T) {
 			}
 			if response.StatusCode != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", response.StatusCode, tt.wantStatus)
+			}
+			if tt.wantProblem {
+				if got := response.Header.Get("Content-Type"); got != publicapiv1.ProblemContentType {
+					t.Fatalf("Content-Type = %q, body=%s", got, body)
+				}
+				var problem publicapiv1.Problem
+				if err := json.Unmarshal(body, &problem); err != nil {
+					t.Fatalf("decode problem: %v; body=%s", err, body)
+				}
+				if problem.Status != tt.wantStatus || problem.RequestID == "" {
+					t.Fatalf("unexpected problem: %+v", problem)
+				}
 			}
 		})
 	}

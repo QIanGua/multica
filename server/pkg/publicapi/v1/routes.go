@@ -55,13 +55,13 @@ var sharedRateLimits = []RateLimitProfile{RateLimitUserDefault, RateLimitPluginS
 var pluginRateLimits = []RateLimitProfile{RateLimitPluginStrict}
 
 var Operations = []Operation{
-	{Method: http.MethodGet, Path: PathContext, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskRead, RateLimits: pluginRateLimits}},
-	{Method: http.MethodGet, Path: PathIssue, Contract: ContractSharedResource, Policy: OperationPolicy{Credentials: sharedCredentials, Scope: "issues:read", Risk: RiskRead, Audit: true, RateLimits: sharedRateLimits}},
-	{Method: http.MethodPatch, Path: PathIssue, Contract: ContractSharedResource, Policy: OperationPolicy{Credentials: sharedCredentials, Scope: "issues:write", Risk: RiskContentWrite, Audit: true, RateLimits: sharedRateLimits}},
-	{Method: http.MethodGet, Path: PathIssueComments, Contract: ContractSharedResource, Policy: OperationPolicy{Credentials: sharedCredentials, Scope: "comments:read", Risk: RiskRead, Audit: true, RateLimits: sharedRateLimits}},
-	{Method: http.MethodPost, Path: PathIssueComments, Contract: ContractSharedResource, Policy: OperationPolicy{Credentials: sharedCredentials, Scope: "comments:write", Risk: RiskContentWrite, Audit: true, RateLimits: sharedRateLimits}},
-	{Method: http.MethodGet, Path: PathStorageScope, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskRead, RateLimits: pluginRateLimits}},
-	{Method: http.MethodGet, Path: PathStorageValue, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskRead, RateLimits: pluginRateLimits}},
-	{Method: http.MethodPut, Path: PathStorageValue, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskContentWrite, Audit: true, RateLimits: pluginRateLimits}},
-	{Method: http.MethodDelete, Path: PathStorageValue, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskContentWrite, Audit: true, RateLimits: pluginRateLimits}},
+	{Method: http.MethodGet, Path: PathContext, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskRead, Audit: AuditNotRequired, RateLimits: pluginRateLimits}},
+	{Method: http.MethodGet, Path: PathIssue, Contract: ContractSharedResource, Policy: OperationPolicy{Credentials: sharedCredentials, Scope: "issues:read", Risk: RiskRead, Audit: AuditPlanned, RateLimits: sharedRateLimits}},
+	{Method: http.MethodPatch, Path: PathIssue, Contract: ContractSharedResource, Policy: OperationPolicy{Credentials: sharedCredentials, Scope: "issues:write", Risk: RiskContentWrite, Audit: AuditPlanned, RateLimits: sharedRateLimits}},
+	{Method: http.MethodGet, Path: PathIssueComments, Contract: ContractSharedResource, Policy: OperationPolicy{Credentials: sharedCredentials, Scope: "comments:read", Risk: RiskRead, Audit: AuditPlanned, RateLimits: sharedRateLimits}},
+	{Method: http.MethodPost, Path: PathIssueComments, Contract: ContractSharedResource, Policy: OperationPolicy{Credentials: sharedCredentials, Scope: "comments:write", Risk: RiskContentWrite, Audit: AuditPlanned, RateLimits: sharedRateLimits}},
+	{Method: http.MethodGet, Path: PathStorageScope, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskRead, Audit: AuditNotRequired, RateLimits: pluginRateLimits}},
+	{Method: http.MethodGet, Path: PathStorageValue, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskRead, Audit: AuditNotRequired, RateLimits: pluginRateLimits}},
+	{Method: http.MethodPut, Path: PathStorageValue, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskContentWrite, Audit: AuditPlanned, RateLimits: pluginRateLimits}},
+	{Method: http.MethodDelete, Path: PathStorageValue, Contract: ContractPluginExtension, Policy: OperationPolicy{Credentials: pluginCredentials, Risk: RiskContentWrite, Audit: AuditPlanned, RateLimits: pluginRateLimits}},
 }

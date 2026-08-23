@@ -1407,6 +1407,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Use(middleware.PluginRateLimit(rdb, envPositiveInt("RATE_LIMIT_PLUGIN_API", 120), time.Minute))
 		r.Route(publicapiv1.BasePath, func(r chi.Router) {
 			registerPluginActionRoutes(r, h)
+			r.NotFound(publicapiv1.NotFound)
+			r.MethodNotAllowed(publicapiv1.MethodNotAllowed)
 		})
 	})
 

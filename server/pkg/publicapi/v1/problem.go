@@ -101,3 +101,11 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, status int, code, deta
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }
+
+func NotFound(w http.ResponseWriter, r *http.Request) {
+	WriteProblem(w, r, http.StatusNotFound, "not_found", "resource not found")
+}
+
+func MethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	WriteProblem(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+}

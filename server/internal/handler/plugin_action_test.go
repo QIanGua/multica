@@ -72,6 +72,83 @@ func pluginActionRequest(method, path, installationID string, body any, params m
 	return request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, routeContext))
 }
 
+func pluginInstallTokenRequest(method, path, token string, body any, params map[string]string) *http.Request {
+	request := pluginActionRequest(method, path, "", body, params)
+	request.Header.Del("X-User-ID")
+	request.Header.Set("Authorization", "Bearer "+token)
+	return request
+}
+
+func TestPluginInstallTokenRunsIssueCommentWorkflow(t *testing.T) {
+	installationID := installPluginForAction(t, []string{"issues:read", "issues:write", "comments:read", "comments:write"})
+	token, err := testHandler.PluginService.IssueInstallToken(context.Background(), parseUUID(installationID))
+	if err != nil {
+		t.Fatalf("issue install token: %v", err)
+	}
+	issueID := createTestIssue(t, "Install token workflow", "todo", "none")
+
+	get := httptest.NewRecorder()
+	testHandler.GetPluginIssue(get, pluginInstallTokenRequest(http.MethodGet, "/v1/issues/"+issueID, token, nil,
+		map[string]string{"issue_ref": issueID}))
+	if get.Code != http.StatusOK {
+		t.Fatalf("install-token issue read status=%d body=%s", get.Code, get.Body.String())
+	}
+
+	patchRequest := pluginInstallTokenRequest(http.MethodPatch, "/v1/issues/"+issueID, token,
+		map[string]any{"title": "Updated by install token"}, map[string]string{"issue_ref": issueID})
+	patchRequest.Header.Set("If-Match", get.Header().Get("ETag"))
+	patch := httptest.NewRecorder()
+	testHandler.PatchPluginIssue(patch, patchRequest)
+	if patch.Code != http.StatusOK {
+		t.Fatalf("install-token issue patch status=%d body=%s", patch.Code, patch.Body.String())
+	}
+
+	create := httptest.NewRecorder()
+	testHandler.CreatePluginComment(create, pluginInstallTokenRequest(http.MethodPost, "/v1/issues/"+issueID+"/comments", token,
+		map[string]any{"content": "created with a real mpi token"}, map[string]string{"issue_ref": issueID}))
+	if create.Code != http.StatusCreated {
+		t.Fatalf("install-token comment create status=%d body=%s", create.Code, create.Body.String())
+	}
+	var comment publicapiv1.Comment
+	if err := json.Unmarshal(create.Body.Bytes(), &comment); err != nil {
+		t.Fatalf("decode install-token comment: %v", err)
+	}
+	if comment.AuthorType != "plugin" || comment.AuthorID != installationID {
+		t.Fatalf("install-token comment attribution = %+v", comment)
+	}
+
+	list := httptest.NewRecorder()
+	testHandler.ListPluginComments(list, pluginInstallTokenRequest(http.MethodGet, "/v1/issues/"+issueID+"/comments", token, nil,
+		map[string]string{"issue_ref": issueID}))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), comment.ID) {
+		t.Fatalf("install-token comment list status=%d body=%s", list.Code, list.Body.String())
+	}
+}
+
+func TestPluginInstallTokenEnforcesGrantedScope(t *testing.T) {
+	installationID := installPluginForAction(t, []string{"issues:read"})
+	token, err := testHandler.PluginService.IssueInstallToken(context.Background(), parseUUID(installationID))
+	if err != nil {
+		t.Fatalf("issue install token: %v", err)
+	}
+	issueID := createTestIssue(t, "Install token scope", "todo", "none")
+
+	request := pluginInstallTokenRequest(http.MethodPatch, "/v1/issues/"+issueID, token,
+		map[string]any{"title": "must not update"}, map[string]string{"issue_ref": issueID})
+	response := httptest.NewRecorder()
+	testHandler.PatchPluginIssue(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("ungranted install-token patch status=%d body=%s", response.Code, response.Body.String())
+	}
+	var problem publicapiv1.Problem
+	if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode scope problem: %v", err)
+	}
+	if problem.Code != "forbidden" || !strings.Contains(problem.Detail, "issues:write") {
+		t.Fatalf("unexpected scope problem: %+v", problem)
+	}
+}
+
 func TestPluginActionRequiresAGrantedScope(t *testing.T) {
 	// Installed with issues:read only. Everything else must be refused, and the
 	// refusal must name the missing scope so an admin can act on it.

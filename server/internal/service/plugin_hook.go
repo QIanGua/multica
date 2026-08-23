@@ -454,6 +454,9 @@ func (s *PluginService) hookSigningKey(installationID pgtype.UUID) ([]byte, erro
 	if len(s.DeploymentKey) == 0 {
 		return nil, pluginErrf(PluginErrorUnavailable, "hooks are disabled: MULTICA_PLUGIN_SECRET_KEY is not configured")
 	}
+	if len(s.DeploymentKey) != 32 {
+		return nil, pluginErrf(PluginErrorUnavailable, "hooks are disabled: MULTICA_PLUGIN_SECRET_KEY must decode to 32 bytes")
+	}
 	mac := hmac.New(sha256.New, s.DeploymentKey)
 	mac.Write([]byte("multica-plugin-hook-signature:v1:"))
 	mac.Write([]byte(uuidString(installationID)))

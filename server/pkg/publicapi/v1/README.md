@@ -41,6 +41,9 @@ endpoint-specific concurrency rules.
 - The capability ledger states credential families, scope, risk, audit, and
   rate-limit policy. Plugin requests use the stricter surface profile even when
   the resource DTO and service are shared with a user/PAT request.
+- Audit requirements use an explicit lifecycle (`planned` or `enforced`). The
+  migrated operations remain `planned` until a durable audit sink is wired;
+  the ledger does not imply that a boolean marker performs an audit write.
 
 ## Rollout ledger
 

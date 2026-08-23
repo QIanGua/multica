@@ -47,6 +47,21 @@ func TestOpenAPICoversCapabilityLedger(t *testing.T) {
 			}
 		}
 	}
+	for _, operation := range Operations {
+		method := strings.ToLower(operation.Method)
+		raw, ok := doc.Paths[operation.Path][method].(map[string]any)
+		if !ok {
+			t.Errorf("OpenAPI operation %s %s is not an object", operation.Method, operation.Path)
+			continue
+		}
+		if got, _ := raw["x-multica-contract"].(string); got != string(operation.Contract) {
+			t.Errorf("%s %s x-multica-contract = %q, want %q", operation.Method, operation.Path, got, operation.Contract)
+		}
+		gotScope, _ := raw["x-multica-scope"].(string)
+		if gotScope != operation.Policy.Scope {
+			t.Errorf("%s %s x-multica-scope = %q, want %q", operation.Method, operation.Path, gotScope, operation.Policy.Scope)
+		}
+	}
 	if _, exposed := doc.Paths["/hooks/{hook_key}"]; exposed {
 		t.Fatal("Plugin-only person hook leaked into the public contract")
 	}
@@ -70,8 +85,8 @@ func TestOperationLedgerPinsSharedScopes(t *testing.T) {
 		if len(operation.Policy.Credentials) != 4 {
 			t.Errorf("%s does not declare both user and Plugin credential families: %v", key, operation.Policy.Credentials)
 		}
-		if !operation.Policy.Audit {
-			t.Errorf("%s must be audit-visible", key)
+		if operation.Policy.Audit != AuditPlanned {
+			t.Errorf("%s audit status = %q, want %q until an audit sink is implemented", key, operation.Policy.Audit, AuditPlanned)
 		}
 		delete(want, key)
 	}
@@ -89,6 +104,14 @@ func TestPluginExtensionsRejectUserCredentialsByContract(t *testing.T) {
 			if credential == CredentialUserOAuth || credential == CredentialPersonalAccess {
 				t.Errorf("%s %s exposes Plugin extension to %s", operation.Method, operation.Path, credential)
 			}
+		}
+	}
+}
+
+func TestOperationLedgerDeclaresAuditLifecycle(t *testing.T) {
+	for _, operation := range Operations {
+		if operation.Policy.Audit == "" {
+			t.Errorf("%s %s has no explicit audit lifecycle", operation.Method, operation.Path)
 		}
 	}
 }

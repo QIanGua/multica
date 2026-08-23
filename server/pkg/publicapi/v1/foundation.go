@@ -50,6 +50,17 @@ const (
 	RateLimitPluginStrict RateLimitProfile = "plugin_strict"
 )
 
+// AuditStatus distinguishes a declared requirement from an implemented audit
+// sink. A capability must not claim enforcement merely because it is listed in
+// the contract ledger.
+type AuditStatus string
+
+const (
+	AuditNotRequired AuditStatus = "not_required"
+	AuditPlanned     AuditStatus = "planned"
+	AuditEnforced    AuditStatus = "enforced"
+)
+
 // OperationPolicy records authorization and observability requirements next
 // to the route contract. Surface-specific middleware enforces the credential
 // kind and rate profile; resource authorization enforces workspace and scope.
@@ -57,7 +68,7 @@ type OperationPolicy struct {
 	Credentials []CredentialKind
 	Scope       string
 	Risk        RiskLevel
-	Audit       bool
+	Audit       AuditStatus
 	RateLimits  []RateLimitProfile
 }
 
