@@ -9,7 +9,18 @@ export const runtimeModelsKeys = {
 };
 
 const POLL_INTERVAL_MS = 500;
-const POLL_TIMEOUT_MS = 30_000;
+// Matched to the server's modelListRunningTimeout (60s), which is how long a
+// claimed request stays answerable. Below that the client abandons requests the
+// server would still have reported on, and the user is shown a generic "timed
+// out" in place of the reason the daemon was about to send — for a hermes that
+// cannot resolve its provider, that reason names the exact command to run
+// (MUL-6606). The budget has to cover a heartbeat pickup (up to 15s) plus the
+// runtime's own discovery, and hermes' failure path alone is ~25s.
+//
+// Waiting longer costs the user nothing here: the picker's manual-entry input
+// stays live for the whole poll, so a model ID can be typed and saved without
+// waiting for discovery at all.
+const POLL_TIMEOUT_MS = 60_000;
 
 // How long a LIVE discovery result (one the daemon just produced) is trusted
 // without re-asking. Discovery is a round trip to the user's machine, and a
@@ -26,8 +37,9 @@ export const MODELS_GC_TIME_MS = 30 * 60_000;
 // (via heartbeat piggyback) and polls until the daemon reports back or
 // the request times out. Returns both the models list and a
 // `supported` flag: `supported=false` means the provider ignores
-// per-agent model selection entirely (hermes today) — the UI uses
-// this to disable its dropdown instead of accepting a value that
+// per-agent model selection entirely (qwenpaw and mcode — hermes is NOT
+// one of them; it applies opts.Model via ACP session/set_model) — the UI
+// uses this to disable its dropdown instead of accepting a value that
 // wouldn't be honoured at runtime.
 //
 // `cached` reports that the server answered from its catalog cache rather than
