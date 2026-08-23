@@ -11,6 +11,21 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 export MULTICA_DEV_HOME="$tmp_dir/dev"
+export MULTICA_DEV_WORKSPACES_PARENT="$tmp_dir/workspaces-parent"
+export MULTICA_DEV_DESKTOP_APP_DATA="$tmp_dir/app-data"
+export MULTICA_DEV_PROFILES_HOME="$tmp_dir/profiles"
+
+fake_bin="$tmp_dir/bin"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/psql" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+  *" DROP DATABASE "*) [ "${FAIL_DROP:-0}" != 1 ] ;;
+  *) printf '1\n' ;;
+esac
+EOF
+chmod +x "$fake_bin/psql"
+export PATH="$fake_bin:$PATH"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -33,20 +48,24 @@ dev_env() {
 
 write_manifest() {
   local name=$1 dir=$2 offset=$3
+  local profile="dev-dev-env-test-$offset"
   mkdir -p "$MULTICA_DEV_HOME/envs/$name/logs"
   cat > "$MULTICA_DEV_HOME/envs/$name/manifest.env" <<EOF
 NAME=$name
-DIR=$dir
+DIR=$(printf '%q' "$dir")
 CREATED_AT=2026-01-01T00:00:00Z
 OWNER=agent
 TTL_HOURS=0
-ENV_FILE=.env.worktree
+ENV_FILE=.env.example
 OFFSET=$offset
 BACKEND_PORT=$((18080 + offset))
 FRONTEND_PORT=$((13000 + offset))
 DB_NAME=multica_dev_env_test_$offset
 DATABASE_URL=postgres://multica:multica@localhost:5432/multica_dev_env_test_$offset?sslmode=disable
-PROFILE=dev-dev-env-test-$offset
+PROFILE=$profile
+WORKSPACES_ROOT=$(printf '%q' "$MULTICA_DEV_WORKSPACES_PARENT/multica_workspaces_$profile")
+DESKTOP_RENDERER_PORT=$((5174 + offset))
+DESKTOP_APP_SUFFIX=$name
 EOF
 }
 
@@ -62,6 +81,37 @@ dev_env list --json > "$out" 2>&1 || fail "list --json on an empty registry must
 if [ "$(cat "$out")" != "[]" ]; then
   fail "list --json on an empty registry = $(cat "$out"), want []"
 fi
+
+# ---------------------------------------------------------------------------
+# Manifest serialization and user-provided names are safe. A manifest is
+# sourced by Bash, so values must be shell-escaped and a name must never be
+# able to walk outside envs/ before destroy eventually runs rm -rf.
+# ---------------------------------------------------------------------------
+quoted="$tmp_dir/quoted.env"
+dangerous='a path with spaces;$(touch should-not-exist)'
+bash -c 'source "$1"; write_manifest_value DIR "$2"' _ "$root_dir/scripts/dev-env.sh" "$dangerous" > "$quoted"
+loaded="$(bash -c 'source "$1"; printf %s "$DIR"' _ "$quoted")"
+[ "$loaded" = "$dangerous" ] || fail "manifest value did not round-trip safely"
+[ ! -e "$root_dir/should-not-exist" ] || fail "loading a manifest executed its value"
+
+status=0
+dev_env up --name ../../escape > "$out" 2>&1 || status=$?
+[ "$status" -ne 0 ] || fail "up accepted a path-traversing environment name"
+require_contains "$out" "Invalid environment name"
+
+status=0
+dev_env up --ttl nope > "$out" 2>&1 || status=$?
+[ "$status" -ne 0 ] || fail "up accepted a non-numeric TTL"
+require_contains "$out" "TTL must be a positive integer"
+
+# Rewriting an allocated database name must preserve the existing connection
+# endpoint, credentials and query parameters.
+rewritten="$(bash -c 'source "$1"; database_url_with_name "$2" "$3"' _ \
+  "$root_dir/scripts/dev-env.sh" \
+  'postgres://dev:p%40ss@127.0.0.1:55432/old_db?sslmode=require&application_name=dev' \
+  'new_db')"
+[ "$rewritten" = 'postgres://dev:p%40ss@127.0.0.1:55432/new_db?sslmode=require&application_name=dev' ] \
+  || fail "database URL rewrite changed more than the database name: $rewritten"
 
 # ---------------------------------------------------------------------------
 # A registered environment is visible to both renderings, and the JSON one
@@ -105,6 +155,25 @@ if [ "$status" -ne 0 ]; then
 fi
 require_contains "$out" "stopped"
 
+# Commands launched through env-exec must not inherit the daemon-task identity
+# hints that make human/profile CLI commands reject --profile.
+write_manifest "clean-env-903" "$root_dir" 903
+MULTICA_TASK_CONFIG_ROOT=/task/config \
+MULTICA_TASK_WORKSPACES_ROOT=/task/workspaces \
+MULTICA_WORKSPACES_ROOT=/owner/workspaces \
+  dev_env exec clean-env-903 -- sh -c '
+    test -z "${MULTICA_TASK_CONFIG_ROOT:-}" &&
+    test -z "${MULTICA_TASK_WORKSPACES_ROOT:-}" &&
+    test "$MULTICA_WORKSPACES_ROOT" = "$1"
+  ' _ "$MULTICA_DEV_WORKSPACES_PARENT/multica_workspaces_dev-dev-env-test-903" \
+  > "$out" 2>&1 || fail "env-exec leaked daemon task identity or owner workspaces root"
+
+# A health response without process identity is never proof that the process is
+# this checkout's freshly launched API.
+if bash -c 'source "$1"; api_started_after '\''{"status":"ok"}'\'' 1' _ "$root_dir/scripts/dev-env.sh"; then
+  fail "legacy /health without started_at was accepted as current"
+fi
+
 # ---------------------------------------------------------------------------
 # Unknown names and components fail loudly instead of doing something else.
 # ---------------------------------------------------------------------------
@@ -131,6 +200,17 @@ if grep -Fq "probe-901 would be collected" "$out"; then
   fail "gc must not collect an environment whose directory still exists"
 fi
 [ -f "$MULTICA_DEV_HOME/envs/orphan-902/manifest.env" ] || fail "gc --dry-run deleted a manifest"
+
+# A failed database drop keeps the manifest and slot so cleanup can be retried;
+# destroy must never print success and forget the only deletion recipe.
+write_manifest "drop-fails-904" "$root_dir" 904
+status=0
+FAIL_DROP=1 dev_env destroy drop-fails-904 --yes > "$out" 2>&1 || status=$?
+[ "$status" -ne 0 ] || fail "destroy succeeded after DROP DATABASE failed"
+[ -f "$MULTICA_DEV_HOME/envs/drop-fails-904/manifest.env" ] \
+  || fail "destroy discarded the manifest after DROP DATABASE failed"
+require_contains "$out" "manifest and slot were kept"
+dev_env destroy drop-fails-904 --yes > "$out" 2>&1 || fail "retrying destroy after database recovery failed"
 
 # ---------------------------------------------------------------------------
 # destroy consumes the manifest: the slot is free afterwards, which is what

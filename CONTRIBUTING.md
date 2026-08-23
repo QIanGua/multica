@@ -121,7 +121,7 @@ make status                  # what is running, and whether it is yours
 make list                    # every environment on this machine
 make down                    # stop the processes, keep the data
 make destroy                 # stop, then drop the database and free the slot
-make gc                      # collect environments whose checkout is gone
+make gc                      # collect expired environments or ones whose checkout is gone
 ```
 
 Components are `api` (Go backend), `web` (Next.js), `daemon` (agent daemon) and
@@ -131,7 +131,7 @@ profile and any component already healthy.
 
 Three properties are worth knowing because the old flow lacked them:
 
-- **Ports, database names and profiles are allocated, not recomputed.** The
+- **API, Web and Desktop renderer ports, database names and profiles are allocated, not recomputed.** The
   allocator starts from this directory's path hash, so a checkout keeps the
   numbers it has always had, and moves only when the registry or a live
   listener says the slot is taken. The registry lives in `~/.multica/dev/`;
@@ -143,7 +143,13 @@ Three properties are worth knowing because the old flow lacked them:
   leftover on the same port.
 - **`down` and `destroy` differ deliberately.** `down` stops processes and
   keeps the database, profile and slot, so the next `make up` is seconds.
-  `destroy` consumes them.
+  `destroy` consumes the database, profile, daemon task workspaces, Desktop
+  userData and slot. If any deletion fails, it keeps the manifest and exits
+  non-zero so cleanup can be retried instead of losing the deletion recipe.
+- **Temporary environments have a best-effort fallback.** `make up
+  ARGS=--ephemeral` records a 24-hour TTL. The next `make up` automatically
+  collects expired and directory-less environments; `make gc` runs the same
+  collection explicitly.
 
 Run any command inside an environment's variables without repeating them:
 
@@ -422,10 +428,13 @@ Two constraints are enforced rather than documented:
 make up C=desktop
 ```
 
-This points `apps/desktop/.env.development.local` at this environment's backend
-and starts Electron. `pnpm dev:desktop` derives its own renderer port and app
-name per worktree, so several checkouts can run desktop side by side; which
-backend each one talks to is decided by that env file alone.
+This writes a marked `apps/desktop/.env.development.local` pointing at this
+environment's backend, starts Electron with the renderer port and app name from
+the environment registry, and waits until that renderer is actually serving.
+Several checkouts can therefore run Desktop side by side without maintaining a
+second path-derived identity. `make destroy` removes the marked env file and
+this environment's Electron userData. Direct `pnpm dev:desktop` still uses its
+path-derived fallback when it is run outside `make up`.
 
 Log in with `dev@localhost` and `888888`.
 

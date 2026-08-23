@@ -30,6 +30,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEV_HOME="${MULTICA_DEV_HOME:-$HOME/.multica/dev}"
 ENVS_DIR="$DEV_HOME/envs"
 LOCK_DIR="$DEV_HOME/lock.d"
+DEV_WORKSPACES_PARENT="${MULTICA_DEV_WORKSPACES_PARENT:-$HOME}"
+DEV_DESKTOP_APP_DATA="${MULTICA_DEV_DESKTOP_APP_DATA:-}"
+DEV_PROFILES_HOME="${MULTICA_DEV_PROFILES_HOME:-$HOME/.multica/profiles}"
 
 DEV_EMAIL="${MULTICA_DEV_EMAIL:-dev@localhost}"
 DEV_CODE_DEFAULT=888888
@@ -53,7 +56,9 @@ DEV_TMPDIR="${MULTICA_DEV_TMPDIR:-$HOME/.multica/dev-tmp}"
 CLEAN_ENV=(env
   -u MULTICA_SERVER_URL -u MULTICA_TOKEN -u MULTICA_WORKSPACE_ID
   -u MULTICA_DAEMON_PORT -u MULTICA_AGENT_ID -u MULTICA_AGENT_NAME
-  -u MULTICA_TASK_ID -u MULTICA_TASK_SLOT)
+  -u MULTICA_TASK_ID -u MULTICA_TASK_SLOT
+  -u MULTICA_TASK_CONFIG_ROOT -u MULTICA_TASK_WORKSPACES_ROOT
+  -u MULTICA_WORKSPACES_ROOT)
 
 # ---------------------------------------------------------------- output ----
 
@@ -75,6 +80,13 @@ json_escape() {
 
 now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 now_epoch() { date -u '+%s'; }
+
+expires_at_after_hours() {
+  node -e '
+    const hours = Number(process.argv[1]);
+    process.stdout.write(new Date(Date.now() + hours * 3600_000).toISOString().replace(/\.\d{3}Z$/, "Z"));
+  ' "$1"
+}
 
 # ----------------------------------------------------------------- locking ---
 
@@ -105,6 +117,23 @@ release_lock() { rm -rf "$LOCK_DIR"; }
 env_dir()      { printf '%s/%s' "$ENVS_DIR" "$1"; }
 manifest_of()  { printf '%s/%s/manifest.env' "$ENVS_DIR" "$1"; }
 
+valid_env_name() {
+  case "$1" in
+    ""|*[!a-z0-9_-]*|-*|_*) return 1 ;;
+    *) [ "${#1}" -le 128 ] ;;
+  esac
+}
+
+require_env_name() {
+  valid_env_name "$1" || die "Invalid environment name '$1'. Use 1-128 lowercase letters, numbers, '-' or '_', starting with a letter or number."
+}
+
+require_ttl() {
+  case "$1" in
+    ""|0|*[!0-9]*) die "TTL must be a positive integer number of hours." ;;
+  esac
+}
+
 list_env_names() {
   [ -d "$ENVS_DIR" ] || return 0
   local path
@@ -118,21 +147,37 @@ list_env_names() {
 # Loads a manifest into NAME/DIR/BACKEND_PORT/... in the caller's scope.
 load_manifest() {
   local file
+  require_env_name "$1"
   file="$(manifest_of "$1")"
   [ -f "$file" ] || return 1
   # shellcheck disable=SC1090
   . "$file"
+  [ "$NAME" = "$1" ] || die "Manifest $file declares NAME=$NAME; expected $1."
 }
 
 # Prints nothing (and succeeds) for a missing manifest or key: callers compare
 # the value, and a non-zero return from a command substitution is fatal under
 # `set -e` on bash 3.2.
 manifest_field() {
-  local file value
+  local file key=$2
+  require_env_name "$1"
   file="$(manifest_of "$1")"
   [ -f "$file" ] || return 0
-  value="$(grep "^$2=" "$file" | head -1 | cut -d= -f2- || true)"
-  printf '%s' "$value"
+  (
+    # shellcheck disable=SC1090
+    . "$file"
+    case "$key" in
+      DIR) printf '%s' "$DIR" ;;
+      OFFSET) printf '%s' "$OFFSET" ;;
+      *) return 1 ;;
+    esac
+  )
+}
+
+write_manifest_value() {
+  printf '%s=' "$1"
+  printf '%q' "$2"
+  printf '\n'
 }
 
 env_name_for_dir() {
@@ -176,13 +221,37 @@ describe_port_owner() {
 # -------------------------------------------------------------- allocation ---
 
 slugify() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//'
+  local slug
+  slug="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')"
+  printf '%s' "${slug:-env}"
 }
 
 path_offset() {
   local sum
   sum="$(printf '%s' "$1" | cksum | awk '{print $1}')"
   printf '%s' $((sum % 1000))
+}
+
+renderer_port_for_offset() {
+  local port=$((5174 + $1))
+  [ "$port" -ne 6000 ] || port=6174
+  printf '%s' "$port"
+}
+
+desktop_app_data_root() {
+  if [ -n "$DEV_DESKTOP_APP_DATA" ]; then
+    printf '%s' "$DEV_DESKTOP_APP_DATA"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Application Support' "$HOME" ;;
+    MINGW*|MSYS*|CYGWIN*) printf '%s' "${APPDATA:-$HOME/AppData/Roaming}" ;;
+    *) printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+  esac
+}
+
+desktop_user_data_dir() {
+  printf '%s/Multica Canary %s' "$(desktop_app_data_root)" "$1"
 }
 
 offset_registered() {
@@ -205,15 +274,17 @@ EOF
 # are actually free — the registry alone cannot see a process started before
 # this tooling existed.
 allocate_offset() {
-  local dir=$1 self=${2:-} start i offset backend frontend
+  local dir=$1 self=${2:-} start i offset backend frontend renderer
   start="$(path_offset "$dir")"
   for i in $(seq 0 999); do
     offset=$(((start + i) % 1000))
     backend=$((18080 + offset))
     frontend=$((13000 + offset))
+    renderer="$(renderer_port_for_offset "$offset")"
     offset_registered "$offset" "$self" && continue
     port_free "$backend" || continue
     port_free "$frontend" || continue
+    port_free "$renderer" || continue
     printf '%s' "$offset"
     return 0
   done
@@ -235,12 +306,13 @@ detect_env_file() {
 }
 
 load_env_file() {
+  local root="${2:-$REPO_ROOT}"
   set -a
   # shellcheck disable=SC1090
-  . "$REPO_ROOT/$1"
+  . "$root/$1"
   set +a
   # shellcheck disable=SC1091
-  . "$REPO_ROOT/scripts/local-env.sh"
+  . "$root/scripts/local-env.sh"
 }
 
 # The verification code has to be in the file BEFORE the backend starts: the
@@ -263,14 +335,17 @@ ensure_dev_code() {
 }
 
 rewrite_env_ports() {
-  local file="$REPO_ROOT/$1" offset=$2 backend=$3 frontend=$4 db=$5 tmp
+  local file="$REPO_ROOT/$1" offset=$2 backend=$3 frontend=$4 db=$5 tmp database_url escaped_database_url
+  database_url="$(database_url_with_name "${DATABASE_URL:-}" "$db")" \
+    || die "DATABASE_URL is not a valid PostgreSQL URL: ${DATABASE_URL:-<unset>}"
+  escaped_database_url="$(printf '%s' "$database_url" | sed 's/[\\&|]/\\&/g')"
   tmp="$(mktemp)"
   sed \
     -e "s|^PORT=.*|PORT=${backend}|" \
     -e "s|^FRONTEND_PORT=.*|FRONTEND_PORT=${frontend}|" \
     -e "s|^FRONTEND_ORIGIN=.*|FRONTEND_ORIGIN=http://localhost:${frontend}|" \
     -e "s|^POSTGRES_DB=.*|POSTGRES_DB=${db}|" \
-    -e "s|^DATABASE_URL=.*|DATABASE_URL=postgres://multica:multica@localhost:5432/${db}?sslmode=disable|" \
+    -e "s|^DATABASE_URL=.*|DATABASE_URL=${escaped_database_url}|" \
     -e "s|^MULTICA_SERVER_URL=.*|MULTICA_SERVER_URL=ws://localhost:${backend}/ws|" \
     -e "s|^MULTICA_PUBLIC_URL=.*|MULTICA_PUBLIC_URL=http://localhost:${backend}|" \
     -e "s|^MULTICA_APP_URL=.*|MULTICA_APP_URL=http://localhost:${frontend}|" \
@@ -288,6 +363,15 @@ admin_database_url() {
     url.pathname = "/postgres";
     process.stdout.write(url.toString());
   ' "$1" 2>/dev/null || true
+}
+
+database_url_with_name() {
+  node -e '
+    const url = new URL(process.argv[1]);
+    if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") process.exit(1);
+    url.pathname = "/" + process.argv[2];
+    process.stdout.write(url.toString());
+  ' "$1" "$2" 2>/dev/null
 }
 
 # Diagnoses the failure mode this whole script exists to make impossible:
@@ -343,6 +427,7 @@ component_selected() {
 }
 
 pid_file()  { printf '%s/%s.pid' "$STATE_DIR" "$1"; }
+listener_pid_file() { printf '%s/%s.listener.pid' "$STATE_DIR" "$1"; }
 log_file()  { printf '%s/%s.log' "$LOG_DIR" "$1"; }
 
 component_pid() {
@@ -383,16 +468,60 @@ json_field() {
 api_started_after() {
   local started_at epoch
   started_at="$(json_field "$1" started_at || true)"
-  [ -n "$started_at" ] || return 0 # older build without process identity
+  [ -n "$started_at" ] || return 1
   epoch="$(node -e 'process.stdout.write(String(Math.floor(Date.parse(process.argv[1]) / 1000)))' "$started_at" 2>/dev/null || echo 0)"
   [ "$epoch" -ge $(($2 - 5)) ]
 }
 
+checkout_commit() {
+  git -C "${DIR:-$REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || printf 'unknown'
+}
+
+process_group_id() {
+  ps -p "$1" -o pgid= 2>/dev/null | tr -d ' ' || true
+}
+
+listener_belongs_to_component() {
+  local component=$1 port=$2 launcher listener recorded
+  launcher="$(component_pid "$component" || true)"
+  listener="$(port_listener_pid "$port")"
+  [ -n "$launcher" ] && [ -n "$listener" ] || return 1
+  recorded="$(cat "$(listener_pid_file "$component")" 2>/dev/null || true)"
+  [ -n "$recorded" ] && [ "$listener" = "$recorded" ] && return 0
+  [ "$(process_group_id "$listener")" = "$launcher" ]
+}
+
+health_belongs_to_api() {
+  local health=$1 health_pid listener
+  health_pid="$(json_field "$health" pid || true)"
+  listener="$(port_listener_pid "$BACKEND_PORT")"
+  [ -n "$health_pid" ] && [ "$health_pid" = "$listener" ] \
+    && listener_belongs_to_component api "$BACKEND_PORT"
+}
+
+api_identity_matches() {
+  local health=$1 expected_commit=$2 launched_at=${3:-0} reported_commit started_at
+  health_belongs_to_api "$health" || return 1
+  reported_commit="$(json_field "$health" commit || true)"
+  started_at="$(json_field "$health" started_at || true)"
+  [ -n "$started_at" ] && [ "$reported_commit" = "$expected_commit" ] || return 1
+  [ "$launched_at" = 0 ] || api_started_after "$health" "$launched_at"
+}
+
 start_api() {
-  local launched_at health waited=0
+  local launched_at health waited=0 expected_commit
+  expected_commit="$(checkout_commit)"
   if health="$(health_json)" && [ -n "$health" ] && component_pid api >/dev/null; then
-    ok "api already running on :$BACKEND_PORT"
-    return 0
+    if api_identity_matches "$health" "$expected_commit"; then
+      ok "api already running on :$BACKEND_PORT (pid $(json_field "$health" pid), commit $expected_commit)"
+      return 0
+    fi
+    if health_belongs_to_api "$health"; then
+      warn "api on :$BACKEND_PORT is ours but not commit $expected_commit; restarting it."
+      stop_component api
+    else
+      die "Port $BACKEND_PORT answers /health, but its pid/commit does not match this environment. Refusing to reuse or kill it."
+    fi
   fi
   if ! port_free "$BACKEND_PORT"; then
     die "Port $BACKEND_PORT is busy: $(describe_port_owner "$BACKEND_PORT").
@@ -406,11 +535,13 @@ Run 'make down' here first — a leftover instance answers /health with 200 and 
   while [ "$waited" -lt 300 ]; do
     health="$(health_json || true)"
     if [ -n "$health" ]; then
-      # A 200 is not enough. If the answer predates this launch, something else
-      # owns the port and every later step would configure the wrong server.
-      api_started_after "$health" "$launched_at" \
-        || die "Something else is serving :$BACKEND_PORT — it started before this run. Stop it and retry."
-      ok "api healthy at http://localhost:$BACKEND_PORT (pid $(json_field "$health" pid || echo '?'), commit $(json_field "$health" commit || echo '?'))"
+      # A 200 is not enough: pid, process group, commit and launch time all have
+      # to identify the process this environment just started.
+      if ! api_identity_matches "$health" "$expected_commit" "$launched_at"; then
+        stop_component api
+        die "Something else is serving :$BACKEND_PORT, or the launched api did not report pid/commit/started_at for commit $expected_commit."
+      fi
+      ok "api healthy at http://localhost:$BACKEND_PORT (pid $(json_field "$health" pid), commit $expected_commit)"
       return 0
     fi
     component_pid api >/dev/null || { tail -20 "$(log_file api)" | sed 's/^/    /' >&2; die "api exited during startup. Log: $(log_file api)"; }
@@ -422,7 +553,8 @@ Run 'make down' here first — a leftover instance answers /health with 200 and 
 
 start_web() {
   local waited=0 listener
-  if curl -sf --max-time 3 "http://localhost:${FRONTEND_PORT}" >/dev/null 2>&1 && component_pid web >/dev/null; then
+  if curl -sf --max-time 15 "http://localhost:${FRONTEND_PORT}" >/dev/null 2>&1 \
+    && listener_belongs_to_component web "$FRONTEND_PORT"; then
     ok "web already running on :$FRONTEND_PORT"
     return 0
   fi
@@ -434,8 +566,12 @@ start_web() {
   info "web launching (pid $(cat "$(pid_file web)")), log: $(log_file web)"
 
   while [ "$waited" -lt 300 ]; do
-    if curl -sf --max-time 3 "http://localhost:${FRONTEND_PORT}" >/dev/null 2>&1; then
+    if curl -sf --max-time 15 "http://localhost:${FRONTEND_PORT}" >/dev/null 2>&1; then
       listener="$(port_listener_pid "$FRONTEND_PORT")"
+      if ! listener_belongs_to_component web "$FRONTEND_PORT"; then
+        stop_component web
+        die "Web on :$FRONTEND_PORT is not owned by the process group this environment launched."
+      fi
       ok "web serving http://localhost:$FRONTEND_PORT (pid ${listener:-?})"
       return 0
     fi
@@ -448,6 +584,21 @@ start_web() {
 
 # send-code once, verify-code once. Repeated verify attempts lock the code out
 # and start returning 400 even when it is correct, so retrying is self-defeating.
+write_profile_config() {
+  local config=$1 pat=$2 ws=$3
+  mkdir -p "$PROFILE_DIR"
+  cat > "$config" <<EOF
+{
+  "server_url": "http://localhost:${BACKEND_PORT}",
+  "app_url": "http://localhost:${FRONTEND_PORT}",
+  "token": "$(json_escape "$pat")",
+  "workspace_id": "$(json_escape "$ws")",
+  "workspaces_root": "$(json_escape "$WORKSPACES_ROOT")"
+}
+EOF
+  chmod 600 "$config"
+}
+
 ensure_credentials() {
   local server="http://localhost:${BACKEND_PORT}" config="$PROFILE_DIR/config.json"
   local code="${MULTICA_DEV_VERIFICATION_CODE:-$DEV_CODE_DEFAULT}"
@@ -458,6 +609,7 @@ ensure_credentials() {
     ws="$(json_field "$(cat "$config")" workspace_id || true)"
     if [ -n "$pat" ] && curl -sf --max-time 5 "$server/api/me" -H "Authorization: Bearer $pat" >/dev/null 2>&1; then
       WORKSPACE_ID="$ws"
+      write_profile_config "$config" "$pat" "$ws"
       ok "CLI profile $PROFILE already authenticated"
       return 0
     fi
@@ -501,16 +653,7 @@ Do not retry immediately — repeated attempts lock the code. Wait ~40s and re-r
     -H "Authorization: Bearer $pat" -H "X-Workspace-ID: $ws" \
     -H 'Content-Type: application/json' -d '{"exit":"existing"}' >/dev/null 2>&1 || true
 
-  mkdir -p "$PROFILE_DIR"
-  cat > "$config" <<EOF
-{
-  "server_url": "http://localhost:${BACKEND_PORT}",
-  "app_url": "http://localhost:${FRONTEND_PORT}",
-  "token": "$pat",
-  "workspace_id": "$ws"
-}
-EOF
-  chmod 600 "$config"
+  write_profile_config "$config" "$pat" "$ws"
   WORKSPACE_ID="$ws"
   ok "Logged in as $DEV_EMAIL and wrote profile $PROFILE"
 }
@@ -545,9 +688,11 @@ start_daemon() {
   info "Building $MULTICA_BIN (a go run daemon would fail every task later)."
   (cd "$REPO_ROOT/server" && go build -o bin/multica ./cmd/multica) || die "Failed to build the multica CLI."
 
-  "${CLEAN_ENV[@]}" "$MULTICA_BIN" daemon start --profile "$PROFILE" 2>&1 | sed 's/^/    /' || true
+  "${CLEAN_ENV[@]}" MULTICA_WORKSPACES_ROOT="$WORKSPACES_ROOT" \
+    "$MULTICA_BIN" daemon start --profile "$PROFILE" 2>&1 | sed 's/^/    /' || true
 
-  status="$("${CLEAN_ENV[@]}" "$MULTICA_BIN" daemon status --profile "$PROFILE" --output json 2>/dev/null || true)"
+  status="$("${CLEAN_ENV[@]}" MULTICA_WORKSPACES_ROOT="$WORKSPACES_ROOT" \
+    "$MULTICA_BIN" daemon status --profile "$PROFILE" --output json 2>/dev/null || true)"
   state="$(json_field "$status" status || echo unknown)"
   # `daemon status` reports "stopped" plus port_conflict when the daemon
   # answering this profile's health port belongs to another profile, so a
@@ -562,45 +707,117 @@ start_daemon() {
 }
 
 start_desktop() {
-  local desktop_env="$REPO_ROOT/apps/desktop/.env.development.local"
-  if component_pid desktop >/dev/null; then
-    ok "desktop already running (pid $(component_pid desktop))"
-    return 0
+  local waited=0 listener stable_listener
+  if component_pid desktop >/dev/null \
+    && curl -sf --max-time 10 "http://localhost:${DESKTOP_RENDERER_PORT}" >/dev/null 2>&1 \
+    && listener_belongs_to_component desktop "$DESKTOP_RENDERER_PORT" \
+    && desktop_env_matches; then
+      ok "desktop already running (pid $(component_pid desktop), renderer :$DESKTOP_RENDERER_PORT)"
+      return 0
   fi
-  # Which backend the renderer talks to is controlled only by this file; the
-  # per-worktree renderer port and app name are derived by dev:desktop itself.
-  cat > "$desktop_env" <<EOF
+  if component_pid desktop >/dev/null; then
+    warn "desktop launcher exists but its renderer/backend identity is stale; restarting it."
+    stop_component desktop
+  fi
+  if ! port_free "$DESKTOP_RENDERER_PORT"; then
+    die "Desktop renderer port $DESKTOP_RENDERER_PORT is busy: $(describe_port_owner "$DESKTOP_RENDERER_PORT")."
+  fi
+
+  # The marker makes destroy remove only a file this tool owns. Explicit
+  # renderer/app values bind Desktop to the registry allocation rather than
+  # independently hashing the checkout path again.
+  cat > "$DESKTOP_ENV_FILE" <<EOF
+# Managed by scripts/dev-env.sh for environment ${NAME}.
 VITE_API_URL=http://localhost:${BACKEND_PORT}
 VITE_WS_URL=ws://localhost:${BACKEND_PORT}/ws
 EOF
-  launch_detached desktop make -C "$REPO_ROOT" -s desktop-dev ENV_FILE="$ENV_FILE"
-  sleep 2
-  component_pid desktop >/dev/null \
-    || { tail -20 "$(log_file desktop)" | sed 's/^/    /' >&2; die "desktop exited immediately. Log: $(log_file desktop)"; }
-  ok "desktop launching (pid $(component_pid desktop)), pointed at :$BACKEND_PORT — log: $(log_file desktop)"
+  launch_detached desktop env \
+    DESKTOP_RENDERER_PORT="$DESKTOP_RENDERER_PORT" DESKTOP_APP_SUFFIX="$DESKTOP_APP_SUFFIX" \
+    make -C "$REPO_ROOT" -s desktop-dev ENV_FILE="$ENV_FILE"
+
+  while [ "$waited" -lt 300 ]; do
+    if curl -sf --max-time 10 "http://localhost:${DESKTOP_RENDERER_PORT}" >/dev/null 2>&1; then
+      listener="$(port_listener_pid "$DESKTOP_RENDERER_PORT")"
+      if ! component_pid desktop >/dev/null || [ -z "$listener" ] || ! desktop_env_matches; then
+        stop_component desktop
+        die "Desktop renderer on :$DESKTOP_RENDERER_PORT does not belong to this environment."
+      fi
+      # Electron can bring Vite up and then crash during renderer bootstrap.
+      # Require a short stable window before the environment claims readiness.
+      sleep 5
+      stable_listener="$(port_listener_pid "$DESKTOP_RENDERER_PORT")"
+      if ! component_pid desktop >/dev/null || [ "$stable_listener" != "$listener" ] \
+        || ! curl -sf --max-time 10 "http://localhost:${DESKTOP_RENDERER_PORT}" >/dev/null 2>&1; then
+        tail -20 "$(log_file desktop)" | sed 's/^/    /' >&2 || true
+        stop_component desktop
+        die "desktop exited during renderer bootstrap. Log: $(log_file desktop)"
+      fi
+      printf '%s\n' "$listener" > "$(listener_pid_file desktop)"
+      ok "desktop ready (launcher $(component_pid desktop), renderer pid ${listener:-?}, backend :$BACKEND_PORT)"
+      return 0
+    fi
+    component_pid desktop >/dev/null \
+      || { tail -20 "$(log_file desktop)" | sed 's/^/    /' >&2; die "desktop exited during startup. Log: $(log_file desktop)"; }
+    sleep 2
+    waited=$((waited + 2))
+  done
+  stop_component desktop
+  die "desktop renderer never became ready on :$DESKTOP_RENDERER_PORT. Log: $(log_file desktop)"
+}
+
+desktop_env_matches() {
+  [ -f "$DESKTOP_ENV_FILE" ] \
+    && grep -Fqx "# Managed by scripts/dev-env.sh for environment ${NAME}." "$DESKTOP_ENV_FILE" \
+    && grep -Fqx "VITE_API_URL=http://localhost:${BACKEND_PORT}" "$DESKTOP_ENV_FILE" \
+    && grep -Fqx "VITE_WS_URL=ws://localhost:${BACKEND_PORT}/ws" "$DESKTOP_ENV_FILE"
 }
 
 stop_component() {
-  local name=$1 pid
+  local name=$1 pid launcher="" status state recorded_listener=""
   case "$name" in
     daemon)
       if [ -x "$MULTICA_BIN" ]; then
-        "${CLEAN_ENV[@]}" "$MULTICA_BIN" daemon stop --profile "$PROFILE" >/dev/null 2>&1 \
-          && ok "daemon stopped" || info "daemon was not running"
+        if "${CLEAN_ENV[@]}" MULTICA_WORKSPACES_ROOT="$WORKSPACES_ROOT" \
+          "$MULTICA_BIN" daemon stop --profile "$PROFILE" >/dev/null 2>&1; then
+          ok "daemon stopped"
+        else
+          status="$("${CLEAN_ENV[@]}" MULTICA_WORKSPACES_ROOT="$WORKSPACES_ROOT" \
+            "$MULTICA_BIN" daemon status --profile "$PROFILE" --output json 2>/dev/null || true)"
+          state="$(json_field "$status" status || echo stopped)"
+          if [ "$state" = running ]; then
+            warn "daemon for profile $PROFILE is still running"
+            return 1
+          fi
+          info "daemon was not running"
+        fi
       else
-        info "daemon skipped ($MULTICA_BIN not built, so nothing here started one)"
+        pid="$(cat "$PROFILE_DIR/daemon.pid" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+          warn "cannot stop daemon pid $pid because no usable multica binary was found"
+          return 1
+        fi
+        info "daemon skipped (no usable binary and no live profile pid)"
       fi
       return 0
       ;;
   esac
 
+  recorded_listener="$(cat "$(listener_pid_file "$name")" 2>/dev/null || true)"
   pid="$(component_pid "$name" || true)"
   if [ -n "$pid" ]; then
+    launcher="$pid"
     # Negative pid targets the process group, so make → go run → server all go
     # down together instead of leaving the real listener orphaned.
     kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     sleep 1
-    kill -0 "$pid" 2>/dev/null && { kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; }
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      sleep 1
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "$name launcher pid $pid is still running"
+      return 1
+    fi
     rm -f "$(pid_file "$name")"
     ok "$name stopped (pid $pid)"
   else
@@ -608,23 +825,39 @@ stop_component() {
     info "$name was not running"
   fi
 
-  # A process group kill misses a listener that reparented away from it. Only
-  # LISTEN sockets are considered, never clients of the port.
+  # A process group kill can miss a listener that has reparented away from its
+  # launcher. Only kill that listener when its process group still proves it
+  # belongs to the recorded launcher; a stale manifest must never kill an
+  # unrelated process that later reused the port.
   local port=""
   case "$name" in
     api) port="$BACKEND_PORT" ;;
     web) port="$FRONTEND_PORT" ;;
+    desktop) port="$DESKTOP_RENDERER_PORT" ;;
   esac
   if [ -n "$port" ]; then
     local listener
     listener="$(port_listener_pid "$port")"
     if [ -n "$listener" ]; then
-      kill -TERM "$listener" 2>/dev/null || true
-      sleep 1
-      kill -0 "$listener" 2>/dev/null && kill -KILL "$listener" 2>/dev/null || true
-      info "released :$port (pid $listener)"
+      if { [ -n "$recorded_listener" ] && [ "$listener" = "$recorded_listener" ]; } \
+        || { [ -n "$launcher" ] && [ "$(process_group_id "$listener")" = "$launcher" ]; }; then
+        kill -TERM "$listener" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$listener" 2>/dev/null; then
+          kill -KILL "$listener" 2>/dev/null || true
+          sleep 1
+        fi
+        if kill -0 "$listener" 2>/dev/null; then
+          warn "$name listener pid $listener is still running"
+          return 1
+        fi
+        info "released :$port (pid $listener)"
+      else
+        warn "left :$port alone: listener pid $listener is not owned by this environment"
+      fi
     fi
   fi
+  rm -f "$(listener_pid_file "$name")"
 }
 
 # ------------------------------------------------------------------ status ---
@@ -634,18 +867,23 @@ component_state() {
     api)
       local health
       health="$(health_json || true)"
-      if [ -n "$health" ]; then
+      if [ -n "$health" ] && api_identity_matches "$health" "$(checkout_commit)"; then
         printf 'running|http://localhost:%s|pid %s commit %s started %s' "$BACKEND_PORT" \
           "$(json_field "$health" pid || echo '?')" \
           "$(json_field "$health" commit || echo '?')" \
           "$(json_field "$health" started_at || echo '?')"
+      elif [ -n "$health" ]; then
+        printf 'mismatch|http://localhost:%s|health responder is not this checkout/process' "$BACKEND_PORT"
       else
         printf 'stopped|http://localhost:%s|' "$BACKEND_PORT"
       fi
       ;;
     web)
-      if curl -sf --max-time 3 "http://localhost:${FRONTEND_PORT}" >/dev/null 2>&1; then
+      if curl -sf --max-time 10 "http://localhost:${FRONTEND_PORT}" >/dev/null 2>&1 \
+        && listener_belongs_to_component web "$FRONTEND_PORT"; then
         printf 'running|http://localhost:%s|pid %s' "$FRONTEND_PORT" "$(port_listener_pid "$FRONTEND_PORT")"
+      elif [ -n "$(port_listener_pid "$FRONTEND_PORT")" ]; then
+        printf 'mismatch|http://localhost:%s|listener is not owned by this environment' "$FRONTEND_PORT"
       else
         printf 'stopped|http://localhost:%s|' "$FRONTEND_PORT"
       fi
@@ -653,7 +891,8 @@ component_state() {
     daemon)
       local status state
       if [ -x "$MULTICA_BIN" ]; then
-        status="$("${CLEAN_ENV[@]}" "$MULTICA_BIN" daemon status --profile "$PROFILE" --output json 2>/dev/null || true)"
+        status="$("${CLEAN_ENV[@]}" MULTICA_WORKSPACES_ROOT="$WORKSPACES_ROOT" \
+          "$MULTICA_BIN" daemon status --profile "$PROFILE" --output json 2>/dev/null || true)"
         state="$(json_field "$status" status || echo stopped)"
         printf '%s|%s|pid %s' "$state" "$PROFILE" "$(json_field "$status" pid || echo '-')"
       else
@@ -663,7 +902,17 @@ component_state() {
     desktop)
       local pid
       pid="$(component_pid desktop || true)"
-      if [ -n "$pid" ]; then printf 'running||pid %s' "$pid"; else printf 'stopped||'; fi
+      if [ -n "$pid" ] \
+        && curl -sf --max-time 10 "http://localhost:${DESKTOP_RENDERER_PORT}" >/dev/null 2>&1 \
+        && listener_belongs_to_component desktop "$DESKTOP_RENDERER_PORT" \
+        && desktop_env_matches; then
+        printf 'running|http://localhost:%s|launcher %s renderer %s' \
+          "$DESKTOP_RENDERER_PORT" "$pid" "$(port_listener_pid "$DESKTOP_RENDERER_PORT")"
+      elif [ -n "$pid" ] || [ -n "$(port_listener_pid "$DESKTOP_RENDERER_PORT")" ]; then
+        printf 'mismatch|http://localhost:%s|renderer/backend identity does not match' "$DESKTOP_RENDERER_PORT"
+      else
+        printf 'stopped|http://localhost:%s|' "$DESKTOP_RENDERER_PORT"
+      fi
       ;;
   esac
 }
@@ -679,7 +928,7 @@ print_status_human() {
     printf '  %-9s %-9s %-32s %s\n' "$comp" "$state" "${url:--}" "${detail:--}"
   done
   printf '  %-9s %-9s %-32s %s\n' database "$(database_state)" "$DB_NAME" "${DATABASE_URL%%\?*}"
-  printf '\n  owner %s · created %s%s\n' "$OWNER" "$CREATED_AT" "$( [ "${TTL_HOURS:-0}" != 0 ] && printf ' · ttl %sh' "$TTL_HOURS" )"
+  printf '\n  owner %s · created %s%s\n' "$OWNER" "$CREATED_AT" "$( [ "${TTL_HOURS:-0}" != 0 ] && printf ' · expires %s' "$EXPIRES_AT" )"
   printf '  logs  %s\n' "$LOG_DIR"
 }
 
@@ -699,11 +948,11 @@ database_state() {
 
 print_status_json() {
   local comp row state url detail first=1
-  printf '{"name":"%s","dir":"%s","owner":"%s","created_at":"%s","ttl_hours":%s,' \
+  printf '{"name":"%s","dir":"%s","owner":"%s","created_at":"%s","ttl_hours":%s,"expires_at":"%s",' \
     "$(json_escape "$NAME")" "$(json_escape "$DIR")" "$(json_escape "$OWNER")" \
-    "$(json_escape "$CREATED_AT")" "${TTL_HOURS:-0}"
-  printf '"backend_port":%s,"frontend_port":%s,"database":"%s","profile":"%s","env_file":"%s","logs":"%s","components":{' \
-    "$BACKEND_PORT" "$FRONTEND_PORT" "$(json_escape "$DB_NAME")" "$(json_escape "$PROFILE")" \
+    "$(json_escape "$CREATED_AT")" "${TTL_HOURS:-0}" "$(json_escape "$EXPIRES_AT")"
+  printf '"backend_port":%s,"frontend_port":%s,"desktop_renderer_port":%s,"database":"%s","profile":"%s","env_file":"%s","logs":"%s","components":{' \
+    "$BACKEND_PORT" "$FRONTEND_PORT" "$DESKTOP_RENDERER_PORT" "$(json_escape "$DB_NAME")" "$(json_escape "$PROFILE")" \
     "$(json_escape "$ENV_FILE")" "$(json_escape "$LOG_DIR")"
   for comp in $ALL_COMPONENTS; do
     row="$(component_state "$comp")"
@@ -718,15 +967,23 @@ print_status_json() {
 }
 
 print_handoff() {
+  local entrypoint
+  if component_selected web; then
+    entrypoint="Open        http://localhost:${FRONTEND_PORT}/${WORKSPACE_SLUG}/issues"
+  elif component_selected desktop; then
+    entrypoint="Desktop     renderer http://localhost:${DESKTOP_RENDERER_PORT} → backend :${BACKEND_PORT}"
+  else
+    entrypoint="API only    http://localhost:${BACKEND_PORT}"
+  fi
   cat <<EOF
 
 ${C_GREEN}✓ Environment ready.${C_OFF}
 
-  Open        http://localhost:${FRONTEND_PORT}/${WORKSPACE_SLUG}/issues
+  ${entrypoint}
   Sign in     ${DEV_EMAIL}  ·  code ${MULTICA_DEV_VERIFICATION_CODE:-$DEV_CODE_DEFAULT}
   Backend     http://localhost:${BACKEND_PORT}   (GET /health reports pid + commit + started_at)
   Commit      $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
-  Environment ${NAME}$( [ "${TTL_HOURS:-0}" != 0 ] && printf ' (expires in %sh)' "$TTL_HOURS" )
+  Environment ${NAME}$( [ "${TTL_HOURS:-0}" != 0 ] && printf ' (expires %s)' "$EXPIRES_AT" )
 
   Inspect     make status
   Stop        make down            (keeps the database, restarts in seconds)
@@ -742,6 +999,7 @@ resolve_env_for_read() {
     name="$(env_name_for_dir "$REPO_ROOT" || true)"
     [ -n "$name" ] || die "No environment registered for $REPO_ROOT. Run 'make up' first."
   fi
+  require_env_name "$name"
   load_manifest "$name" || die "Unknown environment '$name'. Run 'make list' to see what exists."
   bind_paths
 }
@@ -749,24 +1007,59 @@ resolve_env_for_read() {
 bind_paths() {
   STATE_DIR="$(env_dir "$NAME")"
   LOG_DIR="$STATE_DIR/logs"
-  PROFILE_DIR="$HOME/.multica/profiles/$PROFILE"
-  MULTICA_BIN="$REPO_ROOT/server/bin/multica"
+  PROFILE_DIR="$DEV_PROFILES_HOME/$PROFILE"
+  WORKSPACES_ROOT="${WORKSPACES_ROOT:-$DEV_WORKSPACES_PARENT/multica_workspaces_$PROFILE}"
+  DESKTOP_RENDERER_PORT="${DESKTOP_RENDERER_PORT:-$(renderer_port_for_offset "$OFFSET")}"
+  DESKTOP_APP_SUFFIX="${DESKTOP_APP_SUFFIX:-$NAME}"
+  DESKTOP_USER_DATA_DIR="${DESKTOP_USER_DATA_DIR:-$(desktop_user_data_dir "$DESKTOP_APP_SUFFIX")}"
+  DESKTOP_ENV_FILE="${DESKTOP_ENV_FILE:-$DIR/apps/desktop/.env.development.local}"
+  EXPIRES_AT="${EXPIRES_AT:-}"
+  MULTICA_BIN="$DIR/server/bin/multica"
+  if [ ! -x "$MULTICA_BIN" ] && [ -x "$REPO_ROOT/server/bin/multica" ]; then
+    MULTICA_BIN="$REPO_ROOT/server/bin/multica"
+  fi
   mkdir -p "$LOG_DIR"
 }
 
+save_manifest() {
+  {
+    write_manifest_value NAME "$NAME"
+    write_manifest_value DIR "$DIR"
+    write_manifest_value CREATED_AT "$CREATED_AT"
+    write_manifest_value OWNER "$OWNER"
+    write_manifest_value TTL_HOURS "$TTL_HOURS"
+    write_manifest_value EXPIRES_AT "$EXPIRES_AT"
+    write_manifest_value ENV_FILE "$ENV_FILE"
+    write_manifest_value OFFSET "$OFFSET"
+    write_manifest_value BACKEND_PORT "$BACKEND_PORT"
+    write_manifest_value FRONTEND_PORT "$FRONTEND_PORT"
+    write_manifest_value DB_NAME "$DB_NAME"
+    write_manifest_value DATABASE_URL "$DATABASE_URL"
+    write_manifest_value PROFILE "$PROFILE"
+    write_manifest_value WORKSPACES_ROOT "$WORKSPACES_ROOT"
+    write_manifest_value DESKTOP_RENDERER_PORT "$DESKTOP_RENDERER_PORT"
+    write_manifest_value DESKTOP_APP_SUFFIX "$DESKTOP_APP_SUFFIX"
+    write_manifest_value DESKTOP_USER_DATA_DIR "$DESKTOP_USER_DATA_DIR"
+    write_manifest_value DESKTOP_ENV_FILE "$DESKTOP_ENV_FILE"
+  } > "$(manifest_of "$NAME")"
+}
+
 cmd_up() {
-  local requested="$DEFAULT_COMPONENTS" name="" owner=human ttl=0 comp
+  local requested="$DEFAULT_COMPONENTS" name="" owner=human ttl=0 lifecycle_requested=0 comp
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --components|-c) requested="$(printf '%s' "$2" | tr ',' ' ')"; shift 2 ;;
       --all) requested="$ALL_COMPONENTS"; shift ;;
       --name) name="$2"; shift 2 ;;
-      --ephemeral) owner=agent; [ "$ttl" != 0 ] || ttl=24; shift ;;
-      --ttl) ttl="$2"; owner=agent; shift 2 ;;
+      --ephemeral) owner=agent; lifecycle_requested=1; [ "$ttl" != 0 ] || ttl=24; shift ;;
+      --ttl) ttl="$2"; owner=agent; lifecycle_requested=1; shift 2 ;;
       *) die "Unknown flag for up: $1" ;;
     esac
   done
+
+  [ -z "$name" ] || require_env_name "$name"
+  [ "$ttl" = 0 ] || require_ttl "$ttl"
 
   for comp in $requested; do
     case " $ALL_COMPONENTS " in *" $comp "*) ;; *) die "Unknown component '$comp'. Valid: $ALL_COMPONENTS" ;; esac
@@ -775,6 +1068,10 @@ cmd_up() {
   # without api would produce an environment that cannot serve a single request.
   case " $requested " in *" api "*) ;; *) requested="api $requested" ;; esac
   COMPONENTS="$requested"
+
+  # No resident cleanup service is required: every future environment start is
+  # a safe opportunity to collect expired or directory-less environments.
+  cmd_gc --auto
 
   step "Prerequisites"
   local missing=() tool needed="node go curl"
@@ -825,13 +1122,24 @@ Start the rest with 'make up C=api,web', or run 'make up C=daemon' from your own
   if [ -n "$existing" ]; then
     load_manifest "$existing"
     NAME="$existing"
+    bind_paths
+    if [ "$lifecycle_requested" = 1 ]; then
+      OWNER="$owner"
+      TTL_HOURS="$ttl"
+      EXPIRES_AT="$(expires_at_after_hours "$ttl")"
+      save_manifest
+    fi
     info "Reusing environment $NAME (ports $BACKEND_PORT/$FRONTEND_PORT, database $DB_NAME)"
   else
     offset=$((PORT - 18080))
     # A slot is adopted only when the registry does not hold it and both ports
     # are genuinely free; otherwise a fresh one is allocated and the env file is
     # rewritten, which is the whole point of allocating instead of computing.
-    if [ "$PORT" -lt 18080 ] || offset_registered "$offset" || ! port_free "$PORT" || ! port_free "$FRONTEND_PORT"; then
+    local candidate_renderer
+    candidate_renderer="$(renderer_port_for_offset "$offset")"
+    if [ "$PORT" -lt 18080 ] || [ "$FRONTEND_PORT" -ne $((13000 + offset)) ] \
+      || offset_registered "$offset" || ! port_free "$PORT" \
+      || ! port_free "$FRONTEND_PORT" || ! port_free "$candidate_renderer"; then
       if [ "$PORT" -ge 18080 ] && { offset_registered "$offset" || ! port_free "$PORT"; }; then
         warn "Slot $offset (port $PORT) is taken: $(describe_port_owner "$PORT"). Allocating another."
       fi
@@ -844,22 +1152,25 @@ Start the rest with 'make up C=api,web', or run 'make up C=daemon' from your own
     fi
 
     NAME="${name:-$(slugify "$(basename "$REPO_ROOT")")-${offset}}"
+    require_env_name "$NAME"
+    PROFILE="dev-$(slugify "$(basename "$REPO_ROOT")")-${offset}"
+    WORKSPACES_ROOT="$DEV_WORKSPACES_PARENT/multica_workspaces_$PROFILE"
+    DESKTOP_RENDERER_PORT="$(renderer_port_for_offset "$offset")"
+    DESKTOP_APP_SUFFIX="$NAME"
+    DESKTOP_USER_DATA_DIR="$(desktop_user_data_dir "$DESKTOP_APP_SUFFIX")"
+    DESKTOP_ENV_FILE="$REPO_ROOT/apps/desktop/.env.development.local"
     [ ! -f "$(manifest_of "$NAME")" ] || die "Environment '$NAME' already exists for a different directory."
     mkdir -p "$(env_dir "$NAME")/logs"
-    cat > "$(manifest_of "$NAME")" <<EOF
-NAME=$NAME
-DIR=$REPO_ROOT
-CREATED_AT=$(now_iso)
-OWNER=$owner
-TTL_HOURS=$ttl
-ENV_FILE=$ENV_FILE
-OFFSET=$offset
-BACKEND_PORT=$PORT
-FRONTEND_PORT=$FRONTEND_PORT
-DB_NAME=$POSTGRES_DB
-DATABASE_URL=$DATABASE_URL
-PROFILE=dev-$(slugify "$(basename "$REPO_ROOT")")-${offset}
-EOF
+    DIR="$REPO_ROOT"
+    CREATED_AT="$(now_iso)"
+    OWNER="$owner"
+    TTL_HOURS="$ttl"
+    EXPIRES_AT=""
+    [ "$ttl" = 0 ] || EXPIRES_AT="$(expires_at_after_hours "$ttl")"
+    OFFSET="$offset"
+    BACKEND_PORT="$PORT"
+    DB_NAME="$POSTGRES_DB"
+    save_manifest
     load_manifest "$NAME"
     ok "Registered environment $NAME"
   fi
@@ -904,12 +1215,16 @@ cmd_down() {
 
   step "Stopping $NAME: $requested"
   local comp
-  for comp in $requested; do stop_component "$comp"; done
+  for comp in $requested; do
+    case " $ALL_COMPONENTS " in *" $comp "*) ;; *) die "Unknown component '$comp'. Valid: $ALL_COMPONENTS" ;; esac
+    stop_component "$comp"
+  done
   printf '\n%s✓ %s stopped.%s Database, profile and slot kept — `make up` restarts in seconds.\n' "$C_GREEN" "$NAME" "$C_OFF"
 }
 
 cmd_destroy() {
-  local name="" assume_yes=0 reply admin_url
+  local name="" assume_yes=0 reply admin_url failures=0
+  local expected_workspaces expected_desktop_data
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes|-y) assume_yes=1; shift ;;
@@ -928,22 +1243,73 @@ cmd_destroy() {
   export PORT="$BACKEND_PORT" FRONTEND_PORT DATABASE_URL POSTGRES_DB="$DB_NAME"
   step "Destroying $NAME"
   local comp
-  for comp in $ALL_COMPONENTS; do stop_component "$comp"; done
+  for comp in $ALL_COMPONENTS; do
+    if ! stop_component "$comp"; then failures=$((failures + 1)); fi
+  done
 
   if command -v psql >/dev/null 2>&1; then
     admin_url="$(admin_database_url "$DATABASE_URL")"
     if PGCONNECT_TIMEOUT=3 psql "$admin_url" -tAc 'SELECT 1' >/dev/null 2>&1; then
-      psql "$admin_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" >/dev/null \
-        && ok "dropped database $DB_NAME"
+      if psql "$admin_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" >/dev/null; then
+        ok "dropped database $DB_NAME"
+      else
+        warn "failed to drop database $DB_NAME; keeping its manifest"
+        failures=$((failures + 1))
+      fi
     else
       warn "Nothing answered on the database host; $DB_NAME was left in place."
+      failures=$((failures + 1))
     fi
   else
     warn "psql not found; $DB_NAME was left in place."
+    failures=$((failures + 1))
   fi
 
-  rm -rf "$PROFILE_DIR" && ok "removed CLI profile $PROFILE"
-  rm -rf "$(env_dir "$NAME")" && ok "released slot $OFFSET"
+  if rm -rf "$PROFILE_DIR"; then
+    ok "removed CLI profile $PROFILE"
+  else
+    warn "failed to remove CLI profile $PROFILE"
+    failures=$((failures + 1))
+  fi
+
+  expected_workspaces="$DEV_WORKSPACES_PARENT/multica_workspaces_$PROFILE"
+  if [ "$WORKSPACES_ROOT" != "$expected_workspaces" ]; then
+    warn "refusing to remove unexpected workspaces root $WORKSPACES_ROOT (expected $expected_workspaces)"
+    failures=$((failures + 1))
+  elif rm -rf "$WORKSPACES_ROOT"; then
+    ok "removed daemon workspaces $WORKSPACES_ROOT"
+  else
+    warn "failed to remove daemon workspaces $WORKSPACES_ROOT"
+    failures=$((failures + 1))
+  fi
+
+  expected_desktop_data="$(desktop_user_data_dir "$DESKTOP_APP_SUFFIX")"
+  if [ "$DESKTOP_USER_DATA_DIR" != "$expected_desktop_data" ]; then
+    warn "refusing to remove unexpected Desktop userData $DESKTOP_USER_DATA_DIR"
+    failures=$((failures + 1))
+  elif rm -rf "$DESKTOP_USER_DATA_DIR"; then
+    ok "removed Desktop userData $DESKTOP_USER_DATA_DIR"
+  else
+    warn "failed to remove Desktop userData $DESKTOP_USER_DATA_DIR"
+    failures=$((failures + 1))
+  fi
+
+  if [ -f "$DESKTOP_ENV_FILE" ] \
+    && grep -Fqx "# Managed by scripts/dev-env.sh for environment ${NAME}." "$DESKTOP_ENV_FILE"; then
+    if rm -f "$DESKTOP_ENV_FILE"; then
+      ok "removed managed Desktop env file"
+    else
+      warn "failed to remove $DESKTOP_ENV_FILE"
+      failures=$((failures + 1))
+    fi
+  fi
+
+  if [ "$failures" -ne 0 ]; then
+    die "$NAME was only partially destroyed ($failures cleanup failure(s)). Its manifest and slot were kept so 'make destroy' can retry."
+  fi
+
+  rm -rf "$(env_dir "$NAME")"
+  ok "released slot $OFFSET"
   printf '\n%s✓ %s destroyed.%s\n' "$C_GREEN" "$NAME" "$C_OFF"
 }
 
@@ -971,12 +1337,12 @@ cmd_list() {
     (
       load_manifest "$name"
       bind_paths
-      alive=stopped
-      curl -sf --max-time 2 "http://localhost:${BACKEND_PORT}/health" >/dev/null 2>&1 && alive=running
+      alive="$(component_state api)"
+      alive="${alive%%|*}"
       if [ "$as_json" = 1 ]; then
-        printf '{"name":"%s","dir":"%s","owner":"%s","api":"%s","backend_port":%s,"frontend_port":%s,"database":"%s","created_at":"%s","ttl_hours":%s}' \
+        printf '{"name":"%s","dir":"%s","owner":"%s","api":"%s","backend_port":%s,"frontend_port":%s,"desktop_renderer_port":%s,"database":"%s","created_at":"%s","ttl_hours":%s,"expires_at":"%s"}' \
           "$(json_escape "$NAME")" "$(json_escape "$DIR")" "$(json_escape "$OWNER")" "$alive" \
-          "$BACKEND_PORT" "$FRONTEND_PORT" "$(json_escape "$DB_NAME")" "$(json_escape "$CREATED_AT")" "${TTL_HOURS:-0}"
+          "$BACKEND_PORT" "$FRONTEND_PORT" "$DESKTOP_RENDERER_PORT" "$(json_escape "$DB_NAME")" "$(json_escape "$CREATED_AT")" "${TTL_HOURS:-0}" "$(json_escape "$EXPIRES_AT")"
       else
         printf '%-24s %-8s %-8s %-6s %-28s %s\n' "$NAME" "$alive" "$OWNER" \
           "$BACKEND_PORT" "$DB_NAME" "$( [ -d "$DIR" ] && printf '%s' "$DIR" || printf '%s(directory gone)%s' "$C_RED" "$C_OFF" )"
@@ -998,8 +1364,15 @@ EOF
 # in psql: an environment whose directory is gone, or whose TTL has passed, has
 # no owner left to stop it.
 cmd_gc() {
-  local dry_run=0 name age_hours created_epoch reason
-  [ "${1:-}" = "--dry-run" ] && dry_run=1
+  local dry_run=0 automatic=0 name age_hours created_epoch expiry_epoch reason
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=1 ;;
+      --auto) automatic=1 ;;
+      *) die "Unknown flag for gc: $1" ;;
+    esac
+    shift
+  done
 
   while read -r name; do
     [ -n "$name" ] || continue
@@ -1008,16 +1381,27 @@ cmd_gc() {
       reason=""
       [ -d "$DIR" ] || reason="its checkout directory is gone"
       if [ -z "$reason" ] && [ "${TTL_HOURS:-0}" != 0 ]; then
-        created_epoch="$(node -e 'process.stdout.write(String(Math.floor(Date.parse(process.argv[1]) / 1000)))' "$CREATED_AT" 2>/dev/null || echo 0)"
-        age_hours=$(( ($(now_epoch) - created_epoch) / 3600 ))
-        [ "$age_hours" -lt "$TTL_HOURS" ] || reason="it expired ${age_hours}h after a ${TTL_HOURS}h ttl"
+        if [ -n "${EXPIRES_AT:-}" ]; then
+          expiry_epoch="$(node -e 'process.stdout.write(String(Math.floor(Date.parse(process.argv[1]) / 1000)))' "$EXPIRES_AT" 2>/dev/null || echo 0)"
+          [ "$(now_epoch)" -lt "$expiry_epoch" ] || reason="it expired at $EXPIRES_AT"
+        else
+          created_epoch="$(node -e 'process.stdout.write(String(Math.floor(Date.parse(process.argv[1]) / 1000)))' "$CREATED_AT" 2>/dev/null || echo 0)"
+          age_hours=$(( ($(now_epoch) - created_epoch) / 3600 ))
+          [ "$age_hours" -lt "$TTL_HOURS" ] || reason="it expired ${age_hours}h after a ${TTL_HOURS}h ttl"
+        fi
       fi
       [ -n "$reason" ] || exit 0
       if [ "$dry_run" = 1 ]; then
         printf '%s would be collected: %s\n' "$NAME" "$reason"
       else
         printf '%s: %s\n' "$NAME" "$reason"
-        bash "$REPO_ROOT/scripts/dev-env.sh" destroy "$NAME" --yes
+        if ! bash "$REPO_ROOT/scripts/dev-env.sh" destroy "$NAME" --yes; then
+          if [ "$automatic" = 1 ]; then
+            warn "automatic cleanup of $NAME failed; its manifest was kept for retry"
+          else
+            exit 1
+          fi
+        fi
       fi
     )
   done <<EOF
@@ -1037,11 +1421,11 @@ cmd_exec() {
   resolve_env_for_read "$name"
   mkdir -p "$DEV_TMPDIR"
   cd "$DIR"
-  load_env_file "$ENV_FILE"
+  load_env_file "$ENV_FILE" "$DIR"
   export PORT="$BACKEND_PORT" FRONTEND_PORT DATABASE_URL POSTGRES_DB="$DB_NAME"
   export TMPDIR="$DEV_TMPDIR" TMP="$DEV_TMPDIR" TEMP="$DEV_TMPDIR"
   export MULTICA_DEV_PROFILE="$PROFILE"
-  exec "${CLEAN_ENV[@]}" "$@"
+  exec "${CLEAN_ENV[@]}" MULTICA_WORKSPACES_ROOT="$WORKSPACES_ROOT" "$@"
 }
 
 usage() {
@@ -1081,4 +1465,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
