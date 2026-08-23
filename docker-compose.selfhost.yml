@@ -139,6 +139,7 @@ services:
       # either empty disables plugin surfaces rather than weakening isolation.
       MULTICA_PLUGIN_SECRET_KEY: ${MULTICA_PLUGIN_SECRET_KEY:-}
       MULTICA_PLUGIN_SURFACE_ORIGIN: ${MULTICA_PLUGIN_SURFACE_ORIGIN:-}
+      MULTICA_PLUGIN_API_URL: ${MULTICA_PLUGIN_API_URL:-}
       MULTICA_PLUGIN_DIR: ${MULTICA_PLUGIN_DIR:-}
       # Comma-separated CIDRs whose source IP is allowed to set
       # X-Forwarded-For / X-Real-IP for the webhook per-IP rate limiter.

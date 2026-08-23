@@ -2672,7 +2672,7 @@ export class ApiClient {
     const query = request.path === "/context" && request.issueId
       ? `?issue_id=${encodeURIComponent(request.issueId)}`
       : "";
-    return this.fetch<unknown>(`/api/v1/plugin${request.path}${query}`, {
+    return this.fetch<unknown>(`/api/plugin-bridge/v1${request.path}${query}`, {
       method: request.method,
       headers: { "X-Multica-Plugin-Installation": installationId },
       body: request.body === undefined ? undefined : JSON.stringify(request.body),
@@ -2693,7 +2693,7 @@ export class ApiClient {
     hookKey: string,
     request: { trigger: "ui" | "manual"; issueId?: string; input?: unknown },
   ): Promise<PluginHookResult> {
-    const raw = await this.fetch<unknown>(`/api/v1/plugin/hooks/${encodeURIComponent(hookKey)}`, {
+    const raw = await this.fetch<unknown>(`/api/plugin-bridge/v1/hooks/${encodeURIComponent(hookKey)}`, {
       method: "POST",
       headers: { "X-Multica-Plugin-Installation": installationId },
       body: JSON.stringify({ trigger: request.trigger, issue_id: request.issueId, input: request.input }),
@@ -2704,7 +2704,7 @@ export class ApiClient {
       trigger: request.trigger,
       latency_ms: 0,
       attempts: 1,
-    }, { endpoint: "POST /api/v1/plugin/hooks/{key}" });
+    }, { endpoint: "POST /api/plugin-bridge/v1/hooks/{key}" });
   }
 
   async listPluginInvocations(workspaceId: string, installationId: string): Promise<PluginInvocation[]> {

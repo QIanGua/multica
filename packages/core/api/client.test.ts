@@ -192,6 +192,53 @@ describe("ApiClient Plugin preview response schema", () => {
   });
 });
 
+describe("ApiClient Plugin surface bridge routes", () => {
+  it("relays Action API calls through the session-only bridge prefix", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await new ApiClient("https://api.example.test").callPluginAction(
+      "installation-1",
+      { method: "GET", path: "/context", issueId: "MUL-42" },
+    );
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://api.example.test/api/plugin-bridge/v1/context?issue_id=MUL-42",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: "GET",
+      headers: expect.objectContaining({
+        "X-Multica-Plugin-Installation": "installation-1",
+      }),
+    });
+  });
+
+  it("invokes UI hooks through the session-only bridge prefix", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        status: "ok",
+        hook_key: "summarize",
+        trigger: "ui",
+        latency_ms: 1,
+        attempts: 1,
+      }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await new ApiClient("https://api.example.test").invokePluginHook(
+      "installation-1",
+      "summarize",
+      { trigger: "ui", issueId: "issue-1" },
+    );
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://api.example.test/api/plugin-bridge/v1/hooks/summarize",
+    );
+  });
+});
+
 describe("ApiClient server Table query", () => {
   it("posts the canonical query to the group and branch endpoints", async () => {
     const fetchMock = vi

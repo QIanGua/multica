@@ -53,6 +53,11 @@ var defaultOrigins = []string{
 	"http://localhost:5174", // electron-vite dev (fallback port)
 }
 
+const (
+	pluginActionPublicPrefix = "/v1"
+	pluginBridgePrefix       = "/api/plugin-bridge/v1"
+)
+
 // corsAllowedHeaders must list every header the browser clients send. A header
 // missing here fails the preflight, so the request never reaches the handler at
 // all — the failure looks nothing like "the server ignored my header".
@@ -91,6 +96,21 @@ var corsExposedHeaders = []string{
 	handler.HeaderTimelineTruncated,
 }
 
+func registerPluginActionRoutes(r chi.Router, h *handler.Handler) {
+	r.Get("/context", h.GetPluginContext)
+	r.Get("/issues/{id}", h.GetPluginIssue)
+	r.Patch("/issues/{id}", h.PatchPluginIssue)
+	r.Get("/issues/{id}/comments", h.ListPluginComments)
+	r.Post("/issues/{id}/comments", h.CreatePluginComment)
+	r.Get("/storage/{scope}", h.ListPluginStorage)
+	r.Get("/storage/{scope}/{key}", h.GetPluginStorage)
+	r.Put("/storage/{scope}/{key}", h.PutPluginStorage)
+	r.Delete("/storage/{scope}/{key}", h.DeletePluginStorage)
+	// ui / manual only. `event` is dispatched by the host off the event bus;
+	// `agent` arrives over MCP rather than this HTTP endpoint.
+	r.Post("/hooks/{key}", h.InvokePluginHook)
+}
+
 func allowedOrigins() []string {
 	raw := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
 	if raw == "" {
@@ -123,6 +143,21 @@ func appURLFromEnv() string {
 		return v
 	}
 	return strings.TrimRight(strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN")), "/")
+}
+
+// pluginActionBaseURL resolves the versioned public base a hook handler calls
+// back into. Managed deployments give the Plugin API its own hostname through
+// MULTICA_PLUGIN_API_URL; self-hosted and local deployments can leave it empty
+// and serve the same /v1 contract on MULTICA_PUBLIC_URL.
+func pluginActionBaseURL(publicURL string) string {
+	if value := strings.TrimRight(strings.TrimSpace(os.Getenv("MULTICA_PLUGIN_API_URL")), "/"); value != "" {
+		return value
+	}
+	publicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/")
+	if publicURL == "" {
+		return ""
+	}
+	return publicURL + pluginActionPublicPrefix
 }
 
 // parseTrustedProxies parses a comma-separated list of CIDR prefixes from the
@@ -1101,13 +1136,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// put an outside server on the critical path of creating an issue.
 	if h.PluginService != nil {
 		h.PluginService.Callbacks = service.NewCallbackTokens()
-		// Omitted rather than sent relative: a handler receiving
-		// "/api/v1/plugin" cannot call anything with it, and a broken absolute
-		// URL is harder to diagnose than an absent one.
-		if publicURL := strings.TrimSpace(os.Getenv("MULTICA_PUBLIC_URL")); publicURL != "" {
-			h.PluginService.CallbackBaseURL = strings.TrimSuffix(publicURL, "/") + "/api/v1/plugin"
+		// Omitted rather than sent relative: a third-party hook server cannot
+		// call a path-only URL, and a broken absolute URL is harder to diagnose
+		// than an absent one.
+		if baseURL := pluginActionBaseURL(signupConfig.PublicURL); baseURL != "" {
+			h.PluginService.CallbackBaseURL = baseURL
 		} else {
-			slog.Warn("plugins: MULTICA_PUBLIC_URL is not set; hook callbacks will carry no callback_url")
+			slog.Warn("plugins: MULTICA_PLUGIN_API_URL and MULTICA_PUBLIC_URL are not set; hook callbacks will carry no callback_url")
 		}
 		// The flag reaches the event path only through the service: a worker has
 		// no request to read it from.
@@ -1365,36 +1400,25 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
 	})
 
-	// Protected API routes
-	// Plugin Action API. Two kinds of caller reach these, and the difference is
-	// only in WHO the call acts as.
-	//
-	// A SURFACE has no credential: the iframe asks the host page over the
-	// postMessage bridge, and the host re-issues the call on the signed-in
-	// user's own session, naming the installation in a header the iframe cannot
-	// set for itself. That path goes through the ordinary Auth chain.
-	//
-	// A HOOK HANDLER — the plugin author's own server — has no session and
-	// never will, so it presents a plugin bearer token instead. PluginAuth
-	// routes that request past the session chain to the handler, which resolves
-	// the token itself; a request with neither credential is refused there.
-	//
-	// The workspace always comes from the installation, never from the client.
+	// Public Plugin Action API. This is the stable, globally versioned contract
+	// exposed on the Plugin API origin. It accepts only mpi_/mpc_ bearer tokens;
+	// browser sessions use the bridge group below and cannot cross this trust
+	// boundary even when both hostnames route to the same Go service.
 	r.Group(func(r chi.Router) {
-		r.Use(middleware.PluginAuth(middleware.Auth(queries, patCache, cloudPATVerifier)))
-		r.Route("/api/v1/plugin", func(r chi.Router) {
-			r.Get("/context", h.GetPluginContext)
-			r.Get("/issues/{id}", h.GetPluginIssue)
-			r.Patch("/issues/{id}", h.PatchPluginIssue)
-			r.Get("/issues/{id}/comments", h.ListPluginComments)
-			r.Post("/issues/{id}/comments", h.CreatePluginComment)
-			r.Get("/storage/{scope}", h.ListPluginStorage)
-			r.Get("/storage/{scope}/{key}", h.GetPluginStorage)
-			r.Put("/storage/{scope}/{key}", h.PutPluginStorage)
-			r.Delete("/storage/{scope}/{key}", h.DeletePluginStorage)
-			// ui / manual only. `event` is dispatched by the host off the event
-			// bus and never requested; `agent` arrives over MCP in PR 4.
-			r.Post("/hooks/{key}", h.InvokePluginHook)
+		r.Use(middleware.PluginBearerOnly)
+		r.Route(pluginActionPublicPrefix, func(r chi.Router) {
+			registerPluginActionRoutes(r, h)
+		})
+	})
+
+	// Browser-session relay for sandboxed plugin surfaces. The iframe talks to
+	// the host over MessagePort; the host calls this internal route with the
+	// signed-in user's session and the installation header. Keeping it outside
+	// /v1 prevents the Public API from accepting session cookies.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
+		r.Route(pluginBridgePrefix, func(r chi.Router) {
+			registerPluginActionRoutes(r, h)
 		})
 	})
 
