@@ -168,8 +168,12 @@
         "description": "선호하는 태스크 만들기 흐름을 엽니다."
       },
       "toggleSidebar": {
-        "label": "사이드바 전환",
-        "description": "기본 사이드바를 표시하거나 숨깁니다."
+        "label": "왼쪽 사이드바 전환",
+        "description": "왼쪽 사이드바를 표시하거나 숨깁니다."
+      },
+      "toggleRightSidebar": {
+        "label": "오른쪽 사이드바 전환",
+        "description": "현재 페이지에 오른쪽 사이드바가 있으면 표시하거나 숨깁니다."
       },
       "toggleChat": {
         "label": "채팅 창 전환",

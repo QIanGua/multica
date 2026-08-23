@@ -168,8 +168,12 @@
         "description": "Open your preferred issue creation flow."
       },
       "toggleSidebar": {
-        "label": "Toggle sidebar",
-        "description": "Show or hide the main sidebar."
+        "label": "Toggle left sidebar",
+        "description": "Show or hide the left sidebar."
+      },
+      "toggleRightSidebar": {
+        "label": "Toggle right sidebar",
+        "description": "Show or hide the right sidebar when the current page has one."
       },
       "toggleChat": {
         "label": "Toggle chat window",

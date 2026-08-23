@@ -168,8 +168,12 @@
         "description": "優先するタスク作成フローを開きます。"
       },
       "toggleSidebar": {
-        "label": "サイドバーを切り替え",
-        "description": "メインサイドバーの表示を切り替えます。"
+        "label": "左サイドバーを切り替え",
+        "description": "左サイドバーの表示を切り替えます。"
+      },
+      "toggleRightSidebar": {
+        "label": "右サイドバーを切り替え",
+        "description": "現在のページに右サイドバーがある場合、その表示を切り替えます。"
       },
       "toggleChat": {
         "label": "チャットウィンドウを切り替え",

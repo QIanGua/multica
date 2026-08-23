@@ -9,6 +9,7 @@ export type ShortcutActionId =
   | "openSearch"
   | "createIssue"
   | "toggleSidebar"
+  | "toggleRightSidebar"
   | "toggleChat"
   | "findInIssue"
   | "openThreadNav"
@@ -80,6 +81,14 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = [
   { id: "openSearch", category: "general", defaultShortcut: primary("K"), allowInEditable: true },
   { id: "createIssue", category: "general", defaultShortcut: createShortcutChord("C"), allowInEditable: false },
   { id: "toggleSidebar", category: "general", defaultShortcut: primary("B"), allowInEditable: false },
+  // Keep the two sidebars on one mnemonic: Shift selects the secondary,
+  // right-hand panel while preserving the established Mod+B left toggle.
+  {
+    id: "toggleRightSidebar",
+    category: "general",
+    defaultShortcut: createShortcutChord("B", { primary: true, shift: true }),
+    allowInEditable: false,
+  },
   // Mod+J follows the "toggle a docked panel" convention, and is one of the few
   // letters this module's own policy leaves free on every platform and runtime:
   // it is neither app-owned (PRIMARY_RESERVED_KEYS) nor browser-owned
