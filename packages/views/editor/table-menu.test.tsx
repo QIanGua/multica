@@ -11,16 +11,17 @@ import type { Editor } from "@tiptap/core";
 const computePositionMock = vi.hoisted(() =>
   vi.fn(async () => ({ x: 12, y: 24, middlewareData: {} })),
 );
+const autoUpdateMock = vi.hoisted(() =>
+  vi.fn(
+    (_reference: unknown, _floating: unknown, update: () => void) => {
+      update();
+      return vi.fn();
+    },
+  ),
+);
 
 vi.mock("@floating-ui/dom", () => ({
-  autoUpdate: (
-    _reference: unknown,
-    _floating: unknown,
-    update: () => void,
-  ) => {
-    update();
-    return vi.fn();
-  },
+  autoUpdate: autoUpdateMock,
   computePosition: computePositionMock,
   flip: () => ({ name: "flip" }),
   hide: () => ({ name: "hide" }),
@@ -57,9 +58,12 @@ function createEditorHarness() {
   const table = document.createElement("table");
   const row = document.createElement("tr");
   const cell = document.createElement("td");
+  const tableWrapper = document.createElement("div");
+  tableWrapper.className = "tableWrapper";
   row.append(cell);
   table.append(row);
-  editorDom.append(table);
+  tableWrapper.append(table);
+  editorDom.append(tableWrapper);
 
   const run = vi.fn(() => true);
   const commands = {
@@ -107,6 +111,7 @@ function createEditorHarness() {
   } as unknown as Editor;
 
   return {
+    cell,
     commands,
     editor,
     emit(event: EditorEvent) {
@@ -136,6 +141,25 @@ describe("EditorTableMenu", () => {
     harness.setInTable(false);
     harness.emit("transaction");
     expect(screen.queryByRole("toolbar", { name: "Edit table" })).toBeNull();
+  });
+
+  it("uses the selected cell as the floating context for table scrolling", async () => {
+    const harness = createEditorHarness();
+    const callsBeforeEnteringTable = autoUpdateMock.mock.calls.length;
+    render(<EditorTableMenu editor={harness.editor} />);
+
+    harness.setInTable(true);
+    harness.emit("transaction");
+    await waitFor(() =>
+      expect(autoUpdateMock.mock.calls.length).toBeGreaterThan(
+        callsBeforeEnteringTable,
+      ),
+    );
+
+    const reference = autoUpdateMock.mock.calls.at(-1)?.[0] as {
+      contextElement?: Element;
+    };
+    expect(reference.contextElement).toBe(harness.cell);
   });
 
   it.each([

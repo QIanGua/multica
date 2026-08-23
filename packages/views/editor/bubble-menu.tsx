@@ -81,6 +81,7 @@ import {
 
 function shouldShowBubbleMenu(editor: Editor): boolean {
   if (!editor.isEditable) return false;
+  if (editor.isActive("table")) return false;
   const { selection } = editor.state;
   if (selection.empty) return false;
   const { from, to } = selection;
@@ -656,4 +657,4 @@ function EditorBubbleMenu({
   );
 }
 
-export { EditorBubbleMenu };
+export { EditorBubbleMenu, shouldShowBubbleMenu };

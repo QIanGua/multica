@@ -34,12 +34,21 @@ function shouldShowTableMenu(editor: Editor): boolean {
   return editor.isEditable && !editor.isDestroyed && editor.isActive("table");
 }
 
+function selectedTableCell(editor: Editor): Element | null {
+  try {
+    const { from } = editor.state.selection;
+    const { node } = editor.view.domAtPos(from);
+    const element = node instanceof Element ? node : node.parentElement;
+    return element?.closest("td, th") ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function selectionRect(editor: Editor): DOMRect {
   try {
     const { from, to } = editor.state.selection;
-    const { node } = editor.view.domAtPos(from);
-    const element = node instanceof Element ? node : node.parentElement;
-    const cell = element?.closest("td, th");
+    const cell = selectedTableCell(editor);
     if (cell) return cell.getBoundingClientRect();
     return posToDOMRect(editor.view, from, to);
   } catch {
@@ -90,6 +99,9 @@ function TableActionButton({
 function EditorTableMenu({ editor }: { editor: Editor }) {
   const { t } = useT("editor");
   const [visible, setVisible] = useState(() => shouldShowTableMenu(editor));
+  const [contextElement, setContextElement] = useState<Element>(
+    () => selectedTableCell(editor) ?? editor.view.dom,
+  );
   const floatingRef = useRef<HTMLDivElement>(null);
   const updatePositionRef = useRef<() => void>(() => {});
 
@@ -97,9 +109,9 @@ function EditorTableMenu({ editor }: { editor: Editor }) {
     () => ({
       getBoundingClientRect: () =>
         editor.isDestroyed ? new DOMRect() : selectionRect(editor),
-      contextElement: editor.view.dom,
+      contextElement,
     }),
-    [editor],
+    [contextElement, editor],
   );
 
   useEffect(() => {
@@ -107,7 +119,10 @@ function EditorTableMenu({ editor }: { editor: Editor }) {
       if (!editor.isInitialized) return;
       const nextVisible = shouldShowTableMenu(editor);
       setVisible(nextVisible);
-      if (nextVisible) updatePositionRef.current();
+      if (nextVisible) {
+        setContextElement(selectedTableCell(editor) ?? editor.view.dom);
+        updatePositionRef.current();
+      }
     };
     editor.on("transaction", onTransaction);
     return () => {
