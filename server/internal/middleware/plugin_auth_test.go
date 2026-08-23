@@ -1,9 +1,12 @@
 package middleware
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	publicapiv1 "github.com/multica-ai/multica/server/pkg/publicapi/v1"
 )
 
 func TestPluginBearerOnlyRejectsNonPluginCredentials(t *testing.T) {
@@ -36,6 +39,16 @@ func TestPluginBearerOnlyRejectsNonPluginCredentials(t *testing.T) {
 			}
 			if called {
 				t.Fatal("non-plugin credential reached the Action API handler")
+			}
+			if got := response.Header().Get("Content-Type"); got != publicapiv1.ProblemContentType {
+				t.Fatalf("Content-Type = %q", got)
+			}
+			var problem publicapiv1.Problem
+			if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			if problem.Code != "plugin_bearer_required" || problem.Error == "" || problem.RequestID == "" {
+				t.Fatalf("unexpected problem: %+v", problem)
 			}
 		})
 	}

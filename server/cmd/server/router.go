@@ -45,6 +45,7 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
 	"github.com/multica-ai/multica/server/pkg/llm"
+	publicapiv1 "github.com/multica-ai/multica/server/pkg/publicapi/v1"
 )
 
 var defaultOrigins = []string{
@@ -53,10 +54,7 @@ var defaultOrigins = []string{
 	"http://localhost:5174", // electron-vite dev (fallback port)
 }
 
-const (
-	pluginActionPublicPrefix = "/v1"
-	pluginBridgePrefix       = "/api/plugin-bridge/v1"
-)
+const pluginBridgePrefix = "/api/plugin-bridge/v1"
 
 // corsAllowedHeaders must list every header the browser clients send. A header
 // missing here fails the preflight, so the request never reaches the handler at
@@ -69,6 +67,7 @@ var corsAllowedHeaders = []string{
 	"Authorization",
 	"Content-Type",
 	"Idempotency-Key",
+	"If-Match",
 	"X-Workspace-ID",
 	"X-Workspace-Slug",
 	"X-Request-ID",
@@ -92,20 +91,22 @@ var corsAllowedHeaders = []string{
 // Referencing the handler constant rather than re-typing the string keeps a
 // rename from quietly switching the signal off (MUL-5492).
 var corsExposedHeaders = []string{
+	"ETag",
+	"X-Request-ID",
 	handler.HeaderCommentsTruncated,
 	handler.HeaderTimelineTruncated,
 }
 
 func registerPluginActionRoutes(r chi.Router, h *handler.Handler) {
-	r.Get("/context", h.GetPluginContext)
-	r.Get("/issues/{id}", h.GetPluginIssue)
-	r.Patch("/issues/{id}", h.PatchPluginIssue)
-	r.Get("/issues/{id}/comments", h.ListPluginComments)
-	r.Post("/issues/{id}/comments", h.CreatePluginComment)
-	r.Get("/storage/{scope}", h.ListPluginStorage)
-	r.Get("/storage/{scope}/{key}", h.GetPluginStorage)
-	r.Put("/storage/{scope}/{key}", h.PutPluginStorage)
-	r.Delete("/storage/{scope}/{key}", h.DeletePluginStorage)
+	r.Get(publicapiv1.PathContext, h.GetPluginContext)
+	r.Get(publicapiv1.PathIssue, h.GetPluginIssue)
+	r.Patch(publicapiv1.PathIssue, h.PatchPluginIssue)
+	r.Get(publicapiv1.PathIssueComments, h.ListPluginComments)
+	r.Post(publicapiv1.PathIssueComments, h.CreatePluginComment)
+	r.Get(publicapiv1.PathStorageScope, h.ListPluginStorage)
+	r.Get(publicapiv1.PathStorageValue, h.GetPluginStorage)
+	r.Put(publicapiv1.PathStorageValue, h.PutPluginStorage)
+	r.Delete(publicapiv1.PathStorageValue, h.DeletePluginStorage)
 }
 
 func allowedOrigins() []string {
@@ -154,7 +155,7 @@ func pluginActionBaseURL(publicURL string) string {
 	if publicURL == "" {
 		return ""
 	}
-	return publicURL + pluginActionPublicPrefix
+	return publicURL + publicapiv1.BasePath
 }
 
 // parseTrustedProxies parses a comma-separated list of CIDR prefixes from the
@@ -1403,7 +1404,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// boundary even when both hostnames route to the same Go service.
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.PluginBearerOnly)
-		r.Route(pluginActionPublicPrefix, func(r chi.Router) {
+		r.Use(middleware.PluginRateLimit(rdb, envPositiveInt("RATE_LIMIT_PLUGIN_API", 120), time.Minute))
+		r.Route(publicapiv1.BasePath, func(r chi.Router) {
 			registerPluginActionRoutes(r, h)
 		})
 	})

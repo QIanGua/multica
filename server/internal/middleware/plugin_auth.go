@@ -3,6 +3,8 @@ package middleware
 import (
 	"net/http"
 	"strings"
+
+	publicapiv1 "github.com/multica-ai/multica/server/pkg/publicapi/v1"
 )
 
 // PluginBearerOnly keeps the public Action API on a machine-credential trust
@@ -14,7 +16,7 @@ import (
 func PluginBearerOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !IsPluginBearerToken(BearerToken(r)) {
-			writeError(w, http.StatusUnauthorized, "plugin bearer token required")
+			publicapiv1.WriteProblem(w, r, http.StatusUnauthorized, "plugin_bearer_required", "plugin bearer token required")
 			return
 		}
 		next.ServeHTTP(w, r)

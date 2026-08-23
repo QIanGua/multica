@@ -40,7 +40,7 @@ func (h *Handler) InvokePluginHook(w http.ResponseWriter, r *http.Request) {
 	// A hook invoked from the UI is invoked BY somebody. A plugin's own server
 	// calling this would be asking us to call it back, which is a loop with no
 	// person in it and no reason to exist.
-	if !actor.requireMember(w) {
+	if !actor.requireMember(w, r) {
 		return
 	}
 
