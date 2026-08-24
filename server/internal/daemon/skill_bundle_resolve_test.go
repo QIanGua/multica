@@ -529,25 +529,39 @@ func TestResolveSkillBundle_ServerErrorBodyIsNotCountedAsBundleData(t *testing.T
 func TestEnsureTaskSkillBundles_MalformedSuccessfulResponseIsNotNetworkError(t *testing.T) {
 	defer noSleepRetry(t)()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"bundles": definitely-not-json}`)
-	}))
-	defer srv.Close()
+	for _, tc := range []struct {
+		name              string
+		body              string
+		wantUnexpectedEOF bool
+	}{
+		{name: "invalid token", body: `{"bundles": definitely-not-json}`},
+		{name: "clean EOF after truncated JSON", body: `{"bundles":`, wantUnexpectedEOF: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
 
-	ref := skillRefFromBundle(makeResolvableSkillBundle("frontend-review"))
-	d := &Daemon{client: NewClient(srv.URL), skillCache: NewSkillBundleCache(t.TempDir())}
-	task := &Task{
-		ID: "task-1", RuntimeID: "rt-1", WorkspaceID: "ws-1",
-		Agent: &AgentData{ID: "agent-1", SkillRefs: []SkillRefData{ref}},
-	}
+			ref := skillRefFromBundle(makeResolvableSkillBundle("frontend-review"))
+			d := &Daemon{client: NewClient(srv.URL), skillCache: NewSkillBundleCache(t.TempDir())}
+			task := &Task{
+				ID: "task-1", RuntimeID: "rt-1", WorkspaceID: "ws-1",
+				Agent: &AgentData{ID: "agent-1", SkillRefs: []SkillRefData{ref}},
+			}
 
-	err := d.ensureTaskSkillBundles(context.Background(), task)
-	if err == nil {
-		t.Fatal("expected malformed response error")
-	}
-	if got := err.Error(); strings.Contains(got, "network error") || strings.Contains(got, "skill content is not at fault") {
-		t.Errorf("complete malformed JSON is a server payload error, not a network failure:\n%s", got)
+			err := d.ensureTaskSkillBundles(context.Background(), task)
+			if err == nil {
+				t.Fatal("expected malformed response error")
+			}
+			if tc.wantUnexpectedEOF && !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("truncated JSON must exercise json.Decoder's io.ErrUnexpectedEOF path, got %v", err)
+			}
+			if got := err.Error(); strings.Contains(got, "network error") || strings.Contains(got, "skill content is not at fault") {
+				t.Errorf("malformed JSON ending at a clean EOF is a server payload error, not a network failure:\n%s", got)
+			}
+		})
 	}
 }
 

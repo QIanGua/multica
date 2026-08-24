@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"log/slog"
 	"math/rand"
 	"net"
@@ -6074,13 +6073,15 @@ func (d *Daemon) resolveSkillBundle(ctx context.Context, task *Task, ref SkillRe
 // isSkillBundleTransferFailure identifies errors for which byte-level network
 // diagnostics are meaningful. A requestError is an explicit server response;
 // malformed but complete JSON and bundle-validation errors are server payload
-// problems. Neither should be presented as a slow or dead network link.
+// problems. Neither should be presented as a slow or dead network link. In
+// particular, json.Decoder can synthesize io.ErrUnexpectedEOF after its source
+// ended with a clean EOF, so that decoder error alone is not transport proof.
 func isSkillBundleTransferFailure(err error) bool {
 	var reqErr *requestError
 	if errors.As(err, &reqErr) {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.ErrUnexpectedEOF) {
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	var netErr net.Error
