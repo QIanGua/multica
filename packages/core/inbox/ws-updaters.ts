@@ -34,7 +34,10 @@ export function patchInboxIssueProjection(
         ...(patch.status !== undefined
           ? { issue_status: patch.status }
           : {}),
-        ...(patch.priority !== undefined
+        // Do not manufacture the projection on data returned by an older
+        // backend. Capability detection relies on `undefined` continuing to
+        // mean "this endpoint version does not provide issue_priority".
+        ...(patch.priority !== undefined && item.issue_priority !== undefined
           ? { issue_priority: patch.priority }
           : {}),
       };

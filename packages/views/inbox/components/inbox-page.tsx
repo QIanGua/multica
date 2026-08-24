@@ -40,7 +40,9 @@ import {
 } from "@multica/core/inbox/mutations";
 import {
   filterInboxItems,
+  inboxFiltersForPrioritySupport,
   inboxFilterCount,
+  inboxPriorityFilterSupport,
   useInboxFilters,
   useInboxFilterStore,
 } from "@multica/core/inbox/filter-store";
@@ -133,11 +135,23 @@ export function InboxPage() {
   const viewItems = isArchivedView ? archivedItems : items;
   const filters = useInboxFilters(wsId);
   const clearFilters = useInboxFilterStore((state) => state.clearFilters);
-  const visibleItems = useMemo(
-    () => filterInboxItems(viewItems, filters),
-    [viewItems, filters],
+  // Active and archived endpoints return the same row contract and are both
+  // already loaded on this page. Requiring the combined response to expose the
+  // projection prevents one pod in a rolling deploy from advertising a
+  // capability the other pod does not have yet.
+  const priorityFilterSupport = useMemo(
+    () => inboxPriorityFilterSupport([...rawItems, ...rawArchivedItems]),
+    [rawItems, rawArchivedItems],
   );
-  const hasActiveFilters = inboxFilterCount(filters) > 0;
+  const effectiveFilters = useMemo(
+    () => inboxFiltersForPrioritySupport(filters, priorityFilterSupport),
+    [filters, priorityFilterSupport],
+  );
+  const visibleItems = useMemo(
+    () => filterInboxItems(viewItems, effectiveFilters),
+    [viewItems, effectiveFilters],
+  );
+  const hasActiveFilters = inboxFilterCount(effectiveFilters) > 0;
 
   const selected =
     visibleItems.find((i) => (i.issue_id ?? i.id) === selectedKey) ?? null;
@@ -507,7 +521,11 @@ export function InboxPage() {
           />
         )}
       </div>
-      <InboxFilterMenu wsId={wsId} items={viewItems} />
+      <InboxFilterMenu
+        wsId={wsId}
+        items={viewItems}
+        priorityFilterSupport={priorityFilterSupport}
+      />
       {/* Batch actions are main-view only. Every entry archives from the MAIN
           inbox, so offering them while the archived list is on screen reads as
           "archive all of these" and does the opposite of what it looks like. */}

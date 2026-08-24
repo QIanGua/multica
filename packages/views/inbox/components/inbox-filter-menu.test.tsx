@@ -11,7 +11,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setApiInstance } from "@multica/core/api";
 import type { ApiClient } from "@multica/core/api/client";
 import { STATUS_ORDER } from "@multica/core/issues/config";
-import { useInboxFilterStore } from "@multica/core/inbox/filter-store";
+import {
+  type InboxPriorityFilterSupport,
+  useInboxFilterStore,
+} from "@multica/core/inbox/filter-store";
 import type { InboxItem, IssueStatusEntry } from "@multica/core/types";
 import { renderWithI18n } from "../../test/i18n";
 import { InboxFilterMenu } from "./inbox-filter-menu";
@@ -64,7 +67,13 @@ const ITEMS = [
   item("done-low", "done", "low"),
 ];
 
-function renderMenu() {
+function renderMenu({
+  items = ITEMS,
+  priorityFilterSupport = "supported",
+}: {
+  items?: InboxItem[];
+  priorityFilterSupport?: InboxPriorityFilterSupport;
+} = {}) {
   setApiInstance({
     listIssueStatuses: async () => ({
       statuses: STATUS_ORDER.map(statusEntry),
@@ -77,7 +86,11 @@ function renderMenu() {
   });
   return renderWithI18n(
     <QueryClientProvider client={queryClient}>
-      <InboxFilterMenu wsId="ws-1" items={ITEMS} />
+      <InboxFilterMenu
+        wsId="ws-1"
+        items={items}
+        priorityFilterSupport={priorityFilterSupport}
+      />
     </QueryClientProvider>,
   );
 }
@@ -145,5 +158,23 @@ describe("InboxFilterMenu", () => {
     expect(
       useInboxFilterStore.getState().filtersByWorkspace["ws-1"],
     ).toBeUndefined();
+  });
+
+  it("hides priority and clears its filter for a legacy response", async () => {
+    useInboxFilterStore.getState().togglePriorityFilter("ws-1", "high");
+    renderMenu({
+      items: [item("legacy", "todo", undefined)],
+      priorityFilterSupport: "unsupported",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter inbox" }));
+    expect(
+      screen.queryByRole("menuitem", { name: /^Priority/ }),
+    ).toBeNull();
+    await waitFor(() =>
+      expect(
+        useInboxFilterStore.getState().filtersByWorkspace["ws-1"],
+      ).toBeUndefined(),
+    );
   });
 });

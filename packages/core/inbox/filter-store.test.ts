@@ -5,7 +5,9 @@ import type { InboxItem } from "../types";
 import {
   EMPTY_INBOX_FILTERS,
   filterInboxItems,
+  inboxFiltersForPrioritySupport,
   inboxFilterCount,
+  inboxPriorityFilterSupport,
   useInboxFilterStore,
 } from "./filter-store";
 
@@ -67,6 +69,32 @@ describe("filterInboxItems", () => {
       ),
     ).toEqual(["todo-high", "done-high"]);
   });
+
+  it("does not apply a priority condition until the projection is supported", () => {
+    const filters = { statuses: ["todo"], priorities: ["high"] } as const;
+
+    expect(inboxFiltersForPrioritySupport(filters, "unknown")).toEqual({
+      statuses: ["todo"],
+      priorities: [],
+    });
+    expect(inboxFiltersForPrioritySupport(filters, "unsupported")).toEqual({
+      statuses: ["todo"],
+      priorities: [],
+    });
+    expect(inboxFiltersForPrioritySupport(filters, "supported")).toBe(filters);
+  });
+});
+
+describe("inboxPriorityFilterSupport", () => {
+  it("distinguishes an omitted legacy projection from a supported null", () => {
+    expect(inboxPriorityFilterSupport([])).toBe("unknown");
+    expect(inboxPriorityFilterSupport([item("system", null, null)])).toBe(
+      "supported",
+    );
+    expect(inboxPriorityFilterSupport([item("legacy", "todo", undefined)])).toBe(
+      "unsupported",
+    );
+  });
 });
 
 describe("useInboxFilterStore", () => {
@@ -86,5 +114,18 @@ describe("useInboxFilterStore", () => {
     useInboxFilterStore.getState().clearFilters("ws-1");
     expect(useInboxFilterStore.getState().filtersByWorkspace["ws-1"]).toBeUndefined();
     expect(useInboxFilterStore.getState().filtersByWorkspace["ws-2"]).toBeDefined();
+  });
+
+  it("clears only the unsupported priority dimension", () => {
+    const store = useInboxFilterStore.getState();
+    store.toggleStatusFilter("ws-1", "todo");
+    store.togglePriorityFilter("ws-1", "high");
+
+    useInboxFilterStore.getState().clearPriorityFilters("ws-1");
+
+    expect(useInboxFilterStore.getState().filtersByWorkspace["ws-1"]).toEqual({
+      statuses: ["todo"],
+      priorities: [],
+    });
   });
 });

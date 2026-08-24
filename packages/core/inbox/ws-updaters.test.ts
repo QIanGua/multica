@@ -183,4 +183,17 @@ describe("patchInboxIssueProjection", () => {
         ?.issue_priority,
     ).toBe("urgent");
   });
+
+  it("does not manufacture priority capability for legacy Inbox rows", () => {
+    const qc = new QueryClient();
+    qc.setQueryData<InboxItem[]>(inboxKeys.list(wsId), [
+      makeItem("legacy", "issue-a"),
+    ]);
+
+    patchInboxIssueProjection(qc, wsId, "issue-a", { priority: "urgent" });
+
+    expect(
+      qc.getQueryData<InboxItem[]>(inboxKeys.list(wsId))?.[0],
+    ).not.toHaveProperty("issue_priority");
+  });
 });

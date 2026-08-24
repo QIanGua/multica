@@ -292,6 +292,23 @@ describe("InboxPage", () => {
     expect(screen.getByTestId("row")).toHaveTextContent("todo-high");
   });
 
+  it("ignores a priority filter when a legacy response omits the projection", () => {
+    reset();
+    const legacyItem = item({
+      id: "legacy-todo",
+      issue_status: "todo",
+    });
+    delete legacyItem.issue_priority;
+    listData.active = [legacyItem];
+    useInboxFilterStore
+      .getState()
+      .togglePriorityFilter("workspace-1", "urgent");
+
+    render(<InboxPage />);
+
+    expect(screen.getByTestId("row")).toHaveTextContent("legacy-todo");
+  });
+
   it("renders the archived list when the URL asks for it", () => {
     // ?view=archived is what makes a refresh, a back/forward step, or a mobile
     // detail-back land in the archive instead of the main inbox.
