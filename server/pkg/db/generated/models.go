@@ -1156,6 +1156,7 @@ type SeatCapacityOutbox struct {
 	DeliveredAt    pgtype.Timestamptz `json:"delivered_at"`
 	AttemptCount   int32              `json:"attempt_count"`
 	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
 	LastError      pgtype.Text        `json:"last_error"`
 	DeadLetteredAt pgtype.Timestamptz `json:"dead_lettered_at"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`

@@ -23,10 +23,11 @@ WITH due AS (
 )
 UPDATE seat_capacity_outbox AS outbox
 SET next_attempt_at = $1,
+    lease_token = gen_random_uuid(),
     updated_at = now()
 FROM due
 WHERE outbox.operation_token = due.operation_token
-RETURNING outbox.workspace_id, outbox.operation_token, outbox.action, outbox.subject_id, outbox.member_id, outbox.invitation_id, outbox.share_link_id, outbox.user_id, outbox.expires_at, outbox.delivered_at, outbox.attempt_count, outbox.next_attempt_at, outbox.last_error, outbox.dead_lettered_at, outbox.created_at, outbox.updated_at
+RETURNING outbox.workspace_id, outbox.operation_token, outbox.action, outbox.subject_id, outbox.member_id, outbox.invitation_id, outbox.share_link_id, outbox.user_id, outbox.expires_at, outbox.delivered_at, outbox.attempt_count, outbox.next_attempt_at, outbox.lease_token, outbox.last_error, outbox.dead_lettered_at, outbox.created_at, outbox.updated_at
 `
 
 func (q *Queries) ClaimNextDueSeatCapacityIntent(ctx context.Context, leaseUntil pgtype.Timestamptz) (SeatCapacityOutbox, error) {
@@ -45,12 +46,101 @@ func (q *Queries) ClaimNextDueSeatCapacityIntent(ctx context.Context, leaseUntil
 		&i.DeliveredAt,
 		&i.AttemptCount,
 		&i.NextAttemptAt,
+		&i.LeaseToken,
 		&i.LastError,
 		&i.DeadLetteredAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const createOrReactivateShareJoinCapacityIntent = `-- name: CreateOrReactivateShareJoinCapacityIntent :one
+INSERT INTO seat_capacity_outbox (
+    workspace_id, operation_token, action, subject_id, share_link_id, user_id,
+    next_attempt_at
+) VALUES (
+    $1, $2, 'claim_share_join',
+    $2, $3, $4,
+    $5
+)
+ON CONFLICT (workspace_id, share_link_id, user_id)
+WHERE share_link_id IS NOT NULL AND user_id IS NOT NULL
+DO UPDATE SET
+    action = 'claim_share_join',
+    subject_id = seat_capacity_outbox.operation_token,
+    member_id = NULL,
+    invitation_id = NULL,
+    expires_at = NULL,
+    delivered_at = NULL,
+    attempt_count = 0,
+    next_attempt_at = EXCLUDED.next_attempt_at,
+    lease_token = NULL,
+    last_error = NULL,
+    dead_lettered_at = NULL,
+    updated_at = now()
+WHERE seat_capacity_outbox.action IN ('claim_share_join', 'release')
+RETURNING workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, lease_token, last_error, dead_lettered_at, created_at, updated_at
+`
+
+type CreateOrReactivateShareJoinCapacityIntentParams struct {
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	OperationToken pgtype.UUID        `json:"operation_token"`
+	ShareLinkID    pgtype.UUID        `json:"share_link_id"`
+	UserID         pgtype.UUID        `json:"user_id"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+}
+
+func (q *Queries) CreateOrReactivateShareJoinCapacityIntent(ctx context.Context, arg CreateOrReactivateShareJoinCapacityIntentParams) (SeatCapacityOutbox, error) {
+	row := q.db.QueryRow(ctx, createOrReactivateShareJoinCapacityIntent,
+		arg.WorkspaceID,
+		arg.OperationToken,
+		arg.ShareLinkID,
+		arg.UserID,
+		arg.NextAttemptAt,
+	)
+	var i SeatCapacityOutbox
+	err := row.Scan(
+		&i.WorkspaceID,
+		&i.OperationToken,
+		&i.Action,
+		&i.SubjectID,
+		&i.MemberID,
+		&i.InvitationID,
+		&i.ShareLinkID,
+		&i.UserID,
+		&i.ExpiresAt,
+		&i.DeliveredAt,
+		&i.AttemptCount,
+		&i.NextAttemptAt,
+		&i.LeaseToken,
+		&i.LastError,
+		&i.DeadLetteredAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const deleteClaimedSeatCapacityIntent = `-- name: DeleteClaimedSeatCapacityIntent :execrows
+DELETE FROM seat_capacity_outbox
+WHERE operation_token = $1
+  AND action = $2
+  AND lease_token = $3
+`
+
+type DeleteClaimedSeatCapacityIntentParams struct {
+	OperationToken pgtype.UUID `json:"operation_token"`
+	Action         string      `json:"action"`
+	LeaseToken     pgtype.UUID `json:"lease_token"`
+}
+
+func (q *Queries) DeleteClaimedSeatCapacityIntent(ctx context.Context, arg DeleteClaimedSeatCapacityIntentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteClaimedSeatCapacityIntent, arg.OperationToken, arg.Action, arg.LeaseToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteSeatCapacityConfirmIntentsForWorkspaceDeletion = `-- name: DeleteSeatCapacityConfirmIntentsForWorkspaceDeletion :exec
@@ -100,13 +190,14 @@ ON CONFLICT (operation_token) DO UPDATE SET
     delivered_at = NULL,
     attempt_count = 0,
     next_attempt_at = EXCLUDED.next_attempt_at,
+    lease_token = NULL,
     last_error = NULL,
     dead_lettered_at = NULL,
     updated_at = now()
 WHERE seat_capacity_outbox.action IN (
     'reserve_invitation', 'consume_invitation', 'claim_share_join', 'release'
 )
-RETURNING workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, last_error, dead_lettered_at, created_at, updated_at
+RETURNING workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, lease_token, last_error, dead_lettered_at, created_at, updated_at
 `
 
 type EnqueueSeatCapacityReleaseParams struct {
@@ -137,6 +228,7 @@ func (q *Queries) EnqueueSeatCapacityRelease(ctx context.Context, arg EnqueueSea
 		&i.DeliveredAt,
 		&i.AttemptCount,
 		&i.NextAttemptAt,
+		&i.LeaseToken,
 		&i.LastError,
 		&i.DeadLetteredAt,
 		&i.CreatedAt,
@@ -156,8 +248,46 @@ func (q *Queries) ExpireInvitationForCapacityRecovery(ctx context.Context, id pg
 	return err
 }
 
+const getClaimedSeatCapacityIntent = `-- name: GetClaimedSeatCapacityIntent :one
+SELECT workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, lease_token, last_error, dead_lettered_at, created_at, updated_at FROM seat_capacity_outbox
+WHERE operation_token = $1
+  AND action = $2
+  AND lease_token = $3
+`
+
+type GetClaimedSeatCapacityIntentParams struct {
+	OperationToken pgtype.UUID `json:"operation_token"`
+	Action         string      `json:"action"`
+	LeaseToken     pgtype.UUID `json:"lease_token"`
+}
+
+func (q *Queries) GetClaimedSeatCapacityIntent(ctx context.Context, arg GetClaimedSeatCapacityIntentParams) (SeatCapacityOutbox, error) {
+	row := q.db.QueryRow(ctx, getClaimedSeatCapacityIntent, arg.OperationToken, arg.Action, arg.LeaseToken)
+	var i SeatCapacityOutbox
+	err := row.Scan(
+		&i.WorkspaceID,
+		&i.OperationToken,
+		&i.Action,
+		&i.SubjectID,
+		&i.MemberID,
+		&i.InvitationID,
+		&i.ShareLinkID,
+		&i.UserID,
+		&i.ExpiresAt,
+		&i.DeliveredAt,
+		&i.AttemptCount,
+		&i.NextAttemptAt,
+		&i.LeaseToken,
+		&i.LastError,
+		&i.DeadLetteredAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getMemberReleaseCapacityIntent = `-- name: GetMemberReleaseCapacityIntent :one
-SELECT workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, last_error, dead_lettered_at, created_at, updated_at FROM seat_capacity_outbox
+SELECT workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, lease_token, last_error, dead_lettered_at, created_at, updated_at FROM seat_capacity_outbox
 WHERE workspace_id = $1
   AND member_id = $2
   AND action = 'release_member'
@@ -186,47 +316,7 @@ func (q *Queries) GetMemberReleaseCapacityIntent(ctx context.Context, arg GetMem
 		&i.DeliveredAt,
 		&i.AttemptCount,
 		&i.NextAttemptAt,
-		&i.LastError,
-		&i.DeadLetteredAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
-const getPendingShareJoinCapacityIntent = `-- name: GetPendingShareJoinCapacityIntent :one
-SELECT workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, last_error, dead_lettered_at, created_at, updated_at FROM seat_capacity_outbox
-WHERE workspace_id = $1
-  AND share_link_id = $2
-  AND user_id = $3
-  AND action = 'claim_share_join'
-  AND dead_lettered_at IS NULL
-ORDER BY created_at DESC
-LIMIT 1
-`
-
-type GetPendingShareJoinCapacityIntentParams struct {
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	ShareLinkID pgtype.UUID `json:"share_link_id"`
-	UserID      pgtype.UUID `json:"user_id"`
-}
-
-func (q *Queries) GetPendingShareJoinCapacityIntent(ctx context.Context, arg GetPendingShareJoinCapacityIntentParams) (SeatCapacityOutbox, error) {
-	row := q.db.QueryRow(ctx, getPendingShareJoinCapacityIntent, arg.WorkspaceID, arg.ShareLinkID, arg.UserID)
-	var i SeatCapacityOutbox
-	err := row.Scan(
-		&i.WorkspaceID,
-		&i.OperationToken,
-		&i.Action,
-		&i.SubjectID,
-		&i.MemberID,
-		&i.InvitationID,
-		&i.ShareLinkID,
-		&i.UserID,
-		&i.ExpiresAt,
-		&i.DeliveredAt,
-		&i.AttemptCount,
-		&i.NextAttemptAt,
+		&i.LeaseToken,
 		&i.LastError,
 		&i.DeadLetteredAt,
 		&i.CreatedAt,
@@ -236,7 +326,7 @@ func (q *Queries) GetPendingShareJoinCapacityIntent(ctx context.Context, arg Get
 }
 
 const getSeatCapacityIntent = `-- name: GetSeatCapacityIntent :one
-SELECT workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, last_error, dead_lettered_at, created_at, updated_at FROM seat_capacity_outbox WHERE operation_token = $1
+SELECT workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, lease_token, last_error, dead_lettered_at, created_at, updated_at FROM seat_capacity_outbox WHERE operation_token = $1
 `
 
 func (q *Queries) GetSeatCapacityIntent(ctx context.Context, operationToken pgtype.UUID) (SeatCapacityOutbox, error) {
@@ -255,6 +345,7 @@ func (q *Queries) GetSeatCapacityIntent(ctx context.Context, operationToken pgty
 		&i.DeliveredAt,
 		&i.AttemptCount,
 		&i.NextAttemptAt,
+		&i.LeaseToken,
 		&i.LastError,
 		&i.DeadLetteredAt,
 		&i.CreatedAt,
@@ -263,25 +354,67 @@ func (q *Queries) GetSeatCapacityIntent(ctx context.Context, operationToken pgty
 	return i, err
 }
 
-const markSeatCapacityIntentDeadLettered = `-- name: MarkSeatCapacityIntentDeadLettered :execrows
+const markClaimedSeatCapacityIntentDeadLettered = `-- name: MarkClaimedSeatCapacityIntentDeadLettered :execrows
 UPDATE seat_capacity_outbox
 SET attempt_count = attempt_count + 1,
     last_error = left($1, 1000),
     dead_lettered_at = now(),
+    lease_token = NULL,
     updated_at = now()
 WHERE operation_token = $2
   AND action = $3
+  AND lease_token = $4
   AND dead_lettered_at IS NULL
 `
 
-type MarkSeatCapacityIntentDeadLetteredParams struct {
+type MarkClaimedSeatCapacityIntentDeadLetteredParams struct {
 	LastError      string      `json:"last_error"`
 	OperationToken pgtype.UUID `json:"operation_token"`
 	Action         string      `json:"action"`
+	LeaseToken     pgtype.UUID `json:"lease_token"`
 }
 
-func (q *Queries) MarkSeatCapacityIntentDeadLettered(ctx context.Context, arg MarkSeatCapacityIntentDeadLetteredParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markSeatCapacityIntentDeadLettered, arg.LastError, arg.OperationToken, arg.Action)
+func (q *Queries) MarkClaimedSeatCapacityIntentDeadLettered(ctx context.Context, arg MarkClaimedSeatCapacityIntentDeadLetteredParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markClaimedSeatCapacityIntentDeadLettered,
+		arg.LastError,
+		arg.OperationToken,
+		arg.Action,
+		arg.LeaseToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markClaimedSeatCapacityIntentFailed = `-- name: MarkClaimedSeatCapacityIntentFailed :execrows
+UPDATE seat_capacity_outbox
+SET attempt_count = attempt_count + 1,
+    last_error = left($1, 1000),
+    next_attempt_at = $2,
+    lease_token = NULL,
+    updated_at = now()
+WHERE operation_token = $3
+  AND action = $4
+  AND lease_token = $5
+`
+
+type MarkClaimedSeatCapacityIntentFailedParams struct {
+	LastError      string             `json:"last_error"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	OperationToken pgtype.UUID        `json:"operation_token"`
+	Action         string             `json:"action"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+}
+
+func (q *Queries) MarkClaimedSeatCapacityIntentFailed(ctx context.Context, arg MarkClaimedSeatCapacityIntentFailedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markClaimedSeatCapacityIntentFailed,
+		arg.LastError,
+		arg.NextAttemptAt,
+		arg.OperationToken,
+		arg.Action,
+		arg.LeaseToken,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -292,6 +425,7 @@ const markSeatCapacityIntentDelivered = `-- name: MarkSeatCapacityIntentDelivere
 UPDATE seat_capacity_outbox
 SET delivered_at = now(),
     attempt_count = attempt_count + 1,
+    lease_token = NULL,
     last_error = NULL,
     updated_at = now()
 WHERE operation_token = $1 AND action = $2
@@ -312,6 +446,7 @@ UPDATE seat_capacity_outbox
 SET attempt_count = attempt_count + 1,
     last_error = left($1, 1000),
     next_attempt_at = $2,
+    lease_token = NULL,
     updated_at = now()
 WHERE operation_token = $3 AND action = $4
 `
@@ -348,9 +483,13 @@ ON CONFLICT (operation_token) DO UPDATE SET
     delivered_at = NULL,
     attempt_count = 0,
     next_attempt_at = now(),
+    lease_token = NULL,
     last_error = NULL,
     dead_lettered_at = NULL,
     updated_at = now()
+WHERE seat_capacity_outbox.action IN (
+    'reserve_invitation', 'consume_invitation', 'claim_share_join', 'release'
+)
 `
 
 func (q *Queries) PrepareSeatCapacityInvitationReleasesForWorkspaceDeletion(ctx context.Context, workspaceID pgtype.UUID) error {
@@ -386,6 +525,7 @@ SET action = 'release',
     delivered_at = NULL,
     attempt_count = 0,
     next_attempt_at = now(),
+    lease_token = NULL,
     last_error = NULL,
     dead_lettered_at = NULL,
     updated_at = now()
@@ -445,6 +585,46 @@ func (q *Queries) SeatCapacityOutboxStats(ctx context.Context) ([]SeatCapacityOu
 	return items, nil
 }
 
+const transitionClaimedSeatCapacityIntent = `-- name: TransitionClaimedSeatCapacityIntent :execrows
+UPDATE seat_capacity_outbox
+SET action = $1,
+    member_id = $2,
+    delivered_at = NULL,
+    attempt_count = 0,
+    next_attempt_at = $3,
+    lease_token = NULL,
+    last_error = NULL,
+    dead_lettered_at = NULL,
+    updated_at = now()
+WHERE operation_token = $4
+  AND action = $5
+  AND lease_token = $6
+`
+
+type TransitionClaimedSeatCapacityIntentParams struct {
+	NextAction     string             `json:"next_action"`
+	MemberID       pgtype.UUID        `json:"member_id"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	OperationToken pgtype.UUID        `json:"operation_token"`
+	CurrentAction  string             `json:"current_action"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+}
+
+func (q *Queries) TransitionClaimedSeatCapacityIntent(ctx context.Context, arg TransitionClaimedSeatCapacityIntentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, transitionClaimedSeatCapacityIntent,
+		arg.NextAction,
+		arg.MemberID,
+		arg.NextAttemptAt,
+		arg.OperationToken,
+		arg.CurrentAction,
+		arg.LeaseToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const transitionSeatCapacityIntent = `-- name: TransitionSeatCapacityIntent :execrows
 UPDATE seat_capacity_outbox
 SET action = $1,
@@ -452,6 +632,7 @@ SET action = $1,
     delivered_at = NULL,
     attempt_count = 0,
     next_attempt_at = $3,
+    lease_token = NULL,
     last_error = NULL,
     dead_lettered_at = NULL,
     updated_at = now()
@@ -509,12 +690,13 @@ ON CONFLICT (operation_token) DO UPDATE SET
         ELSE NULL
     END,
     next_attempt_at = EXCLUDED.next_attempt_at,
+    lease_token = NULL,
     last_error = NULL,
     dead_lettered_at = NULL,
     updated_at = now()
 WHERE seat_capacity_outbox.action = EXCLUDED.action
    OR (seat_capacity_outbox.action = 'reserve_invitation' AND EXCLUDED.action = 'consume_invitation')
-RETURNING workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, last_error, dead_lettered_at, created_at, updated_at
+RETURNING workspace_id, operation_token, action, subject_id, member_id, invitation_id, share_link_id, user_id, expires_at, delivered_at, attempt_count, next_attempt_at, lease_token, last_error, dead_lettered_at, created_at, updated_at
 `
 
 type UpsertSeatCapacityIntentParams struct {
@@ -557,6 +739,7 @@ func (q *Queries) UpsertSeatCapacityIntent(ctx context.Context, arg UpsertSeatCa
 		&i.DeliveredAt,
 		&i.AttemptCount,
 		&i.NextAttemptAt,
+		&i.LeaseToken,
 		&i.LastError,
 		&i.DeadLetteredAt,
 		&i.CreatedAt,

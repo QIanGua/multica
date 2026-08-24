@@ -28,6 +28,8 @@ type stubSeatCapacity struct {
 	reserveErr      error
 	reserveCalls    int
 	releaseCalls    int
+	consumeCalls    int
+	consumeErr      error
 }
 
 func (s *stubSeatCapacity) Enabled() bool { return true }
@@ -39,7 +41,8 @@ func (s *stubSeatCapacity) ClaimShareJoin(context.Context, uuid.UUID, uuid.UUID)
 	return seatcapacity.Decision{Managed: true, Allowed: true}, nil
 }
 func (s *stubSeatCapacity) Consume(context.Context, uuid.UUID, uuid.UUID) (seatcapacity.Decision, error) {
-	return seatcapacity.Decision{Managed: true, Allowed: true}, nil
+	s.consumeCalls++
+	return seatcapacity.Decision{Managed: true, Allowed: true}, s.consumeErr
 }
 func (s *stubSeatCapacity) Confirm(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (seatcapacity.Decision, error) {
 	return seatcapacity.Decision{Managed: true, Allowed: true}, nil
@@ -58,8 +61,13 @@ func (s *stubSeatCapacity) GetOperation(context.Context, uuid.UUID, uuid.UUID) (
 func useSeatCapacity(t *testing.T, executor seatcapacity.Executor) {
 	t.Helper()
 	previous := testHandler.SeatCapacity
+	previousEnforcement := testHandler.SeatCapacityEnforcementEnabled
 	testHandler.SeatCapacity = executor
-	t.Cleanup(func() { testHandler.SeatCapacity = previous })
+	testHandler.SeatCapacityEnforcementEnabled = true
+	t.Cleanup(func() {
+		testHandler.SeatCapacity = previous
+		testHandler.SeatCapacityEnforcementEnabled = previousEnforcement
+	})
 }
 
 func TestDefaultInvitationRateLimits(t *testing.T) {

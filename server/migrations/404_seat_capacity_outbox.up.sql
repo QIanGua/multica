@@ -21,6 +21,7 @@ CREATE TABLE seat_capacity_outbox (
     delivered_at TIMESTAMPTZ,
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lease_token UUID,
     last_error TEXT,
     dead_lettered_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

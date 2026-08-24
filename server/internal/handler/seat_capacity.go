@@ -20,7 +20,25 @@ var (
 )
 
 func (h *Handler) seatCapacityEnabled() bool {
+	return h != nil && h.SeatCapacityEnforcementEnabled && h.seatCapacitySettlementEnabled()
+}
+
+func (h *Handler) seatCapacitySettlementEnabled() bool {
 	return h != nil && h.SeatCapacity != nil && h.SeatCapacity.Enabled()
+}
+
+func (h *Handler) lockSeatCapacityWorkspace(ctx context.Context, workspaceID uuid.UUID) (*db.Queries, func(), error) {
+	if h == nil {
+		return nil, nil, errors.New("seat capacity handler is unavailable")
+	}
+	if h.SeatCapacityLocker == nil {
+		return h.Queries, func() {}, nil
+	}
+	lockedDB, unlock, err := h.SeatCapacityLocker.Lock(ctx, workspaceID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db.New(lockedDB), unlock, nil
 }
 
 func capacityIntentParams(workspaceID, token uuid.UUID, action string, due time.Time) db.UpsertSeatCapacityIntentParams {
@@ -36,90 +54,116 @@ func (h *Handler) reserveInvitationCapacity(ctx context.Context, workspaceID, in
 	if !h.seatCapacityEnabled() {
 		return nil
 	}
+	q, unlock, err := h.lockSeatCapacityWorkspace(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("%w: acquire workspace capacity lock: %v", errSeatCapacityUnavailable, err)
+	}
+	defer unlock()
 	params := capacityIntentParams(workspaceID, invitationID, seatcapacity.ActionReserveInvitation, seatcapacity.RecoveryDue(time.Now()).Time)
 	params.SubjectID = uuidToPG(invitationID)
 	params.InvitationID = uuidToPG(invitationID)
 	params.ExpiresAt = pgtype.Timestamptz{Time: expiresAt, Valid: true}
-	if _, err := h.Queries.UpsertSeatCapacityIntent(ctx, params); err != nil {
+	if _, err := q.UpsertSeatCapacityIntent(ctx, params); err != nil {
 		return fmt.Errorf("record invitation capacity intent: %w", err)
 	}
 	decision, err := h.SeatCapacity.ReserveInvitation(ctx, workspaceID, invitationID, expiresAt)
 	if err != nil {
-		h.compensateCapacityIntent(ctx, invitationID)
+		h.compensateCapacityIntentLocked(ctx, q, invitationID)
 		return fmt.Errorf("%w: %v", errSeatCapacityUnavailable, err)
 	}
 	if !decision.Managed {
-		return h.deleteCapacityIntentForAction(ctx, invitationID, seatcapacity.ActionReserveInvitation)
+		return deleteCapacityIntentForAction(ctx, q, invitationID, seatcapacity.ActionReserveInvitation)
 	}
 	if !decision.Allowed {
-		_ = h.deleteCapacityIntentForAction(ctx, invitationID, seatcapacity.ActionReserveInvitation)
+		_ = deleteCapacityIntentForAction(ctx, q, invitationID, seatcapacity.ActionReserveInvitation)
 		if decision.Reason == "capacity_full" || decision.Reason == "denied" {
 			return errSeatCapacityFull
 		}
 		return fmt.Errorf("%w: reservation rejected in state %s", errSeatCapacityUnavailable, decision.Reason)
 	}
-	if err := h.Queries.MarkSeatCapacityIntentDelivered(ctx, db.MarkSeatCapacityIntentDeliveredParams{
+	if err := q.MarkSeatCapacityIntentDelivered(ctx, db.MarkSeatCapacityIntentDeliveredParams{
 		OperationToken: uuidToPG(invitationID), Action: seatcapacity.ActionReserveInvitation,
 	}); err != nil {
-		h.compensateCapacityIntent(ctx, invitationID)
+		h.compensateCapacityIntentLocked(ctx, q, invitationID)
 		return fmt.Errorf("record invitation capacity reservation: %w", err)
 	}
 	return nil
 }
 
-func (h *Handler) beginCapacityConsume(ctx context.Context, workspaceID, token, invitationID, userID uuid.UUID) error {
-	if !h.seatCapacityEnabled() {
-		return nil
+func (h *Handler) beginCapacityConsume(ctx context.Context, workspaceID, token, invitationID, userID uuid.UUID) (bool, error) {
+	if !h.seatCapacitySettlementEnabled() {
+		return false, nil
 	}
+	enforced := h.seatCapacityEnabled()
+	q, unlock, err := h.lockSeatCapacityWorkspace(ctx, workspaceID)
+	if err != nil {
+		return false, fmt.Errorf("%w: acquire workspace capacity lock: %v", errSeatCapacityUnavailable, err)
+	}
+	defer unlock()
 	params := capacityIntentParams(workspaceID, token, seatcapacity.ActionConsumeInvitation, seatcapacity.RecoveryDue(time.Now()).Time)
 	params.SubjectID = uuidToPG(token)
 	params.InvitationID = uuidToPG(invitationID)
 	params.UserID = uuidToPG(userID)
-	if _, err := h.Queries.UpsertSeatCapacityIntent(ctx, params); err != nil {
-		return fmt.Errorf("record invitation consume intent: %w", err)
+	if _, err := q.UpsertSeatCapacityIntent(ctx, params); err != nil {
+		return false, fmt.Errorf("record invitation consume intent: %w", err)
 	}
 	decision, err := h.SeatCapacity.Consume(ctx, workspaceID, token)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errSeatCapacityUnavailable, err)
+		if !enforced && seatcapacity.IsNotFound(err) {
+			_ = deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConsumeInvitation)
+			return false, nil
+		}
+		return false, fmt.Errorf("%w: %v", errSeatCapacityUnavailable, err)
 	}
 	if !decision.Managed {
-		return h.deleteCapacityIntentForAction(ctx, token, seatcapacity.ActionConsumeInvitation)
+		return false, deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConsumeInvitation)
 	}
 	if !decision.Allowed {
-		_ = h.deleteCapacityIntentForAction(ctx, token, seatcapacity.ActionConsumeInvitation)
-		_ = h.Queries.ExpireInvitationForCapacityRecovery(ctx, uuidToPG(invitationID))
-		return errSeatCapacityFull
+		_ = deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConsumeInvitation)
+		_ = q.ExpireInvitationForCapacityRecovery(ctx, uuidToPG(invitationID))
+		return false, errSeatCapacityFull
 	}
-	return h.Queries.MarkSeatCapacityIntentDelivered(ctx, db.MarkSeatCapacityIntentDeliveredParams{
+	err = q.MarkSeatCapacityIntentDelivered(ctx, db.MarkSeatCapacityIntentDeliveredParams{
 		OperationToken: uuidToPG(token), Action: seatcapacity.ActionConsumeInvitation,
 	})
+	return err == nil, err
 }
 
-func (h *Handler) beginShareJoinCapacity(ctx context.Context, workspaceID, token, shareLinkID, userID uuid.UUID) error {
+func (h *Handler) beginShareJoinCapacity(ctx context.Context, workspaceID, shareLinkID, userID uuid.UUID) (uuid.UUID, error) {
 	if !h.seatCapacityEnabled() {
-		return nil
+		return uuid.Nil, nil
 	}
-	params := capacityIntentParams(workspaceID, token, seatcapacity.ActionClaimShareJoin, seatcapacity.RecoveryDue(time.Now()).Time)
-	params.SubjectID = uuidToPG(token)
-	params.ShareLinkID = uuidToPG(shareLinkID)
-	params.UserID = uuidToPG(userID)
-	if _, err := h.Queries.UpsertSeatCapacityIntent(ctx, params); err != nil {
-		return fmt.Errorf("record share-join capacity intent: %w", err)
+	q, unlock, err := h.lockSeatCapacityWorkspace(ctx, workspaceID)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("%w: acquire workspace capacity lock: %v", errSeatCapacityUnavailable, err)
 	}
+	defer unlock()
+	intent, err := q.CreateOrReactivateShareJoinCapacityIntent(ctx, db.CreateOrReactivateShareJoinCapacityIntentParams{
+		WorkspaceID: uuidToPG(workspaceID), OperationToken: uuidToPG(uuid.New()),
+		ShareLinkID: uuidToPG(shareLinkID), UserID: uuidToPG(userID),
+		NextAttemptAt: seatcapacity.RecoveryDue(time.Now()),
+	})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("record share-join capacity intent: %w", err)
+	}
+	token := uuid.UUID(intent.OperationToken.Bytes)
 	decision, err := h.SeatCapacity.ClaimShareJoin(ctx, workspaceID, token)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errSeatCapacityUnavailable, err)
+		return uuid.Nil, fmt.Errorf("%w: %v", errSeatCapacityUnavailable, err)
 	}
 	if !decision.Managed {
-		return h.deleteCapacityIntentForAction(ctx, token, seatcapacity.ActionClaimShareJoin)
+		return uuid.Nil, deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionClaimShareJoin)
 	}
 	if !decision.Allowed {
-		_ = h.deleteCapacityIntentForAction(ctx, token, seatcapacity.ActionClaimShareJoin)
-		return errSeatCapacityFull
+		_ = deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionClaimShareJoin)
+		return uuid.Nil, errSeatCapacityFull
 	}
-	return h.Queries.MarkSeatCapacityIntentDelivered(ctx, db.MarkSeatCapacityIntentDeliveredParams{
+	if err := q.MarkSeatCapacityIntentDelivered(ctx, db.MarkSeatCapacityIntentDeliveredParams{
 		OperationToken: uuidToPG(token), Action: seatcapacity.ActionClaimShareJoin,
-	})
+	}); err != nil {
+		return uuid.Nil, err
+	}
+	return token, nil
 }
 
 func transitionCapacityIntentToConfirm(ctx context.Context, q *db.Queries, token, memberID uuid.UUID, currentAction string) error {
@@ -154,12 +198,23 @@ func enqueueMemberCapacityRelease(ctx context.Context, q *db.Queries, workspaceI
 }
 
 func (h *Handler) confirmCapacityIntent(ctx context.Context, workspaceID, token, memberID uuid.UUID) {
-	if !h.seatCapacityEnabled() {
+	if !h.seatCapacitySettlementEnabled() {
+		return
+	}
+	q, unlock, err := h.lockSeatCapacityWorkspace(ctx, workspaceID)
+	if err != nil {
+		slog.WarnContext(ctx, "seat capacity confirm deferred while workspace lock is unavailable",
+			"workspace_id", workspaceID.String(), "operation_token", token.String(), "error", err)
+		return
+	}
+	defer unlock()
+	intent, err := q.GetSeatCapacityIntent(ctx, uuidToPG(token))
+	if err != nil || intent.Action != seatcapacity.ActionConfirm {
 		return
 	}
 	decision, err := h.SeatCapacity.Confirm(ctx, workspaceID, token, memberID)
 	if err == nil && (!decision.Managed || decision.Allowed) {
-		if deleteErr := h.deleteCapacityIntentForAction(ctx, token, seatcapacity.ActionConfirm); deleteErr == nil {
+		if deleteErr := deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConfirm); deleteErr == nil {
 			return
 		} else {
 			err = deleteErr
@@ -168,14 +223,27 @@ func (h *Handler) confirmCapacityIntent(ctx context.Context, workspaceID, token,
 	if err == nil {
 		err = fmt.Errorf("confirm rejected in state %s", decision.Reason)
 	}
-	h.recordCapacityFailure(ctx, token, seatcapacity.ActionConfirm, err)
+	recordCapacityFailure(ctx, q, token, seatcapacity.ActionConfirm, err)
 }
 
 func (h *Handler) compensateCapacityIntent(ctx context.Context, token uuid.UUID) {
-	if !h.seatCapacityEnabled() {
+	if !h.seatCapacitySettlementEnabled() {
 		return
 	}
 	intent, err := h.Queries.GetSeatCapacityIntent(ctx, uuidToPG(token))
+	if err != nil {
+		return
+	}
+	q, unlock, err := h.lockSeatCapacityWorkspace(ctx, uuid.UUID(intent.WorkspaceID.Bytes))
+	if err != nil {
+		return
+	}
+	defer unlock()
+	h.compensateCapacityIntentLocked(ctx, q, token)
+}
+
+func (h *Handler) compensateCapacityIntentLocked(ctx context.Context, q *db.Queries, token uuid.UUID) {
+	intent, err := q.GetSeatCapacityIntent(ctx, uuidToPG(token))
 	if err != nil {
 		return
 	}
@@ -184,7 +252,7 @@ func (h *Handler) compensateCapacityIntent(ctx context.Context, token uuid.UUID)
 	if intent.Action == seatcapacity.ActionConfirm || intent.Action == seatcapacity.ActionReleaseMember {
 		return
 	}
-	rows, err := h.Queries.TransitionSeatCapacityIntent(ctx, db.TransitionSeatCapacityIntentParams{
+	rows, err := q.TransitionSeatCapacityIntent(ctx, db.TransitionSeatCapacityIntentParams{
 		NextAction: seatcapacity.ActionRelease, CurrentAction: intent.Action,
 		OperationToken: uuidToPG(token), NextAttemptAt: seatcapacity.RetryDue(time.Now()),
 	})
@@ -193,20 +261,25 @@ func (h *Handler) compensateCapacityIntent(ctx context.Context, token uuid.UUID)
 	}
 	decision, releaseErr := h.SeatCapacity.Release(ctx, uuid.UUID(intent.WorkspaceID.Bytes), token)
 	if (releaseErr == nil && (!decision.Managed || decision.Allowed || decision.Reason == "released" || decision.Reason == "denied")) || seatcapacity.IsNotFound(releaseErr) {
-		_ = h.deleteCapacityIntentForAction(ctx, token, seatcapacity.ActionRelease)
+		_ = deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionRelease)
 		return
 	}
 	if releaseErr == nil {
 		releaseErr = fmt.Errorf("release rejected in state %s", decision.Reason)
 	}
-	h.recordCapacityFailure(ctx, token, seatcapacity.ActionRelease, releaseErr)
+	recordCapacityFailure(ctx, q, token, seatcapacity.ActionRelease, releaseErr)
 }
 
 func (h *Handler) settleMemberCapacityRelease(ctx context.Context, workspaceID, memberID uuid.UUID) {
-	if !h.seatCapacityEnabled() {
+	if !h.seatCapacitySettlementEnabled() {
 		return
 	}
-	intent, err := h.Queries.GetMemberReleaseCapacityIntent(ctx, db.GetMemberReleaseCapacityIntentParams{
+	q, unlock, err := h.lockSeatCapacityWorkspace(ctx, workspaceID)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	intent, err := q.GetMemberReleaseCapacityIntent(ctx, db.GetMemberReleaseCapacityIntentParams{
 		WorkspaceID: uuidToPG(workspaceID), MemberID: uuidToPG(memberID),
 	})
 	if err != nil {
@@ -214,26 +287,26 @@ func (h *Handler) settleMemberCapacityRelease(ctx context.Context, workspaceID, 
 	}
 	decision, releaseErr := h.SeatCapacity.ReleaseMember(ctx, workspaceID, memberID)
 	if (releaseErr == nil && (!decision.Managed || decision.Allowed || decision.Reason == "released")) || seatcapacity.IsNotFound(releaseErr) {
-		_ = h.deleteCapacityIntentForAction(ctx, uuid.UUID(intent.OperationToken.Bytes), seatcapacity.ActionReleaseMember)
+		_ = deleteCapacityIntentForAction(ctx, q, uuid.UUID(intent.OperationToken.Bytes), seatcapacity.ActionReleaseMember)
 		return
 	}
 	if releaseErr == nil {
 		releaseErr = fmt.Errorf("member release rejected in state %s", decision.Reason)
 	}
-	h.recordCapacityFailure(ctx, uuid.UUID(intent.OperationToken.Bytes), intent.Action, releaseErr)
+	recordCapacityFailure(ctx, q, uuid.UUID(intent.OperationToken.Bytes), intent.Action, releaseErr)
 }
 
-func (h *Handler) deleteCapacityIntentForAction(ctx context.Context, token uuid.UUID, action string) error {
-	return h.Queries.DeleteSeatCapacityIntentForAction(ctx, db.DeleteSeatCapacityIntentForActionParams{
+func deleteCapacityIntentForAction(ctx context.Context, q *db.Queries, token uuid.UUID, action string) error {
+	return q.DeleteSeatCapacityIntentForAction(ctx, db.DeleteSeatCapacityIntentForActionParams{
 		OperationToken: uuidToPG(token), Action: action,
 	})
 }
 
-func (h *Handler) recordCapacityFailure(ctx context.Context, token uuid.UUID, action string, capacityErr error) {
+func recordCapacityFailure(ctx context.Context, q *db.Queries, token uuid.UUID, action string, capacityErr error) {
 	if capacityErr == nil {
 		return
 	}
-	_ = h.Queries.MarkSeatCapacityIntentFailed(ctx, db.MarkSeatCapacityIntentFailedParams{
+	_ = q.MarkSeatCapacityIntentFailed(ctx, db.MarkSeatCapacityIntentFailedParams{
 		LastError: capacityErr.Error(), NextAttemptAt: pgtype.Timestamptz{Time: time.Now().Add(5 * time.Second), Valid: true},
 		OperationToken: uuidToPG(token), Action: action,
 	})

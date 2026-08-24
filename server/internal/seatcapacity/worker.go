@@ -23,6 +23,7 @@ const (
 	defaultReconcileInterval = 30 * time.Second
 	defaultRecoveryGrace     = 5 * time.Minute
 	defaultClaimLease        = 5 * time.Minute
+	defaultWorkspaceLockWait = 30 * time.Second
 	defaultBatchSize         = 100
 	defaultMaxAttempts       = 10
 )
@@ -37,13 +38,14 @@ type WorkerConfig struct {
 
 type workerQueries interface {
 	ClaimNextDueSeatCapacityIntent(context.Context, pgtype.Timestamptz) (db.SeatCapacityOutbox, error)
-	DeleteSeatCapacityIntentForAction(context.Context, db.DeleteSeatCapacityIntentForActionParams) error
+	DeleteClaimedSeatCapacityIntent(context.Context, db.DeleteClaimedSeatCapacityIntentParams) (int64, error)
 	ExpireInvitationForCapacityRecovery(context.Context, pgtype.UUID) error
+	GetClaimedSeatCapacityIntent(context.Context, db.GetClaimedSeatCapacityIntentParams) (db.SeatCapacityOutbox, error)
 	GetInvitation(context.Context, pgtype.UUID) (db.WorkspaceInvitation, error)
-	MarkSeatCapacityIntentDeadLettered(context.Context, db.MarkSeatCapacityIntentDeadLetteredParams) (int64, error)
-	MarkSeatCapacityIntentFailed(context.Context, db.MarkSeatCapacityIntentFailedParams) error
+	MarkClaimedSeatCapacityIntentDeadLettered(context.Context, db.MarkClaimedSeatCapacityIntentDeadLetteredParams) (int64, error)
+	MarkClaimedSeatCapacityIntentFailed(context.Context, db.MarkClaimedSeatCapacityIntentFailedParams) (int64, error)
 	SeatCapacityOutboxStats(context.Context) ([]db.SeatCapacityOutboxStatsRow, error)
-	TransitionSeatCapacityIntent(context.Context, db.TransitionSeatCapacityIntentParams) (int64, error)
+	TransitionClaimedSeatCapacityIntent(context.Context, db.TransitionClaimedSeatCapacityIntentParams) (int64, error)
 }
 
 type WorkerMetrics interface {
@@ -61,11 +63,14 @@ type Worker struct {
 	maxAttempts       int32
 	logger            *slog.Logger
 	metrics           WorkerMetrics
+	workspaceLocker   WorkspaceLocker
 	now               func() time.Time
 }
 
-func NewWorker(queries *db.Queries, executor Executor, cfg WorkerConfig) *Worker {
-	return newWorker(queries, executor, cfg)
+func NewWorker(queries *db.Queries, executor Executor, locker WorkspaceLocker, cfg WorkerConfig) *Worker {
+	worker := newWorker(queries, executor, cfg)
+	worker.workspaceLocker = locker
+	return worker
 }
 
 func newWorker(queries workerQueries, executor Executor, cfg WorkerConfig) *Worker {
@@ -128,14 +133,47 @@ func (w *Worker) ReconcileOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := w.settle(ctx, intent); err != nil {
-			w.recordFailure(ctx, intent, err)
+		settleErr := w.settleWithWorkspaceLimit(ctx, intent)
+		if settleErr != nil {
+			w.recordFailure(ctx, intent, settleErr)
 		}
 	}
 	return w.refreshMetrics(ctx)
 }
 
+func (w *Worker) settleWithWorkspaceLimit(ctx context.Context, intent db.SeatCapacityOutbox) error {
+	if w.workspaceLocker == nil {
+		return w.settle(ctx, intent)
+	}
+	lockCtx, cancel := context.WithTimeout(ctx, defaultWorkspaceLockWait)
+	defer cancel()
+	lockedDB, unlock, err := w.workspaceLocker.Lock(lockCtx, uuidFromPG(intent.WorkspaceID))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	lockedQueries := w.queries
+	if lockedDB != nil {
+		lockedQueries = db.New(lockedDB)
+	}
+	current, err := lockedQueries.GetClaimedSeatCapacityIntent(ctx, db.GetClaimedSeatCapacityIntentParams{
+		OperationToken: intent.OperationToken, Action: intent.Action, LeaseToken: intent.LeaseToken,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	lockedWorker := *w
+	lockedWorker.queries = lockedQueries
+	return lockedWorker.settle(ctx, current)
+}
+
 func (w *Worker) settle(ctx context.Context, intent db.SeatCapacityOutbox) error {
+	if !intent.LeaseToken.Valid {
+		return errors.New("claimed seat capacity intent omitted lease token")
+	}
 	workspaceID := uuidFromPG(intent.WorkspaceID)
 	token := uuidFromPG(intent.OperationToken)
 	switch intent.Action {
@@ -212,9 +250,6 @@ func (w *Worker) recoverReserve(ctx context.Context, intent db.SeatCapacityOutbo
 func (w *Worker) recoverConsuming(ctx context.Context, intent db.SeatCapacityOutbox, workspaceID, token uuid.UUID) error {
 	decision, err := w.executor.GetOperation(ctx, workspaceID, token)
 	if IsNotFound(err) || (err == nil && !decision.Managed) {
-		if intent.Action == ActionConsumeInvitation && intent.InvitationID.Valid {
-			_ = w.queries.ExpireInvitationForCapacityRecovery(ctx, intent.InvitationID)
-		}
 		return w.deleteCurrent(ctx, intent)
 	}
 	if err != nil {
@@ -256,24 +291,27 @@ func (w *Worker) recoverConsuming(ctx context.Context, intent db.SeatCapacityOut
 }
 
 func (w *Worker) transition(ctx context.Context, intent db.SeatCapacityOutbox, action string, memberID pgtype.UUID) (bool, error) {
-	rows, err := w.queries.TransitionSeatCapacityIntent(ctx, db.TransitionSeatCapacityIntentParams{
+	rows, err := w.queries.TransitionClaimedSeatCapacityIntent(ctx, db.TransitionClaimedSeatCapacityIntentParams{
 		NextAction: action, CurrentAction: intent.Action, MemberID: memberID, OperationToken: intent.OperationToken,
-		NextAttemptAt: pgtype.Timestamptz{Time: w.now(), Valid: true},
+		NextAttemptAt: pgtype.Timestamptz{Time: w.now(), Valid: true}, LeaseToken: intent.LeaseToken,
 	})
 	return rows == 1, err
 }
 
 func (w *Worker) deleteCurrent(ctx context.Context, intent db.SeatCapacityOutbox) error {
-	return w.queries.DeleteSeatCapacityIntentForAction(ctx, db.DeleteSeatCapacityIntentForActionParams{
+	_, err := w.queries.DeleteClaimedSeatCapacityIntent(ctx, db.DeleteClaimedSeatCapacityIntentParams{
 		OperationToken: intent.OperationToken,
 		Action:         intent.Action,
+		LeaseToken:     intent.LeaseToken,
 	})
+	return err
 }
 
 func (w *Worker) recordFailure(ctx context.Context, intent db.SeatCapacityOutbox, settleErr error) {
 	if intent.AttemptCount+1 >= w.maxAttempts {
-		rows, err := w.queries.MarkSeatCapacityIntentDeadLettered(ctx, db.MarkSeatCapacityIntentDeadLetteredParams{
+		rows, err := w.queries.MarkClaimedSeatCapacityIntentDeadLettered(ctx, db.MarkClaimedSeatCapacityIntentDeadLetteredParams{
 			LastError: settleErr.Error(), OperationToken: intent.OperationToken, Action: intent.Action,
+			LeaseToken: intent.LeaseToken,
 		})
 		if err != nil {
 			w.logger.WarnContext(ctx, "seat capacity outbox dead letter could not be recorded", "error", err)
@@ -293,14 +331,14 @@ func (w *Worker) recordFailure(ctx context.Context, intent db.SeatCapacityOutbox
 	if backoff > 5*time.Minute {
 		backoff = 5 * time.Minute
 	}
-	err := w.queries.MarkSeatCapacityIntentFailed(ctx, db.MarkSeatCapacityIntentFailedParams{
+	rows, err := w.queries.MarkClaimedSeatCapacityIntentFailed(ctx, db.MarkClaimedSeatCapacityIntentFailedParams{
 		LastError: settleErr.Error(), NextAttemptAt: pgtype.Timestamptz{Time: w.now().Add(backoff), Valid: true},
-		OperationToken: intent.OperationToken, Action: intent.Action,
+		OperationToken: intent.OperationToken, Action: intent.Action, LeaseToken: intent.LeaseToken,
 	})
 	if err != nil {
 		w.logger.WarnContext(ctx, "seat capacity outbox failure could not be recorded", "error", err)
 	}
-	if intent.AttemptCount == 0 || (intent.AttemptCount+1)%10 == 0 {
+	if rows == 1 && (intent.AttemptCount == 0 || (intent.AttemptCount+1)%10 == 0) {
 		w.logger.WarnContext(ctx, "seat capacity outbox intent remains unsettled",
 			"workspace_id", workspaceIDString(intent.WorkspaceID), "action", intent.Action,
 			"attempt", intent.AttemptCount+1, "error", settleErr)

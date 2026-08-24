@@ -302,16 +302,8 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 
 	var capacityToken uuid.UUID
 	if h.seatCapacityEnabled() {
-		capacityToken = uuid.New()
-		if existing, intentErr := h.Queries.GetPendingShareJoinCapacityIntent(r.Context(), db.GetPendingShareJoinCapacityIntentParams{
-			WorkspaceID: linkPreview.WorkspaceID, ShareLinkID: linkPreview.ID, UserID: user.ID,
-		}); intentErr == nil {
-			capacityToken = uuid.UUID(existing.OperationToken.Bytes)
-		} else if !errors.Is(intentErr, pgx.ErrNoRows) {
-			writeError(w, http.StatusInternalServerError, "failed to join workspace")
-			return
-		}
-		if err := h.beginShareJoinCapacity(r.Context(), uuid.UUID(linkPreview.WorkspaceID.Bytes), capacityToken, uuid.UUID(linkPreview.ID.Bytes), uuid.UUID(user.ID.Bytes)); err != nil {
+		capacityToken, err = h.beginShareJoinCapacity(r.Context(), uuid.UUID(linkPreview.WorkspaceID.Bytes), uuid.UUID(linkPreview.ID.Bytes), uuid.UUID(user.ID.Bytes))
+		if err != nil {
 			writeSeatCapacityError(w, err)
 			return
 		}
@@ -367,7 +359,7 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to finalize onboarding")
 		return
 	}
-	if h.seatCapacityEnabled() {
+	if capacityToken != uuid.Nil {
 		if err := transitionCapacityIntentToConfirm(r.Context(), qtx, capacityToken, uuid.UUID(member.ID.Bytes), seatcapacity.ActionClaimShareJoin); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to join workspace")
 			return
@@ -378,7 +370,7 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to join workspace")
 		return
 	}
-	if h.seatCapacityEnabled() {
+	if capacityToken != uuid.Nil {
 		h.confirmCapacityIntent(r.Context(), uuid.UUID(link.WorkspaceID.Bytes), capacityToken, uuid.UUID(member.ID.Bytes))
 	}
 

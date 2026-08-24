@@ -109,7 +109,7 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create invitation")
 		return
 	}
-	if h.seatCapacityEnabled() {
+	if h.seatCapacitySettlementEnabled() {
 		for _, expired := range expiredInvitations {
 			if err := enqueueCapacityRelease(r.Context(), h.Queries, uuid.UUID(expired.WorkspaceID.Bytes), uuid.UUID(expired.ID.Bytes)); err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to release expired invitation capacity")
@@ -313,7 +313,7 @@ func (h *Handler) RevokeInvitation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "invitation not found")
 		return
 	}
-	if h.seatCapacityEnabled() {
+	if h.seatCapacitySettlementEnabled() {
 		if err := enqueueCapacityRelease(r.Context(), qtx, uuid.UUID(inv.WorkspaceID.Bytes), uuid.UUID(inv.ID.Bytes)); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to revoke invitation")
 			return
@@ -323,7 +323,7 @@ func (h *Handler) RevokeInvitation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to revoke invitation")
 		return
 	}
-	if h.seatCapacityEnabled() {
+	if h.seatCapacitySettlementEnabled() {
 		h.compensateCapacityIntent(r.Context(), uuid.UUID(inv.ID.Bytes))
 	}
 
@@ -477,7 +477,8 @@ func (h *Handler) AcceptInvitation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusGone, "invitation has expired")
 		return
 	}
-	if err := h.beginCapacityConsume(r.Context(), uuid.UUID(inv.WorkspaceID.Bytes), uuid.UUID(inv.ID.Bytes), uuid.UUID(inv.ID.Bytes), uuid.UUID(user.ID.Bytes)); err != nil {
+	capacityActive, err := h.beginCapacityConsume(r.Context(), uuid.UUID(inv.WorkspaceID.Bytes), uuid.UUID(inv.ID.Bytes), uuid.UUID(inv.ID.Bytes), uuid.UUID(user.ID.Bytes))
+	if err != nil {
 		writeSeatCapacityError(w, err)
 		return
 	}
@@ -527,7 +528,7 @@ func (h *Handler) AcceptInvitation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to mark user onboarded")
 		return
 	}
-	if h.seatCapacityEnabled() {
+	if capacityActive {
 		if err := transitionCapacityIntentToConfirm(r.Context(), qtx, uuid.UUID(inv.ID.Bytes), uuid.UUID(member.ID.Bytes), seatcapacity.ActionConsumeInvitation); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to accept invitation")
 			return
@@ -538,7 +539,9 @@ func (h *Handler) AcceptInvitation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to accept invitation")
 		return
 	}
-	h.confirmCapacityIntent(r.Context(), uuid.UUID(accepted.WorkspaceID.Bytes), uuid.UUID(accepted.ID.Bytes), uuid.UUID(member.ID.Bytes))
+	if capacityActive {
+		h.confirmCapacityIntent(r.Context(), uuid.UUID(accepted.WorkspaceID.Bytes), uuid.UUID(accepted.ID.Bytes), uuid.UUID(member.ID.Bytes))
+	}
 
 	slog.Info("invitation accepted", "invitation_id", invitationID, "user_id", userID, "workspace_id", uuidToString(accepted.WorkspaceID))
 
@@ -638,7 +641,7 @@ func (h *Handler) DeclineInvitation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to decline invitation")
 		return
 	}
-	if h.seatCapacityEnabled() {
+	if h.seatCapacitySettlementEnabled() {
 		if err := enqueueCapacityRelease(r.Context(), qtx, uuid.UUID(inv.WorkspaceID.Bytes), uuid.UUID(inv.ID.Bytes)); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to decline invitation")
 			return
@@ -648,7 +651,7 @@ func (h *Handler) DeclineInvitation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to decline invitation")
 		return
 	}
-	if h.seatCapacityEnabled() {
+	if h.seatCapacitySettlementEnabled() {
 		h.compensateCapacityIntent(r.Context(), uuid.UUID(inv.ID.Bytes))
 	}
 

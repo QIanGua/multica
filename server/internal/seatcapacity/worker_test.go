@@ -17,6 +17,17 @@ import (
 type workerTestExecutor struct {
 	decision Decision
 	err      error
+	confirms int
+}
+
+type workerTestLocker struct {
+	locks   int
+	unlocks int
+}
+
+func (l *workerTestLocker) Lock(context.Context, uuid.UUID) (db.DBTX, func(), error) {
+	l.locks++
+	return nil, func() { l.unlocks++ }, nil
 }
 
 func (e *workerTestExecutor) Enabled() bool { return true }
@@ -30,6 +41,7 @@ func (e *workerTestExecutor) Consume(context.Context, uuid.UUID, uuid.UUID) (Dec
 	return Decision{}, nil
 }
 func (e *workerTestExecutor) Confirm(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (Decision, error) {
+	e.confirms++
 	return e.decision, e.err
 }
 func (e *workerTestExecutor) Release(context.Context, uuid.UUID, uuid.UUID) (Decision, error) {
@@ -65,16 +77,18 @@ func (q *workerTestQueries) ClaimNextDueSeatCapacityIntent(context.Context, pgty
 		return db.SeatCapacityOutbox{}, pgx.ErrNoRows
 	}
 	q.claimAvailable = false
+	q.intent.LeaseToken = uuidToTestPG(uuid.New())
 	return q.intent, nil
 }
 
-func (q *workerTestQueries) DeleteSeatCapacityIntentForAction(_ context.Context, arg db.DeleteSeatCapacityIntentForActionParams) error {
+func (q *workerTestQueries) DeleteClaimedSeatCapacityIntent(_ context.Context, arg db.DeleteClaimedSeatCapacityIntentParams) (int64, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.intent.OperationToken == arg.OperationToken && q.intent.Action == arg.Action {
+	if q.intent.OperationToken == arg.OperationToken && q.intent.Action == arg.Action && q.intent.LeaseToken == arg.LeaseToken {
 		q.deletes++
+		return 1, nil
 	}
-	return nil
+	return 0, nil
 }
 
 func (q *workerTestQueries) ExpireInvitationForCapacityRecovery(context.Context, pgtype.UUID) error {
@@ -88,31 +102,49 @@ func (q *workerTestQueries) GetInvitation(context.Context, pgtype.UUID) (db.Work
 	return q.invitation, q.invitationError
 }
 
-func (q *workerTestQueries) MarkSeatCapacityIntentDeadLettered(context.Context, db.MarkSeatCapacityIntentDeadLetteredParams) (int64, error) {
+func (q *workerTestQueries) GetClaimedSeatCapacityIntent(_ context.Context, arg db.GetClaimedSeatCapacityIntentParams) (db.SeatCapacityOutbox, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.intent.OperationToken != arg.OperationToken || q.intent.Action != arg.Action || q.intent.LeaseToken != arg.LeaseToken {
+		return db.SeatCapacityOutbox{}, pgx.ErrNoRows
+	}
+	return q.intent, nil
+}
+
+func (q *workerTestQueries) MarkClaimedSeatCapacityIntentDeadLettered(_ context.Context, arg db.MarkClaimedSeatCapacityIntentDeadLetteredParams) (int64, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.intent.OperationToken != arg.OperationToken || q.intent.Action != arg.Action || q.intent.LeaseToken != arg.LeaseToken {
+		return 0, nil
+	}
 	q.deadLetters++
+	q.intent.LeaseToken = pgtype.UUID{}
 	return 1, nil
 }
 
-func (q *workerTestQueries) MarkSeatCapacityIntentFailed(context.Context, db.MarkSeatCapacityIntentFailedParams) error {
+func (q *workerTestQueries) MarkClaimedSeatCapacityIntentFailed(_ context.Context, arg db.MarkClaimedSeatCapacityIntentFailedParams) (int64, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.intent.OperationToken != arg.OperationToken || q.intent.Action != arg.Action || q.intent.LeaseToken != arg.LeaseToken {
+		return 0, nil
+	}
 	q.failures++
-	return nil
+	q.intent.LeaseToken = pgtype.UUID{}
+	return 1, nil
 }
 
 func (q *workerTestQueries) SeatCapacityOutboxStats(context.Context) ([]db.SeatCapacityOutboxStatsRow, error) {
 	return q.stats, nil
 }
 
-func (q *workerTestQueries) TransitionSeatCapacityIntent(_ context.Context, arg db.TransitionSeatCapacityIntentParams) (int64, error) {
+func (q *workerTestQueries) TransitionClaimedSeatCapacityIntent(_ context.Context, arg db.TransitionClaimedSeatCapacityIntentParams) (int64, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.intent.OperationToken != arg.OperationToken || q.intent.Action != arg.CurrentAction {
+	if q.intent.OperationToken != arg.OperationToken || q.intent.Action != arg.CurrentAction || q.intent.LeaseToken != arg.LeaseToken {
 		return 0, nil
 	}
 	q.intent.Action = arg.NextAction
+	q.intent.LeaseToken = pgtype.UUID{}
 	q.transitions++
 	return 1, nil
 }
@@ -126,7 +158,7 @@ func (q *workerTestQueries) counts() (transitions, deletes, expires, failures, d
 func workerTestIntent(action string) db.SeatCapacityOutbox {
 	return db.SeatCapacityOutbox{
 		WorkspaceID: uuidToTestPG(uuid.New()), OperationToken: uuidToTestPG(uuid.New()),
-		Action: action, InvitationID: uuidToTestPG(uuid.New()),
+		Action: action, InvitationID: uuidToTestPG(uuid.New()), LeaseToken: uuidToTestPG(uuid.New()),
 	}
 }
 
@@ -207,8 +239,8 @@ func TestRecoveryCleansUnknownOrUnmanagedOperations(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, deletes, expires, _, _ := queries.counts()
-			if deletes != 1 || expires != 1 {
-				t.Fatalf("deletes=%d expires=%d, want 1/1", deletes, expires)
+			if deletes != 1 || expires != 0 {
+				t.Fatalf("deletes=%d expires=%d, want 1/0", deletes, expires)
 			}
 		})
 	}
@@ -258,6 +290,37 @@ func TestWorkerDeadLettersAfterMaximumAttempts(t *testing.T) {
 	_, _, _, failures, deadLetters := queries.counts()
 	if failures != 0 || deadLetters != 1 {
 		t.Fatalf("failures=%d deadLetters=%d, want 0/1", failures, deadLetters)
+	}
+}
+
+func TestWorkerUsesWorkspaceSerializationBeforeCloudCall(t *testing.T) {
+	intent := workerTestIntent(ActionConfirm)
+	queries := &workerTestQueries{intent: intent}
+	locker := &workerTestLocker{}
+	worker := newWorker(queries, &workerTestExecutor{decision: Decision{Managed: true, Allowed: true}}, WorkerConfig{})
+	worker.workspaceLocker = locker
+
+	if err := worker.settleWithWorkspaceLimit(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	if locker.locks != 1 || locker.unlocks != 1 {
+		t.Fatalf("locks=%d unlocks=%d, want 1/1", locker.locks, locker.unlocks)
+	}
+}
+
+func TestWorkerSkipsCloudCallWhenClaimWasReactivatedBeforeWorkspaceLock(t *testing.T) {
+	intent := workerTestIntent(ActionConfirm)
+	queries := &workerTestQueries{intent: intent}
+	executor := &workerTestExecutor{decision: Decision{Managed: true, Allowed: true}}
+	worker := newWorker(queries, executor, WorkerConfig{})
+	worker.workspaceLocker = &workerTestLocker{}
+	queries.intent.LeaseToken = pgtype.UUID{}
+
+	if err := worker.settleWithWorkspaceLimit(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	if executor.confirms != 0 {
+		t.Fatalf("stale worker made %d Cloud confirm calls, want 0", executor.confirms)
 	}
 }
 
