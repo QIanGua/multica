@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -355,5 +356,164 @@ func TestEnsureTaskSkillBundles_DeadlineIsLabelledStructurally(t *testing.T) {
 	want := taskfailure.ReasonSkillBundleUnavailable.String()
 	if got := taskRunFailureReason(err); got != want {
 		t.Errorf("taskRunFailureReason = %q, want %q (retryable platform-side reason)", got, want)
+	}
+}
+
+// clearProxyEnv unsets every variable proxyEnvSummary consults, so a developer
+// machine that happens to run behind a proxy does not flip these assertions.
+func clearProxyEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
+		t.Setenv(key, "")
+	}
+}
+
+// TestDescribeSkillBundleFailure is the GitHub #7386 regression. The reporter
+// spent a day re-importing xlsx because the message named the skill and said
+// nothing about the wire; the whole point of this text is that a reader can
+// tell, without a packet capture, whether the link was dead or merely slow.
+func TestDescribeSkillBundleFailure(t *testing.T) {
+	clearProxyEnv(t)
+	ref := SkillRefData{Name: "xlsx", ID: "c5034ed6", SizeBytes: 1101426}
+
+	t.Run("dead link reports zero bytes and no response", func(t *testing.T) {
+		got := describeSkillBundleFailure(ref, TransferStats{}, 30*time.Second)
+		for _, want := range []string{
+			"network error downloading skill \"xlsx\"",
+			"no response from server after 30s",
+			"0 of 1.05 MB received",
+			"no proxy configured",
+			"the skill content is not at fault",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("missing %q in:\n%s", want, got)
+			}
+		}
+	})
+
+	t.Run("slow link reports how far it got and the rate", func(t *testing.T) {
+		// 540 KB in 30s — the "still transferring, just too slow" shape a
+		// larger deadline would actually rescue.
+		stats := TransferStats{ResponseStarted: true, BytesRead: 552960}
+		got := describeSkillBundleFailure(ref, stats, 30*time.Second)
+		for _, want := range []string{"received 540 KB of 1.05 MB", "18 KB/s"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("missing %q in:\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, "no response from server") {
+			t.Errorf("a link that delivered bytes must not read as no-response:\n%s", got)
+		}
+	})
+
+	t.Run("configured proxy is named but never valued", func(t *testing.T) {
+		clearProxyEnv(t)
+		t.Setenv("HTTPS_PROXY", "http://user:secret@127.0.0.1:7890")
+		got := describeSkillBundleFailure(ref, TransferStats{}, time.Second)
+		if !strings.Contains(got, "proxy configured (HTTPS_PROXY)") {
+			t.Errorf("expected the proxy to be reported as configured:\n%s", got)
+		}
+		// Proxy URLs routinely carry credentials and this string is shown to
+		// the whole workspace.
+		if strings.Contains(got, "secret") || strings.Contains(got, "7890") {
+			t.Errorf("proxy value must never be echoed into failure text:\n%s", got)
+		}
+	})
+}
+
+func TestFormatBytesAndRate(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want string
+	}{
+		{0, "0 B"},
+		{512, "512 B"},
+		{1024, "1 KB"},
+		{552960, "540 KB"},
+		{1101426, "1.05 MB"},
+	}
+	for _, tc := range cases {
+		if got := formatBytes(tc.n); got != tc.want {
+			t.Errorf("formatBytes(%d) = %q, want %q", tc.n, got, tc.want)
+		}
+	}
+	if got := formatRate(552960, 30*time.Second); got != "18 KB/s" {
+		t.Errorf("formatRate = %q, want %q", got, "18 KB/s")
+	}
+	// A failure before any byte moved must not divide by zero or invent a rate.
+	if got := formatRate(0, 0); got != "0 B/s" {
+		t.Errorf("formatRate(0,0) = %q, want %q", got, "0 B/s")
+	}
+}
+
+// TestTransferStatsKeepsHighWaterMark pins the across-retries semantics: the
+// question the counter answers is "did this link ever get anywhere", so an
+// attempt that reached the body must not be erased by a later one that died
+// during connect.
+func TestTransferStatsKeepsHighWaterMark(t *testing.T) {
+	var stats TransferStats
+	first := stats.wrap(strings.NewReader("0123456789"))
+	if _, err := io.ReadAll(first); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if stats.BytesRead != 10 {
+		t.Fatalf("BytesRead = %d, want 10", stats.BytesRead)
+	}
+	// A second, shorter attempt must not lower the mark.
+	second := stats.wrap(strings.NewReader("abc"))
+	if _, err := io.ReadAll(second); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if stats.BytesRead != 10 {
+		t.Errorf("a shorter retry lowered the high-water mark to %d, want 10", stats.BytesRead)
+	}
+	// nil must stay usable so callers can opt out of the accounting.
+	var nilStats *TransferStats
+	if got := nilStats.wrap(strings.NewReader("x")); got == nil {
+		t.Error("nil TransferStats must still return a usable reader")
+	}
+	nilStats.observeResponseStarted()
+}
+
+// TestEnsureTaskSkillBundles_SlowLinkReportsPartialTransfer is the other half
+// of #7386. A link that accepts the connection and then trickles must be
+// reported as a partial transfer, not as "no response" — that is exactly the
+// distinction that decides whether raising the deadline would have helped.
+func TestEnsureTaskSkillBundles_SlowLinkReportsPartialTransfer(t *testing.T) {
+	defer noSleepRetry(t)()
+	clearProxyEnv(t)
+
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Emit a valid prefix of the response, flush it so it really lands on
+		// the wire, then stall — a body that started but cannot finish.
+		io.WriteString(w, `{"bundles":[{"id":"x","content":"`+strings.Repeat("a", 4096))
+		w.(http.Flusher).Flush()
+		<-block
+	}))
+	defer srv.Close()
+	defer close(block)
+
+	ref := skillRefFromBundle(makeResolvableSkillBundle("frontend-review"))
+	d := &Daemon{client: NewClient(srv.URL), skillCache: NewSkillBundleCache(t.TempDir())}
+	task := &Task{
+		ID: "task-1", RuntimeID: "rt-1", WorkspaceID: "ws-1",
+		Agent: &AgentData{ID: "agent-1", SkillRefs: []SkillRefData{ref}},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	err := d.ensureTaskSkillBundles(ctx, task)
+	if err == nil {
+		t.Fatal("expected an error when the body never completes")
+	}
+	if !errors.Is(err, errSkillBundleUnavailable) {
+		t.Errorf("sentinel must survive, got %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "received") || strings.Contains(got, "no response from server") {
+		t.Errorf("a stalled body must report a partial transfer, got:\n%s", got)
 	}
 }
