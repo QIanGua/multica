@@ -29,6 +29,7 @@ type stubSeatCapacity struct {
 	reserveCalls    int
 	releaseCalls    int
 	consumeCalls    int
+	consumeDecision *seatcapacity.Decision
 	consumeErr      error
 }
 
@@ -42,7 +43,11 @@ func (s *stubSeatCapacity) ClaimShareJoin(context.Context, uuid.UUID, uuid.UUID)
 }
 func (s *stubSeatCapacity) Consume(context.Context, uuid.UUID, uuid.UUID) (seatcapacity.Decision, error) {
 	s.consumeCalls++
-	return seatcapacity.Decision{Managed: true, Allowed: true}, s.consumeErr
+	decision := seatcapacity.Decision{Managed: true, Allowed: true}
+	if s.consumeDecision != nil {
+		decision = *s.consumeDecision
+	}
+	return decision, s.consumeErr
 }
 func (s *stubSeatCapacity) Confirm(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (seatcapacity.Decision, error) {
 	return seatcapacity.Decision{Managed: true, Allowed: true}, nil

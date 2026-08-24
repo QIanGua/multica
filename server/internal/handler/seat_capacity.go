@@ -19,6 +19,8 @@ var (
 	errSeatCapacityUnavailable = errors.New("seat capacity service is unavailable")
 )
 
+const seatCapacityWorkspaceLockWait = 2 * time.Second
+
 func (h *Handler) seatCapacityEnabled() bool {
 	return h != nil && h.SeatCapacityEnforcementEnabled && h.seatCapacitySettlementEnabled()
 }
@@ -34,7 +36,9 @@ func (h *Handler) lockSeatCapacityWorkspace(ctx context.Context, workspaceID uui
 	if h.SeatCapacityLocker == nil {
 		return h.Queries, func() {}, nil
 	}
-	lockedDB, unlock, err := h.SeatCapacityLocker.Lock(ctx, workspaceID)
+	lockCtx, cancel := context.WithTimeout(ctx, seatCapacityWorkspaceLockWait)
+	defer cancel()
+	lockedDB, unlock, err := h.SeatCapacityLocker.Lock(lockCtx, workspaceID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -109,8 +113,10 @@ func (h *Handler) beginCapacityConsume(ctx context.Context, workspaceID, token, 
 	}
 	decision, err := h.SeatCapacity.Consume(ctx, workspaceID, token)
 	if err != nil {
-		if !enforced && seatcapacity.IsNotFound(err) {
-			_ = deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConsumeInvitation)
+		if !enforced {
+			if deleteErr := deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConsumeInvitation); deleteErr != nil {
+				return false, fmt.Errorf("discard unenforced invitation consume intent: %w", deleteErr)
+			}
 			return false, nil
 		}
 		return false, fmt.Errorf("%w: %v", errSeatCapacityUnavailable, err)
@@ -119,7 +125,12 @@ func (h *Handler) beginCapacityConsume(ctx context.Context, workspaceID, token, 
 		return false, deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConsumeInvitation)
 	}
 	if !decision.Allowed {
-		_ = deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConsumeInvitation)
+		if deleteErr := deleteCapacityIntentForAction(ctx, q, token, seatcapacity.ActionConsumeInvitation); deleteErr != nil {
+			return false, fmt.Errorf("discard rejected invitation consume intent: %w", deleteErr)
+		}
+		if !enforced {
+			return false, nil
+		}
 		_ = q.ExpireInvitationForCapacityRecovery(ctx, uuidToPG(invitationID))
 		return false, errSeatCapacityFull
 	}
