@@ -88,8 +88,9 @@ you just read; passing an unrelated issue id is rejected and the error names the
 issue you should have used.
 
 If the call fails, do not exit silently — the comment prohibition on `no_action`
-only applies once the recording succeeded. Post a short comment with the outcome
-instead.
+only applies once the recording succeeded. Post one short comment with the
+outcome instead, and only when this turn has not already commented: on the
+`action` path your delegation comment is already that record.
 
 Issue/comment commands often needed with squads:
 

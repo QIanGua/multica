@@ -141,16 +141,27 @@ Contracts:
   anyone (MUL-6622 / GH #7487). The pre-fix `issue.assignee_type == "squad"`
   gate diverged from the claim-side `is_leader_task` gate and made the call
   unsatisfiable on `@squad`-on-agent-issue and leader-task-on-child paths;
-- the caller must be `task.agent_id` — deliberately NOT `squad.leader_id`, so a
-  mid-run leader change cannot discard or misattribute a real evaluation;
-- `activity_log.actor_id` is `task.agent_id` for the same reason: the
-  `no_action` comment suppression lookup matches on `task.agent_id`, so writing
-  the live leader id there would silently break suppression;
+- the task is loaded with `GetAgentTaskInWorkspace`, not `GetAgentTask`: the
+  latter is a global lookup by id, and the rejection path quotes the task's
+  issue id. Check order is load-bearing — tenant scope, then "caller owns this
+  task", and only then any message naming a task-derived id;
+- two authorization gates: `task.agent_id == caller`, then
+  `squad.leader_id == caller`. The second is required because
+  `is_leader_task` on the row is enqueue-time INTENT: when the leader was
+  swapped before the claim, `handler/daemon.go` clears `resp.IsLeaderTask` and
+  runs the task as an ordinary agent turn while the row keeps
+  `is_leader_task = true`. Without the live check, such a downgraded run could
+  write a leader verdict and suppress its own comment. Removing this gate
+  requires persisting the role the claim actually delivered;
+- `activity_log.actor_id` is `task.agent_id`, not `squad.leader_id`: the
+  `no_action` comment suppression lookup matches on `task.agent_id`, so the
+  live leader id there would silently break suppression;
 - a leader agent running a NON-leader task is rejected — it is not running as
   the leader, and the runtime only mandates the call for `is_leader_task`;
 - the `no_action` comment prohibition is conditional on this write succeeding
   (comment.go:1851 checks the activity exists), so the injected instructions
-  tell leaders to fall back to a comment when the call errors.
+  tell leaders to fall back to a comment when the call errors — capped at one
+  comment, and only when the turn has not already commented.
 
 ## Issue Assignment
 

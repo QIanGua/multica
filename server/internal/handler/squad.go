@@ -953,6 +953,11 @@ func (h *Handler) UpdateSquadMemberRole(w http.ResponseWriter, r *http.Request) 
 // briefing and the mandatory-recording instruction. The target issue's own
 // assignee is deliberately NOT consulted: leaders legitimately run on issues
 // that are not squad-assigned. See MUL-6622 / GH #7487.
+//
+// Two authorization gates, in this order: the caller must own the task, and must
+// still be the squad's leader. The first is what makes it safe to quote the
+// task's issue id in an error; the second is what keeps a claim-downgraded run
+// (see the comment at gate 2) from writing a leader verdict.
 func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Request) {
 	issue, ok := h.loadIssueForUser(w, r, chi.URLParam(r, "id"))
 	if !ok {
@@ -984,21 +989,41 @@ func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Req
 	// plain agent, or a leader task bound to a child issue — and because the
 	// no_action instruction forbids substituting a comment, the decision left
 	// no trace at all.
+	//
+	// Check ORDER is load-bearing. Every rejection below the ownership gate may
+	// quote task-derived ids; every rejection above it must not. `GetAgentTask`
+	// is a global lookup by id, so tenant scoping (GetAgentTaskInWorkspace,
+	// which joins the owning agent's workspace) and the "caller owns this task"
+	// gate both come first — otherwise an unrelated task id, probed through an
+	// issue the caller can legitimately read, would echo back a foreign
+	// workspace's issue id.
 	taskID := r.Header.Get("X-Task-ID")
 	taskUUID, ok := parseUUIDOrBadRequest(w, taskID, "task id")
 	if !ok {
 		return
 	}
-	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
+	task, err := h.Queries.GetAgentTaskInWorkspace(r.Context(), db.GetAgentTaskInWorkspaceParams{
+		ID:          taskUUID,
+		WorkspaceID: issue.WorkspaceID,
+	})
 	if err != nil || !task.IssueID.Valid {
 		writeError(w, http.StatusBadRequest, "task does not belong to issue")
 		return
 	}
+
+	// Security gate 1: the caller must be the agent this task was enqueued for.
+	workspaceID := uuidToString(issue.WorkspaceID)
+	userID := requestUserID(r)
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	if actorType != "agent" || !task.AgentID.Valid || actorID != uuidToString(task.AgentID) {
+		writeError(w, http.StatusForbidden, "only the squad leader agent can record evaluations")
+		return
+	}
+
+	// Past the ownership gate, naming the task's own issue is safe — and useful:
+	// a leader woken by a stage barrier / child-done callback runs on the PARENT
+	// issue, so recording against the child it just read is the common mistake.
 	if uuidToString(task.IssueID) != uuidToString(issue.ID) {
-		// Actionable message: a leader woken by a stage barrier / child-done
-		// callback runs on the PARENT issue, so recording against the child it
-		// just read is the common mistake. Name the issue it must record on
-		// instead of only saying "no".
 		writeError(w, http.StatusBadRequest,
 			"task does not belong to issue; record the evaluation on issue "+uuidToString(task.IssueID)+" (the issue this task is running on)")
 		return
@@ -1032,16 +1057,22 @@ func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Security: the caller must be the agent this leader task was enqueued for.
-	// The task row — not squad.leader_id — is the provenance: a leader change
-	// mid-run must not discard a record for an evaluation that really happened
-	// (and must not misattribute it to the incoming leader, which would also
-	// desync the no_action comment suppression lookup, which matches on
-	// task.agent_id).
-	workspaceID := uuidToString(issue.WorkspaceID)
-	userID := requestUserID(r)
-	actorType, actorID := h.resolveActor(r, userID, workspaceID)
-	if actorType != "agent" || !task.AgentID.Valid || actorID != uuidToString(task.AgentID) {
+	// Security gate 2: the caller must still be this squad's leader.
+	//
+	// `is_leader_task` on the row records the enqueue-time INTENT, which is not
+	// always the role the claim actually delivered: when the leader was swapped
+	// between enqueue and claim, the claim path clears resp.IsLeaderTask and the
+	// run proceeds as an ordinary agent turn, while the row keeps
+	// is_leader_task = true (handler/daemon.go, "claim delivered as a non-leader
+	// task"). Trusting the row alone would let such a downgraded run write a
+	// leader verdict — and, on no_action, suppress its own comment. Until the
+	// delivered role is persisted, the live leader check is the only thing that
+	// distinguishes the two, so it stays.
+	//
+	// Cost of the conservative choice: a leader rotated away MID-run is refused
+	// here. That no longer means silence — the injected rules now tell a leader
+	// whose recording call failed to leave a short comment instead.
+	if actorID != uuidToString(squad.LeaderID) {
 		writeError(w, http.StatusForbidden, "only the squad leader agent can record evaluations")
 		return
 	}
@@ -1058,9 +1089,13 @@ func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Req
 		WorkspaceID: issue.WorkspaceID,
 		IssueID:     issue.ID,
 		ActorType:   pgtype.Text{String: "agent", Valid: true},
-		ActorID:     task.AgentID,
-		Action:      "squad_leader_evaluated",
-		Details:     details,
+		// task.AgentID, not squad.LeaderID: the no_action comment suppression
+		// lookup matches actor_id against task.agent_id
+		// (service.HasSquadLeaderNoActionEvaluationForTask), so this column has
+		// to carry the task's agent for suppression to find the row at all.
+		ActorID: task.AgentID,
+		Action:  "squad_leader_evaluated",
+		Details: details,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to record evaluation")

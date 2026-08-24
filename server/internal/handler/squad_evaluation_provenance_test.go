@@ -2,88 +2,72 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 // These tests pin the authorization contract of RecordSquadLeaderEvaluation
-// after MUL-6622 / GH #7487: the leader turn is proven by the TASK row
-// (is_leader_task + squad_id + agent_id), never by the target issue's assignee.
+// after MUL-6622 / GH #7487. Two gates, in order: the caller owns the task, and
+// the caller is still the squad's leader. The target issue's own assignee is
+// deliberately not consulted.
 
-// insertIssueWithAssignee creates a workspace issue owned by an individual agent
-// — i.e. NOT assigned to any squad — and returns its id.
-func insertIssueWithAssignee(t *testing.T, title, assigneeType, assigneeID string) string {
-	t.Helper()
-
-	// issue.number is assigned by application code, so a raw INSERT would reuse
-	// the 0 default and collide with uq_issue_workspace_number as soon as a test
-	// creates a second issue in this workspace.
-	var issueID string
-	if err := testPool.QueryRow(context.Background(), `
-		INSERT INTO issue (workspace_id, creator_type, creator_id, title, assignee_type, assignee_id, number)
-		VALUES ($1, 'member', $2, $3, $4, $5,
-		        (SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1))
-		RETURNING id
-	`, testWorkspaceID, testUserID, title, assigneeType, assigneeID).Scan(&issueID); err != nil {
-		t.Fatalf("create issue: %v", err)
-	}
-	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
-	})
-	return issueID
+type squadEvalFixture struct {
+	SquadID      string
+	LeaderID     string
+	OtherID      string
+	SquadIssueID string // issue assigned to the squad
 }
 
-// insertLeaderTaskOnIssue creates a running task for agentID bound to issueID.
-// isLeaderTask / squadID control the exact provenance under test; an empty
-// squadID leaves squad_id NULL.
-func insertLeaderTaskOnIssue(t *testing.T, agentID, issueID string, isLeaderTask bool, squadID string) string {
+func newSquadEvalFixture(t *testing.T) squadEvalFixture {
 	t.Helper()
-	ctx := context.Background()
 
-	var runtimeID string
-	if err := testPool.QueryRow(ctx, `SELECT runtime_id FROM agent WHERE id = $1`, agentID).Scan(&runtimeID); err != nil {
-		t.Fatalf("load agent runtime: %v", err)
+	leaderID := createHandlerTestAgent(t, "Squad Eval Leader", nil)
+	otherID := createHandlerTestAgent(t, "Squad Eval Other", nil)
+	squadID := dbfx.Squad(t, "Squad Eval", leaderID)
+	issueID := dbfx.Issue(t, "squad eval owner issue", testutil.Cols{
+		"assignee_type": "squad",
+		"assignee_id":   squadID,
+	})
+
+	return squadEvalFixture{
+		SquadID:      squadID,
+		LeaderID:     leaderID,
+		OtherID:      otherID,
+		SquadIssueID: issueID,
 	}
+}
 
-	var squadArg any
+// leaderTask seeds a running task bound to issueID. isLeaderTask / squadID carry
+// the exact provenance under test; an empty squadID leaves squad_id NULL.
+func leaderTask(t *testing.T, agentID, issueID string, isLeaderTask bool, squadID string) string {
+	t.Helper()
+
+	cols := testutil.Cols{
+		"runtime_id":     handlerTestRuntimeID(t),
+		"status":         "running",
+		"issue_id":       issueID,
+		"started_at":     testutil.Raw("now()"),
+		"is_leader_task": isLeaderTask,
+	}
 	if squadID != "" {
-		squadArg = squadID
+		cols["squad_id"] = squadID
 	}
-
-	var taskID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (
-			agent_id, runtime_id, issue_id, status, priority, started_at,
-			is_leader_task, squad_id
-		)
-		VALUES ($1, $2, $3, 'running', 0, now(), $4, $5)
-		RETURNING id
-	`, agentID, runtimeID, issueID, isLeaderTask, squadArg).Scan(&taskID); err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
-	})
-	return taskID
+	return dbfx.Task(t, agentID, cols)
 }
 
-func postSquadEvaluation(t *testing.T, issueID, agentID, taskID, outcome string) *httptest.ResponseRecorder {
-	t.Helper()
-
-	w := httptest.NewRecorder()
-	r := newRequest("POST", "/api/issues/"+issueID+"/squad-evaluated", map[string]any{
-		"outcome": outcome,
-		"reason":  "test reason",
-	})
-	r = withURLParam(r, "id", issueID)
-	r.Header.Set("X-Agent-ID", agentID)
-	r.Header.Set("X-Task-ID", taskID)
-
-	testHandler.RecordSquadLeaderEvaluation(w, r)
-	return w
+func evaluationRequest(issueID, agentID, taskID, outcome string) *http.Request {
+	return testutil.WithHeaders(
+		testutil.WithURLParams(
+			newRequest(http.MethodPost, "/api/issues/"+issueID+"/squad-evaluated",
+				map[string]any{"outcome": outcome, "reason": "test reason"}),
+			"id", issueID,
+		),
+		"X-Agent-ID", agentID,
+		"X-Task-ID", taskID,
+	)
 }
 
 type recordedEvaluation struct {
@@ -117,37 +101,26 @@ func loadEvaluations(t *testing.T, issueID string) []recordedEvaluation {
 	return out
 }
 
-func errorMessage(t *testing.T, w *httptest.ResponseRecorder) string {
-	t.Helper()
-	var body map[string]any
-	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
-		t.Fatalf("decode error response: %v", err)
-	}
-	msg, _ := body["error"].(string)
-	return msg
-}
-
 // The regression: a leader task on an issue owned by an individual agent (the
 // `@squad`-mention path) used to be rejected with "issue is not assigned to a
 // squad", dropping the decision entirely.
 func TestRecordSquadLeaderEvaluation_AcceptedOnNonSquadAssignedIssue(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
+	fx := newSquadEvalFixture(t)
+	issueID := dbfx.Issue(t, "agent-owned issue", testutil.Cols{
+		"assignee_type": "agent",
+		"assignee_id":   fx.OtherID,
+	})
+	taskID := leaderTask(t, fx.LeaderID, issueID, true, fx.SquadID)
 
-	fx := newSquadCommentTriggerFixture(t)
-	issueID := insertIssueWithAssignee(t, "agent-owned issue", "agent", fx.OtherID)
-	taskID := insertLeaderTaskOnIssue(t, fx.LeaderID, issueID, true, fx.SquadID)
-
-	w := postSquadEvaluation(t, issueID, fx.LeaderID, taskID, "no_action")
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201 on non-squad-assigned issue, got %d: %s", w.Code, w.Body.String())
-	}
+	testutil.Call(t, testHandler.RecordSquadLeaderEvaluation,
+		evaluationRequest(issueID, fx.LeaderID, taskID, "no_action")).Want(http.StatusCreated)
 
 	got := loadEvaluations(t, issueID)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly one recorded evaluation, got %d", len(got))
 	}
+	// actor_id must be the task's agent: the no_action comment suppression
+	// lookup matches on task.agent_id.
 	if got[0].ActorID != fx.LeaderID {
 		t.Fatalf("actor_id: want task agent %s, got %s", fx.LeaderID, got[0].ActorID)
 	}
@@ -162,21 +135,17 @@ func TestRecordSquadLeaderEvaluation_AcceptedOnNonSquadAssignedIssue(t *testing.
 // A child issue the leader itself is running on records fine too — the parent's
 // squad assignment is irrelevant to the check.
 func TestRecordSquadLeaderEvaluation_AcceptedOnChildIssueBoundTask(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
+	fx := newSquadEvalFixture(t)
+	childID := dbfx.Issue(t, "squad child issue", testutil.Cols{
+		"assignee_type":   "agent",
+		"assignee_id":     fx.OtherID,
+		"parent_issue_id": fx.SquadIssueID,
+	})
+	taskID := leaderTask(t, fx.LeaderID, childID, true, fx.SquadID)
 
-	fx := newSquadCommentTriggerFixture(t)
-	childID := insertIssueWithAssignee(t, "squad child issue", "agent", fx.OtherID)
-	if _, err := testPool.Exec(context.Background(),
-		`UPDATE issue SET parent_issue_id = $1 WHERE id = $2`, uuidToString(fx.Issue.ID), childID); err != nil {
-		t.Fatalf("link child to parent: %v", err)
-	}
-	taskID := insertLeaderTaskOnIssue(t, fx.LeaderID, childID, true, fx.SquadID)
+	testutil.Call(t, testHandler.RecordSquadLeaderEvaluation,
+		evaluationRequest(childID, fx.LeaderID, taskID, "action")).Want(http.StatusCreated)
 
-	if w := postSquadEvaluation(t, childID, fx.LeaderID, taskID, "action"); w.Code != http.StatusCreated {
-		t.Fatalf("expected 201 on child issue, got %d: %s", w.Code, w.Body.String())
-	}
 	if got := loadEvaluations(t, childID); len(got) != 1 {
 		t.Fatalf("expected one recorded evaluation on the child, got %d", len(got))
 	}
@@ -185,126 +154,138 @@ func TestRecordSquadLeaderEvaluation_AcceptedOnChildIssueBoundTask(t *testing.T)
 // Behavior narrowing made explicit: the leader agent running a task that is NOT
 // a leader task is not running as the leader, so it may not record.
 func TestRecordSquadLeaderEvaluation_RejectsNonLeaderTask(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
+	fx := newSquadEvalFixture(t)
+	taskID := leaderTask(t, fx.LeaderID, fx.SquadIssueID, false, fx.SquadID)
 
-	fx := newSquadCommentTriggerFixture(t)
-	issueID := uuidToString(fx.Issue.ID)
-	taskID := insertLeaderTaskOnIssue(t, fx.LeaderID, issueID, false, fx.SquadID)
+	testutil.Call(t, testHandler.RecordSquadLeaderEvaluation,
+		evaluationRequest(fx.SquadIssueID, fx.LeaderID, taskID, "no_action")).Want(http.StatusBadRequest)
 
-	w := postSquadEvaluation(t, issueID, fx.LeaderID, taskID, "no_action")
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a non-leader task, got %d: %s", w.Code, w.Body.String())
-	}
-	if got := loadEvaluations(t, issueID); len(got) != 0 {
+	if got := loadEvaluations(t, fx.SquadIssueID); len(got) != 0 {
 		t.Fatalf("expected no evaluation recorded, got %d", len(got))
 	}
 }
 
 // A leader task without a stamped squad cannot be attributed to a squad.
 func TestRecordSquadLeaderEvaluation_RejectsLeaderTaskWithoutSquadID(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
+	fx := newSquadEvalFixture(t)
+	taskID := leaderTask(t, fx.LeaderID, fx.SquadIssueID, true, "")
 
-	fx := newSquadCommentTriggerFixture(t)
-	issueID := uuidToString(fx.Issue.ID)
-	taskID := insertLeaderTaskOnIssue(t, fx.LeaderID, issueID, true, "")
+	testutil.Call(t, testHandler.RecordSquadLeaderEvaluation,
+		evaluationRequest(fx.SquadIssueID, fx.LeaderID, taskID, "no_action")).Want(http.StatusBadRequest)
 
-	w := postSquadEvaluation(t, issueID, fx.LeaderID, taskID, "no_action")
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a leader task with no squad_id, got %d: %s", w.Code, w.Body.String())
-	}
-	if got := loadEvaluations(t, issueID); len(got) != 0 {
+	if got := loadEvaluations(t, fx.SquadIssueID); len(got) != 0 {
 		t.Fatalf("expected no evaluation recorded, got %d", len(got))
 	}
 }
 
 // Recording still binds to the task's own issue, and the error names it — the
 // stage-barrier case wakes the leader on the PARENT, so a leader that reaches
-// for the child id gets told where to record instead of a dead end.
+// for the child id gets told where to record instead of a dead end. Naming it is
+// only safe because the ownership gate has already passed.
 func TestRecordSquadLeaderEvaluation_RejectsCrossIssueTaskAndNamesTaskIssue(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
+	fx := newSquadEvalFixture(t)
+	childID := dbfx.Issue(t, "stage barrier child", testutil.Cols{
+		"assignee_type": "agent",
+		"assignee_id":   fx.OtherID,
+	})
+	taskID := leaderTask(t, fx.LeaderID, fx.SquadIssueID, true, fx.SquadID)
 
-	fx := newSquadCommentTriggerFixture(t)
-	parentID := uuidToString(fx.Issue.ID)
-	childID := insertIssueWithAssignee(t, "stage barrier child", "agent", fx.OtherID)
-	taskID := insertLeaderTaskOnIssue(t, fx.LeaderID, parentID, true, fx.SquadID)
+	body := testutil.Call(t, testHandler.RecordSquadLeaderEvaluation,
+		evaluationRequest(childID, fx.LeaderID, taskID, "no_action")).Want(http.StatusBadRequest).Text()
 
-	w := postSquadEvaluation(t, childID, fx.LeaderID, taskID, "no_action")
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a cross-issue task, got %d: %s", w.Code, w.Body.String())
-	}
-	if msg := errorMessage(t, w); !strings.Contains(msg, parentID) {
-		t.Fatalf("expected the error to name the task's issue %s, got %q", parentID, msg)
+	if !strings.Contains(body, fx.SquadIssueID) {
+		t.Fatalf("expected the error to name the task's issue %s, got %q", fx.SquadIssueID, body)
 	}
 	if got := loadEvaluations(t, childID); len(got) != 0 {
 		t.Fatalf("expected no evaluation recorded on the child, got %d", len(got))
 	}
 }
 
-// An agent that is not the task's agent may not record on its behalf.
-func TestRecordSquadLeaderEvaluation_RejectsForeignAgent(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
+// An agent that is not the task's agent may not record on its behalf, and the
+// rejection must not disclose anything about that task.
+func TestRecordSquadLeaderEvaluation_RejectsForeignAgentWithoutLeakingTaskIssue(t *testing.T) {
+	fx := newSquadEvalFixture(t)
+	leaderOnly := dbfx.Issue(t, "leader-only issue", testutil.Cols{
+		"assignee_type": "squad",
+		"assignee_id":   fx.SquadID,
+	})
+	taskID := leaderTask(t, fx.LeaderID, leaderOnly, true, fx.SquadID)
 
-	fx := newSquadCommentTriggerFixture(t)
-	issueID := uuidToString(fx.Issue.ID)
-	taskID := insertLeaderTaskOnIssue(t, fx.LeaderID, issueID, true, fx.SquadID)
+	body := testutil.Call(t, testHandler.RecordSquadLeaderEvaluation,
+		evaluationRequest(fx.SquadIssueID, fx.OtherID, taskID, "no_action")).Want(http.StatusForbidden).Text()
 
-	w := postSquadEvaluation(t, issueID, fx.OtherID, taskID, "no_action")
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for a non-task agent, got %d: %s", w.Code, w.Body.String())
+	if strings.Contains(body, leaderOnly) {
+		t.Fatalf("403 body leaked the task's issue id %s: %q", leaderOnly, body)
 	}
-	if got := loadEvaluations(t, issueID); len(got) != 0 {
+	if got := loadEvaluations(t, fx.SquadIssueID); len(got) != 0 {
 		t.Fatalf("expected no evaluation recorded, got %d", len(got))
 	}
 }
 
-// A leader handover mid-run must not discard the record or misattribute it: the
-// activity actor stays the task's agent, which is what the no_action comment
-// suppression lookup matches on.
-func TestRecordSquadLeaderEvaluation_SurvivesLeaderChangeAndKeepsNoActionSuppression(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
+// Tenant isolation: a task id from another workspace must be unreadable through
+// an issue the caller legitimately owns, and its issue id must not appear in the
+// response. GetAgentTask is a global lookup, so the workspace-scoped query plus
+// the ownership gate are what stop the probe.
+func TestRecordSquadLeaderEvaluation_RejectsForeignWorkspaceTaskWithoutLeakingItsIssue(t *testing.T) {
+	fx := newSquadEvalFixture(t)
 
-	fx := newRunningSquadLeaderTaskFixture(t)
-	newLeaderID := createHandlerTestAgent(t, "Squad New Leader", nil)
-	if _, err := testPool.Exec(context.Background(),
-		`UPDATE squad SET leader_id = $1 WHERE id = $2`, newLeaderID, fx.SquadID); err != nil {
-		t.Fatalf("rotate squad leader: %v", err)
-	}
-
-	w := postSquadEvaluation(t, fx.IssueID, fx.LeaderID, fx.TaskID, "no_action")
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201 after a leader change, got %d: %s", w.Code, w.Body.String())
-	}
-
-	got := loadEvaluations(t, fx.IssueID)
-	if len(got) != 1 {
-		t.Fatalf("expected one recorded evaluation, got %d", len(got))
-	}
-	if got[0].ActorID != fx.LeaderID {
-		t.Fatalf("actor_id: want the task's agent %s, got %s", fx.LeaderID, got[0].ActorID)
-	}
-
-	// Suppression must still fire for this task.
-	cw := httptest.NewRecorder()
-	cr := newRequest("POST", "/api/issues/"+fx.IssueID+"/comments", map[string]any{
-		"content":   "No action needed.",
-		"parent_id": fx.TriggerCommentID,
+	foreignUser := dbfx.User(t, "Squad Eval Foreign User", "squad-eval-foreign@example.com")
+	foreignWorkspace := dbfx.Workspace(t, "Squad Eval Foreign", "squad-eval-foreign")
+	dbfx.Member(t, foreignWorkspace, foreignUser, "owner")
+	foreignRuntime := dbfx.Runtime(t, "Squad Eval Foreign Runtime", testutil.Cols{
+		"workspace_id": foreignWorkspace,
+		"owner_id":     foreignUser,
 	})
-	cr = withURLParam(cr, "id", fx.IssueID)
-	cr.Header.Set("X-Agent-ID", fx.LeaderID)
-	cr.Header.Set("X-Task-ID", fx.TaskID)
+	foreignAgent := dbfx.Agent(t, "Squad Eval Foreign Agent", foreignRuntime, testutil.Cols{
+		"workspace_id": foreignWorkspace,
+		"owner_id":     foreignUser,
+	})
+	foreignSquad := dbfx.Squad(t, "Squad Eval Foreign Squad", foreignAgent, testutil.Cols{
+		"workspace_id": foreignWorkspace,
+		"creator_id":   foreignUser,
+	})
+	foreignIssue := dbfx.Issue(t, "foreign workspace issue", testutil.Cols{
+		"workspace_id":  foreignWorkspace,
+		"creator_id":    foreignUser,
+		"assignee_type": "squad",
+		"assignee_id":   foreignSquad,
+	})
+	foreignTask := dbfx.Task(t, foreignAgent, testutil.Cols{
+		"runtime_id":     foreignRuntime,
+		"status":         "running",
+		"issue_id":       foreignIssue,
+		"started_at":     testutil.Raw("now()"),
+		"is_leader_task": true,
+		"squad_id":       foreignSquad,
+	})
 
-	testHandler.CreateComment(cw, cr)
-	if cw.Code != http.StatusConflict {
-		t.Fatalf("expected the no_action comment to stay suppressed after a leader change, got %d: %s", cw.Code, cw.Body.String())
+	body := testutil.Call(t, testHandler.RecordSquadLeaderEvaluation,
+		evaluationRequest(fx.SquadIssueID, fx.LeaderID, foreignTask, "no_action")).
+		Want(http.StatusBadRequest).Text()
+
+	if strings.Contains(body, foreignIssue) {
+		t.Fatalf("rejection leaked a foreign workspace issue id %s: %q", foreignIssue, body)
+	}
+	if got := loadEvaluations(t, fx.SquadIssueID); len(got) != 0 {
+		t.Fatalf("expected no evaluation recorded, got %d", len(got))
+	}
+}
+
+// The claim path clears the leader role when the leader was swapped before the
+// claim, but leaves is_leader_task = true on the row. The row therefore records
+// enqueue-time intent, not the delivered role, so a run that was downgraded to
+// an ordinary agent turn must not be able to write a leader verdict here.
+func TestRecordSquadLeaderEvaluation_RejectsAfterLeaderChange(t *testing.T) {
+	fx := newSquadEvalFixture(t)
+	taskID := leaderTask(t, fx.LeaderID, fx.SquadIssueID, true, fx.SquadID)
+
+	newLeader := createHandlerTestAgent(t, "Squad Eval New Leader", nil)
+	dbfx.Exec(t, `UPDATE squad SET leader_id = $1 WHERE id = $2`, newLeader, fx.SquadID)
+
+	testutil.Call(t, testHandler.RecordSquadLeaderEvaluation,
+		evaluationRequest(fx.SquadIssueID, fx.LeaderID, taskID, "no_action")).Want(http.StatusForbidden)
+
+	if got := loadEvaluations(t, fx.SquadIssueID); len(got) != 0 {
+		t.Fatalf("expected no evaluation recorded after a leader change, got %d", len(got))
 	}
 }
