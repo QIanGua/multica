@@ -155,11 +155,13 @@ func TestDiscoverHermesModelsStillReturnsACatalogOnSuccess(t *testing.T) {
 func TestACPDiscoveryTimeoutIsPerProvider(t *testing.T) {
 	t.Parallel()
 
-	// A binary that never answers initialize. Without an honoured deadline
-	// this test would hang rather than fail.
+	// A binary that consumes initialize but never answers it. Keep the stall in
+	// the shell's built-in read: spawning sleep here would leave a descendant
+	// holding stdout open after CommandContext kills the shell, so Scanner would
+	// wait for the descendant instead of measuring the provider deadline.
 	stalled := `#!/bin/sh
-while IFS= read -r line; do
-  sleep 30
+while IFS= read -r _; do
+  :
 done
 `
 	fakePath := filepath.Join(t.TempDir(), "stalled")

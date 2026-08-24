@@ -1794,8 +1794,8 @@ const acpDiscoveryDefaultTimeout = 15 * time.Second
 // the user would be told "context deadline exceeded" instead of the exact
 // command hermes wants them to run.
 //
-// Bounded above by the server's 60s modelListRunningTimeout, so a report that
-// takes this long still lands in a request record that is still open.
+// Kept well below the server's 60s modelListRunningTimeout so discovery leaves
+// time for report delivery and retry backoffs before the request closes.
 const hermesDiscoveryTimeout = 40 * time.Second
 
 // acpDiscoveryProvider configures how discoverACPModels launches an

@@ -101,7 +101,7 @@ func TestHermesDiscoveryHintDoesNotReclassifyTheFailure(t *testing.T) {
 	}
 }
 
-// TestHermesDiscoveryTimeoutFitsTheServerRequestWindow is the reason the
+// TestHermesDiscoveryTimeoutLeavesRoomForReportRetryBackoffs is the reason the
 // per-provider knob exists, and pins both ends of it.
 //
 // Lower bound: measured against hermes 0.20.0, a healthy session/new returns in
@@ -114,10 +114,11 @@ func TestHermesDiscoveryHintDoesNotReclassifyTheFailure(t *testing.T) {
 // handler.modelListRunningTimeout (60s), measured from RunStartedAt — which
 // PopPending sets at claim time. Heartbeat pickup happens BEFORE the claim and
 // is bounded separately by modelListPendingTimeout, so it does not eat into this
-// 60s; what does share it is the daemon's report-retry schedule
-// (runtimeReportBackoffs, ≈6.5s). Discovery plus that retry budget has to land
-// inside 60s, so the ceiling is ~53s and 45s keeps real headroom.
-func TestHermesDiscoveryTimeoutFitsTheServerRequestWindow(t *testing.T) {
+// 60s; what does share it is the daemon's report-retry backoff schedule
+// (runtimeReportBackoffs, ≈6.5s). Discovery plus those scheduled sleeps must
+// leave room inside 60s for report attempts. This test deliberately does not
+// model the HTTP attempts themselves; those have a separate client timeout.
+func TestHermesDiscoveryTimeoutLeavesRoomForReportRetryBackoffs(t *testing.T) {
 	t.Parallel()
 
 	// Mirrors internal/handler.modelListRunningTimeout and
@@ -125,7 +126,7 @@ func TestHermesDiscoveryTimeoutFitsTheServerRequestWindow(t *testing.T) {
 	// because pkg/agent must not depend on either package; the comment above is
 	// the contract, and this test is what notices when it drifts.
 	const serverRunningWindow = 60 * time.Second
-	const reportRetryBudget = 6500 * time.Millisecond
+	const reportRetryBackoffBudget = 6500 * time.Millisecond
 
 	if hermesDiscoveryTimeout <= acpDiscoveryDefaultTimeout {
 		t.Fatalf("hermes budget %s must exceed the shared default %s; its failure path needs ~25s",
@@ -134,9 +135,9 @@ func TestHermesDiscoveryTimeoutFitsTheServerRequestWindow(t *testing.T) {
 	if hermesDiscoveryTimeout < 30*time.Second {
 		t.Errorf("hermes budget %s leaves no margin over the ~25s failure path", hermesDiscoveryTimeout)
 	}
-	if got := hermesDiscoveryTimeout + reportRetryBudget; got > serverRunningWindow {
-		t.Errorf("discovery (%s) plus report retries (%s) = %s, which outlives the server's %s claimed-request window",
-			hermesDiscoveryTimeout, reportRetryBudget, got, serverRunningWindow)
+	if got := hermesDiscoveryTimeout + reportRetryBackoffBudget; got > serverRunningWindow {
+		t.Errorf("discovery (%s) plus report retry backoffs (%s) = %s, which outlives the server's %s claimed-request window",
+			hermesDiscoveryTimeout, reportRetryBackoffBudget, got, serverRunningWindow)
 	}
 }
 
