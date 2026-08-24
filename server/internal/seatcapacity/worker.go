@@ -21,28 +21,54 @@ const (
 	ActionReleaseMember     = "release_member"
 
 	defaultReconcileInterval = 30 * time.Second
-	defaultRecoveryGrace     = 2 * time.Minute
+	defaultRecoveryGrace     = 5 * time.Minute
+	defaultClaimLease        = 5 * time.Minute
 	defaultBatchSize         = 100
+	defaultMaxAttempts       = 10
 )
 
 type WorkerConfig struct {
 	ReconcileInterval time.Duration
 	BatchSize         int32
+	MaxAttempts       int32
 	Logger            *slog.Logger
+	Metrics           WorkerMetrics
 }
 
-// Worker settles durable product-side intents. The Cloud operations are
-// idempotent, so multiple API replicas may process the same row safely.
+type workerQueries interface {
+	ClaimNextDueSeatCapacityIntent(context.Context, pgtype.Timestamptz) (db.SeatCapacityOutbox, error)
+	DeleteSeatCapacityIntentForAction(context.Context, db.DeleteSeatCapacityIntentForActionParams) error
+	ExpireInvitationForCapacityRecovery(context.Context, pgtype.UUID) error
+	GetInvitation(context.Context, pgtype.UUID) (db.WorkspaceInvitation, error)
+	MarkSeatCapacityIntentDeadLettered(context.Context, db.MarkSeatCapacityIntentDeadLetteredParams) (int64, error)
+	MarkSeatCapacityIntentFailed(context.Context, db.MarkSeatCapacityIntentFailedParams) error
+	SeatCapacityOutboxStats(context.Context) ([]db.SeatCapacityOutboxStatsRow, error)
+	TransitionSeatCapacityIntent(context.Context, db.TransitionSeatCapacityIntentParams) (int64, error)
+}
+
+type WorkerMetrics interface {
+	ResetOutbox()
+	SetOutbox(action string, pending, deadLettered int64, oldestPendingAgeSeconds float64)
+}
+
+// Worker settles durable product-side intents. Each row is claimed atomically
+// before a Cloud request, so API replicas do not amplify the same backlog.
 type Worker struct {
-	queries           *db.Queries
+	queries           workerQueries
 	executor          Executor
 	reconcileInterval time.Duration
 	batchSize         int32
+	maxAttempts       int32
 	logger            *slog.Logger
+	metrics           WorkerMetrics
 	now               func() time.Time
 }
 
 func NewWorker(queries *db.Queries, executor Executor, cfg WorkerConfig) *Worker {
+	return newWorker(queries, executor, cfg)
+}
+
+func newWorker(queries workerQueries, executor Executor, cfg WorkerConfig) *Worker {
 	interval := cfg.ReconcileInterval
 	if interval <= 0 {
 		interval = defaultReconcileInterval
@@ -51,13 +77,18 @@ func NewWorker(queries *db.Queries, executor Executor, cfg WorkerConfig) *Worker
 	if batch <= 0 {
 		batch = defaultBatchSize
 	}
+	maxAttempts := cfg.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultMaxAttempts
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Worker{
 		queries: queries, executor: executor, reconcileInterval: interval,
-		batchSize: batch, logger: logger, now: time.Now,
+		batchSize: batch, maxAttempts: maxAttempts, logger: logger,
+		metrics: cfg.Metrics, now: time.Now,
 	}
 }
 
@@ -87,16 +118,21 @@ func (w *Worker) ReconcileOnce(ctx context.Context) error {
 	if !w.Enabled() {
 		return nil
 	}
-	intents, err := w.queries.ListDueSeatCapacityIntents(ctx, w.batchSize)
-	if err != nil {
-		return err
-	}
-	for _, intent := range intents {
+	for i := int32(0); i < w.batchSize; i++ {
+		intent, err := w.queries.ClaimNextDueSeatCapacityIntent(ctx, pgtype.Timestamptz{
+			Time: w.now().Add(defaultClaimLease), Valid: true,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			break
+		}
+		if err != nil {
+			return err
+		}
 		if err := w.settle(ctx, intent); err != nil {
 			w.recordFailure(ctx, intent, err)
 		}
 	}
-	return nil
+	return w.refreshMetrics(ctx)
 }
 
 func (w *Worker) settle(ctx context.Context, intent db.SeatCapacityOutbox) error {
@@ -235,6 +271,21 @@ func (w *Worker) deleteCurrent(ctx context.Context, intent db.SeatCapacityOutbox
 }
 
 func (w *Worker) recordFailure(ctx context.Context, intent db.SeatCapacityOutbox, settleErr error) {
+	if intent.AttemptCount+1 >= w.maxAttempts {
+		rows, err := w.queries.MarkSeatCapacityIntentDeadLettered(ctx, db.MarkSeatCapacityIntentDeadLetteredParams{
+			LastError: settleErr.Error(), OperationToken: intent.OperationToken, Action: intent.Action,
+		})
+		if err != nil {
+			w.logger.WarnContext(ctx, "seat capacity outbox dead letter could not be recorded", "error", err)
+			return
+		}
+		if rows == 1 {
+			w.logger.ErrorContext(ctx, "seat capacity outbox intent moved to dead letter",
+				"workspace_id", workspaceIDString(intent.WorkspaceID), "action", intent.Action,
+				"attempt", intent.AttemptCount+1, "error", settleErr)
+		}
+		return
+	}
 	backoff := 5 * time.Second
 	for i := int32(0); i < intent.AttemptCount && backoff < 5*time.Minute; i++ {
 		backoff *= 2
@@ -254,6 +305,21 @@ func (w *Worker) recordFailure(ctx context.Context, intent db.SeatCapacityOutbox
 			"workspace_id", workspaceIDString(intent.WorkspaceID), "action", intent.Action,
 			"attempt", intent.AttemptCount+1, "error", settleErr)
 	}
+}
+
+func (w *Worker) refreshMetrics(ctx context.Context) error {
+	if w.metrics == nil {
+		return nil
+	}
+	stats, err := w.queries.SeatCapacityOutboxStats(ctx)
+	if err != nil {
+		return err
+	}
+	w.metrics.ResetOutbox()
+	for _, stat := range stats {
+		w.metrics.SetOutbox(stat.Action, stat.PendingCount, stat.DeadLetteredCount, stat.OldestPendingAgeSeconds)
+	}
+	return nil
 }
 
 func uuidFromPG(value pgtype.UUID) uuid.UUID {

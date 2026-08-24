@@ -138,9 +138,10 @@ func transitionCapacityIntentToConfirm(ctx context.Context, q *db.Queries, token
 }
 
 func enqueueCapacityRelease(ctx context.Context, q *db.Queries, workspaceID, token uuid.UUID) error {
-	params := capacityIntentParams(workspaceID, token, seatcapacity.ActionRelease, time.Now())
-	params.SubjectID = uuidToPG(token)
-	_, err := q.UpsertSeatCapacityIntent(ctx, params)
+	_, err := q.EnqueueSeatCapacityRelease(ctx, db.EnqueueSeatCapacityReleaseParams{
+		WorkspaceID: uuidToPG(workspaceID), OperationToken: uuidToPG(token),
+		SubjectID: uuidToPG(token), NextAttemptAt: seatcapacity.RetryDue(time.Now()),
+	})
 	return err
 }
 

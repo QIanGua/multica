@@ -1144,7 +1144,6 @@ type RuntimeProfile struct {
 }
 
 type SeatCapacityOutbox struct {
-	ID             pgtype.UUID        `json:"id"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
 	OperationToken pgtype.UUID        `json:"operation_token"`
 	Action         string             `json:"action"`
@@ -1158,6 +1157,7 @@ type SeatCapacityOutbox struct {
 	AttemptCount   int32              `json:"attempt_count"`
 	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
 	LastError      pgtype.Text        `json:"last_error"`
+	DeadLetteredAt pgtype.Timestamptz `json:"dead_lettered_at"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }

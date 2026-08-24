@@ -240,4 +240,7 @@ monitoring:
     additionalLabels: {}
     samplerQueryErrorsFor: 5m
     samplerQueryLatencyFor: 10m
+    seatCapacityDeadLetteredFor: 5m
+    seatCapacityPendingAgeSeconds: 900
+    seatCapacityPendingFor: 5m
     severity: warning

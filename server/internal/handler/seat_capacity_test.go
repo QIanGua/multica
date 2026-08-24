@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -62,16 +63,32 @@ func TestSeatCapacityIntentCannotRegressOrBeDeletedByStaleWorker(t *testing.T) {
 	if intent.Action != seatcapacity.ActionConfirm || !intent.MemberID.Valid || intent.MemberID.Bytes != memberID {
 		t.Fatalf("intent regressed or was deleted: %+v", intent)
 	}
-
-	if err := queries.PrepareSeatCapacityWorkspaceDeletion(ctx, workspaceID); err != nil {
-		t.Fatal(err)
+	if err := enqueueCapacityRelease(ctx, queries, uuid.UUID(workspaceID.Bytes), token); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("release over confirm error = %v, want pgx.ErrNoRows", err)
 	}
 	intent, err = queries.GetSeatCapacityIntent(ctx, uuidToPG(token))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if intent.Action != seatcapacity.ActionRelease || intent.MemberID.Valid {
-		t.Fatalf("workspace deletion did not compensate the pending operation: %+v", intent)
+	if intent.Action != seatcapacity.ActionConfirm {
+		t.Fatalf("release regressed confirmed intent to %q", intent.Action)
+	}
+
+	if err := queries.DeleteSeatCapacityConfirmIntentsForWorkspaceDeletion(ctx, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := queries.PrepareSeatCapacityOperationReleasesForWorkspaceDeletion(ctx, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := queries.PrepareSeatCapacityInvitationReleasesForWorkspaceDeletion(ctx, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := queries.PrepareSeatCapacityMemberReleasesForWorkspaceDeletion(ctx, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = queries.GetSeatCapacityIntent(ctx, uuidToPG(token))
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("confirmed token intent survived workspace deletion: %v", err)
 	}
 	var memberReleases int
 	if err := testPool.QueryRow(ctx, `
@@ -82,5 +99,99 @@ func TestSeatCapacityIntentCannotRegressOrBeDeletedByStaleWorker(t *testing.T) {
 	}
 	if memberReleases == 0 {
 		t.Fatal("workspace deletion did not enqueue member capacity releases")
+	}
+}
+
+func TestSeatCapacityWorkspaceDeletionSettlesOverlappingInvitationIntent(t *testing.T) {
+	ctx := context.Background()
+	queries := db.New(testPool)
+	workspaceID := parseUUID(testWorkspaceID)
+	invitationID := uuid.New()
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO workspace_invitation (
+			id, workspace_id, inviter_id, invitee_email, role, status, expires_at
+		) VALUES ($1, $2, $3, $4, 'member', 'pending', now() + interval '1 day')
+	`, invitationID, workspaceID, parseUUID(testUserID), invitationID.String()+"@multica.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM seat_capacity_outbox WHERE operation_token = $1`, invitationID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM workspace_invitation WHERE id = $1`, invitationID)
+	})
+	_, err = queries.UpsertSeatCapacityIntent(ctx, db.UpsertSeatCapacityIntentParams{
+		WorkspaceID: workspaceID, OperationToken: uuidToPG(invitationID),
+		Action: seatcapacity.ActionReserveInvitation, SubjectID: uuidToPG(invitationID),
+		InvitationID:  uuidToPG(invitationID),
+		ExpiresAt:     pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		NextAttemptAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := queries.PrepareSeatCapacityOperationReleasesForWorkspaceDeletion(ctx, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := queries.PrepareSeatCapacityInvitationReleasesForWorkspaceDeletion(ctx, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	intent, err := queries.GetSeatCapacityIntent(ctx, uuidToPG(invitationID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.Action != seatcapacity.ActionRelease || intent.MemberID.Valid || intent.DeadLetteredAt.Valid {
+		t.Fatalf("overlapping invitation intent = %+v, want live release", intent)
+	}
+}
+
+func TestClaimNextDueSeatCapacityIntentIsExclusiveAcrossReplicas(t *testing.T) {
+	ctx := context.Background()
+	queries := db.New(testPool)
+	workspaceID := parseUUID(testWorkspaceID)
+	token := uuid.New()
+	_, err := queries.UpsertSeatCapacityIntent(ctx, db.UpsertSeatCapacityIntentParams{
+		WorkspaceID: workspaceID, OperationToken: uuidToPG(token),
+		Action: seatcapacity.ActionConfirm, MemberID: uuidToPG(uuid.New()),
+		NextAttemptAt: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM seat_capacity_outbox WHERE operation_token = $1`, token)
+	})
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, claimErr := queries.ClaimNextDueSeatCapacityIntent(ctx, pgtype.Timestamptz{
+				Time: time.Now().Add(5 * time.Minute), Valid: true,
+			})
+			results <- claimErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var claimed, empty int
+	for claimErr := range results {
+		switch {
+		case claimErr == nil:
+			claimed++
+		case errors.Is(claimErr, pgx.ErrNoRows):
+			empty++
+		default:
+			t.Fatal(claimErr)
+		}
+	}
+	if claimed != 1 || empty != 1 {
+		t.Fatalf("claimed=%d empty=%d, want 1/1", claimed, empty)
 	}
 }

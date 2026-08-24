@@ -216,6 +216,7 @@ type RouterOptions struct {
 	HTTPMetrics         *obsmetrics.HTTPMetrics
 	BusinessMetrics     *obsmetrics.BusinessMetrics
 	ChannelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
+	SeatCapacityMetrics *obsmetrics.SeatCapacityMetrics
 	// ChannelLeaseRedis is a dedicated non-blocking Redis client/pool. It is
 	// required only when CHANNEL_WS_LEASE_BACKEND=redis.
 	ChannelLeaseRedis *redis.Client
@@ -436,7 +437,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		h.SeatCapacity = capacityClient
 	}
 	if h.SeatCapacity.Enabled() {
-		h.SeatCapacityWorker = seatcapacity.NewWorker(queries, h.SeatCapacity, seatcapacity.WorkerConfig{})
+		h.SeatCapacityWorker = seatcapacity.NewWorker(queries, h.SeatCapacity, seatcapacity.WorkerConfig{
+			Metrics: opts.SeatCapacityMetrics,
+		})
 	}
 	if opts.BusinessMetrics != nil {
 		// Wire the BusinessMetrics receiver into the cloud runtime client

@@ -554,80 +554,6 @@ func normalizeMemberRole(role string) (string, bool) {
 	}
 }
 
-func (h *Handler) CreateMember(w http.ResponseWriter, r *http.Request) {
-	workspaceID := workspaceIDFromURL(r, "id")
-	requester, ok := h.workspaceMember(w, r, workspaceID)
-	if !ok {
-		return
-	}
-
-	var req CreateMemberRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	email := strings.ToLower(strings.TrimSpace(req.Email))
-	if email == "" {
-		writeError(w, http.StatusBadRequest, "email is required")
-		return
-	}
-
-	role, valid := normalizeMemberRole(req.Role)
-	if !valid {
-		writeError(w, http.StatusBadRequest, "invalid member role")
-		return
-	}
-	if role == "owner" && requester.Role != "owner" {
-		writeError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	user, err := h.Queries.GetUserByEmail(r.Context(), email)
-	if err != nil {
-		if isNotFound(err) {
-			// Auto-create user with email so they can be invited before signing up
-			user, err = h.Queries.CreateUser(r.Context(), db.CreateUserParams{
-				Name:  email,
-				Email: email,
-			})
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to create user")
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, "failed to load user")
-			return
-		}
-	}
-
-	member, err := h.Queries.CreateMember(r.Context(), db.CreateMemberParams{
-		WorkspaceID: requester.WorkspaceID,
-		UserID:      user.ID,
-		Role:        role,
-	})
-	if err != nil {
-		if isUniqueViolation(err) {
-			writeError(w, http.StatusConflict, "user is already a member")
-			return
-		}
-		slog.Warn("create member failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID, "email", email)...)
-		writeError(w, http.StatusInternalServerError, "failed to create member")
-		return
-	}
-
-	slog.Info("member added", append(logger.RequestAttrs(r), "member_id", uuidToString(member.ID), "workspace_id", workspaceID, "email", email, "role", role)...)
-	userID := requestUserID(r)
-	eventPayload := map[string]any{"member": h.memberWithUserResponse(member, user)}
-	if ws, err := h.Queries.GetWorkspace(r.Context(), requester.WorkspaceID); err == nil {
-		eventPayload["workspace_name"] = ws.Name
-	}
-	h.publish(protocol.EventMemberAdded, uuidToString(requester.WorkspaceID), "member", userID, eventPayload)
-	h.notifyDaemonWorkspacesChanged(uuidToString(user.ID))
-
-	writeJSON(w, http.StatusCreated, h.memberWithUserResponse(member, user))
-}
-
 type UpdateMemberRequest struct {
 	Role string `json:"role"`
 }
@@ -1227,7 +1153,16 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 				if !h.seatCapacityEnabled() {
 					return nil
 				}
-				return qtx.PrepareSeatCapacityWorkspaceDeletion(ctx, requester.WorkspaceID)
+				if err := qtx.DeleteSeatCapacityConfirmIntentsForWorkspaceDeletion(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				if err := qtx.PrepareSeatCapacityOperationReleasesForWorkspaceDeletion(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				if err := qtx.PrepareSeatCapacityInvitationReleasesForWorkspaceDeletion(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				return qtx.PrepareSeatCapacityMemberReleasesForWorkspaceDeletion(ctx, requester.WorkspaceID)
 			},
 		},
 		{

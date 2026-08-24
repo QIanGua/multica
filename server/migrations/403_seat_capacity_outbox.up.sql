@@ -2,9 +2,8 @@
 -- table contains no commercial limits; it only records cross-service writes
 -- until their idempotent Cloud operation is settled.
 CREATE TABLE seat_capacity_outbox (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL,
-    operation_token UUID NOT NULL UNIQUE,
+    operation_token UUID NOT NULL,
     action TEXT NOT NULL CHECK (action IN (
         'reserve_invitation',
         'consume_invitation',
@@ -23,6 +22,7 @@ CREATE TABLE seat_capacity_outbox (
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error TEXT,
+    dead_lettered_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK ((action <> 'reserve_invitation') OR (invitation_id IS NOT NULL AND expires_at IS NOT NULL)),
@@ -31,10 +31,3 @@ CREATE TABLE seat_capacity_outbox (
     CHECK ((action <> 'confirm') OR member_id IS NOT NULL),
     CHECK ((action <> 'release_member') OR member_id IS NOT NULL)
 );
-
-CREATE INDEX idx_seat_capacity_outbox_due
-    ON seat_capacity_outbox(next_attempt_at, created_at);
-
-CREATE INDEX idx_seat_capacity_outbox_share_join
-    ON seat_capacity_outbox(workspace_id, share_link_id, user_id)
-    WHERE action = 'claim_share_join';

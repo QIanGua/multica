@@ -905,10 +905,12 @@ function BillingTabContent() {
   const billedSeats = summaryQuery.data?.billedSeats;
   const pendingSeatQuantity = summaryQuery.data?.pendingSeatQuantity;
   const reservedSeats = summaryQuery.data?.reservedSeats ?? 0;
-  const seatUsageOutOfSync =
+  const membersExceedPurchasedSeats =
     hasManagedSubscription &&
     summaryQuery.data !== undefined &&
-    actualSeats !== usedSeats;
+    billedSeats !== null &&
+    billedSeats !== undefined &&
+    actualSeats > billedSeats;
   const availableSeats =
     billedSeats === null || billedSeats === undefined
       ? null
@@ -1490,20 +1492,20 @@ function BillingTabContent() {
             <AlertDescription>{reconcileMessage}</AlertDescription>
           </Alert>
         ) : null}
-        {seatUsageOutOfSync ? (
-          <Alert className="mb-3" variant="destructive">
+        {membersExceedPurchasedSeats ? (
+          <Alert className="mb-3">
             <AlertCircle />
             <AlertTitle>
-              {t(($) => $.workspace.seats.usage_out_of_sync_title)}
+              {t(($) => $.workspace.seats.members_over_capacity_title)}
             </AlertTitle>
             <AlertDescription>
               <p>
-                {t(($) => $.workspace.seats.usage_out_of_sync_description, {
+                {t(($) => $.workspace.seats.members_over_capacity_description, {
                   actual: actualSeats,
-                  used: usedSeats,
+                  purchased: billedSeats,
                 })}
               </p>
-              {actualSeats > usedSeats && canAddSeats ? (
+              {canAddSeats ? (
                 <Button
                   className="mt-3"
                   type="button"

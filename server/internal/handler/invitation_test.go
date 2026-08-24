@@ -14,6 +14,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/seatcapacity"
@@ -25,6 +27,7 @@ type stubSeatCapacity struct {
 	reserveDecision seatcapacity.Decision
 	reserveErr      error
 	reserveCalls    int
+	releaseCalls    int
 }
 
 func (s *stubSeatCapacity) Enabled() bool { return true }
@@ -42,6 +45,7 @@ func (s *stubSeatCapacity) Confirm(context.Context, uuid.UUID, uuid.UUID, uuid.U
 	return seatcapacity.Decision{Managed: true, Allowed: true}, nil
 }
 func (s *stubSeatCapacity) Release(context.Context, uuid.UUID, uuid.UUID) (seatcapacity.Decision, error) {
+	s.releaseCalls++
 	return seatcapacity.Decision{Managed: true, Allowed: true}, nil
 }
 func (s *stubSeatCapacity) ReleaseMember(context.Context, uuid.UUID, uuid.UUID) (seatcapacity.Decision, error) {
@@ -129,6 +133,27 @@ func clearInvitationsForTestWorkspace(t *testing.T) {
 	})
 }
 
+type rollbackOnCommitTx struct {
+	pgx.Tx
+}
+
+func (tx rollbackOnCommitTx) Commit(ctx context.Context) error {
+	_ = tx.Tx.Rollback(ctx)
+	return errors.New("forced commit failure")
+}
+
+type rollbackOnCommitTxStarter struct {
+	pool *pgxpool.Pool
+}
+
+func (s rollbackOnCommitTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return rollbackOnCommitTx{Tx: tx}, nil
+}
+
 // Sanity check: a fresh, live pending invitation must block re-invitation.
 func TestCreateInvitation_BlocksWhilePending(t *testing.T) {
 	clearInvitationsForTestWorkspace(t)
@@ -209,6 +234,47 @@ func TestCreateInvitation_BlocksWhenPurchasedCapacityIsFull(t *testing.T) {
 	}
 	if invitationCount != 0 || outboxCount != 0 {
 		t.Fatalf("persisted invitation=%d outbox=%d, want both zero", invitationCount, outboxCount)
+	}
+}
+
+func TestCreateInvitation_CompensatesCapacityWhenCommitRollsBack(t *testing.T) {
+	clearInvitationsForTestWorkspace(t)
+	ctx := context.Background()
+	workspaceID := parseUUID(testWorkspaceID)
+	if _, err := testPool.Exec(ctx, `DELETE FROM seat_capacity_outbox WHERE workspace_id = $1`, workspaceID); err != nil {
+		t.Fatalf("clear capacity outbox: %v", err)
+	}
+
+	capacity := &stubSeatCapacity{reserveDecision: seatcapacity.Decision{Managed: true, Allowed: true}}
+	useSeatCapacity(t, capacity)
+	previousTxStarter := testHandler.TxStarter
+	testHandler.TxStarter = rollbackOnCommitTxStarter{pool: testPool}
+	t.Cleanup(func() { testHandler.TxStarter = previousTxStarter })
+
+	const email = "capacity-commit-failure@multica.ai"
+	req := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/members", CreateMemberRequest{
+		Email: email, Role: "member",
+	})
+	req = withURLParam(req, "id", testWorkspaceID)
+	rec := httptest.NewRecorder()
+	testHandler.CreateInvitation(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	if capacity.reserveCalls != 1 || capacity.releaseCalls != 1 {
+		t.Fatalf("reserve calls = %d, release calls = %d; want one each", capacity.reserveCalls, capacity.releaseCalls)
+	}
+
+	var invitationCount, outboxCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM workspace_invitation WHERE workspace_id = $1 AND invitee_email = $2`, workspaceID, email).Scan(&invitationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM seat_capacity_outbox WHERE workspace_id = $1`, workspaceID).Scan(&outboxCount); err != nil {
+		t.Fatal(err)
+	}
+	if invitationCount != 0 || outboxCount != 0 {
+		t.Fatalf("persisted invitation=%d outbox=%d, want both zero after compensation", invitationCount, outboxCount)
 	}
 }
 

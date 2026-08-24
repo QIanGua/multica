@@ -94,4 +94,13 @@ require_rendered_value "$capacity_config" 'MULTICA_SUBSCRIPTION_CAPACITY_URL: "h
 require_rendered_value "$capacity_config" 'MULTICA_SUBSCRIPTION_CAPACITY_TIMEOUT: "2s"'
 reject_rendered_value "$capacity_config" 'MULTICA_SUBSCRIPTION_CAPACITY_SERVICE_TOKEN'
 
+capacity_alerts="$(
+  helm template multica "$CHART_DIR" \
+    --show-only templates/prometheusrule.yaml \
+    --set monitoring.prometheusRule.enabled=true
+)"
+require_rendered_value "$capacity_alerts" 'alert: MulticaSeatCapacityOutboxDeadLettered'
+require_rendered_value "$capacity_alerts" 'alert: MulticaSeatCapacityOutboxStalled'
+require_rendered_value "$capacity_alerts" 'multica_seat_capacity_outbox_oldest_pending_age_seconds'
+
 echo "helm config rendering ok"

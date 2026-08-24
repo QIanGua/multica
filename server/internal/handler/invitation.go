@@ -154,7 +154,7 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	createParams := db.CreateInvitationWithCapacityParams{
+	createParams := db.CreateInvitationParams{
 		ID: uuidToPG(invitationID), WorkspaceID: requester.WorkspaceID, InviterID: requester.UserID,
 		InviteeEmail: email, InviteeUserID: inviteeUserID, Role: role,
 		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
@@ -169,7 +169,7 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 		}
 		defer tx.Rollback(r.Context())
 		qtx := h.Queries.WithTx(tx)
-		inv, err = qtx.CreateInvitationWithCapacity(r.Context(), createParams)
+		inv, err = qtx.CreateInvitation(r.Context(), createParams)
 		if err == nil {
 			err = qtx.DeleteSeatCapacityIntentForAction(r.Context(), db.DeleteSeatCapacityIntentForActionParams{
 				OperationToken: uuidToPG(invitationID), Action: seatcapacity.ActionReserveInvitation,
@@ -178,10 +178,16 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			err = tx.Commit(r.Context())
 		}
+		if err != nil {
+			// Release transaction locks before the out-of-transaction Cloud
+			// compensation below reads and transitions the durable intent.
+			_ = tx.Rollback(r.Context())
+		}
 	} else {
-		inv, err = h.Queries.CreateInvitationWithCapacity(r.Context(), createParams)
+		inv, err = h.Queries.CreateInvitation(r.Context(), createParams)
 	}
 	if err != nil {
+		h.compensateCapacityIntent(r.Context(), invitationID)
 		if isUniqueViolation(err) {
 			writeError(w, http.StatusConflict, "invitation already pending for this email")
 			return
@@ -298,8 +304,13 @@ func (h *Handler) RevokeInvitation(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	qtx := h.Queries.WithTx(tx)
-	if err := qtx.RevokeInvitation(r.Context(), inv.ID); err != nil {
+	rows, err := qtx.RevokeInvitation(r.Context(), inv.ID)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to revoke invitation")
+		return
+	}
+	if rows != 1 {
+		writeError(w, http.StatusNotFound, "invitation not found")
 		return
 	}
 	if h.seatCapacityEnabled() {

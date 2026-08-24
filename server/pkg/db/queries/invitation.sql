@@ -1,9 +1,4 @@
 -- name: CreateInvitation :one
-INSERT INTO workspace_invitation (workspace_id, inviter_id, invitee_email, invitee_user_id, role)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING *;
-
--- name: CreateInvitationWithCapacity :one
 INSERT INTO workspace_invitation (id, workspace_id, inviter_id, invitee_email, invitee_user_id, role, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
@@ -46,7 +41,7 @@ SET status = 'declined', updated_at = now()
 WHERE id = $1 AND status = 'pending'
 RETURNING *;
 
--- name: RevokeInvitation :exec
+-- name: RevokeInvitation :execrows
 DELETE FROM workspace_invitation
 WHERE id = $1 AND status = 'pending';
 

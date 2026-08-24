@@ -11,39 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const claimShareLinkByCode = `-- name: ClaimShareLinkByCode :one
-UPDATE workspace_share_link
-SET use_count = use_count + 1
-WHERE code = $1
-  AND is_active = true
-  AND (expires_at IS NULL OR expires_at > now())
-  AND (max_uses IS NULL OR use_count < max_uses)
-RETURNING id, workspace_id, code, created_by, role, expires_at, max_uses, use_count, is_active, created_at
-`
-
-// Atomically consume one use of a share link. The conditional UPDATE both
-// revalidates validity (active, not expired, below max_uses) and increments
-// use_count in a single statement, so concurrent joins cannot exceed max_uses
-// and a join cannot slip in after the link was revoked or expired. Returns the
-// row only if the link is still usable.
-func (q *Queries) ClaimShareLinkByCode(ctx context.Context, code string) (WorkspaceShareLink, error) {
-	row := q.db.QueryRow(ctx, claimShareLinkByCode, code)
-	var i WorkspaceShareLink
-	err := row.Scan(
-		&i.ID,
-		&i.WorkspaceID,
-		&i.Code,
-		&i.CreatedBy,
-		&i.Role,
-		&i.ExpiresAt,
-		&i.MaxUses,
-		&i.UseCount,
-		&i.IsActive,
-		&i.CreatedAt,
-	)
-	return i, err
-}
-
 const claimShareLinkByID = `-- name: ClaimShareLinkByID :one
 UPDATE workspace_share_link
 SET use_count = use_count + 1
@@ -54,8 +21,9 @@ WHERE id = $1
 RETURNING id, workspace_id, code, created_by, role, expires_at, max_uses, use_count, is_active, created_at
 `
 
-// Recovery/retry form of ClaimShareLinkByCode. The caller first resolved the
-// opaque code and durably recorded only this non-secret row ID.
+// The caller first resolves the opaque code and then atomically consumes the
+// non-secret row ID. The conditional UPDATE revalidates validity and the use
+// limit so a join cannot race past revocation or expiry.
 func (q *Queries) ClaimShareLinkByID(ctx context.Context, id pgtype.UUID) (WorkspaceShareLink, error) {
 	row := q.db.QueryRow(ctx, claimShareLinkByID, id)
 	var i WorkspaceShareLink
