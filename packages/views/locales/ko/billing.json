@@ -221,6 +221,8 @@
       "summary_loading": "구독 좌석 상세 정보 불러오는 중",
       "summary_unavailable_title": "일부 좌석 상세 정보를 불러올 수 없습니다",
       "summary_unavailable_description": "현재 요금제는 계속 표시되지만 구매한 좌석과 예정 좌석 수를 불러오지 못했습니다.",
+      "usage_out_of_sync_title": "멤버 좌석이 일치하지 않습니다",
+      "usage_out_of_sync_description": "이 워크스페이스에는 실제 멤버가 {{actual}}명이지만 Billing에는 사용 좌석이 {{used}}개로 기록되어 있습니다. 더 초대하기 전에 좌석을 추가하거나 멤버를 제거하고, 불일치가 계속되면 지원팀에 문의하세요.",
       "updated": "좌석 새로고침됨",
       "reconciled": "현재 멤버: {{actual}} · 결제 좌석: {{billed}}"
     },

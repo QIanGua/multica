@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,8 +13,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/seatcapacity"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -281,6 +285,35 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var capacityToken uuid.UUID
+	var capacityLink db.WorkspaceShareLink
+	if h.seatCapacityEnabled() {
+		capacityLink, err = h.Queries.GetActiveShareLinkByCode(r.Context(), code)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "share link not found or expired")
+			return
+		}
+		if _, memberErr := h.Queries.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
+			UserID: user.ID, WorkspaceID: capacityLink.WorkspaceID,
+		}); memberErr == nil {
+			writeError(w, http.StatusConflict, "you are already a member of this workspace")
+			return
+		}
+		capacityToken = uuid.New()
+		if existing, intentErr := h.Queries.GetPendingShareJoinCapacityIntent(r.Context(), db.GetPendingShareJoinCapacityIntentParams{
+			WorkspaceID: capacityLink.WorkspaceID, ShareLinkID: capacityLink.ID, UserID: user.ID,
+		}); intentErr == nil {
+			capacityToken = uuid.UUID(existing.OperationToken.Bytes)
+		} else if !errors.Is(intentErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusInternalServerError, "failed to join workspace")
+			return
+		}
+		if err := h.beginShareJoinCapacity(r.Context(), uuid.UUID(capacityLink.WorkspaceID.Bytes), capacityToken, uuid.UUID(capacityLink.ID.Bytes), uuid.UUID(user.ID.Bytes)); err != nil {
+			writeSeatCapacityError(w, err)
+			return
+		}
+	}
+
 	// Open the transaction first, then atomically claim the link. The claim is
 	// a conditional UPDATE that revalidates active/not-expired/below-max_uses
 	// and increments use_count in one statement, so concurrent joins cannot
@@ -294,7 +327,12 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 
 	qtx := h.Queries.WithTx(tx)
 
-	link, err := qtx.ClaimShareLinkByCode(r.Context(), code)
+	var link db.WorkspaceShareLink
+	if h.seatCapacityEnabled() {
+		link, err = qtx.ClaimShareLinkByID(r.Context(), capacityLink.ID)
+	} else {
+		link, err = qtx.ClaimShareLinkByCode(r.Context(), code)
+	}
 	if err != nil {
 		writeError(w, http.StatusNotFound, "share link not found or expired")
 		return
@@ -317,6 +355,7 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
+			h.compensateCapacityIntent(r.Context(), capacityToken)
 			writeError(w, http.StatusConflict, "you are already a member of this workspace")
 			return
 		}
@@ -330,10 +369,19 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to finalize onboarding")
 		return
 	}
+	if h.seatCapacityEnabled() {
+		if err := transitionCapacityIntentToConfirm(r.Context(), qtx, capacityToken, uuid.UUID(member.ID.Bytes), seatcapacity.ActionClaimShareJoin); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to join workspace")
+			return
+		}
+	}
 
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to join workspace")
 		return
+	}
+	if h.seatCapacityEnabled() {
+		h.confirmCapacityIntent(r.Context(), uuid.UUID(link.WorkspaceID.Bytes), capacityToken, uuid.UUID(member.ID.Bytes))
 	}
 
 	wsID := uuidToString(link.WorkspaceID)

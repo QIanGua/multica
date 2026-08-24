@@ -613,6 +613,9 @@ func main() {
 	if h.WebhookDeliveryWorker != nil {
 		go h.WebhookDeliveryWorker.Run(sweepCtx)
 	}
+	if h.SeatCapacityWorker != nil {
+		go h.SeatCapacityWorker.Run(sweepCtx)
+	}
 	if h.TelegramOutbound != nil {
 		h.TelegramOutbound.Start(sweepCtx)
 	}

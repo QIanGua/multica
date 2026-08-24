@@ -44,6 +44,36 @@ func (q *Queries) ClaimShareLinkByCode(ctx context.Context, code string) (Worksp
 	return i, err
 }
 
+const claimShareLinkByID = `-- name: ClaimShareLinkByID :one
+UPDATE workspace_share_link
+SET use_count = use_count + 1
+WHERE id = $1
+  AND is_active = true
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_uses IS NULL OR use_count < max_uses)
+RETURNING id, workspace_id, code, created_by, role, expires_at, max_uses, use_count, is_active, created_at
+`
+
+// Recovery/retry form of ClaimShareLinkByCode. The caller first resolved the
+// opaque code and durably recorded only this non-secret row ID.
+func (q *Queries) ClaimShareLinkByID(ctx context.Context, id pgtype.UUID) (WorkspaceShareLink, error) {
+	row := q.db.QueryRow(ctx, claimShareLinkByID, id)
+	var i WorkspaceShareLink
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Code,
+		&i.CreatedBy,
+		&i.Role,
+		&i.ExpiresAt,
+		&i.MaxUses,
+		&i.UseCount,
+		&i.IsActive,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createShareLink = `-- name: CreateShareLink :one
 INSERT INTO workspace_share_link (workspace_id, code, created_by, role, expires_at, max_uses)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -93,6 +123,32 @@ WHERE workspace_id = $1 AND is_active = true
 func (q *Queries) DeactivateWorkspaceShareLinks(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deactivateWorkspaceShareLinks, workspaceID)
 	return err
+}
+
+const getActiveShareLinkByCode = `-- name: GetActiveShareLinkByCode :one
+SELECT id, workspace_id, code, created_by, role, expires_at, max_uses, use_count, is_active, created_at FROM workspace_share_link
+WHERE code = $1
+  AND is_active = true
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_uses IS NULL OR use_count < max_uses)
+`
+
+func (q *Queries) GetActiveShareLinkByCode(ctx context.Context, code string) (WorkspaceShareLink, error) {
+	row := q.db.QueryRow(ctx, getActiveShareLinkByCode, code)
+	var i WorkspaceShareLink
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Code,
+		&i.CreatedBy,
+		&i.Role,
+		&i.ExpiresAt,
+		&i.MaxUses,
+		&i.UseCount,
+		&i.IsActive,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const getShareLinkInfoByCode = `-- name: GetShareLinkInfoByCode :one

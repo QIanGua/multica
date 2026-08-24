@@ -37,6 +37,7 @@ import (
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
+	"github.com/multica-ai/multica/server/internal/seatcapacity"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/storage"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -418,6 +419,24 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		h.Entitlements = entitlementClient
 		h.AutopilotService.Entitlements = entitlementClient
 		h.AutopilotService.QuotaMetrics = opts.BusinessMetrics
+	}
+	capacityClient, capacityErr := seatcapacity.New(seatcapacity.Config{
+		Enabled:      envBool("MULTICA_SUBSCRIPTION_CAPACITY_ENABLED", false),
+		BaseURL:      strings.TrimSpace(os.Getenv("MULTICA_SUBSCRIPTION_CAPACITY_URL")),
+		ServiceToken: os.Getenv("MULTICA_SUBSCRIPTION_CAPACITY_SERVICE_TOKEN"),
+		Timeout:      envDuration("MULTICA_SUBSCRIPTION_CAPACITY_TIMEOUT", 3*time.Second),
+	})
+	if capacityErr != nil {
+		// Explicit enablement with malformed config must not silently restore
+		// unlimited membership. The fail-closed executor returns 503 until the
+		// operator repairs the service URL or credential.
+		slog.Error("subscription seat capacity executor unavailable", "error", capacityErr)
+		h.SeatCapacity = seatcapacity.NewUnavailable(capacityErr)
+	} else {
+		h.SeatCapacity = capacityClient
+	}
+	if h.SeatCapacity.Enabled() {
+		h.SeatCapacityWorker = seatcapacity.NewWorker(queries, h.SeatCapacity, seatcapacity.WorkerConfig{})
 	}
 	if opts.BusinessMetrics != nil {
 		// Wire the BusinessMetrics receiver into the cloud runtime client

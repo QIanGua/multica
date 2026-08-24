@@ -17,6 +17,24 @@ WHERE code = $1
   AND (max_uses IS NULL OR use_count < max_uses)
 RETURNING *;
 
+-- name: ClaimShareLinkByID :one
+-- Recovery/retry form of ClaimShareLinkByCode. The caller first resolved the
+-- opaque code and durably recorded only this non-secret row ID.
+UPDATE workspace_share_link
+SET use_count = use_count + 1
+WHERE id = $1
+  AND is_active = true
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_uses IS NULL OR use_count < max_uses)
+RETURNING *;
+
+-- name: GetActiveShareLinkByCode :one
+SELECT * FROM workspace_share_link
+WHERE code = $1
+  AND is_active = true
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_uses IS NULL OR use_count < max_uses);
+
 -- name: GetShareLinkInfoByCode :one
 SELECT wsl.role,
        w.name  AS workspace_name,

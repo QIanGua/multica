@@ -1389,6 +1389,32 @@ describe("BillingTab", () => {
     );
   });
 
+  it("warns when actual members and accounted used seats diverge", () => {
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+      version: 3,
+    });
+    Object.assign(mocks.summary, {
+      actualSeats: 5,
+      usedSeats: 4,
+      billedSeats: 4,
+      reservedSeats: 0,
+      purchaseVersion: 9,
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("Member capacity is out of sync")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "This workspace has 5 actual members, but billing accounts for 4 used seats. Add enough seats or remove members before sending more invitations; contact support if the mismatch remains.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it.each(["canceled", "incomplete_expired"])(
     "keeps management and self-service repurchase available for %s Free",
     (status) => {

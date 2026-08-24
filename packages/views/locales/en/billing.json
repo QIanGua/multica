@@ -225,6 +225,8 @@
       "summary_loading": "Loading subscription seat details",
       "summary_unavailable_title": "Some seat details are unavailable",
       "summary_unavailable_description": "The current plan is still shown, but purchased and scheduled seat quantities could not be loaded.",
+      "usage_out_of_sync_title": "Member capacity is out of sync",
+      "usage_out_of_sync_description": "This workspace has {{actual}} actual members, but billing accounts for {{used}} used seats. Add enough seats or remove members before sending more invitations; contact support if the mismatch remains.",
       "updated": "Seats refreshed",
       "reconciled": "Current members: {{actual}} · billed seats: {{billed}}"
     },

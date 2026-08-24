@@ -905,6 +905,10 @@ function BillingTabContent() {
   const billedSeats = summaryQuery.data?.billedSeats;
   const pendingSeatQuantity = summaryQuery.data?.pendingSeatQuantity;
   const reservedSeats = summaryQuery.data?.reservedSeats ?? 0;
+  const seatUsageOutOfSync =
+    hasManagedSubscription &&
+    summaryQuery.data !== undefined &&
+    actualSeats !== usedSeats;
   const availableSeats =
     billedSeats === null || billedSeats === undefined
       ? null
@@ -1484,6 +1488,35 @@ function BillingTabContent() {
             <CheckCircle2 />
             <AlertTitle>{t(($) => $.workspace.seats.updated)}</AlertTitle>
             <AlertDescription>{reconcileMessage}</AlertDescription>
+          </Alert>
+        ) : null}
+        {seatUsageOutOfSync ? (
+          <Alert className="mb-3" variant="destructive">
+            <AlertCircle />
+            <AlertTitle>
+              {t(($) => $.workspace.seats.usage_out_of_sync_title)}
+            </AlertTitle>
+            <AlertDescription>
+              <p>
+                {t(($) => $.workspace.seats.usage_out_of_sync_description, {
+                  actual: actualSeats,
+                  used: usedSeats,
+                })}
+              </p>
+              {actualSeats > usedSeats && canAddSeats ? (
+                <Button
+                  className="mt-3"
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={isMutating}
+                  onClick={() => handleSeatPurchaseOpenChange(true)}
+                >
+                  <Plus />
+                  {t(($) => $.workspace.actions.add_seats)}
+                </Button>
+              ) : null}
+            </AlertDescription>
           </Alert>
         ) : null}
         {activeSeatPurchase ? (
