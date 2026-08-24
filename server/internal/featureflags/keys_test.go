@@ -38,6 +38,17 @@ func TestAgentSkillTogglesCompatDecisionStaysEnabled(t *testing.T) {
 	}
 }
 
+// MUL-6643: the rollout gate is gone server-side, but v0.4.30–v0.4.32 are
+// installed and still hide the "New status" button unless this key arrives as
+// `true`. Those clients fail closed on absence, so the key has to keep being
+// published even though nothing reads it here any more.
+func TestCustomIssueStatusesCompatDecisionStaysEnabled(t *testing.T) {
+	flags := EvaluateFrontendPublicFlags(context.Background(), nil)
+	if !flags[customIssueStatusesCompat] {
+		t.Fatal("custom issue statuses must stay enabled for installed clients")
+	}
+}
+
 func TestPluginsV1DefaultsOff(t *testing.T) {
 	flags := EvaluateFrontendPublicFlags(context.Background(), nil)
 	if flags[PluginsV1] {
