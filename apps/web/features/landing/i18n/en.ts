@@ -296,11 +296,9 @@ export function createEnDict(allowSignup: boolean): LandingDict {
       {
         version: "0.5.0",
         date: "2026-08-24",
-        title: "Public APIs, Plugin schedules, and Inbox filters",
+        title: "Inbox filters, ZeroClaw runtime, and local environments",
         changes: [],
         features: [
-          "Build integrations with the new public API.",
-          "Run Plugin hooks automatically on a schedule.",
           "Filter Inbox notifications by Issue status and priority.",
           "Use ZeroClaw as a native agent runtime.",
           "Manage named local environments through every lifecycle step.",
@@ -309,11 +307,10 @@ export function createEnDict(allowSignup: boolean): LandingDict {
         ],
         improvements: [
           "Task failure messages now appear in your chosen language.",
-          "Grok shows each model's supported reasoning levels and current pricing.",
+          "Grok shows each model's supported reasoning levels.",
           "Skill download failures now show how much data arrived.",
           "Use a keyboard shortcut to show or hide the right sidebar.",
           "The iOS app now has a cleaner flat icon.",
-          "Billing timelines are easier to read.",
           "Self-hosting guides now state the right PostgreSQL requirements.",
         ],
         fixes: [

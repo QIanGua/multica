@@ -271,11 +271,9 @@ export function createKoDict(allowSignup: boolean): LandingDict {
       {
         version: "0.5.0",
         date: "2026-08-24",
-        title: "공개 API, 플러그인 예약 실행, 받은 편지함 필터",
+        title: "받은 편지함 필터, ZeroClaw 런타임, 로컬 환경",
         changes: [],
         features: [
-          "새 공개 API로 연동을 만들 수 있습니다.",
-          "플러그인 훅을 예약에 따라 자동 실행할 수 있습니다.",
           "Issue 상태와 우선순위로 받은 편지함 알림을 필터링할 수 있습니다.",
           "ZeroClaw를 기본 에이전트 런타임으로 사용할 수 있습니다.",
           "이름이 있는 로컬 환경을 전체 수명 주기 동안 관리할 수 있습니다.",
@@ -284,11 +282,10 @@ export function createKoDict(allowSignup: boolean): LandingDict {
         ],
         improvements: [
           "태스크 실패 메시지가 선택한 언어로 표시됩니다.",
-          "Grok이 모델별 추론 수준과 현재 요금을 표시합니다.",
+          "Grok이 모델별 추론 수준을 표시합니다.",
           "스킬 다운로드에 실패해도 받은 데이터 양을 확인할 수 있습니다.",
           "단축키로 오른쪽 사이드바를 표시하거나 숨길 수 있습니다.",
           "iOS 앱 아이콘이 더 깔끔한 평면 디자인으로 바뀌었습니다.",
-          "결제 타임라인을 더 쉽게 읽을 수 있습니다.",
           "셀프 호스팅 안내에서 올바른 PostgreSQL 요구 사항을 확인할 수 있습니다.",
         ],
         fixes: [

@@ -296,11 +296,9 @@ export function createZhDict(allowSignup: boolean): LandingDict {
       {
         version: "0.5.0",
         date: "2026-08-24",
-        title: "公共 API、插件定时任务、收件箱筛选",
+        title: "收件箱筛选、ZeroClaw 运行时、本地环境",
         changes: [],
         features: [
-          "现在可以通过新的公共 API 构建集成。",
-          "插件钩子现在可以按计划自动运行。",
           "现在可以按 Issue 状态和优先级筛选收件箱通知。",
           "ZeroClaw 现已成为内置智能体运行时。",
           "现在可以用独立名称管理本地环境的完整生命周期。",
@@ -309,11 +307,10 @@ export function createZhDict(allowSignup: boolean): LandingDict {
         ],
         improvements: [
           "任务失败信息现在会按你选择的语言显示。",
-          "Grok 现在显示每个模型的推理级别和当前价格。",
+          "Grok 现在显示每个模型的推理级别。",
           "技能下载失败时会显示已接收的数据量。",
           "可用快捷键显示或隐藏右侧边栏。",
           "iOS 应用现在使用更简洁的扁平图标。",
-          "账单时间线现在更易阅读。",
           "自托管指南现在说明正确的 PostgreSQL 要求。",
         ],
         fixes: [

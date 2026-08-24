@@ -272,11 +272,9 @@ export function createJaDict(allowSignup: boolean): LandingDict {
       {
         version: "0.5.0",
         date: "2026-08-24",
-        title: "パブリック API、プラグインのスケジュール、受信トレイのフィルター",
+        title: "受信トレイのフィルター、ZeroClaw 実行環境、ローカル環境",
         changes: [],
         features: [
-          "新しいパブリック API で連携を作れます。",
-          "プラグインのフックをスケジュールで自動実行できます。",
           "Issue の状態と優先度で受信トレイ通知を絞り込めます。",
           "ZeroClaw を標準のエージェント実行環境として使えます。",
           "名前付きのローカル環境をライフサイクル全体で管理できます。",
@@ -285,11 +283,10 @@ export function createJaDict(allowSignup: boolean): LandingDict {
         ],
         improvements: [
           "タスク失敗の内容が選択した言語で表示されます。",
-          "Grok はモデルごとの推論レベルと料金を表示します。",
+          "Grok はモデルごとの推論レベルを表示します。",
           "スキルのダウンロード失敗時に受信データ量が分かります。",
           "ショートカットで右サイドバーを表示・非表示にできます。",
           "iOS アプリのアイコンが、よりすっきりしました。",
-          "請求のタイムラインが読みやすくなりました。",
           "セルフホストの手順で正しい PostgreSQL 要件を確認できます。",
         ],
         fixes: [
