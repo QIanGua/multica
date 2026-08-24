@@ -294,14 +294,13 @@ export function createZhDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
-        version: "0.5.0",
+        version: "0.4.33",
         date: "2026-08-24",
-        title: "收件箱筛选、ZeroClaw 运行时、本地环境",
+        title: "收件箱筛选、ZeroClaw 运行时、多语言失败说明",
         changes: [],
         features: [
           "现在可以按 Issue 状态和优先级筛选收件箱通知。",
           "ZeroClaw 现已成为内置智能体运行时。",
-          "现在可以用独立名称管理本地环境的完整生命周期。",
           "自托管团队可将守护进程流量发送到独立服务器。",
           "自托管团队可设置排队任务的保留时长。",
         ],

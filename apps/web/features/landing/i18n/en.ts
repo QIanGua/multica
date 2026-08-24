@@ -294,14 +294,13 @@ export function createEnDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
-        version: "0.5.0",
+        version: "0.4.33",
         date: "2026-08-24",
-        title: "Inbox filters, ZeroClaw runtime, and local environments",
+        title: "Inbox filters, the ZeroClaw runtime, and localized failure messages",
         changes: [],
         features: [
           "Filter Inbox notifications by Issue status and priority.",
           "Use ZeroClaw as a native agent runtime.",
-          "Manage named local environments through every lifecycle step.",
           "Self-hosted teams can send daemon traffic to a separate server.",
           "Self-hosted teams can set how long queued tasks remain available.",
         ],
