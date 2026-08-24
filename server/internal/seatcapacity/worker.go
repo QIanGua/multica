@@ -26,8 +26,6 @@ const (
 	defaultWorkspaceLockWait = 30 * time.Second
 	defaultBatchSize         = 100
 	defaultMaxAttempts       = 10
-	retryBackoffBase         = 5 * time.Second
-	retryBackoffCap          = 5 * time.Minute
 )
 
 type WorkerConfig struct {
@@ -309,53 +307,6 @@ func (w *Worker) deleteCurrent(ctx context.Context, intent db.SeatCapacityOutbox
 	return err
 }
 
-// retryBackoff is how long the worker waits before the attempt after
-// attemptCount. Exponential from retryBackoffBase, capped at retryBackoffCap.
-func retryBackoff(attemptCount int32) time.Duration {
-	backoff := retryBackoffBase
-	for i := int32(0); i < attemptCount && backoff < retryBackoffCap; i++ {
-		backoff *= 2
-	}
-	if backoff > retryBackoffCap {
-		backoff = retryBackoffCap
-	}
-	return backoff
-}
-
-// SettlementBudget is the worst case time this worker may keep retrying one
-// cross-service intent before dead-lettering it: every backoff interval, plus a
-// reconcile tick and a workspace lock wait for each attempt.
-//
-// This is a cross-repository contract. Multica Cloud's ledger reconciliation
-// must wait longer than this before it treats a product member row as one its
-// ledger never recorded (its memberAdoptionSettlementHorizon). A member whose
-// confirm is still legitimately retrying here would otherwise be adopted while
-// its hold is also counted, making one person look like two seats — and an
-// over-estimate is what tells a customer to buy seats they do not owe. Cloud
-// additionally refuses to enforce while such a hold is outstanding, so this
-// budget governs how long that window lasts rather than whether it is safe.
-func SettlementBudget(maxAttempts int32, reconcileInterval, workspaceLockWait time.Duration) time.Duration {
-	if maxAttempts <= 0 {
-		maxAttempts = defaultMaxAttempts
-	}
-	if reconcileInterval <= 0 {
-		reconcileInterval = defaultReconcileInterval
-	}
-	if workspaceLockWait <= 0 {
-		workspaceLockWait = defaultWorkspaceLockWait
-	}
-	total := time.Duration(0)
-	for attempt := int32(0); attempt+1 < maxAttempts; attempt++ {
-		total += retryBackoff(attempt) + reconcileInterval + workspaceLockWait
-	}
-	return total
-}
-
-// DefaultSettlementBudget is SettlementBudget with this package's defaults.
-func DefaultSettlementBudget() time.Duration {
-	return SettlementBudget(defaultMaxAttempts, defaultReconcileInterval, defaultWorkspaceLockWait)
-}
-
 func (w *Worker) recordFailure(ctx context.Context, intent db.SeatCapacityOutbox, settleErr error) {
 	if intent.AttemptCount+1 >= w.maxAttempts {
 		rows, err := w.queries.MarkClaimedSeatCapacityIntentDeadLettered(ctx, db.MarkClaimedSeatCapacityIntentDeadLetteredParams{
@@ -373,7 +324,13 @@ func (w *Worker) recordFailure(ctx context.Context, intent db.SeatCapacityOutbox
 		}
 		return
 	}
-	backoff := retryBackoff(intent.AttemptCount)
+	backoff := 5 * time.Second
+	for i := int32(0); i < intent.AttemptCount && backoff < 5*time.Minute; i++ {
+		backoff *= 2
+	}
+	if backoff > 5*time.Minute {
+		backoff = 5 * time.Minute
+	}
 	rows, err := w.queries.MarkClaimedSeatCapacityIntentFailed(ctx, db.MarkClaimedSeatCapacityIntentFailedParams{
 		LastError: settleErr.Error(), NextAttemptAt: pgtype.Timestamptz{Time: w.now().Add(backoff), Valid: true},
 		OperationToken: intent.OperationToken, Action: intent.Action, LeaseToken: intent.LeaseToken,
