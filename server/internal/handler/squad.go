@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
+	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -946,6 +947,12 @@ func (h *Handler) UpdateSquadMemberRole(w http.ResponseWriter, r *http.Request) 
 // RecordSquadLeaderEvaluation records a squad leader's evaluation decision
 // into the unified activity_log. Called by the leader agent via CLI after
 // each trigger to record whether it took action, stayed silent, or failed.
+//
+// The leader-turn check is task-provenance based (is_leader_task + squad_id on
+// the X-Task-ID row), the SAME source the claim path uses to inject the squad
+// briefing and the mandatory-recording instruction. The target issue's own
+// assignee is deliberately NOT consulted: leaders legitimately run on issues
+// that are not squad-assigned. See MUL-6622 / GH #7487.
 func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Request) {
 	issue, ok := h.loadIssueForUser(w, r, chi.URLParam(r, "id"))
 	if !ok {
@@ -966,14 +973,58 @@ func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// The issue must be assigned to a squad.
-	if !issue.AssigneeType.Valid || issue.AssigneeType.String != "squad" || !issue.AssigneeID.Valid {
-		writeError(w, http.StatusBadRequest, "issue is not assigned to a squad")
+	// Authority for "is this run a squad leader turn" is the TASK ROW, not the
+	// target issue's assignee (MUL-6622 / GH #7487). is_leader_task + squad_id
+	// are stamped at enqueue time and are exactly what the claim path keys the
+	// squad briefing and the mandatory-`squad activity` instruction off
+	// (handler/daemon.go, daemon/prompt.go taskIsSquadLeader). Gating this
+	// endpoint on issue.assignee_type == "squad" instead made the recording
+	// call unsatisfiable on the paths where a leader legitimately runs on a
+	// non-squad-assigned issue — a `@squad` mention on an issue owned by a
+	// plain agent, or a leader task bound to a child issue — and because the
+	// no_action instruction forbids substituting a comment, the decision left
+	// no trace at all.
+	taskID := r.Header.Get("X-Task-ID")
+	taskUUID, ok := parseUUIDOrBadRequest(w, taskID, "task id")
+	if !ok {
+		return
+	}
+	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
+	if err != nil || !task.IssueID.Valid {
+		writeError(w, http.StatusBadRequest, "task does not belong to issue")
+		return
+	}
+	if uuidToString(task.IssueID) != uuidToString(issue.ID) {
+		// Actionable message: a leader woken by a stage barrier / child-done
+		// callback runs on the PARENT issue, so recording against the child it
+		// just read is the common mistake. Name the issue it must record on
+		// instead of only saying "no".
+		writeError(w, http.StatusBadRequest,
+			"task does not belong to issue; record the evaluation on issue "+uuidToString(task.IssueID)+" (the issue this task is running on)")
+		return
+	}
+	// Narrowing vs. the old behavior: a leader agent running a NON-leader task
+	// on a squad-assigned issue (for example a same-squad worker task) used to
+	// be accepted here. It is rejected now — it is not running as the leader,
+	// and the runtime only mandates this call when taskIsSquadLeader(task).
+	if !task.IsLeaderTask {
+		writeError(w, http.StatusBadRequest, "task is not a squad leader task")
+		return
+	}
+	if !task.SquadID.Valid {
+		// Pre-MUL-3730 rows can be leader tasks without a stamped squad. Log it
+		// rather than failing silently from the operator's point of view.
+		slog.Warn("squad leader evaluation: leader task has no squad_id",
+			append(logger.RequestAttrs(r),
+				"task_id", uuidToString(task.ID),
+				"issue_id", uuidToString(issue.ID),
+			)...)
+		writeError(w, http.StatusBadRequest, "leader task has no squad_id")
 		return
 	}
 
 	squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
-		ID:          issue.AssigneeID,
+		ID:          task.SquadID,
 		WorkspaceID: issue.WorkspaceID,
 	})
 	if err != nil {
@@ -981,23 +1032,17 @@ func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Security: only the squad leader agent can record evaluations.
+	// Security: the caller must be the agent this leader task was enqueued for.
+	// The task row — not squad.leader_id — is the provenance: a leader change
+	// mid-run must not discard a record for an evaluation that really happened
+	// (and must not misattribute it to the incoming leader, which would also
+	// desync the no_action comment suppression lookup, which matches on
+	// task.agent_id).
 	workspaceID := uuidToString(issue.WorkspaceID)
 	userID := requestUserID(r)
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
-	if actorType != "agent" || actorID != uuidToString(squad.LeaderID) {
+	if actorType != "agent" || !task.AgentID.Valid || actorID != uuidToString(task.AgentID) {
 		writeError(w, http.StatusForbidden, "only the squad leader agent can record evaluations")
-		return
-	}
-
-	taskID := r.Header.Get("X-Task-ID")
-	taskUUID, ok := parseUUIDOrBadRequest(w, taskID, "task id")
-	if !ok {
-		return
-	}
-	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
-	if err != nil || !task.IssueID.Valid || uuidToString(task.IssueID) != uuidToString(issue.ID) {
-		writeError(w, http.StatusBadRequest, "task does not belong to issue")
 		return
 	}
 
@@ -1013,7 +1058,7 @@ func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Req
 		WorkspaceID: issue.WorkspaceID,
 		IssueID:     issue.ID,
 		ActorType:   pgtype.Text{String: "agent", Valid: true},
-		ActorID:     squad.LeaderID,
+		ActorID:     task.AgentID,
 		Action:      "squad_leader_evaluated",
 		Details:     details,
 	})

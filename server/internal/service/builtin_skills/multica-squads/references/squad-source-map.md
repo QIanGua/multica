@@ -122,6 +122,36 @@ Contracts:
   members carry no skills segment (squad_briefing.go renderMemberRow);
 - no traced behavior injects `instructions` into every squad member.
 
+## Leader Evaluation Recording
+
+Source:
+
+```text
+server/internal/handler/squad.go                  # RecordSquadLeaderEvaluation ~949
+server/cmd/multica/cmd_squad.go                   # runSquadActivity ~459
+server/internal/service/squad_no_action.go        # HasSquadLeaderNoActionEvaluationForTask
+server/internal/handler/comment.go                # no_action comment rejection ~1851
+```
+
+Contracts:
+
+- authority is the TASK row from `X-Task-ID`, not the issue's assignee:
+  `task.issue_id == issue.id`, `task.is_leader_task`, `task.squad_id` valid.
+  The squad is loaded from `task.squad_id`; the target issue may be assigned to
+  anyone (MUL-6622 / GH #7487). The pre-fix `issue.assignee_type == "squad"`
+  gate diverged from the claim-side `is_leader_task` gate and made the call
+  unsatisfiable on `@squad`-on-agent-issue and leader-task-on-child paths;
+- the caller must be `task.agent_id` — deliberately NOT `squad.leader_id`, so a
+  mid-run leader change cannot discard or misattribute a real evaluation;
+- `activity_log.actor_id` is `task.agent_id` for the same reason: the
+  `no_action` comment suppression lookup matches on `task.agent_id`, so writing
+  the live leader id there would silently break suppression;
+- a leader agent running a NON-leader task is rejected — it is not running as
+  the leader, and the runtime only mandates the call for `is_leader_task`;
+- the `no_action` comment prohibition is conditional on this write succeeding
+  (comment.go:1851 checks the activity exists), so the injected instructions
+  tell leaders to fall back to a comment when the call errors.
+
 ## Issue Assignment
 
 Source:

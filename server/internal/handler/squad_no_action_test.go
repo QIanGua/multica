@@ -13,6 +13,7 @@ import (
 
 type runningSquadLeaderTaskFixture struct {
 	IssueID          string
+	SquadID          string
 	LeaderID         string
 	TaskID           string
 	TriggerCommentID string
@@ -41,15 +42,17 @@ func newRunningSquadLeaderTaskFixture(t *testing.T) runningSquadLeaderTaskFixtur
 		t.Fatalf("create trigger comment: %v", err)
 	}
 
+	// is_leader_task + squad_id are what RecordSquadLeaderEvaluation authorizes
+	// against (MUL-6622); a leader task without them is not a leader turn.
 	var taskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (
 			agent_id, runtime_id, issue_id, trigger_comment_id,
-			status, priority, started_at
+			status, priority, started_at, is_leader_task, squad_id
 		)
-		VALUES ($1, $2, $3, $4, 'running', 0, now())
+		VALUES ($1, $2, $3, $4, 'running', 0, now(), true, $5)
 		RETURNING id
-	`, fx.LeaderID, runtimeID, issueID, triggerCommentID).Scan(&taskID); err != nil {
+	`, fx.LeaderID, runtimeID, issueID, triggerCommentID, fx.SquadID).Scan(&taskID); err != nil {
 		t.Fatalf("create running squad leader task: %v", err)
 	}
 	t.Cleanup(func() {
@@ -58,6 +61,7 @@ func newRunningSquadLeaderTaskFixture(t *testing.T) runningSquadLeaderTaskFixtur
 
 	return runningSquadLeaderTaskFixture{
 		IssueID:          issueID,
+		SquadID:          fx.SquadID,
 		LeaderID:         fx.LeaderID,
 		TaskID:           taskID,
 		TriggerCommentID: triggerCommentID,

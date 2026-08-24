@@ -57,6 +57,11 @@ Your responsibilities, in order:
    ` + "`" + `failed` + "`" + ` (you hit an error).
    This is mandatory on every turn — it records your decision in the
    issue timeline so humans can see you evaluated the trigger.
+   Record it against the issue THIS turn is running on (the issue id in
+   your task context). It does not need to be assigned to your squad.
+   If the call fails, do not exit silently: post one short comment
+   stating the outcome and the error, so the decision still leaves a
+   trace.
 4. **Stop after dispatching.** Once your delegation comment is posted
    and evaluation recorded, end your turn. Do not continue working,
    do not write code, do not open files. You will be re-triggered
@@ -130,7 +135,8 @@ const squadOperatingProtocolHardRules = `Hard rules:
   explaining the gap (and @mention the issue's reporter if possible)
   rather than silently doing the work.
 - ALWAYS call ` + "`" + `multica squad activity` + "`" + ` before ending your turn —
-  even when the outcome is no_action.
+  even when the outcome is no_action. If it errors, fall back to a short
+  comment; never let an evaluation end with no record at all.
 - A child issue you create with ` + "`" + `--status todo` + "`" + ` and an agent assignee
   already fires that agent automatically — the assignment IS the trigger.
   If you also @mention the same agent on this parent issue for the same
