@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -368,6 +369,68 @@ func TestUpdateAutopilotPreservesSubscribersWhenOmitted(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("DB rows after omitted PATCH = %d, want 1 (subscribers must not have been touched)", count)
+	}
+}
+
+// TestAutopilotDepartedSubscriberReadRepair covers the MUL-6640 regression:
+// older member-removal code could leave an autopilot_subscriber row behind.
+// The member picker hid that user, but GET still returned the stale id and the
+// edit dialog round-tripped it into PATCH, which then rejected every save.
+//
+// The read path must expose only current members. Sending that authoritative
+// list back through the existing full-replace PATCH then removes the legacy
+// row without weakening create/update validation for arbitrary foreign ids.
+func TestAutopilotDepartedSubscriberReadRepair(t *testing.T) {
+	ctx := context.Background()
+	departedUserID := createPlainMember(t, fmt.Sprintf("autopilot-departed-%d@multica.ai", time.Now().UnixNano()))
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1`, testWorkspaceID).Scan(&agentID); err != nil {
+		t.Fatalf("load test agent: %v", err)
+	}
+
+	createReq := newRequest("POST", "/api/autopilots?workspace_id="+testWorkspaceID, map[string]any{
+		"title":          "Departed subscriber read repair",
+		"assignee_id":    agentID,
+		"execution_mode": "create_issue",
+		"subscribers": []map[string]any{
+			{"user_type": "member", "user_id": departedUserID},
+		},
+	})
+	var created AutopilotResponse
+	testutil.Call(t, testHandler.CreateAutopilot, createReq).
+		Want(http.StatusCreated).
+		JSON(&created)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM autopilot WHERE id = $1`, created.ID)
+	})
+
+	// Model a row produced before member-removal learned to prune autopilot
+	// templates. Deliberately leave autopilot_subscriber intact.
+	dbfx.Exec(t, `DELETE FROM member WHERE workspace_id = $1 AND user_id = $2`, testWorkspaceID, departedUserID)
+
+	getReq := newRequest("GET", "/api/autopilots/"+created.ID+"?workspace_id="+testWorkspaceID, nil)
+	getReq = withURLParam(getReq, "id", created.ID)
+	var detail struct {
+		Autopilot AutopilotResponse `json:"autopilot"`
+	}
+	testutil.Call(t, testHandler.GetAutopilot, getReq).
+		Want(http.StatusOK).
+		JSON(&detail)
+	if len(detail.Autopilot.Subscribers) != 0 {
+		t.Fatalf("GET subscribers = %+v, want departed member omitted", detail.Autopilot.Subscribers)
+	}
+
+	updateReq := newRequest("PATCH", "/api/autopilots/"+created.ID+"?workspace_id="+testWorkspaceID, map[string]any{
+		"subscribers": detail.Autopilot.Subscribers,
+	})
+	updateReq = withURLParam(updateReq, "id", created.ID)
+	testutil.Call(t, testHandler.UpdateAutopilot, updateReq).Want(http.StatusOK)
+
+	var count int
+	dbfx.QueryRow(t, `SELECT count(*) FROM autopilot_subscriber WHERE autopilot_id = $1`, created.ID).Scan(&count)
+	if count != 0 {
+		t.Fatalf("legacy autopilot_subscriber rows after save = %d, want 0", count)
 	}
 }
 
