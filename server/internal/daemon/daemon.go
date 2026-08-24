@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -5995,19 +5997,17 @@ func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
 		started := time.Now()
 		bundle, stats, err := d.resolveSkillBundle(ctx, task, ref)
 		if err != nil {
-			// Lead with the network, then say what actually crossed the
-			// wire. Naming the skill first (the previous shape) reads as a
-			// defect in that skill: reporters re-import it, find nothing,
-			// then watch the next-largest bundle fail the same way, because
-			// which skill is named is just whichever was fetched first
-			// (GitHub #7386, MUL-5370). The byte counts are the part that
-			// ends the guesswork — "0 of 1.05 MB" is a dead link, which no
-			// deadline can fix, while "540 KB of 1.05 MB at 18 KB/s" is a
-			// slow one, which a larger deadline can.
-			return fmt.Errorf("%w: %s: %w",
-				errSkillBundleUnavailable,
-				describeSkillBundleFailure(ref, stats, time.Since(started)),
-				err)
+			if isSkillBundleTransferFailure(err) {
+				// Only transport failures and incomplete 2xx bodies get the
+				// network diagnosis. HTTP error responses and invalid complete
+				// payloads retain their server semantics instead of being
+				// relabelled as connectivity problems (GitHub #7386).
+				return fmt.Errorf("%w: %s: %w",
+					errSkillBundleUnavailable,
+					describeSkillBundleFailure(ref, stats, time.Since(started)),
+					err)
+			}
+			return fmt.Errorf("%w: %w", errSkillBundleUnavailable, err)
 		}
 		resolved[skillRefKey(bundle.Source, bundle.ID)] = bundle
 	}
@@ -6071,38 +6071,51 @@ func (d *Daemon) resolveSkillBundle(ctx context.Context, task *Task, ref SkillRe
 	return bundle, stats, nil
 }
 
+// isSkillBundleTransferFailure identifies errors for which byte-level network
+// diagnostics are meaningful. A requestError is an explicit server response;
+// malformed but complete JSON and bundle-validation errors are server payload
+// problems. Neither should be presented as a slow or dead network link.
+func isSkillBundleTransferFailure(err error) bool {
+	var reqErr *requestError
+	if errors.As(err, &reqErr) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 // describeSkillBundleFailure renders the diagnostic half of a failed bundle
-// download: what was being fetched, how much of it actually arrived, and
-// whether this host has a proxy at all.
+// download: what was being fetched, how many HTTP response-body bytes arrived,
+// the separately declared decoded content size, and whether this host has a
+// proxy at all.
 //
 // The three facts answer the three wrong turns the old text invited. "network
 // error downloading skill X" instead of "skill X unavailable" stops the reader
-// blaming the skill. The byte counts distinguish a dead link (0 bytes — no
-// timeout change helps) from a slow one (partial bytes — a larger deadline
-// would). The proxy note catches the case behind GitHub #7386, where a daemon
-// that inherited no proxy on a cross-border link never got a byte through
-// while the same host succeeded through a local proxy.
+// blaming the skill. The response byte count distinguishes a dead link from a
+// partial response without pretending JSON wire bytes and decoded skill-content
+// bytes form one progress ratio. The proxy note catches the case behind GitHub
+// #7386, where a daemon that inherited no proxy on a cross-border link never got
+// a byte through while the same host succeeded through a local proxy.
 func describeSkillBundleFailure(ref SkillRefData, stats TransferStats, elapsed time.Duration) string {
 	elapsed = elapsed.Round(time.Millisecond)
 	var transfer string
 	switch {
 	case !stats.ResponseStarted:
-		// Never got response headers: the failure is in connect / TLS /
-		// request send, so the download deadline was never the binding
-		// constraint.
-		transfer = fmt.Sprintf("no response from server after %s (0 of %s received)",
-			elapsed, formatBytes(ref.SizeBytes))
-	case stats.BytesRead < ref.SizeBytes:
-		transfer = fmt.Sprintf("received %s of %s in %s (%s)",
-			formatBytes(stats.BytesRead), formatBytes(ref.SizeBytes), elapsed,
-			formatRate(stats.BytesRead, elapsed))
+		transfer = fmt.Sprintf("no successful response from server after %s overall", elapsed)
+	case stats.BytesRead == 0:
+		transfer = fmt.Sprintf("a successful response started but delivered no body bytes before failing after %s overall", elapsed)
 	default:
-		transfer = fmt.Sprintf("received %s in %s (%s)",
-			formatBytes(stats.BytesRead), elapsed,
-			formatRate(stats.BytesRead, elapsed))
+		// BytesRead is a single-attempt high-water mark, while elapsed covers
+		// the logical call including retries and backoff. State both scopes
+		// rather than deriving a rate from mismatched measurements.
+		transfer = fmt.Sprintf("received up to %s of response body data in one attempt; failed after %s overall",
+			formatBytes(stats.BytesRead), elapsed)
 	}
-	return fmt.Sprintf("network error downloading skill %q (id=%s): %s; %s; the skill content is not at fault",
-		ref.Name, ref.ID, transfer, proxyEnvSummary())
+	return fmt.Sprintf("network error downloading skill %q (id=%s): %s; declared skill content size %s; %s; the skill content is not at fault",
+		ref.Name, ref.ID, transfer, formatBytes(ref.SizeBytes), proxyEnvSummary())
 }
 
 // proxyEnvSummary reports whether the daemon inherited any proxy setting. It
@@ -6134,15 +6147,6 @@ func formatBytes(n int64) string {
 	default:
 		return fmt.Sprintf("%.2f MB", float64(n)/(1024*1024))
 	}
-}
-
-// formatRate renders observed throughput, the number that tells a reader
-// whether the link was merely slow or not moving at all.
-func formatRate(n int64, elapsed time.Duration) string {
-	if elapsed <= 0 || n <= 0 {
-		return "0 B/s"
-	}
-	return formatBytes(int64(float64(n)/elapsed.Seconds())) + "/s"
 }
 
 const (

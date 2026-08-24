@@ -322,11 +322,12 @@ func (c *Client) claimTasksLegacy(ctx context.Context, runtimeIDs []string, maxT
 	return out, nil
 }
 
-// TransferStats records what a logical HTTP call actually moved over the wire.
-// For a skill-bundle download it separates "the link never produced a
-// response" from "the body arrived but too slowly to finish" — a distinction
-// the failure text could not previously express, so a connectivity fault read
-// as a broken skill and sent reporters chasing the wrong thing (GitHub #7386).
+// TransferStats records successful HTTP response-body bytes read by a logical
+// call. For a skill-bundle download it separates "the link never produced a
+// successful response" from "a 2xx body arrived but did not finish" — a
+// distinction the failure text could not previously express, so a connectivity
+// fault read as a broken skill and sent reporters chasing the wrong thing
+// (GitHub #7386).
 //
 // Across retries the fields keep the high-water mark rather than the last
 // attempt: the question they answer is "did this link ever get anywhere", and
@@ -334,9 +335,9 @@ func (c *Client) claimTasksLegacy(ctx context.Context, runtimeIDs []string, maxT
 // The zero value is usable, and every method is nil-safe so callers that do
 // not want the accounting can pass nil.
 type TransferStats struct {
-	// ResponseStarted reports whether response headers ever arrived. False
-	// means every attempt died in connect / TLS / request send, in which
-	// case no download deadline, however generous, would have helped.
+	// ResponseStarted reports whether 2xx response headers ever arrived. Error
+	// response bodies are deliberately excluded: their bytes describe a server
+	// business error, not progress downloading a skill bundle.
 	ResponseStarted bool
 	// BytesRead is the most response-body bytes any single attempt read.
 	BytesRead int64
@@ -1133,13 +1134,12 @@ func (c *Client) postJSONViaObserved(ctx context.Context, httpClient *http.Clien
 		return err
 	}
 	defer resp.Body.Close()
-	stats.observeResponseStarted()
-
-	respReader := stats.wrap(resp.Body)
-	if resp.StatusCode >= 400 {
-		data, _ := io.ReadAll(io.LimitReader(respReader, 4096))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return &requestError{Method: http.MethodPost, Path: path, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(data))}
 	}
+	stats.observeResponseStarted()
+	respReader := stats.wrap(resp.Body)
 	if respBody == nil {
 		io.Copy(io.Discard, respReader)
 		return nil

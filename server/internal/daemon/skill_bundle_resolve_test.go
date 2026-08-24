@@ -376,12 +376,12 @@ func TestDescribeSkillBundleFailure(t *testing.T) {
 	clearProxyEnv(t)
 	ref := SkillRefData{Name: "xlsx", ID: "c5034ed6", SizeBytes: 1101426}
 
-	t.Run("dead link reports zero bytes and no response", func(t *testing.T) {
+	t.Run("dead link reports no response and separates declared content size", func(t *testing.T) {
 		got := describeSkillBundleFailure(ref, TransferStats{}, 30*time.Second)
 		for _, want := range []string{
 			"network error downloading skill \"xlsx\"",
-			"no response from server after 30s",
-			"0 of 1.05 MB received",
+			"no successful response from server after 30s overall",
+			"declared skill content size 1.05 MB",
 			"no proxy configured",
 			"the skill content is not at fault",
 		} {
@@ -391,18 +391,39 @@ func TestDescribeSkillBundleFailure(t *testing.T) {
 		}
 	})
 
-	t.Run("slow link reports how far it got and the rate", func(t *testing.T) {
-		// 540 KB in 30s — the "still transferring, just too slow" shape a
-		// larger deadline would actually rescue.
+	t.Run("partial response reports response bytes without an inferred rate", func(t *testing.T) {
 		stats := TransferStats{ResponseStarted: true, BytesRead: 552960}
 		got := describeSkillBundleFailure(ref, stats, 30*time.Second)
-		for _, want := range []string{"received 540 KB of 1.05 MB", "18 KB/s"} {
+		for _, want := range []string{
+			"received up to 540 KB of response body data in one attempt",
+			"failed after 30s overall",
+			"declared skill content size 1.05 MB",
+		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("missing %q in:\n%s", want, got)
 			}
 		}
+		if strings.Contains(got, "KB/s") || strings.Contains(got, "MB/s") {
+			t.Errorf("cross-retry elapsed time must not be presented as a transfer rate:\n%s", got)
+		}
 		if strings.Contains(got, "no response from server") {
 			t.Errorf("a link that delivered bytes must not read as no-response:\n%s", got)
+		}
+	})
+
+	t.Run("wire bytes may exceed declared content size", func(t *testing.T) {
+		stats := TransferStats{ResponseStarted: true, BytesRead: 1388598}
+		got := describeSkillBundleFailure(ref, stats, 30*time.Second)
+		for _, want := range []string{
+			"received up to 1.32 MB of response body data",
+			"declared skill content size 1.05 MB",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("missing %q in:\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, "1.32 MB of 1.05 MB") {
+			t.Errorf("wire and decoded content sizes must not be shown as one progress ratio:\n%s", got)
 		}
 	})
 
@@ -421,7 +442,7 @@ func TestDescribeSkillBundleFailure(t *testing.T) {
 	})
 }
 
-func TestFormatBytesAndRate(t *testing.T) {
+func TestFormatBytes(t *testing.T) {
 	cases := []struct {
 		n    int64
 		want string
@@ -437,12 +458,96 @@ func TestFormatBytesAndRate(t *testing.T) {
 			t.Errorf("formatBytes(%d) = %q, want %q", tc.n, got, tc.want)
 		}
 	}
-	if got := formatRate(552960, 30*time.Second); got != "18 KB/s" {
-		t.Errorf("formatRate = %q, want %q", got, "18 KB/s")
+}
+
+func TestEnsureTaskSkillBundles_ServerErrorsKeepServerSemantics(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	for _, status := range []int{
+		http.StatusMultipleChoices,
+		http.StatusUnauthorized,
+		http.StatusNotFound,
+		http.StatusConflict,
+		http.StatusInternalServerError,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"error":"task is not preparing"}`)
+			}))
+			defer srv.Close()
+
+			ref := skillRefFromBundle(makeResolvableSkillBundle("frontend-review"))
+			d := &Daemon{client: NewClient(srv.URL), skillCache: NewSkillBundleCache(t.TempDir())}
+			task := &Task{
+				ID: "task-1", RuntimeID: "rt-1", WorkspaceID: "ws-1",
+				Agent: &AgentData{ID: "agent-1", SkillRefs: []SkillRefData{ref}},
+			}
+
+			err := d.ensureTaskSkillBundles(context.Background(), task)
+			if err == nil {
+				t.Fatal("expected server error")
+			}
+			if !errors.Is(err, errSkillBundleUnavailable) {
+				t.Errorf("sentinel must survive, got %v", err)
+			}
+			var reqErr *requestError
+			if !errors.As(err, &reqErr) || reqErr.StatusCode != status {
+				t.Errorf("requestError status = %v, want %d; err=%v", reqErr, status, err)
+			}
+			if got := err.Error(); strings.Contains(got, "network error") || strings.Contains(got, "skill content is not at fault") {
+				t.Errorf("HTTP %d must keep server semantics instead of being relabelled as a network failure:\n%s", status, got)
+			}
+		})
 	}
-	// A failure before any byte moved must not divide by zero or invent a rate.
-	if got := formatRate(0, 0); got != "0 B/s" {
-		t.Errorf("formatRate(0,0) = %q, want %q", got, "0 B/s")
+}
+
+func TestResolveSkillBundle_ServerErrorBodyIsNotCountedAsBundleData(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	for _, status := range []int{http.StatusMultipleChoices, http.StatusConflict, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"error":"task is not preparing"}`)
+			}))
+			defer srv.Close()
+
+			client := NewClient(srv.URL)
+			_, stats, err := client.ResolveSkillBundle(context.Background(), "rt-1", "task-1", SkillRefData{ID: "skill-1"})
+			if err == nil {
+				t.Fatal("expected server error")
+			}
+			if stats.ResponseStarted || stats.BytesRead != 0 {
+				t.Errorf("HTTP %d error body was counted as bundle data: %+v", status, stats)
+			}
+		})
+	}
+}
+
+func TestEnsureTaskSkillBundles_MalformedSuccessfulResponseIsNotNetworkError(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"bundles": definitely-not-json}`)
+	}))
+	defer srv.Close()
+
+	ref := skillRefFromBundle(makeResolvableSkillBundle("frontend-review"))
+	d := &Daemon{client: NewClient(srv.URL), skillCache: NewSkillBundleCache(t.TempDir())}
+	task := &Task{
+		ID: "task-1", RuntimeID: "rt-1", WorkspaceID: "ws-1",
+		Agent: &AgentData{ID: "agent-1", SkillRefs: []SkillRefData{ref}},
+	}
+
+	err := d.ensureTaskSkillBundles(context.Background(), task)
+	if err == nil {
+		t.Fatal("expected malformed response error")
+	}
+	if got := err.Error(); strings.Contains(got, "network error") || strings.Contains(got, "skill content is not at fault") {
+		t.Errorf("complete malformed JSON is a server payload error, not a network failure:\n%s", got)
 	}
 }
 
