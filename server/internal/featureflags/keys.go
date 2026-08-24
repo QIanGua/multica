@@ -38,18 +38,6 @@ const (
 	// gate remained in every such client and fails closed (default false) if
 	// the key stops being published.
 	resourceLabelsCompat = "settings_resource_labels"
-	// customIssueStatusesCompat is no longer a release flag (MUL-6643). It was
-	// the one-way rollout gate on CREATING a custom status: the first custom
-	// status a new pod writes is a value an old pod cannot interpret, so
-	// creation stayed closed until the whole fleet could read one. The fleet is
-	// there, so the gate is gone and creation is always allowed.
-	//
-	// Keep publishing the key as enabled for installed desktop clients from
-	// v0.4.30 through at least v0.4.32, every release that shipped the status
-	// settings tab. Those clients gate the "New status" button on this decision
-	// and fail closed (default false) if the key stops being published, which
-	// would hide an affordance the server now accepts.
-	customIssueStatusesCompat = "custom_issue_statuses"
 )
 
 var frontendPublicFlags = []string{
@@ -71,13 +59,12 @@ func PluginsV1Enabled(ctx context.Context, flags *featureflag.Service) bool {
 }
 
 func EvaluateFrontendPublicFlags(ctx context.Context, flags *featureflag.Service) map[string]bool {
-	out := make(map[string]bool, len(frontendPublicFlags)+4)
+	out := make(map[string]bool, len(frontendPublicFlags)+3)
 	for _, key := range frontendPublicFlags {
 		out[key] = flags.IsEnabled(ctx, key, false)
 	}
 	out[agentBuilderCompat] = true
 	out[agentSkillTogglesCompat] = true
 	out[resourceLabelsCompat] = true
-	out[customIssueStatusesCompat] = true
 	return out
 }
