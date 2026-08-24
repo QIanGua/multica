@@ -148,6 +148,156 @@ func TestCreateAutopilotRejectsForeignSubscriber(t *testing.T) {
 	}
 }
 
+// TestAutopilotSubscriberSave_LosesToConcurrentRevoke covers the race between
+// subscriber validation and member removal for both create and update. The
+// revoke transaction has already pruned templates and deleted the member, but
+// has not committed, so a validation outside the serialized write transaction
+// can still see the old member snapshot and recreate a subscriber row behind
+// the cleanup. Saves must wait for revoke's lock, then reject the departed
+// member from their fresh in-transaction membership check.
+func TestAutopilotSubscriberSave_LosesToConcurrentRevoke(t *testing.T) {
+	ctx := context.Background()
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1`, testWorkspaceID).Scan(&agentID); err != nil {
+		t.Fatalf("load test agent: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, targetUserID string) func() (status int, body string, autopilotID string)
+	}{
+		{
+			name: "create",
+			prepare: func(t *testing.T, targetUserID string) func() (int, string, string) {
+				title := fmt.Sprintf("Concurrent revoke create %d", time.Now().UnixNano())
+				return func() (int, string, string) {
+					w := httptest.NewRecorder()
+					req := newRequest("POST", "/api/autopilots?workspace_id="+testWorkspaceID, map[string]any{
+						"title":          title,
+						"assignee_id":    agentID,
+						"execution_mode": "create_issue",
+						"subscribers": []map[string]any{
+							{"user_type": "member", "user_id": targetUserID},
+						},
+					})
+					testHandler.CreateAutopilot(w, req)
+
+					var autopilotID string
+					testPool.QueryRow(ctx, `SELECT id FROM autopilot WHERE workspace_id = $1 AND title = $2`, testWorkspaceID, title).Scan(&autopilotID)
+					return w.Code, w.Body.String(), autopilotID
+				}
+			},
+		},
+		{
+			name: "update",
+			prepare: func(t *testing.T, targetUserID string) func() (int, string, string) {
+				createReq := newRequest("POST", "/api/autopilots?workspace_id="+testWorkspaceID, map[string]any{
+					"title":          fmt.Sprintf("Concurrent revoke update %d", time.Now().UnixNano()),
+					"assignee_id":    agentID,
+					"execution_mode": "create_issue",
+				})
+				var created AutopilotResponse
+				testutil.Call(t, testHandler.CreateAutopilot, createReq).
+					Want(http.StatusCreated).
+					JSON(&created)
+
+				return func() (int, string, string) {
+					w := httptest.NewRecorder()
+					req := newRequest("PATCH", "/api/autopilots/"+created.ID+"?workspace_id="+testWorkspaceID, map[string]any{
+						"subscribers": []map[string]any{
+							{"user_type": "member", "user_id": targetUserID},
+						},
+					})
+					req = withURLParam(req, "id", created.ID)
+					testHandler.UpdateAutopilot(w, req)
+					return w.Code, w.Body.String(), created.ID
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			targetUserID := createPlainMember(t, fmt.Sprintf("autopilot-revoke-race-%s-%d@multica.ai", tc.name, time.Now().UnixNano()))
+			run := tc.prepare(t, targetUserID)
+
+			revokeTx, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin revoke tx: %v", err)
+			}
+			defer revokeTx.Rollback(context.Background())
+			qtx := testHandler.Queries.WithTx(revokeTx)
+
+			if err := qtx.LockSubscriberWrites(ctx, db.LockSubscriberWritesParams{
+				WorkspaceID: parseUUID(testWorkspaceID),
+				UserID:      parseUUID(targetUserID),
+			}); err != nil {
+				t.Fatalf("revoke lock: %v", err)
+			}
+			if err := qtx.DeleteAutopilotSubscribersByMember(ctx, db.DeleteAutopilotSubscribersByMemberParams{
+				WorkspaceID: parseUUID(testWorkspaceID),
+				UserID:      parseUUID(targetUserID),
+			}); err != nil {
+				t.Fatalf("revoke cleanup: %v", err)
+			}
+			if _, err := revokeTx.Exec(ctx,
+				`DELETE FROM member WHERE workspace_id = $1 AND user_id = $2`,
+				testWorkspaceID, targetUserID,
+			); err != nil {
+				t.Fatalf("revoke member delete: %v", err)
+			}
+
+			type result struct {
+				status      int
+				body        string
+				autopilotID string
+			}
+			done := make(chan result, 1)
+			go func() {
+				status, body, autopilotID := run()
+				done <- result{status: status, body: body, autopilotID: autopilotID}
+			}()
+
+			select {
+			case got := <-done:
+				t.Fatalf("autopilot %s completed (status %d: %s) while revoke held the subscriber lock", tc.name, got.status, got.body)
+			case <-time.After(400 * time.Millisecond):
+			}
+
+			if err := revokeTx.Commit(context.Background()); err != nil {
+				t.Fatalf("commit revoke: %v", err)
+			}
+
+			var got result
+			select {
+			case got = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("autopilot %s never returned after revoke committed", tc.name)
+			}
+			if got.status != http.StatusBadRequest {
+				t.Fatalf("autopilot %s status = %d, want 400 after subscriber left: %s", tc.name, got.status, got.body)
+			}
+			if got.autopilotID != "" {
+				t.Cleanup(func() {
+					testPool.Exec(context.Background(), `DELETE FROM autopilot WHERE id = $1`, got.autopilotID)
+				})
+			}
+
+			var staleRows int
+			if err := testPool.QueryRow(context.Background(), `
+				SELECT count(*)
+				FROM autopilot_subscriber s
+				JOIN autopilot a ON a.id = s.autopilot_id
+				WHERE a.workspace_id = $1 AND s.user_id = $2
+			`, testWorkspaceID, targetUserID).Scan(&staleRows); err != nil {
+				t.Fatalf("count stale subscriber rows: %v", err)
+			}
+			if staleRows != 0 {
+				t.Fatalf("autopilot %s recreated %d subscriber row(s) after revoke cleanup", tc.name, staleRows)
+			}
+		})
+	}
+}
+
 func TestCreateAutopilotRollsBackWhenSubscriberInsertFails(t *testing.T) {
 	ctx := context.Background()
 	title := fmt.Sprintf("Subscriber rollback create %d", time.Now().UnixNano())
