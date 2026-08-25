@@ -52,26 +52,13 @@ vi.mock("@multica/core/issues/stores/draft-store", () => ({
   useIssueDraftStore: { getState: () => ({ setDraft: vi.fn() }) },
 }));
 
-vi.mock("@multica/core/inbox/queries", async () => {
-  // The actor index keeps its real implementation: what the page decides is
-  // WHICH rows to index (the raw list, before deduplication drops every actor
-  // but the newest), and a stub that returned an empty map would let that
-  // choice pass untested.
-  const { buildInboxActorIndex } = await import(
-    "@multica/core/inbox/filter-store"
-  );
-  return {
-    inboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "list"] }),
-    archivedInboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "archived"] }),
-    deduplicateInboxItems: (items: InboxItem[]) => items.filter((i) => !i.archived),
-    deduplicateArchivedInboxItems: (items: InboxItem[]) => items.filter((i) => i.archived),
-    inboxActorIndex: (items: InboxItem[]) =>
-      buildInboxActorIndex(items.filter((i) => !i.archived)),
-    archivedInboxActorIndex: (items: InboxItem[]) =>
-      buildInboxActorIndex(items.filter((i) => i.archived)),
-    useInboxUnreadCount: () => 2,
-  };
-});
+vi.mock("@multica/core/inbox/queries", () => ({
+  inboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "list"] }),
+  archivedInboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "archived"] }),
+  deduplicateInboxItems: (items: InboxItem[]) => items.filter((i) => !i.archived),
+  deduplicateArchivedInboxItems: (items: InboxItem[]) => items.filter((i) => i.archived),
+  useInboxUnreadCount: () => 2,
+}));
 
 // Stable spies: the auto-mark-read effect keys on the mutate identity, so a
 // fresh `vi.fn()` per render would make the effect's deps churn.
@@ -306,7 +293,7 @@ describe("InboxPage", () => {
     expect(screen.getByTestId("row")).toHaveTextContent("unread-row");
   });
 
-  it("filters by an actor the group carries", () => {
+  it("filters by the actor the row carries", () => {
     reset();
     listData.active = [
       item({ id: "from-alice", issue_id: "issue-1", actor_type: "member", actor_id: "alice" }),

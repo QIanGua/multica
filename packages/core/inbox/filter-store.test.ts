@@ -3,8 +3,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { InboxItem } from "../types";
 import {
-  buildInboxActorIndex,
-  EMPTY_INBOX_ACTOR_INDEX,
   EMPTY_INBOX_FILTERS,
   filterInboxItems,
   inboxActorKey,
@@ -55,28 +53,25 @@ beforeEach(() => {
 
 describe("filterInboxItems", () => {
   it("keeps the original reference when no filter is active", () => {
-    expect(
-      filterInboxItems(ITEMS, EMPTY_INBOX_FILTERS, EMPTY_INBOX_ACTOR_INDEX),
-    ).toBe(ITEMS);
+    expect(filterInboxItems(ITEMS, EMPTY_INBOX_FILTERS)).toBe(ITEMS);
   });
 
   it("uses OR within a dimension and AND between dimensions", () => {
     expect(
-      filterInboxItems(
-        ITEMS,
-        { ...EMPTY_INBOX_FILTERS, statuses: ["todo", "done"], priorities: ["high"] },
-        EMPTY_INBOX_ACTOR_INDEX,
-      ).map((candidate) => candidate.id),
+      filterInboxItems(ITEMS, {
+        ...EMPTY_INBOX_FILTERS,
+        statuses: ["todo", "done"],
+        priorities: ["high"],
+      }).map((candidate) => candidate.id),
     ).toEqual(["todo-high", "done-high"]);
   });
 
   it("excludes notifications without an issue when an issue filter is active", () => {
     expect(
-      filterInboxItems(
-        ITEMS,
-        { ...EMPTY_INBOX_FILTERS, priorities: ["high"] },
-        EMPTY_INBOX_ACTOR_INDEX,
-      ).map((candidate) => candidate.id),
+      filterInboxItems(ITEMS, {
+        ...EMPTY_INBOX_FILTERS,
+        priorities: ["high"],
+      }).map((candidate) => candidate.id),
     ).toEqual(["todo-high", "done-high"]);
   });
 
@@ -119,53 +114,35 @@ describe("actor filtering", () => {
     expect(inboxActorKey(item("d", "todo", "high"))).toBeNull();
   });
 
-  it("matches an actor anywhere in the group, not just the surviving row", () => {
+  it("matches the rendered row's actor, not one buried in its group", () => {
     // Alice commented, then Bob changed the status. Deduplication keeps Bob's
-    // row; filtering by Alice must still surface the issue.
-    const raw = [
-      item("newest", "todo", "high", { issue_id: "issue-1", ...bob }),
-      item("older", "todo", "high", { issue_id: "issue-1", ...alice }),
-    ];
-    const index = buildInboxActorIndex(raw);
-    const deduplicated = [raw[0]!];
+    // row, and that row shows Bob — so filtering by Alice must not return it,
+    // or the list would answer "Alice" with Bob's avatar and Bob's wording.
+    const surviving = item("newest", "todo", "high", {
+      issue_id: "issue-1",
+      ...bob,
+    });
 
     expect(
-      filterInboxItems(
-        deduplicated,
-        { ...EMPTY_INBOX_FILTERS, actors: ["member:alice"] },
-        index,
-      ).map((candidate) => candidate.id),
-    ).toEqual(["newest"]);
-    expect(
-      filterInboxItems(
-        deduplicated,
-        { ...EMPTY_INBOX_FILTERS, actors: ["member:carol"] },
-        index,
-      ),
+      filterInboxItems([surviving], {
+        ...EMPTY_INBOX_FILTERS,
+        actors: ["member:alice"],
+      }),
     ).toEqual([]);
-  });
-
-  it("falls back to the row's own actor when its group is missing from the index", () => {
-    const row = item("solo", "todo", "high", alice);
-
     expect(
-      filterInboxItems(
-        [row],
-        { ...EMPTY_INBOX_FILTERS, actors: ["member:alice"] },
-        EMPTY_INBOX_ACTOR_INDEX,
-      ),
-    ).toEqual([row]);
+      filterInboxItems([surviving], {
+        ...EMPTY_INBOX_FILTERS,
+        actors: ["agent:bob"],
+      }).map((candidate) => candidate.id),
+    ).toEqual(["newest"]);
   });
 
   it("excludes a row that carries no attribution", () => {
-    const row = item("unattributed", "todo", "high");
-
     expect(
-      filterInboxItems(
-        [row],
-        { ...EMPTY_INBOX_FILTERS, actors: ["member:alice"] },
-        buildInboxActorIndex([row]),
-      ),
+      filterInboxItems([item("unattributed", "todo", "high")], {
+        ...EMPTY_INBOX_FILTERS,
+        actors: ["member:alice"],
+      }),
     ).toEqual([]);
   });
 });
@@ -179,9 +156,7 @@ describe("unread filtering", () => {
     const filters = { ...EMPTY_INBOX_FILTERS, unreadOnly: true };
 
     expect(
-      filterInboxItems(rows, filters, EMPTY_INBOX_ACTOR_INDEX).map(
-        (candidate) => candidate.id,
-      ),
+      filterInboxItems(rows, filters).map((candidate) => candidate.id),
     ).toEqual(["unread"]);
     expect(inboxFilterCount(filters)).toBe(1);
   });
@@ -192,11 +167,7 @@ describe("unread filtering", () => {
     const rows = [item("no-issue", null, null)];
 
     expect(
-      filterInboxItems(
-        rows,
-        { ...EMPTY_INBOX_FILTERS, unreadOnly: true },
-        EMPTY_INBOX_ACTOR_INDEX,
-      ),
+      filterInboxItems(rows, { ...EMPTY_INBOX_FILTERS, unreadOnly: true }),
     ).toEqual(rows);
   });
 });

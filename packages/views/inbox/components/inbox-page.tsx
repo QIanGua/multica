@@ -27,8 +27,6 @@ import {
   archivedInboxListOptions,
   deduplicateInboxItems,
   deduplicateArchivedInboxItems,
-  inboxActorIndex,
-  archivedInboxActorIndex,
   useInboxUnreadCount,
 } from "@multica/core/inbox/queries";
 import {
@@ -121,9 +119,6 @@ export function InboxPage() {
   const wsId = useWorkspaceId();
   const { data: rawItems = [], isLoading: loading } = useQuery(inboxListOptions(wsId));
   const items = useMemo(() => deduplicateInboxItems(rawItems), [rawItems]);
-  // Built from the raw rows, because deduplication has already discarded every
-  // actor but the newest one. See InboxActorIndex.
-  const actorIndex = useMemo(() => inboxActorIndex(rawItems), [rawItems]);
 
   // Fetched in both views, not just the archived one: the main list's entry
   // into the archive is labelled with this count, so it has to be known before
@@ -137,17 +132,9 @@ export function InboxPage() {
     () => deduplicateArchivedInboxItems(rawArchivedItems),
     [rawArchivedItems],
   );
-  // The archived endpoint returns at most two rows per group (newest, plus a
-  // comment anchor), so this index sees only those — an actor who appears
-  // solely in older archived rows is not offered there.
-  const archivedActorIndex = useMemo(
-    () => archivedInboxActorIndex(rawArchivedItems),
-    [rawArchivedItems],
-  );
 
   const isArchivedView = view === "archived";
   const viewItems = isArchivedView ? archivedItems : items;
-  const viewActorIndex = isArchivedView ? archivedActorIndex : actorIndex;
   const filters = useInboxFilters(wsId);
   const clearFilters = useInboxFilterStore((state) => state.clearFilters);
   // Active and archived endpoints return the same row contract and are both
@@ -163,8 +150,8 @@ export function InboxPage() {
     [filters, priorityFilterSupport],
   );
   const visibleItems = useMemo(
-    () => filterInboxItems(viewItems, effectiveFilters, viewActorIndex),
-    [viewItems, effectiveFilters, viewActorIndex],
+    () => filterInboxItems(viewItems, effectiveFilters),
+    [viewItems, effectiveFilters],
   );
   const hasActiveFilters = inboxFilterCount(effectiveFilters) > 0;
 
@@ -540,7 +527,6 @@ export function InboxPage() {
       <InboxFilterMenu
         wsId={wsId}
         items={viewItems}
-        actorIndex={viewActorIndex}
         priorityFilterSupport={priorityFilterSupport}
       />
       {/* Batch actions are main-view only. Every entry archives from the MAIN

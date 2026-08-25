@@ -5,11 +5,10 @@ import { CircleDot, Filter, Mail, RotateCcw, SignalHigh, UserRound } from "lucid
 import { PRIORITY_DISPLAY_ORDER } from "@multica/core/issues/config";
 import {
   filterInboxItems,
+  inboxActorKey,
   inboxActorKeyParts,
   inboxFiltersForPrioritySupport,
   inboxFilterCount,
-  inboxGroupActorKeys,
-  type InboxActorIndex,
   type InboxPriorityFilterSupport,
   useInboxFilters,
   useInboxFilterStore,
@@ -56,17 +55,12 @@ function priorityCounts(items: InboxItem[]): Map<string, number> {
   return counts;
 }
 
-// One count per GROUP per distinct actor: an issue Alice touched three times
-// counts once for Alice, the same way a status counts the group once.
-function actorCounts(
-  items: InboxItem[],
-  actorIndex: InboxActorIndex,
-): Map<string, number> {
+function actorCounts(items: InboxItem[]): Map<string, number> {
   const counts = new Map<string, number>();
   for (const item of items) {
-    for (const key of inboxGroupActorKeys(item, actorIndex)) {
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
+    const key = inboxActorKey(item);
+    if (key == null) continue;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   return counts;
 }
@@ -75,14 +69,10 @@ function actorCounts(
 export function InboxFilterMenu({
   wsId,
   items,
-  actorIndex,
   priorityFilterSupport,
 }: {
   wsId: string;
   items: InboxItem[];
-  // Actors of the rows BEHIND each deduplicated row — the filter matches the
-  // whole group, so the menu has to offer and count the whole group too.
-  actorIndex: InboxActorIndex;
   priorityFilterSupport: InboxPriorityFilterSupport;
 }) {
   const { t } = useT("inbox");
@@ -141,32 +131,23 @@ export function InboxFilterMenu({
   // ignoring its own, so each number says how many rows selecting that value
   // can actually reveal.
   const statusFacetItems = useMemo(
-    () =>
-      filterInboxItems(items, { ...effectiveFilters, statuses: [] }, actorIndex),
-    [items, effectiveFilters, actorIndex],
+    () => filterInboxItems(items, { ...effectiveFilters, statuses: [] }),
+    [items, effectiveFilters],
   );
   const priorityFacetItems = useMemo(
-    () =>
-      filterInboxItems(
-        items,
-        { ...effectiveFilters, priorities: [] },
-        actorIndex,
-      ),
-    [items, effectiveFilters, actorIndex],
+    () => filterInboxItems(items, { ...effectiveFilters, priorities: [] }),
+    [items, effectiveFilters],
   );
   const actorFacetItems = useMemo(
-    () =>
-      filterInboxItems(items, { ...effectiveFilters, actors: [] }, actorIndex),
-    [items, effectiveFilters, actorIndex],
+    () => filterInboxItems(items, { ...effectiveFilters, actors: [] }),
+    [items, effectiveFilters],
   );
   const unreadCount = useMemo(
     () =>
-      filterInboxItems(
-        items,
-        { ...effectiveFilters, unreadOnly: false },
-        actorIndex,
-      ).filter((item) => item.read !== true).length,
-    [items, effectiveFilters, actorIndex],
+      filterInboxItems(items, { ...effectiveFilters, unreadOnly: false }).filter(
+        (item) => item.read !== true,
+      ).length,
+    [items, effectiveFilters],
   );
   const statuses = useMemo(
     () => statusCounts(statusFacetItems),
@@ -177,8 +158,8 @@ export function InboxFilterMenu({
     [priorityFacetItems],
   );
   const actors = useMemo(
-    () => actorCounts(actorFacetItems, actorIndex),
-    [actorFacetItems, actorIndex],
+    () => actorCounts(actorFacetItems),
+    [actorFacetItems],
   );
   // The universe of actors comes from every row in the view rather than the
   // faceted subset: picking one actor must not remove the others from the menu
@@ -187,7 +168,8 @@ export function InboxFilterMenu({
   const actorOptions = useMemo(() => {
     const keys = new Set<string>();
     for (const item of items) {
-      for (const key of inboxGroupActorKeys(item, actorIndex)) keys.add(key);
+      const key = inboxActorKey(item);
+      if (key != null) keys.add(key);
     }
     return [...keys]
       .map((key) => {
@@ -195,7 +177,7 @@ export function InboxFilterMenu({
         return { key, type, id, name: getActorName(type, id) };
       })
       .sort((a, b) => a.name.localeCompare(b.name));
-  }, [items, actorIndex, getActorName]);
+  }, [items, getActorName]);
   const triggerLabel =
     activeCount > 0
       ? t(($) => $.filters.active_count, { count: activeCount })

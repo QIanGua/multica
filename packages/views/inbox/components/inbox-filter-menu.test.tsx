@@ -12,9 +12,6 @@ import { setApiInstance } from "@multica/core/api";
 import type { ApiClient } from "@multica/core/api/client";
 import { STATUS_ORDER } from "@multica/core/issues/config";
 import {
-  buildInboxActorIndex,
-  EMPTY_INBOX_ACTOR_INDEX,
-  type InboxActorIndex,
   type InboxPriorityFilterSupport,
   useInboxFilterStore,
 } from "@multica/core/inbox/filter-store";
@@ -87,11 +84,9 @@ const ITEMS = [
 
 function renderMenu({
   items = ITEMS,
-  actorIndex = EMPTY_INBOX_ACTOR_INDEX,
   priorityFilterSupport = "supported",
 }: {
   items?: InboxItem[];
-  actorIndex?: InboxActorIndex;
   priorityFilterSupport?: InboxPriorityFilterSupport;
 } = {}) {
   setApiInstance({
@@ -109,7 +104,6 @@ function renderMenu({
       <InboxFilterMenu
         wsId="ws-1"
         items={items}
-        actorIndex={actorIndex}
         priorityFilterSupport={priorityFilterSupport}
       />
     </QueryClientProvider>,
@@ -181,23 +175,19 @@ describe("InboxFilterMenu", () => {
     ).toBeUndefined();
   });
 
-  it("offers every actor in a group, not just the row that survived dedup", async () => {
-    // Alice commented, Bob then changed the status: only Bob's row is on
-    // screen, but the issue is still one Alice touched.
-    const surviving = item("issue-row", "todo", "high", {
-      issue_id: "issue-1",
-      actor_type: "agent",
-      actor_id: "bob",
+  it("offers only the actors the visible rows carry", async () => {
+    renderMenu({
+      items: [
+        item("from-alice", "todo", "high", {
+          actor_type: "member",
+          actor_id: "alice",
+        }),
+        item("from-bob", "done", "low", {
+          actor_type: "agent",
+          actor_id: "bob",
+        }),
+      ],
     });
-    const actorIndex = buildInboxActorIndex([
-      surviving,
-      item("older", "todo", "high", {
-        issue_id: "issue-1",
-        actor_type: "member",
-        actor_id: "alice",
-      }),
-    ]);
-    renderMenu({ items: [surviving], actorIndex });
 
     await openSubmenu("From");
     const alice = await screen.findByRole("menuitemcheckbox", {
