@@ -126,6 +126,13 @@ EXAMPLES
 ENVIRONMENT VARIABLES
   MULTICA_SERVER_URL    Override the default server URL
   MULTICA_WORKSPACE_ID  Set the active workspace
+  MULTICA_CLI           Read-only, exported by the daemon into agent tasks: the
+                        absolute path of the binary it is running. Invoke the CLI
+                        through it (` + "`\"$MULTICA_CLI\" <command>`" + `, or
+                        ` + "`& $env:MULTICA_CLI <command>`" + ` in PowerShell) rather than a
+                        bare ` + "`multica`" + ` — daemon and CLI are the same binary speaking
+                        a version-coupled private protocol, and PATH may resolve
+                        to a different install.
 
 LEARN MORE
   Use ` + "`multica <command> <subcommand> --help`" + ` for more information about a command.

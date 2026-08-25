@@ -584,6 +584,84 @@ func TestTaskMulticaEnvironmentIncludesPrivateConfigRoot(t *testing.T) {
 	}
 }
 
+// applySelfBinaryEnv is the whole point of MUL-6662: PATH was a bet on lookup
+// order, MULTICA_CLI is the deterministic answer. The three cases below are the
+// contract — the value is absolute, the PATH fallback survives, and an
+// unresolvable executable injects nothing rather than an empty variable.
+func TestApplySelfBinaryEnv(t *testing.T) {
+	const hostPath = "/usr/local/bin:/usr/bin"
+
+	t.Run("injects absolute MULTICA_CLI and keeps the PATH prepend", func(t *testing.T) {
+		original := resolveSelfExecutable
+		t.Cleanup(func() { resolveSelfExecutable = original })
+
+		binDir := t.TempDir()
+		selfBin := filepath.Join(binDir, "multica")
+		resolveSelfExecutable = func() (string, error) { return selfBin, nil }
+
+		agentEnv := map[string]string{}
+		applySelfBinaryEnv(agentEnv, hostPath)
+
+		if got := agentEnv[multicaCLIEnv]; got != selfBin {
+			t.Fatalf("%s = %q, want %q", multicaCLIEnv, got, selfBin)
+		}
+		if !filepath.IsAbs(agentEnv[multicaCLIEnv]) {
+			t.Fatalf("%s = %q, want an absolute path", multicaCLIEnv, agentEnv[multicaCLIEnv])
+		}
+		wantPath := binDir + string(os.PathListSeparator) + hostPath
+		if got := agentEnv["PATH"]; got != wantPath {
+			t.Fatalf("PATH = %q, want %q", got, wantPath)
+		}
+	})
+
+	// A blank MULTICA_CLI is worse than a missing one: `"${MULTICA_CLI:-multica}"`
+	// keeps the empty value, and the brief tells agents to fall back on unset.
+	t.Run("injects nothing when the executable cannot be resolved", func(t *testing.T) {
+		original := resolveSelfExecutable
+		t.Cleanup(func() { resolveSelfExecutable = original })
+		resolveSelfExecutable = func() (string, error) { return "", errors.New("cannot resolve executable") }
+
+		agentEnv := map[string]string{}
+		applySelfBinaryEnv(agentEnv, hostPath)
+
+		if got, ok := agentEnv[multicaCLIEnv]; ok {
+			t.Fatalf("%s = %q, want the key absent", multicaCLIEnv, got)
+		}
+		if got, ok := agentEnv["PATH"]; ok {
+			t.Fatalf("PATH = %q, want the key absent", got)
+		}
+	})
+
+	// os.Executable is absolute everywhere Multica runs, so this only fires if
+	// the resolver regresses. A relative path would resolve against the agent's
+	// working directory rather than the daemon's, which is how a "deterministic"
+	// path would quietly become another guess.
+	t.Run("skips a relative executable path but still writes PATH", func(t *testing.T) {
+		original := resolveSelfExecutable
+		t.Cleanup(func() { resolveSelfExecutable = original })
+		resolveSelfExecutable = func() (string, error) { return filepath.Join("build", "multica"), nil }
+
+		agentEnv := map[string]string{}
+		applySelfBinaryEnv(agentEnv, hostPath)
+
+		if got, ok := agentEnv[multicaCLIEnv]; ok {
+			t.Fatalf("%s = %q, want the key absent for a relative executable", multicaCLIEnv, got)
+		}
+		if agentEnv["PATH"] == "" {
+			t.Fatal("PATH prepend dropped; the pre-MULTICA_CLI fallback must survive")
+		}
+	})
+
+	// MULTICA_* is already blocklisted wholesale, so a user's custom_env cannot
+	// hand the agent a different binary. Pinned here because MULTICA_CLI is the
+	// first injected variable whose value is an executable to run.
+	t.Run("is not overridable through custom_env", func(t *testing.T) {
+		if !isBlockedEnvKey(multicaCLIEnv) {
+			t.Fatalf("isBlockedEnvKey(%q) = false, want true", multicaCLIEnv)
+		}
+	})
+}
+
 // When `brew --prefix` is unavailable but the executable path is under a
 // known Cellar root, triggerRestart must recover the prefix from the
 // known-prefix list and target <prefix>/bin/multica.
