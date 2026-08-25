@@ -29,6 +29,12 @@ func TestRootHelpDocumentsMulticaCLI(t *testing.T) {
 	if !strings.Contains(out, "$env:MULTICA_CLI <command>") {
 		t.Error("root help does not show the PowerShell invocation form")
 	}
+	// The daemon injects nothing when it has no usable binary to name, and the
+	// EXAMPLES block a few lines up uses a bare `multica`. Without the unset
+	// branch stated here the two halves of this same help page contradict each
+	// other, and an agent taking help as authoritative would abandon a working
+	// invocation for an empty one.
+	assertStatesUnsetFallback(t, "root help", out)
 }
 
 // TestRepoCheckoutHelpDocumentsMulticaCLI covers the leaf that broke. Unlike the
@@ -42,6 +48,22 @@ func TestRepoCheckoutHelpDocumentsMulticaCLI(t *testing.T) {
 	}
 	if !strings.Contains(out, "PowerShell") {
 		t.Error("`repo checkout --help` shows only the POSIX form; the command runs on Windows too")
+	}
+	assertStatesUnsetFallback(t, "`repo checkout --help`", out)
+}
+
+// assertStatesUnsetFallback checks that a help surface tells the reader what to
+// do when MULTICA_CLI is absent. applySelfBinaryEnv deliberately omits the
+// variable rather than injecting an unusable value, so "unset" is a state real
+// agents hit — on a daemon whose own binary was deleted by an upgrade, and
+// outside a managed task entirely.
+func assertStatesUnsetFallback(t *testing.T, surface, out string) {
+	t.Helper()
+	if !strings.Contains(out, "unset") {
+		t.Errorf("%s never says what to do when MULTICA_CLI is unset", surface)
+	}
+	if !strings.Contains(out, "plain `multica`") {
+		t.Errorf("%s does not name plain `multica` as the fallback", surface)
 	}
 }
 

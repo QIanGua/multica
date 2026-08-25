@@ -195,23 +195,58 @@ func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesR
 // binary being replaced out of band with the restart deferred while tasks run
 // (trySelfReload). This removes the PATH race, not every possible skew.
 //
-// hostPath is the daemon's own PATH. When the executable cannot be resolved,
-// neither layer is applied: an empty or relative MULTICA_CLI would be worse
-// than none, because the documented `${MULTICA_CLI:-multica}` fallback only
-// works if an unusable value is absent rather than blank.
+// hostPath is the daemon's own PATH.
+//
+// MULTICA_CLI is injected ONLY when the path still resolves to an executable
+// regular file, and that check is load-bearing rather than defensive. Under
+// Homebrew, os.Executable() reports the Cellar path and `brew cleanup` deletes
+// it on upgrade, while trySelfReload defers the restart for as long as tasks are
+// running and gates nothing — so a task can legitimately start under a daemon
+// whose own path no longer exists. Injecting it there would be strictly worse
+// than doing nothing: the guidance keys on the variable being UNSET, so a set
+// path pointing at a deleted file skips the fallback and fails deterministically,
+// where a bare `multica` would still have found the current version through
+// Homebrew's stable symlink. Absent, not broken, is what keeps the worst case
+// equal to today's behavior.
+//
+// The check races the filesystem — the binary can be removed between here and
+// the agent's first command — but it converts the one predictable window
+// (upgrade with a deferred restart) into a no-op instead of a failure. The PATH
+// prepend is applied either way: a directory that no longer exists is skipped
+// during lookup, which is exactly what happened before this function existed.
 func applySelfBinaryEnv(agentEnv map[string]string, hostPath string) {
 	selfBin, err := resolveSelfExecutable()
 	if err != nil {
 		return
 	}
 	agentEnv["PATH"] = filepath.Dir(selfBin) + string(os.PathListSeparator) + hostPath
-	// os.Executable is absolute on every platform Multica targets, and
-	// selfexec's argv[0] fallback absolutizes what it finds. Re-checking costs
-	// nothing and keeps a relative path — which would resolve against the
-	// agent's working directory, not the daemon's — out of the environment.
-	if filepath.IsAbs(selfBin) {
+	if usableCLIPath(selfBin) {
 		agentEnv[multicaCLIEnv] = selfBin
 	}
+}
+
+// usableCLIPath reports whether path can be handed to an agent as a runnable
+// multica CLI: absolute, present, and executable right now.
+//
+// Absolute because a relative path would resolve against the AGENT's working
+// directory rather than the daemon's. os.Executable is absolute on every
+// platform Multica targets and selfexec's argv[0] fallback absolutizes what it
+// finds, so this only fires if the resolver regresses.
+func usableCLIPath(path string) bool {
+	if !filepath.IsAbs(path) {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	// Windows decides executability by extension, not by mode bits — Stat
+	// reports 0666-style permissions for ordinary files there, so an exec-bit
+	// test would reject every valid path on the platform it was meant to guard.
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
+		return false
+	}
+	return true
 }
 
 // taskRunner executes a single agent task and returns the result.

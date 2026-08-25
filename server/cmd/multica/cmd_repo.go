@@ -55,9 +55,10 @@ var repoCheckoutCmd = &cobra.Command{
 	// this daemon-local call (GH #7520). Name the injected path here too: an
 	// agent reaching `--help` for the flags is unlikely to re-read the brief.
 	Long: "Creates a git worktree from the daemon's bare clone cache. Used by agents to check out repos on demand. " +
-		"This command talks to the local daemon over a version-coupled private protocol, so run it as `\"$MULTICA_CLI\" repo checkout <url>` " +
-		"(`& $env:MULTICA_CLI repo checkout <url>` in PowerShell): " +
-		"the daemon exports MULTICA_CLI with the absolute path of the binary it runs, while a bare `multica` resolves through PATH and may find an older install.",
+		"This command talks to the local daemon over a version-coupled private protocol, so when MULTICA_CLI is set " +
+		"run it as `\"$MULTICA_CLI\" repo checkout <url>` (`& $env:MULTICA_CLI repo checkout <url>` in PowerShell): " +
+		"the daemon exports that variable with the absolute path of the binary it runs, while a bare `multica` resolves through PATH and may find an older install. " +
+		"When MULTICA_CLI is unset the daemon had no usable binary to name, so fall back to plain `multica`: `multica repo checkout <url>`.",
 	Args: exactArgs(1),
 	RunE: runRepoCheckout,
 }
