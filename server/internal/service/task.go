@@ -5508,17 +5508,7 @@ func (s *TaskService) ensureDelegatedFailureRecoveryComment(ctx context.Context,
 			ActorType:   "system",
 			ActorID:     "",
 			Payload: map[string]any{
-				"comment": map[string]any{
-					"id":             util.UUIDToString(target.comment.ID),
-					"issue_id":       util.UUIDToString(target.comment.IssueID),
-					"author_type":    target.comment.AuthorType,
-					"author_id":      util.UUIDToString(target.comment.AuthorID),
-					"content":        target.comment.Content,
-					"type":           target.comment.Type,
-					"parent_id":      util.UUIDToPtr(target.comment.ParentID),
-					"source_task_id": util.UUIDToPtr(target.comment.SourceTaskID),
-					"created_at":     target.comment.CreatedAt.Time.Format("2006-01-02T15:04:05Z"),
-				},
+				"comment":      commentEventFields(target.comment),
 				"issue_title":  target.issue.Title,
 				"issue_status": target.issue.Status,
 			},
@@ -5658,17 +5648,7 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 			ActorType:   "system",
 			ActorID:     "",
 			Payload: map[string]any{
-				"comment": map[string]any{
-					"id":             util.UUIDToString(exhaustedComment.ID),
-					"issue_id":       util.UUIDToString(exhaustedComment.IssueID),
-					"author_type":    exhaustedComment.AuthorType,
-					"author_id":      util.UUIDToString(exhaustedComment.AuthorID),
-					"content":        exhaustedComment.Content,
-					"type":           exhaustedComment.Type,
-					"parent_id":      util.UUIDToPtr(exhaustedComment.ParentID),
-					"source_task_id": util.UUIDToPtr(exhaustedComment.SourceTaskID),
-					"created_at":     exhaustedComment.CreatedAt.Time.Format("2006-01-02T15:04:05Z"),
-				},
+				"comment":      commentEventFields(exhaustedComment),
 				"issue_title":  target.issue.Title,
 				"issue_status": target.issue.Status,
 			},
@@ -6410,6 +6390,34 @@ func (s *TaskService) getIssuePrefix(workspaceID pgtype.UUID) string {
 	return ws.IssuePrefix
 }
 
+// commentEventFields renders the `comment` object carried by comment:created
+// broadcasts published outside the HTTP handler (agent replies, delegated
+// failure recovery, recovery exhaustion).
+//
+// created_at goes through util.TimestampToString — the SAME helper the REST
+// CommentResponse uses — so the timestamp a client receives over WS is
+// byte-identical to the one it gets when it refetches that comment. These
+// payloads used to format the time with a literal "Z" suffix instead, which
+// is not Go's Z07:00 offset token: pgx decodes timestamptz into the process
+// location (pgtype/timestamptz.go, no ScanLocation configured), so on a
+// deployment whose process TZ is not UTC the broadcast stamped local
+// wall-clock digits with a UTC label. Clients then placed the entry a whole
+// offset away from its real instant and moved it again once a refetch
+// replaced the value — visible as timeline entries jumping position.
+func commentEventFields(c db.Comment) map[string]any {
+	return map[string]any{
+		"id":             util.UUIDToString(c.ID),
+		"issue_id":       util.UUIDToString(c.IssueID),
+		"author_type":    c.AuthorType,
+		"author_id":      util.UUIDToString(c.AuthorID),
+		"content":        c.Content,
+		"type":           c.Type,
+		"parent_id":      util.UUIDToPtr(c.ParentID),
+		"source_task_id": util.UUIDToPtr(c.SourceTaskID),
+		"created_at":     util.TimestampToString(c.CreatedAt),
+	}
+}
+
 func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID pgtype.UUID, content, commentType string, parentID, sourceTaskID pgtype.UUID) {
 	if content == "" {
 		return
@@ -6447,24 +6455,15 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 	}
 	comment := created.Comment()
 	s.CancelDeferredEscalationsForIssueAgent(ctx, issueID, agentID)
+	commentFields := commentEventFields(comment)
+	commentFields["revision"] = comment.Revision
 	s.Bus.Publish(events.Event{
 		Type:        protocol.EventCommentCreated,
 		WorkspaceID: util.UUIDToString(issue.WorkspaceID),
 		ActorType:   "agent",
 		ActorID:     util.UUIDToString(agentID),
 		Payload: map[string]any{
-			"comment": map[string]any{
-				"id":             util.UUIDToString(comment.ID),
-				"issue_id":       util.UUIDToString(comment.IssueID),
-				"author_type":    comment.AuthorType,
-				"author_id":      util.UUIDToString(comment.AuthorID),
-				"content":        comment.Content,
-				"type":           comment.Type,
-				"parent_id":      util.UUIDToPtr(comment.ParentID),
-				"source_task_id": util.UUIDToPtr(comment.SourceTaskID),
-				"created_at":     comment.CreatedAt.Time.Format("2006-01-02T15:04:05Z"),
-				"revision":       comment.Revision,
-			},
+			"comment":        commentFields,
 			"issue_title":    issue.Title,
 			"issue_status":   issue.Status,
 			"issue_revision": created.IssueRevision,
