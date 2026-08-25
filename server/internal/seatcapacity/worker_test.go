@@ -30,7 +30,6 @@ func (l *workerTestLocker) Lock(context.Context, uuid.UUID) (db.DBTX, func(), er
 	return nil, func() { l.unlocks++ }, nil
 }
 
-func (e *workerTestExecutor) Enabled() bool { return true }
 func (e *workerTestExecutor) ReserveInvitation(context.Context, uuid.UUID, uuid.UUID, time.Time) (Decision, error) {
 	return Decision{}, nil
 }

@@ -500,6 +500,10 @@ export function MembersTab() {
         toast.error(t(($) => $.members.toast_seat_capacity_unavailable));
         return;
       }
+      if (code === "seat_capacity_rate_limited") {
+        toast.error(t(($) => $.members.toast_seat_capacity_rate_limited));
+        return;
+      }
       toast.error(e instanceof Error ? e.message : t(($) => $.members.toast_invitation_failed));
     } finally {
       setInviteLoading(false);
@@ -614,6 +618,8 @@ export function MembersTab() {
               ? t(($) => $.members.seat_purchase_capacity_taken)
               : code === "seat_capacity_unavailable"
                 ? t(($) => $.members.toast_seat_capacity_unavailable)
+                : code === "seat_capacity_rate_limited"
+                  ? t(($) => $.members.toast_seat_capacity_rate_limited)
                 : error instanceof Error
                   ? error.message
                   : t(($) => $.members.toast_invitation_failed),

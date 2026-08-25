@@ -134,6 +134,16 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 	if existingUser.ID.Valid {
 		inviteeUserID = existingUser.ID
 	}
+	admission, ok := h.checkInvitationAdmission(
+		w,
+		r,
+		uuidToString(requester.UserID),
+		uuidToString(requester.WorkspaceID),
+		email,
+	)
+	if !ok {
+		return
+	}
 
 	invitationID := uuid.New()
 	expiresAt := time.Now().Add(7 * 24 * time.Hour)
@@ -142,20 +152,10 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Consume rate-limit budgets only after capacity is secured. A request that
-	// must purchase a seat can then retry without spending the same invitation
-	// budgets twice. If admission rejects, the durable capacity intent releases
-	// the hold immediately or through the recovery worker.
-	if !h.admitInvitation(
-		w,
-		r,
-		uuidToString(requester.UserID),
-		uuidToString(requester.WorkspaceID),
-		email,
-	) {
-		h.compensateCapacityIntent(r.Context(), invitationID)
-		return
-	}
+	// The non-consuming abuse checks run before Cloud. Spend their budgets only
+	// after Cloud has secured capacity: rate-limited requests never call Cloud,
+	// and capacity-rejected requests never consume an invitation allowance.
+	h.consumeInvitationAdmission(r, admission)
 
 	createParams := db.CreateInvitationParams{
 		ID: uuidToPG(invitationID), WorkspaceID: requester.WorkspaceID, InviterID: requester.UserID,

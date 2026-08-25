@@ -98,7 +98,7 @@ func newWorker(queries workerQueries, executor Executor, cfg WorkerConfig) *Work
 }
 
 func (w *Worker) Enabled() bool {
-	return w != nil && w.queries != nil && w.executor != nil && w.executor.Enabled()
+	return w != nil && w.queries != nil && w.executor != nil
 }
 
 func (w *Worker) Run(ctx context.Context) {

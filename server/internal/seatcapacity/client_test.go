@@ -26,7 +26,7 @@ func TestClientReserveInvitation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := New(Config{Enabled: true, BaseURL: server.URL + "/base", ServiceToken: strings.Repeat("s", 32)})
+	client, err := New(Config{BaseURL: server.URL + "/base", ServiceToken: strings.Repeat("s", 32)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestClientRejectsRedirectAndDoesNotForwardCredential(t *testing.T) {
 	}))
 	defer source.Close()
 
-	client, err := New(Config{Enabled: true, BaseURL: source.URL, ServiceToken: strings.Repeat("s", 32)})
+	client, err := New(Config{BaseURL: source.URL, ServiceToken: strings.Repeat("s", 32)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,27 +74,48 @@ func TestIsCapacityOvercommittedRequiresCloudConflictCode(t *testing.T) {
 	}
 }
 
-func TestDisabledClientPreservesLegacyBehavior(t *testing.T) {
+func TestClientPreservesCapacityRateLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"code":"capacity_rate_limited","error":"capacity service rate limit exceeded"}`))
+	}))
+	defer server.Close()
+
+	client, err := New(Config{BaseURL: server.URL, ServiceToken: strings.Repeat("s", 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ReserveInvitation(context.Background(), uuid.New(), uuid.New(), time.Now().Add(time.Hour))
+	if !IsRateLimited(err) {
+		t.Fatalf("error = %v, want capacity rate limit", err)
+	}
+	if retry := RateLimitRetryAfter(err); retry != 3*time.Second {
+		t.Fatalf("retry after = %s, want 3s", retry)
+	}
+}
+
+func TestClientIsDisabledOnlyWhenCloudURLAndTokenAreAbsent(t *testing.T) {
 	client, err := New(Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	decision, err := client.ClaimShareJoin(context.Background(), uuid.New(), uuid.New())
-	if err != nil || !decision.Allowed || decision.Managed {
-		t.Fatalf("decision=%+v err=%v", decision, err)
+	if client != nil {
+		t.Fatalf("client = %#v, want nil for self-host", client)
 	}
 }
 
-func TestEnabledClientRejectsUnsafeConfiguration(t *testing.T) {
+func TestCloudConnectedClientRejectsUnsafeConfiguration(t *testing.T) {
 	tests := []struct {
 		name string
 		cfg  Config
 	}{
-		{name: "missing URL", cfg: Config{Enabled: true, ServiceToken: strings.Repeat("s", 32)}},
-		{name: "URL credentials", cfg: Config{Enabled: true, BaseURL: "https://user:password@example.com", ServiceToken: strings.Repeat("s", 32)}},
-		{name: "short token", cfg: Config{Enabled: true, BaseURL: "https://example.com", ServiceToken: "short"}},
-		{name: "token whitespace", cfg: Config{Enabled: true, BaseURL: "https://example.com", ServiceToken: strings.Repeat("s", 31) + "\n"}},
-		{name: "excessive timeout", cfg: Config{Enabled: true, BaseURL: "https://example.com", ServiceToken: strings.Repeat("s", 32), Timeout: 6 * time.Second}},
+		{name: "missing URL", cfg: Config{ServiceToken: strings.Repeat("s", 32)}},
+		{name: "missing token", cfg: Config{BaseURL: "https://example.com"}},
+		{name: "URL credentials", cfg: Config{BaseURL: "https://user:password@example.com", ServiceToken: strings.Repeat("s", 32)}},
+		{name: "short token", cfg: Config{BaseURL: "https://example.com", ServiceToken: "short"}},
+		{name: "token whitespace", cfg: Config{BaseURL: "https://example.com", ServiceToken: strings.Repeat("s", 31) + "\n"}},
+		{name: "excessive timeout", cfg: Config{BaseURL: "https://example.com", ServiceToken: strings.Repeat("s", 32), Timeout: 6 * time.Second}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -68,13 +68,17 @@ type invitationRateLimitGate struct {
 	limiter SlidingWindowRateLimiter
 }
 
+type invitationAdmission struct {
+	gates []invitationRateLimitGate
+}
+
 func invitationRecipientKey(email string) string {
 	normalized := strings.ToLower(strings.TrimSpace(email))
 	digest := sha256.Sum256([]byte(normalized))
 	return hex.EncodeToString(digest[:])
 }
 
-func (h *Handler) admitInvitation(w http.ResponseWriter, r *http.Request, actorID, workspaceID, email string) bool {
+func (h *Handler) checkInvitationAdmission(w http.ResponseWriter, r *http.Request, actorID, workspaceID, email string) (*invitationAdmission, bool) {
 	gates := []invitationRateLimitGate{
 		{name: "actor", key: actorID, limiter: h.InvitationRateLimiters.Actor},
 		{name: "workspace", key: workspaceID, limiter: h.InvitationRateLimiters.Workspace},
@@ -107,17 +111,23 @@ func (h *Handler) admitInvitation(w http.ResponseWriter, r *http.Request, actorI
 	if checkErr != nil {
 		slog.Error("invitation rate limiter unavailable", append(logger.RequestAttrs(r), "gates", strings.Join(checkErrorGates, ","), "error", checkErr)...)
 		writeInvitationLimiterUnavailable(w)
-		return false
+		return nil, false
 	}
 	if len(deniedGates) > 0 {
 		for _, gate := range deniedGates {
 			h.Metrics.RecordEmailRateLimited("workspace_invitation", gate.name)
 		}
 		writeInvitationRateLimited(w, retryAfter)
-		return false
+		return nil, false
 	}
+	return &invitationAdmission{gates: gates}, true
+}
 
-	for _, gate := range gates {
+func (h *Handler) consumeInvitationAdmission(r *http.Request, admission *invitationAdmission) {
+	if admission == nil {
+		return
+	}
+	for _, gate := range admission.gates {
 		allowed, err := slidingWindowLimiterAllow(r.Context(), gate.limiter, gate.key)
 		if err != nil {
 			// All gates passed the non-consuming checks, so this failure began in
@@ -134,7 +144,6 @@ func (h *Handler) admitInvitation(w http.ResponseWriter, r *http.Request, actorI
 			continue
 		}
 	}
-	return true
 }
 
 func writeInvitationLimiterUnavailable(w http.ResponseWriter) {

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,7 +28,6 @@ const (
 var ErrInvalidConfig = errors.New("seat capacity: invalid configuration")
 
 type Config struct {
-	Enabled      bool
 	BaseURL      string
 	ServiceToken string
 	Timeout      time.Duration
@@ -59,7 +59,6 @@ type Decision struct {
 }
 
 type Executor interface {
-	Enabled() bool
 	ReserveInvitation(context.Context, uuid.UUID, uuid.UUID, time.Time) (Decision, error)
 	ClaimShareJoin(context.Context, uuid.UUID, uuid.UUID) (Decision, error)
 	Consume(context.Context, uuid.UUID, uuid.UUID) (Decision, error)
@@ -71,11 +70,10 @@ type Executor interface {
 
 type unavailableExecutor struct{ err error }
 
-// NewUnavailable preserves fail-closed behavior when an operator explicitly
-// enabled managed capacity with invalid configuration.
+// NewUnavailable preserves fail-closed behavior when a Cloud-connected
+// deployment has invalid capacity credentials.
 func NewUnavailable(err error) Executor { return &unavailableExecutor{err: err} }
 
-func (u *unavailableExecutor) Enabled() bool { return true }
 func (u *unavailableExecutor) fail() (Decision, error) {
 	return Decision{}, fmt.Errorf("seat capacity executor unavailable: %w", u.err)
 }
@@ -102,7 +100,6 @@ func (u *unavailableExecutor) GetOperation(context.Context, uuid.UUID, uuid.UUID
 }
 
 type Client struct {
-	enabled      bool
 	baseURL      *url.URL
 	serviceToken string
 	timeout      time.Duration
@@ -111,11 +108,14 @@ type Client struct {
 
 var _ Executor = (*Client)(nil)
 
-func New(cfg Config) (*Client, error) {
-	if !cfg.Enabled {
-		return &Client{}, nil
-	}
+func New(cfg Config) (Executor, error) {
 	rawURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	if rawURL == "" && cfg.ServiceToken == "" {
+		return nil, nil
+	}
+	if rawURL == "" {
+		return nil, fmt.Errorf("%w: base URL is required when a service token is configured", ErrInvalidConfig)
+	}
 	baseURL, err := url.Parse(rawURL)
 	if err != nil || (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" ||
 		baseURL.User != nil || baseURL.RawQuery != "" || baseURL.Fragment != "" {
@@ -139,15 +139,12 @@ func New(cfg Config) (*Client, error) {
 	// The machine credential must never cross an HTTP redirect boundary.
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{
-		enabled:      true,
 		baseURL:      baseURL,
 		serviceToken: cfg.ServiceToken,
 		timeout:      timeout,
 		httpClient:   httpClient,
 	}, nil
 }
-
-func (c *Client) Enabled() bool { return c != nil && c.enabled }
 
 func (c *Client) ReserveInvitation(ctx context.Context, workspaceID, invitationID uuid.UUID, expiresAt time.Time) (Decision, error) {
 	return c.post(ctx, workspaceID, "reserve", map[string]any{
@@ -190,9 +187,6 @@ func (c *Client) post(ctx context.Context, workspaceID uuid.UUID, action string,
 }
 
 func (c *Client) do(ctx context.Context, method string, workspaceID uuid.UUID, suffix string, body []byte) (Decision, error) {
-	if !c.Enabled() {
-		return Decision{Allowed: true}, nil
-	}
 	if workspaceID == uuid.Nil {
 		return Decision{}, fmt.Errorf("seat capacity: workspace ID is required")
 	}
@@ -232,7 +226,12 @@ func (c *Client) do(ctx context.Context, method string, workspaceID uuid.UUID, s
 			Code  string `json:"code"`
 		}
 		_ = json.Unmarshal(payload, &remote)
-		return Decision{}, &HTTPError{StatusCode: resp.StatusCode, Code: remote.Code, Message: remote.Error}
+		return Decision{}, &HTTPError{
+			StatusCode: resp.StatusCode,
+			Code:       remote.Code,
+			Message:    remote.Error,
+			RetryAfter: retryAfterDuration(resp.Header.Get("Retry-After")),
+		}
 	}
 	var out Decision
 	if err := json.Unmarshal(payload, &out); err != nil {
@@ -245,6 +244,7 @@ type HTTPError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	RetryAfter time.Duration
 }
 
 func (e *HTTPError) Error() string {
@@ -262,4 +262,25 @@ func IsNotFound(err error) bool {
 func IsCapacityOvercommitted(err error) bool {
 	var remote *HTTPError
 	return errors.As(err, &remote) && remote.StatusCode == http.StatusConflict && remote.Code == "capacity_overcommitted"
+}
+
+func IsRateLimited(err error) bool {
+	var remote *HTTPError
+	return errors.As(err, &remote) && remote.StatusCode == http.StatusTooManyRequests && remote.Code == "capacity_rate_limited"
+}
+
+func RateLimitRetryAfter(err error) time.Duration {
+	var remote *HTTPError
+	if !errors.As(err, &remote) || !IsRateLimited(remote) {
+		return 0
+	}
+	return remote.RetryAfter
+}
+
+func retryAfterDuration(value string) time.Duration {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || seconds < 1 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
