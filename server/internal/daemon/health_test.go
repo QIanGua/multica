@@ -473,7 +473,7 @@ func TestRepoCheckoutAuthErrorSurfacesDeferredReload(t *testing.T) {
 	d.setReloadPending("multica binary on disk reports v0.4.20, running v0.4.33")
 
 	message := d.repoCheckoutAuthErrorMessage(repoCheckoutAuthNoCredential)
-	if !strings.Contains(message, "on-disk copy has changed since") {
+	if !strings.Contains(message, "on-disk copy has since changed") {
 		t.Fatalf("rejection should warn that the daemon's own binary drifted: %s", message)
 	}
 	if !strings.Contains(message, "reports v0.4.20, running v0.4.33") {

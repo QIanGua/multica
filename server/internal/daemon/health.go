@@ -228,14 +228,14 @@ func (d *Daemon) repoCheckoutAuthErrorMessage(result repoCheckoutAuthResult) str
 	// os.Executable() reports where this process was STARTED from, which is not
 	// a promise about the bytes on disk now: the daemon deliberately supports a
 	// binary being replaced out of band while a restart is deferred (see
-	// pollSelfVersion). Claiming a version match here could hand a version-skew
+	// trySelfReload). Claiming a version match here could hand a version-skew
 	// victim a second stale binary, so state the provenance and let the reader
 	// verify the version.
 	if selfBin, err := resolveSelfExecutable(); err == nil {
 		b.WriteString(" This daemon started from ")
 		b.WriteString(selfBin)
 		if pending := d.reloadPending(); pending != "" {
-			b.WriteString(", whose on-disk copy has changed since (")
+			b.WriteString(", whose on-disk copy has since changed (")
 			b.WriteString(pending)
 			b.WriteString(")")
 		}
