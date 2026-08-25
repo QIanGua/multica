@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
@@ -12,12 +12,28 @@ import { setApiInstance } from "@multica/core/api";
 import type { ApiClient } from "@multica/core/api/client";
 import { STATUS_ORDER } from "@multica/core/issues/config";
 import {
+  buildInboxActorIndex,
+  EMPTY_INBOX_ACTOR_INDEX,
+  type InboxActorIndex,
   type InboxPriorityFilterSupport,
   useInboxFilterStore,
 } from "@multica/core/inbox/filter-store";
 import type { InboxItem, IssueStatusEntry } from "@multica/core/types";
 import { renderWithI18n } from "../../test/i18n";
 import { InboxFilterMenu } from "./inbox-filter-menu";
+
+// The directory hook resolves the current workspace through the route, which
+// this leaf render has none of — stubbed the same way the sibling
+// inbox-detail-label suite stubs it.
+const ACTOR_NAMES: Record<string, string> = { alice: "Alice", bob: "Bob" };
+vi.mock("@multica/core/workspace/hooks", () => ({
+  useActorName: () => ({
+    getActorName: (type: string, id: string) =>
+      type === "system" ? "Multica" : (ACTOR_NAMES[id] ?? "Unknown"),
+    getActorInitials: () => "??",
+    getActorAvatarUrl: () => null,
+  }),
+}));
 
 function statusEntry(category: (typeof STATUS_ORDER)[number]): IssueStatusEntry {
   return {
@@ -40,6 +56,7 @@ function item(
   id: string,
   issueStatus: InboxItem["issue_status"],
   issuePriority: InboxItem["issue_priority"],
+  overrides: Partial<InboxItem> = {},
 ): InboxItem {
   return {
     id,
@@ -59,6 +76,7 @@ function item(
     archived: false,
     created_at: "2026-08-24T00:00:00Z",
     details: null,
+    ...overrides,
   };
 }
 
@@ -69,9 +87,11 @@ const ITEMS = [
 
 function renderMenu({
   items = ITEMS,
+  actorIndex = EMPTY_INBOX_ACTOR_INDEX,
   priorityFilterSupport = "supported",
 }: {
   items?: InboxItem[];
+  actorIndex?: InboxActorIndex;
   priorityFilterSupport?: InboxPriorityFilterSupport;
 } = {}) {
   setApiInstance({
@@ -89,13 +109,14 @@ function renderMenu({
       <InboxFilterMenu
         wsId="ws-1"
         items={items}
+        actorIndex={actorIndex}
         priorityFilterSupport={priorityFilterSupport}
       />
     </QueryClientProvider>,
   );
 }
 
-async function openSubmenu(name: "Status" | "Priority") {
+async function openSubmenu(name: "From" | "Status" | "Priority") {
   fireEvent.click(screen.getByRole("button", { name: "Filter inbox" }));
   const trigger = await screen.findByRole("menuitem", {
     name: new RegExp(`^${name}`),
@@ -158,6 +179,72 @@ describe("InboxFilterMenu", () => {
     expect(
       useInboxFilterStore.getState().filtersByWorkspace["ws-1"],
     ).toBeUndefined();
+  });
+
+  it("offers every actor in a group, not just the row that survived dedup", async () => {
+    // Alice commented, Bob then changed the status: only Bob's row is on
+    // screen, but the issue is still one Alice touched.
+    const surviving = item("issue-row", "todo", "high", {
+      issue_id: "issue-1",
+      actor_type: "agent",
+      actor_id: "bob",
+    });
+    const actorIndex = buildInboxActorIndex([
+      surviving,
+      item("older", "todo", "high", {
+        issue_id: "issue-1",
+        actor_type: "member",
+        actor_id: "alice",
+      }),
+    ]);
+    renderMenu({ items: [surviving], actorIndex });
+
+    await openSubmenu("From");
+    const alice = await screen.findByRole("menuitemcheckbox", {
+      name: /Alice.*1 notification/,
+    });
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: /Bob.*1 notification/ }),
+    ).toBeTruthy();
+
+    fireEvent.click(alice);
+
+    expect(
+      useInboxFilterStore.getState().filtersByWorkspace["ws-1"]?.actors,
+    ).toEqual(["member:alice"]);
+  });
+
+  it("hides the From submenu when no row carries an actor", async () => {
+    renderMenu();
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter inbox" }));
+
+    expect(screen.queryByRole("menuitem", { name: /^From/ })).toBeNull();
+  });
+
+  it("toggles unread only and counts the unread rows behind it", async () => {
+    renderMenu({
+      items: [
+        item("unread", "todo", "high"),
+        item("read", "done", "low", { read: true }),
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter inbox" }));
+    const unread = await screen.findByRole("menuitemcheckbox", {
+      name: /Unread only.*1 notification/,
+    });
+
+    fireEvent.click(unread);
+
+    expect(
+      useInboxFilterStore.getState().filtersByWorkspace["ws-1"]?.unreadOnly,
+    ).toBe(true);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "1 active filter" }),
+      ).toHaveTextContent("1"),
+    );
   });
 
   it("hides priority and clears its filter for a legacy response", async () => {

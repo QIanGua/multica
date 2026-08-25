@@ -52,13 +52,26 @@ vi.mock("@multica/core/issues/stores/draft-store", () => ({
   useIssueDraftStore: { getState: () => ({ setDraft: vi.fn() }) },
 }));
 
-vi.mock("@multica/core/inbox/queries", () => ({
-  inboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "list"] }),
-  archivedInboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "archived"] }),
-  deduplicateInboxItems: (items: InboxItem[]) => items.filter((i) => !i.archived),
-  deduplicateArchivedInboxItems: (items: InboxItem[]) => items.filter((i) => i.archived),
-  useInboxUnreadCount: () => 2,
-}));
+vi.mock("@multica/core/inbox/queries", async () => {
+  // The actor index keeps its real implementation: what the page decides is
+  // WHICH rows to index (the raw list, before deduplication drops every actor
+  // but the newest), and a stub that returned an empty map would let that
+  // choice pass untested.
+  const { buildInboxActorIndex } = await import(
+    "@multica/core/inbox/filter-store"
+  );
+  return {
+    inboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "list"] }),
+    archivedInboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "archived"] }),
+    deduplicateInboxItems: (items: InboxItem[]) => items.filter((i) => !i.archived),
+    deduplicateArchivedInboxItems: (items: InboxItem[]) => items.filter((i) => i.archived),
+    inboxActorIndex: (items: InboxItem[]) =>
+      buildInboxActorIndex(items.filter((i) => !i.archived)),
+    archivedInboxActorIndex: (items: InboxItem[]) =>
+      buildInboxActorIndex(items.filter((i) => i.archived)),
+    useInboxUnreadCount: () => 2,
+  };
+});
 
 // Stable spies: the auto-mark-read effect keys on the mutate identity, so a
 // fresh `vi.fn()` per render would make the effect's deps churn.
@@ -277,6 +290,34 @@ describe("InboxPage", () => {
 
     expect(screen.getAllByTestId("row")).toHaveLength(1);
     expect(screen.getByTestId("row")).toHaveTextContent("done-low");
+  });
+
+  it("hides read notifications while the unread filter is on", () => {
+    reset();
+    listData.active = [
+      item({ id: "unread-row", issue_id: "issue-1", read: false }),
+      item({ id: "read-row", issue_id: "issue-2", read: true }),
+    ];
+    useInboxFilterStore.getState().toggleUnreadOnly("workspace-1");
+
+    render(<InboxPage />);
+
+    expect(screen.getAllByTestId("row")).toHaveLength(1);
+    expect(screen.getByTestId("row")).toHaveTextContent("unread-row");
+  });
+
+  it("filters by an actor the group carries", () => {
+    reset();
+    listData.active = [
+      item({ id: "from-alice", issue_id: "issue-1", actor_type: "member", actor_id: "alice" }),
+      item({ id: "from-bob", issue_id: "issue-2", actor_type: "agent", actor_id: "bob" }),
+    ];
+    useInboxFilterStore.getState().toggleActorFilter("workspace-1", "member:alice");
+
+    render(<InboxPage />);
+
+    expect(screen.getAllByTestId("row")).toHaveLength(1);
+    expect(screen.getByTestId("row")).toHaveTextContent("from-alice");
   });
 
   it("offers to clear filters when they hide every notification", () => {

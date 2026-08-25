@@ -1,6 +1,11 @@
 import { queryOptions, useQuery } from "@tanstack/react-query";
 import { api } from "../api";
 import type { InboxItem, InboxWorkspaceUnread } from "../types";
+import {
+  buildInboxActorIndex,
+  inboxGroupKey,
+  type InboxActorIndex,
+} from "./filter-store";
 
 export const inboxKeys = {
   all: (wsId: string) => ["inbox", wsId] as const,
@@ -102,10 +107,27 @@ export function deduplicateArchivedInboxItems(items: InboxItem[]): InboxItem[] {
   return groupInboxItemsByIssue(items.filter((i) => i.archived));
 }
 
+/**
+ * Actors behind every group in the main list, for the "From" filter.
+ *
+ * Paired with `deduplicateInboxItems` and applying the same `archived` filter:
+ * the deduplicated row is what the list renders, and this is the rest of its
+ * group. An optimistically archived row must drop out of both together, or
+ * the filter would keep offering an actor whose only row has left the list.
+ */
+export function inboxActorIndex(items: InboxItem[]): InboxActorIndex {
+  return buildInboxActorIndex(items.filter((i) => !i.archived));
+}
+
+/** Same, for the archived sub-view. */
+export function archivedInboxActorIndex(items: InboxItem[]): InboxActorIndex {
+  return buildInboxActorIndex(items.filter((i) => i.archived));
+}
+
 function groupInboxItemsByIssue(items: InboxItem[]): InboxItem[] {
   const groups = new Map<string, InboxItem[]>();
   for (const item of items) {
-    const key = item.issue_id ?? item.id;
+    const key = inboxGroupKey(item);
     const group = groups.get(key) ?? [];
     group.push(item);
     groups.set(key, group);
