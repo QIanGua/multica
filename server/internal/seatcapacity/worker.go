@@ -38,6 +38,7 @@ type WorkerConfig struct {
 
 type workerQueries interface {
 	ClaimNextDueSeatCapacityIntent(context.Context, pgtype.Timestamptz) (db.SeatCapacityOutbox, error)
+	DeferClaimedSeatCapacityIntent(context.Context, db.DeferClaimedSeatCapacityIntentParams) (int64, error)
 	DeleteClaimedSeatCapacityIntent(context.Context, db.DeleteClaimedSeatCapacityIntentParams) (int64, error)
 	ExpireInvitationForCapacityRecovery(context.Context, pgtype.UUID) error
 	GetClaimedSeatCapacityIntent(context.Context, db.GetClaimedSeatCapacityIntentParams) (db.SeatCapacityOutbox, error)
@@ -98,7 +99,7 @@ func newWorker(queries workerQueries, executor Executor, cfg WorkerConfig) *Work
 }
 
 func (w *Worker) Enabled() bool {
-	return w != nil && w.queries != nil && w.executor != nil
+	return w != nil && w.queries != nil && CanRunWorker(w.executor)
 }
 
 func (w *Worker) Run(ctx context.Context) {
@@ -135,10 +136,30 @@ func (w *Worker) ReconcileOnce(ctx context.Context) error {
 		}
 		settleErr := w.settleWithWorkspaceLimit(ctx, intent)
 		if settleErr != nil {
+			if IsRateLimited(settleErr) {
+				if err := w.deferRateLimited(ctx, intent, settleErr); err != nil {
+					return errors.Join(settleErr, err)
+				}
+				// Stop this batch after Cloud signals saturation. Continuing would
+				// only consume the shared bucket and defer more intents.
+				break
+			}
 			w.recordFailure(ctx, intent, settleErr)
 		}
 	}
 	return w.refreshMetrics(ctx)
+}
+
+func (w *Worker) deferRateLimited(ctx context.Context, intent db.SeatCapacityOutbox, settleErr error) error {
+	delay := RateLimitRetryAfter(settleErr)
+	if delay <= 0 {
+		delay = time.Second
+	}
+	_, err := w.queries.DeferClaimedSeatCapacityIntent(ctx, db.DeferClaimedSeatCapacityIntentParams{
+		LastError: settleErr.Error(), NextAttemptAt: pgtype.Timestamptz{Time: w.now().Add(delay), Valid: true},
+		OperationToken: intent.OperationToken, Action: intent.Action, LeaseToken: intent.LeaseToken,
+	})
+	return err
 }
 
 func (w *Worker) settleWithWorkspaceLimit(ctx context.Context, intent db.SeatCapacityOutbox) error {

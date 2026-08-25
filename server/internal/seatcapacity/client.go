@@ -74,6 +74,17 @@ type unavailableExecutor struct{ err error }
 // deployment has invalid capacity credentials.
 func NewUnavailable(err error) Executor { return &unavailableExecutor{err: err} }
 
+// CanRunWorker reports whether executor can safely settle durable intents.
+// The unavailable executor must remain installed on request paths so admission
+// fails closed, but a recovery worker using it would only burn retry budgets.
+func CanRunWorker(executor Executor) bool {
+	if executor == nil {
+		return false
+	}
+	_, unavailable := executor.(*unavailableExecutor)
+	return !unavailable
+}
+
 func (u *unavailableExecutor) fail() (Decision, error) {
 	return Decision{}, fmt.Errorf("seat capacity executor unavailable: %w", u.err)
 }

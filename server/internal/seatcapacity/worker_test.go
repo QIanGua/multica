@@ -61,23 +61,39 @@ type workerTestQueries struct {
 	invitation      db.WorkspaceInvitation
 	invitationError error
 	stats           []db.SeatCapacityOutboxStatsRow
+	deferredUntil   pgtype.Timestamptz
 
+	claimCalls  int
 	transitions int
 	deletes     int
 	expires     int
 	failures    int
 	deadLetters int
+	deferrals   int
 }
 
 func (q *workerTestQueries) ClaimNextDueSeatCapacityIntent(context.Context, pgtype.Timestamptz) (db.SeatCapacityOutbox, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.claimCalls++
 	if !q.claimAvailable {
 		return db.SeatCapacityOutbox{}, pgx.ErrNoRows
 	}
 	q.claimAvailable = false
 	q.intent.LeaseToken = uuidToTestPG(uuid.New())
 	return q.intent, nil
+}
+
+func (q *workerTestQueries) DeferClaimedSeatCapacityIntent(_ context.Context, arg db.DeferClaimedSeatCapacityIntentParams) (int64, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.intent.OperationToken != arg.OperationToken || q.intent.Action != arg.Action || q.intent.LeaseToken != arg.LeaseToken {
+		return 0, nil
+	}
+	q.deferrals++
+	q.deferredUntil = arg.NextAttemptAt
+	q.intent.LeaseToken = pgtype.UUID{}
+	return 1, nil
 }
 
 func (q *workerTestQueries) DeleteClaimedSeatCapacityIntent(_ context.Context, arg db.DeleteClaimedSeatCapacityIntentParams) (int64, error) {
@@ -152,6 +168,12 @@ func (q *workerTestQueries) counts() (transitions, deletes, expires, failures, d
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.transitions, q.deletes, q.expires, q.failures, q.deadLetters
+}
+
+func (q *workerTestQueries) rateLimitState() (claimCalls, deferrals int, attemptCount int32, deferredUntil time.Time) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.claimCalls, q.deferrals, q.intent.AttemptCount, q.deferredUntil.Time
 }
 
 func workerTestIntent(action string) db.SeatCapacityOutbox {
@@ -289,6 +311,51 @@ func TestWorkerDeadLettersAfterMaximumAttempts(t *testing.T) {
 	_, _, _, failures, deadLetters := queries.counts()
 	if failures != 0 || deadLetters != 1 {
 		t.Fatalf("failures=%d deadLetters=%d, want 0/1", failures, deadLetters)
+	}
+}
+
+func TestWorkerDefersCloudRateLimitWithoutSpendingRetryBudget(t *testing.T) {
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	intent := workerTestIntent(ActionConfirm)
+	intent.AttemptCount = 9
+	queries := &workerTestQueries{intent: intent, claimAvailable: true}
+	worker := newWorker(queries, &workerTestExecutor{err: &HTTPError{
+		StatusCode: http.StatusTooManyRequests,
+		Code:       "capacity_rate_limited",
+		RetryAfter: 3 * time.Second,
+	}}, WorkerConfig{MaxAttempts: 10})
+	worker.now = func() time.Time { return now }
+
+	if err := worker.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	claimCalls, deferrals, attemptCount, deferredUntil := queries.rateLimitState()
+	_, _, _, failures, deadLetters := queries.counts()
+	if claimCalls != 1 {
+		t.Fatalf("claim calls=%d, want 1 so the rate-limited batch stops immediately", claimCalls)
+	}
+	if deferrals != 1 || failures != 0 || deadLetters != 0 {
+		t.Fatalf("deferrals=%d failures=%d deadLetters=%d, want 1/0/0", deferrals, failures, deadLetters)
+	}
+	if attemptCount != 9 {
+		t.Fatalf("attempt count=%d, want unchanged value 9", attemptCount)
+	}
+	if want := now.Add(3 * time.Second); !deferredUntil.Equal(want) {
+		t.Fatalf("deferred until=%s, want %s", deferredUntil, want)
+	}
+}
+
+func TestUnavailableExecutorDisablesWorkerRecovery(t *testing.T) {
+	unavailable := NewUnavailable(errors.New("invalid capacity credentials"))
+	if CanRunWorker(unavailable) {
+		t.Fatal("unavailable executor can run recovery worker")
+	}
+	worker := newWorker(&workerTestQueries{}, unavailable, WorkerConfig{})
+	if worker.Enabled() {
+		t.Fatal("worker is enabled with unavailable executor")
+	}
+	if !CanRunWorker(&workerTestExecutor{}) {
+		t.Fatal("configured executor cannot run recovery worker")
 	}
 }
 
