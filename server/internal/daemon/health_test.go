@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -339,6 +341,9 @@ func TestRepoCheckoutUsesTaskScopedProjectRefByDefault(t *testing.T) {
 	}
 }
 
+// A request with no Authorization header can only come from a CLI older than
+// repoCheckoutMinCLIVersion, which is a permanent failure. The rejection has to
+// say so: the agent sees this string and nothing else (#7520).
 func TestRepoCheckoutRejectsMissingTaskCredential(t *testing.T) {
 	t.Parallel()
 
@@ -347,6 +352,8 @@ func TestRepoCheckoutRejectsMissingTaskCredential(t *testing.T) {
 	cache := &recordingRepoCache{lookupPath: "/cache/org/repo.git"}
 	workDir := t.TempDir()
 	d := newRepoCheckoutTestDaemon(t, workspaceID, repoURL, workDir, cache)
+	var logs bytes.Buffer
+	d.logger = captureLogger(&logs)
 
 	rec := httptest.NewRecorder()
 	body := strings.NewReader(`{"url":"` + repoURL + `","workspace_id":"` + workspaceID + `","workdir":"` + workDir + `","task_id":"task-1"}`)
@@ -357,6 +364,80 @@ func TestRepoCheckoutRejectsMissingTaskCredential(t *testing.T) {
 	}
 	if got := cache.lastCreateParams(); got != (repocache.WorktreeParams{}) {
 		t.Fatalf("unauthorized checkout reached repo cache: %+v", got)
+	}
+	for _, want := range []string{
+		repoCheckoutMinCLIVersion,
+		"which -a multica",
+		"brew upgrade multica-ai/tap/multica",
+		"v1.0.0",
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("rejection body missing %q: %s", want, rec.Body.String())
+		}
+	}
+	// The silent 401 branch is what made this undiagnosable from daemon.log.
+	if !strings.Contains(logs.String(), "repo checkout rejected") || !strings.Contains(logs.String(), "no_credential") {
+		t.Fatalf("expected a WARN naming the reason, got: %s", logs.String())
+	}
+}
+
+// A token that no active task owns is a different failure with a different fix,
+// so it must not be reported as (or advised like) a stale-CLI problem.
+func TestRepoCheckoutRejectsUnknownTaskCredential(t *testing.T) {
+	t.Parallel()
+
+	const workspaceID = "ws-checkout"
+	const repoURL = "https://github.com/org/repo.git"
+	cache := &recordingRepoCache{lookupPath: "/cache/org/repo.git"}
+	workDir := t.TempDir()
+	d := newRepoCheckoutTestDaemon(t, workspaceID, repoURL, workDir, cache)
+	var logs bytes.Buffer
+	d.logger = captureLogger(&logs)
+
+	rec := httptest.NewRecorder()
+	body := strings.NewReader(`{"url":"` + repoURL + `","workspace_id":"` + workspaceID + `","workdir":"` + workDir + `","task_id":"task-1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/repo/checkout", body)
+	req.Header.Set("Authorization", "Bearer mat_not_an_active_task")
+	d.repoCheckoutHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := cache.lastCreateParams(); got != (repocache.WorktreeParams{}) {
+		t.Fatalf("unauthorized checkout reached repo cache: %+v", got)
+	}
+	if !strings.Contains(rec.Body.String(), "not bound to a task running in this daemon") {
+		t.Fatalf("rejection body should explain the task is gone: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "brew upgrade") {
+		t.Fatalf("a live CLI must not be told to upgrade: %s", rec.Body.String())
+	}
+	if !strings.Contains(logs.String(), "unknown_credential") {
+		t.Fatalf("expected a WARN naming the reason, got: %s", logs.String())
+	}
+	// The token is a live task credential and must never reach the log.
+	if strings.Contains(logs.String(), "mat_not_an_active_task") {
+		t.Fatalf("task credential leaked into daemon.log: %s", logs.String())
+	}
+}
+
+// The daemon knows the absolute path of a version-matched binary — its own —
+// so the rejection can point at one instead of leaving the agent to guess which
+// `multica` on PATH is the right one.
+func TestRepoCheckoutAuthErrorNamesCompatibleBinary(t *testing.T) {
+	original := resolveSelfExecutable
+	t.Cleanup(func() { resolveSelfExecutable = original })
+	resolveSelfExecutable = func() (string, error) { return "/opt/multica/bin/multica", nil }
+
+	d := &Daemon{cfg: Config{CLIVersion: "v0.4.33"}}
+	message := d.repoCheckoutAuthErrorMessage(repoCheckoutAuthNoCredential)
+	if !strings.Contains(message, "/opt/multica/bin/multica") {
+		t.Fatalf("rejection should name the version-matched binary: %s", message)
+	}
+
+	resolveSelfExecutable = func() (string, error) { return "", errors.New("unresolvable") }
+	if message := d.repoCheckoutAuthErrorMessage(repoCheckoutAuthNoCredential); !strings.Contains(message, repoCheckoutMinCLIVersion) {
+		t.Fatalf("rejection must stay useful when the daemon path is unknown: %s", message)
 	}
 }
 
