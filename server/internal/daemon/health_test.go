@@ -367,17 +367,28 @@ func TestRepoCheckoutRejectsMissingTaskCredential(t *testing.T) {
 	}
 	for _, want := range []string{
 		repoCheckoutMinCLIVersion,
-		"which -a multica",
-		"brew upgrade multica-ai/tap/multica",
+		repoCheckoutListBinariesCommand(),
+		"multica update",
 		"v1.0.0",
 	} {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Fatalf("rejection body missing %q: %s", want, rec.Body.String())
 		}
 	}
+	// The endpoint serves Windows and Linux too, so the self-help commands must
+	// not be a macOS/Homebrew recipe. `multica update` resolves the install
+	// method itself; a literal `brew upgrade` is unrunnable for most readers.
+	if strings.Contains(rec.Body.String(), "brew upgrade") {
+		t.Fatalf("rejection body hardcodes a platform-specific upgrade command: %s", rec.Body.String())
+	}
 	// The silent 401 branch is what made this undiagnosable from daemon.log.
 	if !strings.Contains(logs.String(), "repo checkout rejected") || !strings.Contains(logs.String(), "no_credential") {
-		t.Fatalf("expected a WARN naming the reason, got: %s", logs.String())
+		t.Fatalf("expected a log line naming the reason, got: %s", logs.String())
+	}
+	// Asserted explicitly so a later downgrade to Debug — filtered out of
+	// daemon.log by default — cannot silently pass this test.
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("rejection must be logged at WARN, got: %s", logs.String())
 	}
 }
 
@@ -409,7 +420,7 @@ func TestRepoCheckoutRejectsUnknownTaskCredential(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "not bound to a task running in this daemon") {
 		t.Fatalf("rejection body should explain the task is gone: %s", rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "brew upgrade") {
+	if strings.Contains(rec.Body.String(), "multica update") {
 		t.Fatalf("a live CLI must not be told to upgrade: %s", rec.Body.String())
 	}
 	if !strings.Contains(logs.String(), "unknown_credential") {
@@ -421,10 +432,11 @@ func TestRepoCheckoutRejectsUnknownTaskCredential(t *testing.T) {
 	}
 }
 
-// The daemon knows the absolute path of a version-matched binary — its own —
-// so the rejection can point at one instead of leaving the agent to guess which
-// `multica` on PATH is the right one.
-func TestRepoCheckoutAuthErrorNamesCompatibleBinary(t *testing.T) {
+// The daemon can name where it started from, which narrows the search — but it
+// has not probed that file's version, and the daemon explicitly supports the
+// binary being replaced out of band. So the message must describe provenance
+// and ask the reader to verify, never assert a match.
+func TestRepoCheckoutAuthErrorNamesDaemonBinaryWithoutClaimingAMatch(t *testing.T) {
 	original := resolveSelfExecutable
 	t.Cleanup(func() { resolveSelfExecutable = original })
 	resolveSelfExecutable = func() (string, error) { return "/opt/multica/bin/multica", nil }
@@ -432,12 +444,40 @@ func TestRepoCheckoutAuthErrorNamesCompatibleBinary(t *testing.T) {
 	d := &Daemon{cfg: Config{CLIVersion: "v0.4.33"}}
 	message := d.repoCheckoutAuthErrorMessage(repoCheckoutAuthNoCredential)
 	if !strings.Contains(message, "/opt/multica/bin/multica") {
-		t.Fatalf("rejection should name the version-matched binary: %s", message)
+		t.Fatalf("rejection should name the daemon's own binary: %s", message)
+	}
+	if !strings.Contains(message, "check that copy's version") {
+		t.Fatalf("rejection should ask the reader to verify the version: %s", message)
+	}
+	for _, unwanted := range []string{"version-matched", "matches this daemon"} {
+		if strings.Contains(message, unwanted) {
+			t.Fatalf("rejection must not assert an unverified version match (%q): %s", unwanted, message)
+		}
 	}
 
 	resolveSelfExecutable = func() (string, error) { return "", errors.New("unresolvable") }
 	if message := d.repoCheckoutAuthErrorMessage(repoCheckoutAuthNoCredential); !strings.Contains(message, repoCheckoutMinCLIVersion) {
 		t.Fatalf("rejection must stay useful when the daemon path is unknown: %s", message)
+	}
+}
+
+// When the daemon already knows its on-disk copy drifted (a reload deferred
+// because tasks were running), staying silent would point a version-skew victim
+// at a second stale binary.
+func TestRepoCheckoutAuthErrorSurfacesDeferredReload(t *testing.T) {
+	original := resolveSelfExecutable
+	t.Cleanup(func() { resolveSelfExecutable = original })
+	resolveSelfExecutable = func() (string, error) { return "/opt/multica/bin/multica", nil }
+
+	d := &Daemon{cfg: Config{CLIVersion: "v0.4.33"}}
+	d.setReloadPending("multica binary on disk reports v0.4.20, running v0.4.33")
+
+	message := d.repoCheckoutAuthErrorMessage(repoCheckoutAuthNoCredential)
+	if !strings.Contains(message, "on-disk copy has changed since") {
+		t.Fatalf("rejection should warn that the daemon's own binary drifted: %s", message)
+	}
+	if !strings.Contains(message, "reports v0.4.20, running v0.4.33") {
+		t.Fatalf("rejection should carry the drift detail the daemon already has: %s", message)
 	}
 }
 

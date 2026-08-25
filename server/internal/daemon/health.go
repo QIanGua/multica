@@ -179,6 +179,17 @@ func (d *Daemon) activeRepoCheckoutTask(r *http.Request) (activeRepoCheckoutTask
 	return task, repoCheckoutAuthOK
 }
 
+// repoCheckoutListBinariesCommand names the platform's "show every copy on
+// PATH" command. The whole point of the rejection is that the caller ran the
+// wrong binary, so handing them a command their shell does not have just moves
+// the dead end.
+func repoCheckoutListBinariesCommand() string {
+	if runtime.GOOS == "windows" {
+		return "where.exe multica"
+	}
+	return "which -a multica"
+}
+
 // repoCheckoutAuthErrorMessage builds the rejection body. It has to be
 // self-explanatory: the caller is an agent inside a task, and the CLI prints
 // this string as the whole failure. Anything it does not say has to be
@@ -188,6 +199,11 @@ func (d *Daemon) activeRepoCheckoutTask(r *http.Request) (activeRepoCheckoutTask
 // population that hits repoCheckoutAuthNoCredential is, by definition, running
 // a CLI too old to have received any client-side fix; the daemon is the only
 // component on this path guaranteed to be current.
+//
+// Every claim here has to survive Windows and Linux as well as macOS, and has
+// to be true rather than merely likely — advice that is wrong on the reader's
+// platform, or that asserts a version match nobody verified, recreates exactly
+// the misdirection this message exists to end.
 func (d *Daemon) repoCheckoutAuthErrorMessage(result repoCheckoutAuthResult) string {
 	if result == repoCheckoutAuthUnknownCredential {
 		return "repo checkout credential is not bound to a task running in this daemon: " +
@@ -199,19 +215,32 @@ func (d *Daemon) repoCheckoutAuthErrorMessage(result repoCheckoutAuthResult) str
 	b.WriteString("repo checkout requires an active task credential, and this request carried none. ")
 	b.WriteString("The multica CLI has sent that credential since ")
 	b.WriteString(repoCheckoutMinCLIVersion)
-	b.WriteString(", so this is an older `multica` binary")
+	b.WriteString(", so this request came from an older `multica` binary")
 	if daemonVersion := strings.TrimSpace(d.cfg.CLIVersion); daemonVersion != "" {
 		b.WriteString(" (this daemon runs ")
 		b.WriteString(daemonVersion)
 		b.WriteString(")")
 	}
-	b.WriteString(". Check which binary resolved with `which -a multica`.")
+	b.WriteString(" and will fail every time, not intermittently. List every copy on PATH with `")
+	b.WriteString(repoCheckoutListBinariesCommand())
+	b.WriteString("`, check each one's version, then upgrade the stale one with `multica update`")
+	b.WriteString(" — it handles Homebrew and direct installs on every platform.")
+	// os.Executable() reports where this process was STARTED from, which is not
+	// a promise about the bytes on disk now: the daemon deliberately supports a
+	// binary being replaced out of band while a restart is deferred (see
+	// pollSelfVersion). Claiming a version match here could hand a version-skew
+	// victim a second stale binary, so state the provenance and let the reader
+	// verify the version.
 	if selfBin, err := resolveSelfExecutable(); err == nil {
-		b.WriteString(" A version-matched copy is at ")
+		b.WriteString(" This daemon started from ")
 		b.WriteString(selfBin)
-		b.WriteString(" — run that absolute path, or put its directory first on PATH.")
+		if pending := d.reloadPending(); pending != "" {
+			b.WriteString(", whose on-disk copy has changed since (")
+			b.WriteString(pending)
+			b.WriteString(")")
+		}
+		b.WriteString("; check that copy's version before running it directly.")
 	}
-	b.WriteString(" To upgrade a standalone install: `brew upgrade multica-ai/tap/multica`.")
 	return b.String()
 }
 
