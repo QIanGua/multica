@@ -81,7 +81,7 @@ func TestFormatErrorAllKinds(t *testing.T) {
 	withLang(t, "") // default English
 	allKinds := []ErrorKind{
 		KindNetworkTimeout, KindNetworkDNS, KindNetworkRefused, KindNetworkTLS, KindNetworkOffline,
-		KindAuthRequired, KindTaskTokenRevoked, KindForbidden, KindNotFound, KindConflict,
+		KindAuthRequired, KindTaskTokenRejected, KindForbidden, KindNotFound, KindConflict,
 		KindValidation, KindRateLimited, KindServerError, KindUnknown,
 	}
 	for _, lang := range []Language{LangEN, LangZH} {
@@ -375,20 +375,20 @@ func withLang(t *testing.T, lang string) {
 
 func TestErrorKindString(t *testing.T) {
 	cases := map[ErrorKind]string{
-		KindNetworkTimeout:   "network_timeout",
-		KindNetworkDNS:       "network_dns",
-		KindNetworkRefused:   "network_refused",
-		KindNetworkTLS:       "network_tls",
-		KindNetworkOffline:   "network_offline",
-		KindAuthRequired:     "auth_required",
-		KindTaskTokenRevoked: "task_token_revoked",
-		KindForbidden:        "forbidden",
-		KindNotFound:         "not_found",
-		KindConflict:         "conflict",
-		KindValidation:       "validation",
-		KindRateLimited:      "rate_limited",
-		KindServerError:      "server_error",
-		KindUnknown:          "unknown",
+		KindNetworkTimeout:    "network_timeout",
+		KindNetworkDNS:        "network_dns",
+		KindNetworkRefused:    "network_refused",
+		KindNetworkTLS:        "network_tls",
+		KindNetworkOffline:    "network_offline",
+		KindAuthRequired:      "auth_required",
+		KindTaskTokenRejected: "task_token_rejected",
+		KindForbidden:         "forbidden",
+		KindNotFound:          "not_found",
+		KindConflict:          "conflict",
+		KindValidation:        "validation",
+		KindRateLimited:       "rate_limited",
+		KindServerError:       "server_error",
+		KindUnknown:           "unknown",
 	}
 	seen := map[string]ErrorKind{}
 	for k, want := range cases {
@@ -406,14 +406,23 @@ func TestErrorKindString(t *testing.T) {
 	}
 }
 
-// TestFormatErrorRevokedTaskTokenDoesNotSuggestAnotherCredential is GH #7522 in
-// one assertion. The generic 401 copy tells the reader to run `multica login`
-// or ask an administrator for valid credentials. That is right for a person
-// and wrong for an agent: after its task token was revoked mid-run, one read
-// the daemon owner's profile PAT and kept working under the member's identity.
-// A 401 on a task-scoped token has to read as "this task is over", never as
-// "find a working credential".
-func TestFormatErrorRevokedTaskTokenDoesNotSuggestAnotherCredential(t *testing.T) {
+// TestFormatErrorRejectedTaskTokenDoesNotSuggestAnotherCredential is GH #7522
+// in one assertion. The generic 401 copy tells the reader to run `multica
+// login` or ask an administrator for valid credentials. That is right for a
+// person and wrong for an agent: after its task token stopped working mid-run,
+// one read the daemon owner's profile PAT and kept working under the member's
+// identity. A 401 on a task token has to read as "stop", never as "find a
+// working credential".
+//
+// It must also not guess why the token was rejected. A terminal task is the
+// usual cause, but the same 401 covers a malformed token, one sent to the wrong
+// server, and one dropped by an unrelated cleanup — so a message that asserts
+// the task finished is a claim the CLI cannot make.
+//
+// The wiring — which requests are marked task-scoped in the first place — is
+// covered by TestHTTPErrorTaskScopedFollowsTheRequestNotTheClient, which drives
+// a real client instead of hand-building the error.
+func TestFormatErrorRejectedTaskTokenDoesNotSuggestAnotherCredential(t *testing.T) {
 	httpErr := &HTTPError{Method: "GET", Path: "/api/me", StatusCode: 401, TaskScoped: true}
 
 	for _, tc := range []struct {
@@ -422,11 +431,13 @@ func TestFormatErrorRevokedTaskTokenDoesNotSuggestAnotherCredential(t *testing.T
 		refuted []string
 	}{
 		{"en_US.UTF-8",
-			[]string{"revoked", "terminal state", "Do not retry with another credential"},
-			[]string{"multica login", "administrator"}},
+			[]string{"rejected", "no longer usable", "Stop here", "do not retry",
+				"do not fall back to a profile or member credential"},
+			// No sign-in advice, and no claim about a cause it cannot verify.
+			[]string{"multica login", "administrator", "cancelled", "finished", "terminal state"}},
 		{"zh_CN.UTF-8",
-			[]string{"吊销", "终态", "不要换用其他凭证"},
-			[]string{"multica login", "管理员"}},
+			[]string{"已被拒绝", "不再可用", "不要重试", "不要改用 profile 或成员凭证"},
+			[]string{"multica login", "管理员", "已完成", "被取消", "终态"}},
 	} {
 		withLang(t, tc.lang)
 		got := FormatError(httpErr, false)
@@ -437,10 +448,21 @@ func TestFormatErrorRevokedTaskTokenDoesNotSuggestAnotherCredential(t *testing.T
 		}
 		for _, sub := range tc.refuted {
 			if strings.Contains(got, sub) {
-				t.Errorf("%s: a revoked task token must not be told to find another credential, got %q (contains %q)",
-					tc.lang, got, sub)
+				t.Errorf("%s: %q must not contain %q", tc.lang, got, sub)
 			}
 		}
+	}
+
+	// Glossary: an agent execution is `task` in Chinese; 任务 is the product
+	// entity a user files (an issue). Writing this message with 任务 would say
+	// the user's issue was rejected. See conventions.zh.mdx.
+	withLang(t, "zh_CN.UTF-8")
+	zh := FormatError(httpErr, false)
+	if strings.Contains(zh, "任务") {
+		t.Errorf("zh copy used 任务 for an agent execution; it must stay `task`: %q", zh)
+	}
+	if !strings.Contains(zh, "task") {
+		t.Errorf("zh copy dropped the `task` term entirely: %q", zh)
 	}
 
 	// A member 401 is unchanged: that really is an expired login.
@@ -452,7 +474,7 @@ func TestFormatErrorRevokedTaskTokenDoesNotSuggestAnotherCredential(t *testing.T
 
 	// Exit classification is unchanged — still an auth failure.
 	if got := ExitCodeFor(httpErr); got != ExitAuth {
-		t.Errorf("ExitCodeFor(revoked task token) = %d, want %d", got, ExitAuth)
+		t.Errorf("ExitCodeFor(rejected task token) = %d, want %d", got, ExitAuth)
 	}
 }
 
