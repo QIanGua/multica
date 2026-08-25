@@ -62,9 +62,12 @@ type APIClient struct {
 }
 
 // TaskTokenPrefix marks a task-scoped agent token, as minted by
-// internal/auth.NewAgentTaskToken. The server revokes these the moment the
-// task reaches a terminal state, so a 401 on one is a normal end-of-task
-// signal rather than an expired login.
+// internal/auth.NewAgentTaskToken. A 401 on one is not the "your login
+// expired" that a 401 on a member credential is: the token belongs to a single
+// run and there is no sign-in that brings it back. Why it was rejected is not
+// something the CLI can see — a terminal task is the usual cause, but a
+// malformed token, one sent to the wrong server, and one dropped by an
+// unrelated cleanup all look identical from here.
 const TaskTokenPrefix = "mat_"
 
 type HTTPError struct {
@@ -74,8 +77,8 @@ type HTTPError struct {
 	Body       string
 	// TaskScoped records that the failing request actually carried a
 	// task-scoped `mat_` token. It changes nothing about the request; it only
-	// lets FormatError tell a 401 that means "your login expired" from one
-	// that means "this task token is finished" (GH #7522).
+	// lets FormatError tell a 401 worth signing in again for from one where
+	// the right move is to stop (GH #7522).
 	TaskScoped bool
 }
 
@@ -104,8 +107,8 @@ func newHTTPError(method, path string, resp *http.Response) *HTTPError {
 //
 // Reading the client's own Token field would be wrong twice over. DownloadFile
 // deliberately sends no Authorization header for an absolute signed URL, so a
-// 401 from object storage would be reported as a finished task purely because
-// the client happened to hold a `mat_` token. And Go strips Authorization
+// 401 from object storage would be reported as a rejected task token purely
+// because the client happened to hold a `mat_` token. And Go strips Authorization
 // across a cross-host redirect, so the request that was sent is not always the
 // one the caller built. resp.Request is the request that actually went out,
 // after redirects, which is the only thing this claim can honestly rest on.

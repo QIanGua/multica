@@ -568,7 +568,7 @@ func TestSetHeaders_AdvertisesStableAttachmentURLs(t *testing.T) {
 // Reading the client's Token field instead is wrong in a way a hand-built
 // HTTPError cannot show: DownloadFile deliberately sends no Authorization
 // header for an absolute signed URL, so a 401 from object storage would be
-// reported to an agent as "your task token is finished, stop" purely because
+// reported to an agent as "your task token was rejected, stop" purely because
 // the client happened to hold one.
 func TestHTTPErrorTaskScopedFollowsTheRequestNotTheClient(t *testing.T) {
 	var sawAuth []string
