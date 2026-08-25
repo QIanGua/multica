@@ -296,7 +296,7 @@
     "disabled_badge": "Disabled",
     "admin_only_note": "Only workspace owners and admins can change the shared MCP servers.",
     "delete_title": "Remove shared server?",
-    "delete_description": "{{name}} will be removed from the library and from every agent it is assigned to, taking effect on their next task.",
+    "delete_description": "{{name}} will be removed from the library and from every agent it is assigned to, taking effect on their next run.",
     "delete_confirm": "Remove",
     "cancel": "Cancel",
     "added_toast": "Shared MCP server added",
@@ -392,8 +392,8 @@
       "issues_write": "Create and edit issues",
       "comments_read": "Read comments",
       "comments_write": "Post comments",
-      "tasks_read": "Read agent tasks",
-      "tasks_write": "Start and update agent tasks",
+      "tasks_read": "Read agent runs",
+      "tasks_write": "Start and update agent runs",
       "agents_read": "Read the agent list",
       "members_read": "Read the member list",
       "storage_user": "Store data for each member individually",
@@ -584,7 +584,7 @@
       },
       "agent_activity": {
         "label": "Agent activity",
-        "description": "When an agent task completes or fails"
+        "description": "When an agent run completes or fails"
       }
     },
     "system": {

@@ -183,8 +183,8 @@
     "limits": {
       "title": "Usage and limits",
       "description": "Limits come from the current entitlement. Automation usage comes from server quota accounting.",
-      "issues": "Recent tasks",
-      "issues_description": "Free keeps the most recently active tasks available. Pro has no window limit.",
+      "issues": "Recent issues",
+      "issues_description": "Free keeps the most recently active issues available. Pro has no window limit.",
       "autopilots": "Successful automations",
       "autopilots_description": "The Free allowance resets each UTC calendar month. Pro is unlimited.",
       "unlimited": "Unlimited",

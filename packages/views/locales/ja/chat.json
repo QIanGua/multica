@@ -108,8 +108,8 @@
     },
     "stop_dialog": {
       "title": "この実行を停止しますか？",
-      "description_with_title": "\"{{title}}\" の現在のエージェント作業をキャンセルします。生成済みの内容はチャットに残ります。",
-      "description_default": "現在のエージェント作業をキャンセルします。生成済みの内容はチャットに残ります。",
+      "description_with_title": "\"{{title}}\" の現在のエージェント実行をキャンセルします。生成済みの内容はチャットに残ります。",
+      "description_default": "現在のエージェント実行をキャンセルします。生成済みの内容はチャットに残ります。",
       "cancel": "実行を続ける",
       "confirm": "実行を停止",
       "confirming": "停止中..."

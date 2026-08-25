@@ -64,7 +64,7 @@ import { Callout } from "fumadocs-ui/components/callout";
 
 ### `in_place`（默认）—— “原地”
 
-智能体直接在你的目录里工作，任务一次只跑一条。两条执行任务使用同一个真实目录时，后到的任务进入 `waiting_local_directory`，等前一条释放目录后继续。两个路径经不同符号链接指向同一目录时，同样串行。
+智能体直接在你的目录里工作，任务一次只跑一条。两条运行使用同一个真实目录时，后到的任务进入 `waiting_local_directory`，等前一条释放目录后继续。两个路径经不同符号链接指向同一目录时，同样串行。
 
 等待不会修改目录。等待中的任务可以取消，否则会一直等到目录可用。
 
@@ -77,7 +77,7 @@ import { Callout } from "fumadocs-ui/components/callout";
 智能体看到什么、你拿回什么：
 
 - **智能体从你眼前的状态开始，而不是从 `HEAD` 开始。** 你未提交的改动和未跟踪的文件会被回放进 worktree，所以它不会去 review 一份你已经不用的代码。你自己的工作副本、暂存区和 stash 列表都不会被动到。如果这个状态无法忠实还原 —— 包括未跟踪内容超出回放上限（2000 个文件 / 200 MiB）—— 任务会直接失败，而不是从一棵你认不出来的树开始。通常的解决办法是把还没被忽略的构建产物加进 gitignore 或清理掉。
-- **结果是你仓库里的一个分支**，命名为 `agent/<agent>/<task>`。执行记录的**运行详情**面板里会显示分支名（可直接复制），也可以用 `git branch` 找到它。用 `git log` / `git diff` review，然后自己决定 merge 还是 cherry-pick。Multica 不会替你合并。中途失败的任务同样会报告它的分支，因为它已经把智能体做出来的部分提交进去了。
+- **结果是你仓库里的一个分支**，命名为 `agent/<agent>/<task>`。运行的**运行详情**面板里会显示分支名（可直接复制），也可以用 `git branch` 找到它。用 `git log` / `git diff` review，然后自己决定 merge 还是 cherry-pick。Multica 不会替你合并。中途失败的运行同样会报告它的分支，因为它已经把智能体做出来的部分提交进去了。
 - **不会静默丢东西。** 智能体留下的未提交改动，会在 worktree 被移除前提交到那个分支上，**任务中途失败时同样如此**。极少数情况下连这次提交都做不了 —— 例如仓库开了 `commit.gpgSign` 而运行时拿不到签名密钥 —— worktree 会被刻意保留而不是删除，任务标记为失败，并且在你仓库里执行 `git worktree list` 就能看到存放这些改动的目录。
 - **没有产生改动的任务不留下任何东西。** 它的分支会被删除，而不是作为一个空条目留在 `git branch` 里。
 
@@ -133,10 +133,10 @@ multica project resource update <project-id> <resource-id> --execution-mode in_p
 multica project resource remove <project-id> <resource-id>
 ```
 
-资源变更会影响之后创建的执行任务，不会改写已经结束的执行记录。
+资源变更会影响之后创建的运行，不会改写已经结束的执行记录。
 
 ## 接下来
 
 - [项目](/projects) — 了解项目上下文、进度和负责人。
 - [守护进程与运行时](/daemon-runtimes) — 了解任务由哪台电脑领取。
-- [执行任务](/tasks) — 查看 `waiting_local_directory` 等执行状态。
+- [运行](/tasks) — 查看 `waiting_local_directory` 等执行状态。

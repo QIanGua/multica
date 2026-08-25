@@ -100,8 +100,8 @@
     },
     "stop_dialog": {
       "title": "이 실행을 중지할까요?",
-      "description_with_title": "\"{{title}}\"의 현재 에이전트 작업을 취소합니다. 이미 생성된 내용은 채팅에 남습니다.",
-      "description_default": "현재 에이전트 작업을 취소합니다. 이미 생성된 내용은 채팅에 남습니다.",
+      "description_with_title": "\"{{title}}\"의 현재 에이전트 실행을 취소합니다. 이미 생성된 내용은 채팅에 남습니다.",
+      "description_default": "현재 에이전트 실행을 취소합니다. 이미 생성된 내용은 채팅에 남습니다.",
       "cancel": "계속 실행",
       "confirm": "실행 중지",
       "confirming": "중지하는 중..."

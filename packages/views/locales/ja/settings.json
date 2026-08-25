@@ -93,7 +93,7 @@
     "prompt_hint": "そのまま送られます。タスクの内容は既に読めます。",
     "template_not_supported": "変数はまだサポートされていません。{{token}} を削除してください。エージェントはこのタスクを既に読めます。",
     "delete_title": "このクイックアクションを削除しますか？",
-    "delete_description": "すべてのタスクのサイドバーから消えます。過去の実行は実行ログに残ります。後で使う可能性があればアーカイブを選んでください。"
+    "delete_description": "すべてのタスクのサイドバーから消えます。過去の記録は実行ログに残ります。後で使う可能性があればアーカイブを選んでください。"
   },
   "auto_save": {
     "saving": "保存中…",
@@ -296,7 +296,7 @@
     "disabled_badge": "無効",
     "admin_only_note": "共有 MCP サーバーを変更できるのはワークスペースの owner と admin のみです。",
     "delete_title": "共有サーバーを削除しますか？",
-    "delete_description": "{{name}} はライブラリからも、割り当てられている全エージェントからも削除され、各エージェントの次のタスクから反映されます。",
+    "delete_description": "{{name}} はライブラリからも、割り当てられている全エージェントからも削除され、各エージェントの次の実行から反映されます。",
     "delete_confirm": "削除",
     "cancel": "キャンセル",
     "added_toast": "共有 MCP サーバーを追加しました",
@@ -391,8 +391,8 @@
       "issues_write": "issue を作成・編集する",
       "comments_read": "コメントを読み取る",
       "comments_write": "コメントを投稿する",
-      "tasks_read": "agent task を読み取る",
-      "tasks_write": "agent task を開始・更新する",
+      "tasks_read": "エージェントの実行を読み取る",
+      "tasks_write": "エージェントの実行を開始・更新する",
       "agents_read": "agent 一覧を読み取る",
       "members_read": "メンバー一覧を読み取る",
       "storage_user": "メンバーごとにデータを保存する",
@@ -582,7 +582,7 @@
       },
       "agent_activity": {
         "label": "エージェントのアクティビティ",
-        "description": "エージェントの作業が完了または失敗したとき"
+        "description": "エージェントの実行が完了または失敗したとき"
       }
     },
     "system": {

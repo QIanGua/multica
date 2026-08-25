@@ -179,7 +179,7 @@ describe("WorkingAgentsHoverContent", () => {
     expect(screen.queryByText(UNKNOWN_HOVER)).toBeNull();
   });
 
-  it("lists the roster with each agent's running task count", () => {
+  it("lists the roster with each agent's active run count", () => {
     renderWithI18n(
       <WorkingAgentsHoverContent
         agents={[makeAgent("a1"), makeAgent("a2", 3)]}
@@ -188,9 +188,9 @@ describe("WorkingAgentsHoverContent", () => {
 
     expect(screen.getByText("2 agents working")).toBeTruthy();
     expect(screen.getByText("Agent a1")).toBeTruthy();
-    expect(screen.getByText("1 task")).toBeTruthy();
+    expect(screen.getByText("1 run")).toBeTruthy();
     expect(screen.getByText("Agent a2")).toBeTruthy();
-    expect(screen.getByText("3 tasks")).toBeTruthy();
+    expect(screen.getByText("3 runs")).toBeTruthy();
     expect(screen.queryByText(UNKNOWN_HOVER)).toBeNull();
     expect(screen.queryByText(EMPTY_HOVER)).toBeNull();
   });
