@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -135,6 +137,93 @@ func newRuntimeCmd(cmd *exec.Cmd) *exec.Cmd {
 	}
 	return cmd
 }
+
+// runOwned is Run() over an owned process tree: start, wait, drop ownership.
+//
+// os/exec's Run/Output/CombinedOutput call Start themselves, so a probe written
+// with them never reaches startOwnedProcessTree and owns nothing on Windows —
+// where the direct child of a `--version` probe is typically the shim, not the
+// CLI. That is the same escape GH #7522 was reported for, in a path nobody was
+// looking at: detectCLIVersion's own comment already describes a broken CLI
+// leaving grandchildren behind. These three helpers are how a synchronous probe
+// gets the same ownership a task launch has.
+func runOwned(cmd *exec.Cmd, logger *slog.Logger) error {
+	if err := startOwnedProcessTree(cmd, logger); err != nil {
+		return err
+	}
+	// Release after the reap, which on Windows closes the Job Object and takes
+	// any surviving descendant with it.
+	defer releaseProcessGroup(cmd)
+	return cmd.Wait()
+}
+
+// outputOwned is cmd.Output() over an owned process tree. It matches the
+// stdlib's contract — stdout returned, a failed run's stderr attached to the
+// *exec.ExitError — except that the stderr sample is the last
+// probeStderrSampleBytes rather than the stdlib's head-and-tail, which is where
+// a CLI's actual failure line ends up.
+func outputOwned(cmd *exec.Cmd, logger *slog.Logger) ([]byte, error) {
+	if cmd.Stdout != nil {
+		return nil, errors.New("exec: Stdout already set")
+	}
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	// A caller that set its own Stderr wants it; only fill in the sample when
+	// nothing else is watching, exactly as Output() does.
+	var stderr *tailBuffer
+	if cmd.Stderr == nil {
+		stderr = &tailBuffer{max: probeStderrSampleBytes}
+		cmd.Stderr = stderr
+	}
+
+	err := runOwned(cmd, logger)
+	var exitErr *exec.ExitError
+	if stderr != nil && errors.As(err, &exitErr) {
+		exitErr.Stderr = stderr.Bytes()
+	}
+	return stdout.Bytes(), err
+}
+
+// combinedOutputOwned is cmd.CombinedOutput() over an owned process tree.
+// Stdout and Stderr are the same writer value, which is what makes os/exec give
+// them one pipe and therefore one interleaving, as the stdlib does.
+func combinedOutputOwned(cmd *exec.Cmd, logger *slog.Logger) ([]byte, error) {
+	if cmd.Stdout != nil {
+		return nil, errors.New("exec: Stdout already set")
+	}
+	if cmd.Stderr != nil {
+		return nil, errors.New("exec: Stderr already set")
+	}
+	var combined bytes.Buffer
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+	err := runOwned(cmd, logger)
+	return combined.Bytes(), err
+}
+
+// probeStderrSampleBytes bounds the stderr kept for a failed probe's error.
+// os/exec bounds the same sample at 32 KiB; a CLI stuck in a log loop should
+// not be able to grow the daemon's heap through a `--version` call.
+const probeStderrSampleBytes = 32 << 10
+
+// tailBuffer keeps the last max bytes written to it and discards the rest. It
+// always reports a full write, so a child is never blocked or shortened by the
+// bound.
+type tailBuffer struct {
+	buf []byte
+	max int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.max {
+		t.buf = t.buf[len(t.buf)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) Bytes() []byte { return t.buf }
 
 // invocationChooser is the shape of the per-tool platform launch rewrites
 // (chooseCursorInvocation, chooseCopilotInvocation, choosePiInvocation). On

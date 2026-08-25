@@ -290,7 +290,7 @@ func customArgsContains(args []string, flag string) bool {
 func checkOpenclawVersion(ctx context.Context, runtimeCmd Command) error {
 	cmd := runtimeCmd.exec(ctx, "--version")
 	hideAgentWindow(cmd)
-	out, err := cmd.CombinedOutput()
+	out, err := combinedOutputOwned(cmd, runtimeCmd.logger)
 	if err != nil {
 		return fmt.Errorf("openclaw --version failed: %w", err)
 	}

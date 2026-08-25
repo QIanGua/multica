@@ -2066,7 +2066,7 @@ func detectCodexVersionForDiagnostics(ctx context.Context, runtimeCmd Command, e
 
 	cmd := runtimeCmd.exec(versionCtx, "--version")
 	cmd.Env = env
-	data, err := cmd.Output()
+	data, err := outputOwned(cmd, logger)
 	if err != nil {
 		if logger != nil {
 			logger.Debug("codex version diagnostic failed", "error", err)

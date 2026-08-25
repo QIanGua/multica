@@ -4,8 +4,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -64,5 +67,88 @@ sleep 300
 	}
 	for _, pid := range pids {
 		waitProcessGone(t, pid)
+	}
+}
+
+// TestProbeOutputCancellationKillsDescendants is the probe half of GH #7522.
+//
+// outputOwned exists because cmd.Output() calls Start itself and so can never
+// reach the ownership boundary. detectCLIVersion's own comment describes the
+// shape this reproduces: a CLI shim that leaves a grandchild behind. Cancelling
+// the probe has to reap both, not just the shim.
+func TestProbeOutputCancellationKillsDescendants(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	pidFile := filepath.Join(tempDir, "pids")
+	fakePath := filepath.Join(tempDir, "probe")
+	writeTestExecutable(t, fakePath, []byte("#!/bin/sh\n"+
+		`( sleep 300 ) </dev/null >/dev/null 2>&1 &
+printf '%s %s\n' "$$" "$!" > "$1"
+sleep 300
+`))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := NewCommand(fakePath, nil).exec(ctx, pidFile)
+	cmd.WaitDelay = 5 * time.Second
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := outputOwned(cmd, slog.Default())
+		done <- err
+	}()
+
+	pids := waitForPids(t, pidFile)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("outputOwned never returned after the probe was cancelled")
+	}
+	for _, pid := range pids {
+		waitProcessGone(t, pid)
+	}
+}
+
+// TestOutputOwnedMatchesStdlibContract keeps the owned probe helpers drop-in:
+// callers were using cmd.Output() and cmd.CombinedOutput() and must keep
+// getting the same bytes back.
+func TestOutputOwnedMatchesStdlibContract(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	fakePath := filepath.Join(tempDir, "noisy")
+	writeTestExecutable(t, fakePath, []byte("#!/bin/sh\n"+
+		`printf 'to-stdout\n'
+printf 'to-stderr\n' >&2
+exit 3
+`))
+
+	out, err := outputOwned(NewCommand(fakePath, nil).exec(context.Background()), slog.Default())
+	if string(out) != "to-stdout\n" {
+		t.Errorf("stdout = %q, want %q", out, "to-stdout\n")
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("err = %v, want an *exec.ExitError", err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Errorf("exit code = %d, want 3", exitErr.ExitCode())
+	}
+	if !strings.Contains(string(exitErr.Stderr), "to-stderr") {
+		t.Errorf("ExitError.Stderr = %q, want it to carry the probe's stderr", exitErr.Stderr)
+	}
+
+	combined, err := combinedOutputOwned(NewCommand(fakePath, nil).exec(context.Background()), slog.Default())
+	if err == nil {
+		t.Error("combinedOutputOwned should report the non-zero exit")
+	}
+	for _, want := range []string{"to-stdout", "to-stderr"} {
+		if !strings.Contains(string(combined), want) {
+			t.Errorf("combined output %q missing %q", combined, want)
+		}
 	}
 }

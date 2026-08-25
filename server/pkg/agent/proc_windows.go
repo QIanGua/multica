@@ -108,8 +108,15 @@ func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger) error {
 	}
 
 	if err := ownProcessTree(cmd); err != nil && logger != nil {
-		logger.Warn("could not take ownership of the agent process tree; descendant cleanup will be best-effort",
-			"error", err, "pid", cmd.Process.Pid)
+		// Deliberately fail open. Failing the launch instead would take a host
+		// down entirely rather than degrade it, and the realistic causes are
+		// environmental — an outer job that forbids assignment, or a hardened
+		// policy denying PROCESS_SET_QUOTA — not per-task. The consequence is
+		// named in the message because it is the only signal an operator gets
+		// that cancellation on this host is back to killing the leader alone.
+		logger.Warn("could not take ownership of the agent process tree; cancelling or timing out this "+
+			"process will kill only the direct child and can leave its descendants running",
+			"error", err, "pid", cmd.Process.Pid, "executable", cmd.Path)
 	}
 
 	if err := resumeProcess(cmd.Process.Pid); err != nil {

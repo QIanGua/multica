@@ -1113,7 +1113,7 @@ func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 	// closes — defeating the timeout above. WaitDelay forces the pipes shut and
 	// reaps shortly after the context fires so this call always returns.
 	cmd.WaitDelay = 2 * time.Second
-	data, err := cmd.Output()
+	data, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil {
 		// One provider-agnostic boundary for probes: DetectVersion routes every
 		// provider through here, so an ENOEXEC diagnosis added at this point

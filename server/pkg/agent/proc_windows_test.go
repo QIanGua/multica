@@ -127,6 +127,51 @@ func TestStartOwnedProcessTreeCapturesImmediateDescendants(t *testing.T) {
 	}
 }
 
+// TestProbeOutputOwnsItsProcessTree is the Windows regression for the probe
+// path in GH #7522. cmd.Output() calls Start itself, so a probe written with it
+// never reaches startOwnedProcessTree and owns nothing here — and on Windows
+// the direct child of a `--version` probe is typically the npm shim, with the
+// real CLI already a grandchild. outputOwned has to put both in the job and
+// take both down when the probe's context is cancelled.
+func TestProbeOutputOwnsItsProcessTree(t *testing.T) {
+	exePath, pidPath := buildDescendantSpawner(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := NewCommand(exePath, nil).exec(ctx, "spawn")
+	cmd.Env = append(os.Environ(), "DESCENDANT_PID_FILE="+pidPath)
+	hideAgentWindow(cmd)
+	// The grandchild inherits the stdout pipe, so without this a wedged
+	// descendant would hold Wait open past the cancellation — the exact stall
+	// detectCLIVersion documents.
+	cmd.WaitDelay = 5 * time.Second
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = outputOwned(cmd, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		close(done)
+	}()
+
+	descendantPid := waitForDescendantPid(t, pidPath)
+	if !processStillRunning(descendantPid) {
+		t.Fatalf("descendant %d was not running; the test cannot prove anything", descendantPid)
+	}
+	if total := jobTotalProcesses(t, cmd); total < 2 {
+		t.Fatalf("job accounted for %d processes, want the probe and its descendant; the descendant escaped the job", total)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("outputOwned never returned after the probe was cancelled")
+	}
+	if processStillRunning(descendantPid) {
+		t.Fatalf("descendant %d survived cancellation of the probe that spawned it", descendantPid)
+	}
+}
+
 // TestWaitProcessGroupGoneWithoutOwnershipReportsUnconfirmed covers the
 // degraded path: a command started with a plain Start owns no job, so there is
 // nothing to observe, and callers must read that as "cleanup unconfirmed"

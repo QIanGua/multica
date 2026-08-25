@@ -730,7 +730,7 @@ func discoverOpenCodeModels(ctx context.Context, runtimeCmd Command) ([]Model, e
 	// Parse whatever the verbose command printed, even on a non-zero exit — a
 	// stale config entry can make `opencode models` exit non-zero while still
 	// listing the resolvable catalog (mirrors the pi path; see #3729/#3627).
-	out, _ := cmd.Output()
+	out, _ := outputOwned(cmd, runtimeCmd.logger)
 	models := parseOpenCodeModels(string(out))
 	if len(models) == 0 {
 		// Verbose yielded nothing usable (unsupported flag, error text, or an
@@ -738,7 +738,7 @@ func discoverOpenCodeModels(ctx context.Context, runtimeCmd Command) ([]Model, e
 		// but still prints the IDs.
 		cmd = runtimeCmd.exec(runCtx, "models")
 		hideAgentWindow(cmd)
-		out, _ = cmd.Output()
+		out, _ = outputOwned(cmd, runtimeCmd.logger)
 		models = parseOpenCodeModels(string(out))
 	}
 	if len(models) == 0 {
@@ -1177,7 +1177,7 @@ func discoverPiModelsTable(ctx context.Context, runtimeCmd Command) ([]Model, er
 	hideAgentWindow(cmd)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
-	stdout, err := cmd.Output()
+	stdout, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil && len(stdout) == 0 && stderr.Len() == 0 {
 		return []Model{}, nil
 	}
@@ -1309,7 +1309,7 @@ func discoverOmpModels(ctx context.Context, runtimeCmd Command) ([]Model, error)
 	defer cancel()
 	cmd := runtimeCmd.exec(runCtx, "models", "--json")
 	hideAgentWindow(cmd)
-	stdout, err := cmd.Output()
+	stdout, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil || len(stdout) == 0 {
 		return []Model{}, nil
 	}
@@ -1590,7 +1590,7 @@ func discoverKimiProviderThinking(ctx context.Context, runtimeCmd Command) (map[
 	cmd := runtimeCmd.exec(runCtx, "provider", "list", "--json")
 	hideAgentWindow(cmd)
 	cmd.Stderr = io.Discard
-	raw, err := cmd.Output()
+	raw, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil {
 		return nil, fmt.Errorf("kimi provider list: %w", err)
 	}
@@ -2290,7 +2290,7 @@ func discoverAntigravityModels(ctx context.Context, runtimeCmd Command) ([]Model
 	defer cancel()
 	cmd := runtimeCmd.exec(runCtx, "models")
 	hideAgentWindow(cmd)
-	out, err := cmd.Output()
+	out, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil && len(out) == 0 {
 		return nil, nil
 	}
@@ -2488,7 +2488,7 @@ func discoverCursorModels(ctx context.Context, runtimeCmd Command) (Catalog, err
 	defer cancel()
 	cmd := runtimeCmd.exec(runCtx, "--list-models")
 	hideAgentWindow(cmd)
-	out, err := cmd.Output()
+	out, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil && len(out) == 0 {
 		return Catalog{Models: cursorStaticModels(), Fallback: true}, nil
 	}
@@ -2585,7 +2585,7 @@ func discoverOpenclawAgents(ctx context.Context, runtimeCmd Command) ([]Model, e
 	} {
 		cmd := runtimeCmd.exec(runCtx, jsonArgs...)
 		hideAgentWindow(cmd)
-		out, err := cmd.Output()
+		out, err := outputOwned(cmd, runtimeCmd.logger)
 		if err != nil && len(out) == 0 {
 			continue
 		}
@@ -2599,7 +2599,7 @@ func discoverOpenclawAgents(ctx context.Context, runtimeCmd Command) ([]Model, e
 	// the wrong tokens produces nonsense entries like "Identity:".
 	cmd := runtimeCmd.exec(runCtx, "agents", "list")
 	hideAgentWindow(cmd)
-	out, err := cmd.Output()
+	out, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil && len(out) == 0 {
 		return []Model{}, nil
 	}
