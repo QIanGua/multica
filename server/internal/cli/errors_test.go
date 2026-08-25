@@ -81,8 +81,8 @@ func TestFormatErrorAllKinds(t *testing.T) {
 	withLang(t, "") // default English
 	allKinds := []ErrorKind{
 		KindNetworkTimeout, KindNetworkDNS, KindNetworkRefused, KindNetworkTLS, KindNetworkOffline,
-		KindAuthRequired, KindForbidden, KindNotFound, KindConflict, KindValidation,
-		KindRateLimited, KindServerError, KindUnknown,
+		KindAuthRequired, KindTaskTokenRevoked, KindForbidden, KindNotFound, KindConflict,
+		KindValidation, KindRateLimited, KindServerError, KindUnknown,
 	}
 	for _, lang := range []Language{LangEN, LangZH} {
 		for _, k := range allKinds {
@@ -375,19 +375,20 @@ func withLang(t *testing.T, lang string) {
 
 func TestErrorKindString(t *testing.T) {
 	cases := map[ErrorKind]string{
-		KindNetworkTimeout: "network_timeout",
-		KindNetworkDNS:     "network_dns",
-		KindNetworkRefused: "network_refused",
-		KindNetworkTLS:     "network_tls",
-		KindNetworkOffline: "network_offline",
-		KindAuthRequired:   "auth_required",
-		KindForbidden:      "forbidden",
-		KindNotFound:       "not_found",
-		KindConflict:       "conflict",
-		KindValidation:     "validation",
-		KindRateLimited:    "rate_limited",
-		KindServerError:    "server_error",
-		KindUnknown:        "unknown",
+		KindNetworkTimeout:   "network_timeout",
+		KindNetworkDNS:       "network_dns",
+		KindNetworkRefused:   "network_refused",
+		KindNetworkTLS:       "network_tls",
+		KindNetworkOffline:   "network_offline",
+		KindAuthRequired:     "auth_required",
+		KindTaskTokenRevoked: "task_token_revoked",
+		KindForbidden:        "forbidden",
+		KindNotFound:         "not_found",
+		KindConflict:         "conflict",
+		KindValidation:       "validation",
+		KindRateLimited:      "rate_limited",
+		KindServerError:      "server_error",
+		KindUnknown:          "unknown",
 	}
 	seen := map[string]ErrorKind{}
 	for k, want := range cases {
@@ -402,6 +403,56 @@ func TestErrorKindString(t *testing.T) {
 	// Out-of-range value gets a stable fallback rather than an empty string.
 	if got := ErrorKind(999).String(); got != "ErrorKind(999)" {
 		t.Errorf("unexpected fallback String(): %q", got)
+	}
+}
+
+// TestFormatErrorRevokedTaskTokenDoesNotSuggestAnotherCredential is GH #7522 in
+// one assertion. The generic 401 copy tells the reader to run `multica login`
+// or ask an administrator for valid credentials. That is right for a person
+// and wrong for an agent: after its task token was revoked mid-run, one read
+// the daemon owner's profile PAT and kept working under the member's identity.
+// A 401 on a task-scoped token has to read as "this task is over", never as
+// "find a working credential".
+func TestFormatErrorRevokedTaskTokenDoesNotSuggestAnotherCredential(t *testing.T) {
+	httpErr := &HTTPError{Method: "GET", Path: "/api/me", StatusCode: 401, TaskScoped: true}
+
+	for _, tc := range []struct {
+		lang    string
+		want    []string
+		refuted []string
+	}{
+		{"en_US.UTF-8",
+			[]string{"revoked", "terminal state", "Do not retry with another credential"},
+			[]string{"multica login", "administrator"}},
+		{"zh_CN.UTF-8",
+			[]string{"吊销", "终态", "不要换用其他凭证"},
+			[]string{"multica login", "管理员"}},
+	} {
+		withLang(t, tc.lang)
+		got := FormatError(httpErr, false)
+		for _, sub := range tc.want {
+			if !strings.Contains(got, sub) {
+				t.Errorf("%s: %q missing %q", tc.lang, got, sub)
+			}
+		}
+		for _, sub := range tc.refuted {
+			if strings.Contains(got, sub) {
+				t.Errorf("%s: a revoked task token must not be told to find another credential, got %q (contains %q)",
+					tc.lang, got, sub)
+			}
+		}
+	}
+
+	// A member 401 is unchanged: that really is an expired login.
+	withLang(t, "en_US.UTF-8")
+	member := FormatError(&HTTPError{Method: "GET", Path: "/api/me", StatusCode: 401}, false)
+	if !strings.Contains(member, "multica login") {
+		t.Errorf("a member 401 should still point at sign-in, got %q", member)
+	}
+
+	// Exit classification is unchanged — still an auth failure.
+	if got := ExitCodeFor(httpErr); got != ExitAuth {
+		t.Errorf("ExitCodeFor(revoked task token) = %d, want %d", got, ExitAuth)
 	}
 }
 

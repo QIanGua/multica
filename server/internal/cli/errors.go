@@ -33,12 +33,17 @@ const (
 
 	// HTTP status layer.
 	KindAuthRequired // 401
-	KindForbidden    // 403
-	KindNotFound     // 404
-	KindConflict     // 409
-	KindValidation   // 400 / 422
-	KindRateLimited  // 429
-	KindServerError  // 5xx
+	// KindTaskTokenRevoked is a 401 on a task-scoped token. HTTPError.Kind()
+	// never returns it — the status code alone cannot tell the two apart — so
+	// it is selected in userMessage, where the credential kind is known. Exit
+	// classification is unchanged: it is still an auth failure.
+	KindTaskTokenRevoked
+	KindForbidden   // 403
+	KindNotFound    // 404
+	KindConflict    // 409
+	KindValidation  // 400 / 422
+	KindRateLimited // 429
+	KindServerError // 5xx
 
 	// Anything we could not classify.
 	KindUnknown
@@ -80,6 +85,8 @@ func (k ErrorKind) String() string {
 		return "network_offline"
 	case KindAuthRequired:
 		return "auth_required"
+	case KindTaskTokenRevoked:
+		return "task_token_revoked"
 	case KindForbidden:
 		return "forbidden"
 	case KindNotFound:
@@ -307,6 +314,10 @@ var kindMessages = map[ErrorKind][2]string{
 		"Your session has expired or you are not signed in. Run `multica login` to sign in again. On a self-hosted or non-OAuth setup, ask your administrator for valid credentials.",
 		"登录已过期或尚未登录。请运行 `multica login` 重新登录。自托管或非 OAuth 场景请联系管理员获取有效凭证。",
 	},
+	KindTaskTokenRevoked: {
+		"This task's token has been revoked because the task reached a terminal state (it finished, was cancelled, or timed out). This is expected, and it means the work is over. Do not retry with another credential: a profile or member token would run whatever follows as that person rather than as this task.",
+		"该任务的令牌已被吊销，因为任务已进入终态（已完成、被取消或超时）。这是预期行为，说明这项工作已经结束。请不要换用其他凭证重试：使用 profile 或成员令牌会让后续操作以该成员的身份执行，而不是以本任务的身份执行。",
+	},
 	KindForbidden: {
 		"You do not have permission to access this resource. Check that you are in the right workspace, or ask an administrator to grant access.",
 		"无权访问该资源。请确认当前 workspace 是否正确，或联系管理员授予权限。",
@@ -407,6 +418,15 @@ func userMessage(err error, lang Language) string {
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) {
 		kind := httpErr.Kind()
+		// A 401 on a task-scoped token is the task ending, not a login
+		// problem. The generic copy below tells the reader to sign in again or
+		// ask an administrator for valid credentials — advice an autonomous
+		// agent can act on, and did: after its token was revoked mid-run, one
+		// read the daemon owner's profile PAT and kept working under the
+		// member's identity (GH #7522).
+		if kind == KindAuthRequired && httpErr.TaskScoped {
+			return messageFor(KindTaskTokenRevoked, lang)
+		}
 		// Validation and conflict errors carry a useful server-provided
 		// message; surface it instead of the generic line. A body we cannot
 		// recognize still falls back to the template, so this never dumps a

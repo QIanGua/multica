@@ -61,11 +61,22 @@ type APIClient struct {
 	OS       string
 }
 
+// TaskTokenPrefix marks a task-scoped agent token, as minted by
+// internal/auth.NewAgentTaskToken. The server revokes these the moment the
+// task reaches a terminal state, so a 401 on one is a normal end-of-task
+// signal rather than an expired login.
+const TaskTokenPrefix = "mat_"
+
 type HTTPError struct {
 	Method     string
 	Path       string
 	StatusCode int
 	Body       string
+	// TaskScoped records that the request carried a task-scoped `mat_` token
+	// rather than a member credential. It changes nothing about the request;
+	// it only lets FormatError tell a 401 that means "your login expired" from
+	// a 401 that means "this task is over" (GH #7522).
+	TaskScoped bool
 }
 
 func (e *HTTPError) Error() string {
@@ -77,13 +88,17 @@ func (e *HTTPError) Error() string {
 // >= 400 responses through this so the top-level FormatError / ExitCodeFor can
 // classify the failure via errors.As(err, **HTTPError) regardless of which
 // HTTP verb the command used.
-func newHTTPError(method, path string, resp *http.Response) *HTTPError {
+//
+// It is a method so the error can record which kind of credential the request
+// used; nothing else about the client is read.
+func (c *APIClient) newHTTPError(method, path string, resp *http.Response) *HTTPError {
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	return &HTTPError{
 		Method:     method,
 		Path:       path,
 		StatusCode: resp.StatusCode,
 		Body:       strings.TrimSpace(string(data)),
+		TaskScoped: strings.HasPrefix(c.Token, TaskTokenPrefix),
 	}
 }
 
@@ -236,7 +251,7 @@ func (c *APIClient) GetJSON(ctx context.Context, path string, out any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return newHTTPError(http.MethodGet, path, resp)
+		return c.newHTTPError(http.MethodGet, path, resp)
 	}
 	if out == nil {
 		return nil
@@ -262,7 +277,7 @@ func (c *APIClient) GetJSONWithHeaders(ctx context.Context, path string, out any
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, newHTTPError(http.MethodGet, path, resp)
+		return nil, c.newHTTPError(http.MethodGet, path, resp)
 	}
 	if out != nil {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
@@ -293,7 +308,7 @@ func (c *APIClient) DeleteJSONResponse(ctx context.Context, path string, out any
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return newHTTPError(http.MethodDelete, path, resp)
+		return c.newHTTPError(http.MethodDelete, path, resp)
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
@@ -322,7 +337,7 @@ func (c *APIClient) DeleteJSONWithBody(ctx context.Context, path string, body an
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return newHTTPError(http.MethodDelete, path, resp)
+		return c.newHTTPError(http.MethodDelete, path, resp)
 	}
 	return nil
 }
@@ -349,7 +364,7 @@ func (c *APIClient) PostJSON(ctx context.Context, path string, body any, out any
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return newHTTPError(http.MethodPost, path, resp)
+		return c.newHTTPError(http.MethodPost, path, resp)
 	}
 	if out == nil {
 		return nil
@@ -379,7 +394,7 @@ func (c *APIClient) PutJSON(ctx context.Context, path string, body any, out any)
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return newHTTPError(http.MethodPut, path, resp)
+		return c.newHTTPError(http.MethodPut, path, resp)
 	}
 	if out == nil {
 		return nil
@@ -409,7 +424,7 @@ func (c *APIClient) PatchJSON(ctx context.Context, path string, body any, out an
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return newHTTPError(http.MethodPatch, path, resp)
+		return c.newHTTPError(http.MethodPatch, path, resp)
 	}
 	if out == nil {
 		return nil
@@ -470,7 +485,7 @@ func (c *APIClient) UploadFile(ctx context.Context, fileData []byte, filename st
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return "", newHTTPError(http.MethodPost, "/api/upload-file", resp)
+		return "", c.newHTTPError(http.MethodPost, "/api/upload-file", resp)
 	}
 
 	var result map[string]any
@@ -535,7 +550,7 @@ func (c *APIClient) UploadChatAttachment(ctx context.Context, fileData []byte, f
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return AttachmentResponse{}, newHTTPError(http.MethodPost, "/api/upload-file", resp)
+		return AttachmentResponse{}, c.newHTTPError(http.MethodPost, "/api/upload-file", resp)
 	}
 
 	var result AttachmentResponse
@@ -595,7 +610,7 @@ func (c *APIClient) UploadFileWithURL(ctx context.Context, fileData []byte, file
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return "", "", newHTTPError(http.MethodPost, "/api/upload-file", resp)
+		return "", "", c.newHTTPError(http.MethodPost, "/api/upload-file", resp)
 	}
 
 	var result AttachmentResponse
@@ -661,7 +676,7 @@ func (c *APIClient) ImportSkillFile(ctx context.Context, fileData []byte, filena
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return newHTTPError(http.MethodPost, "/api/skills/import", resp)
+		return c.newHTTPError(http.MethodPost, "/api/skills/import", resp)
 	}
 	if out == nil {
 		return nil
@@ -699,7 +714,7 @@ func (c *APIClient) UploadPrivatePlugin(ctx context.Context, path string, archiv
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return newHTTPError(http.MethodPost, path, resp)
+		return c.newHTTPError(http.MethodPost, path, resp)
 	}
 	if out == nil {
 		return nil
@@ -742,7 +757,7 @@ func (c *APIClient) DownloadFile(ctx context.Context, downloadURL string) ([]byt
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, newHTTPError(http.MethodGet, downloadURL, resp)
+		return nil, c.newHTTPError(http.MethodGet, downloadURL, resp)
 	}
 
 	const maxDownloadSize = 100 << 20 // 100 MB
