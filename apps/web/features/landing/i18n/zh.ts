@@ -294,6 +294,31 @@ export function createZhDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
+        version: "0.4.34",
+        date: "2026-08-25",
+        title: "带上下文的子 Issue、自定义状态、稳定的智能体任务",
+        changes: [],
+        features: [
+          "可从评论创建子 Issue，并保留原始上下文。",
+          "工作区管理员现在可创建自定义 Issue 状态。",
+        ],
+        improvements: [
+          "首次填写后，结账会自动带入你的邮箱。",
+          "仓库拉取失败时会说明如何恢复访问。",
+          "自托管部署现可通过统一地址检查健康状态。",
+        ],
+        fixes: [
+          "MCode 会话现在能稳定启动。",
+          "已移除成员不再收到 Autopilot 通知。",
+          "恢复后的智能体任务会留在原评论线程中。",
+          "Issue 评论现在显示正确的本地时间。",
+          "完整 Issue ID 现在可以稳定打开。",
+          "智能体任务结束时能更干净地退出。",
+          "账单中不再显示失效订阅席位。",
+          "被拒绝的任务令牌会说明如何停止任务。",
+        ],
+      },
+      {
         version: "0.4.33",
         date: "2026-08-24",
         title: "收件箱筛选、ZeroClaw 运行时、多语言失败说明",

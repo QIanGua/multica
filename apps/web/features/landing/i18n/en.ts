@@ -294,6 +294,31 @@ export function createEnDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
+        version: "0.4.34",
+        date: "2026-08-25",
+        title: "Contextual sub-Issues, custom statuses, and steadier agent tasks",
+        changes: [],
+        features: [
+          "Create a sub-Issue from a comment and keep its source context.",
+          "Workspace admins can create custom Issue statuses.",
+        ],
+        improvements: [
+          "Checkout now fills your email after the first entry.",
+          "Repository checkout errors now explain how to restore access.",
+          "Self-hosted setup now includes a simpler single-address health check.",
+        ],
+        fixes: [
+          "MCode sessions now start reliably.",
+          "Former members no longer receive Autopilot notifications.",
+          "Recovered agent tasks stay in the original comment thread.",
+          "Issue comments now show the correct local time.",
+          "Full Issue IDs now open reliably.",
+          "Agent tasks now stop cleanly when they finish.",
+          "Inactive subscription seats no longer appear in billing.",
+          "Rejected task tokens now explain how to stop the task.",
+        ],
+      },
+      {
         version: "0.4.33",
         date: "2026-08-24",
         title: "Inbox filters, the ZeroClaw runtime, and localized failure messages",
