@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"syscall"
 )
 
 const redactedAgentCommandArg = "<redacted>"
@@ -107,7 +108,32 @@ func (c Command) Argv(args ...string) []string {
 // reintroduce GH #7046. TestOnlyLaunchGoSpawnsRuntimeProcesses enforces it.
 func (c Command) exec(ctx context.Context, args ...string) *exec.Cmd {
 	warnLaunchPrefixOverlap(c.Prefix, args, c.logger)
-	return exec.CommandContext(ctx, c.Path, c.Argv(args...)...)
+	return newRuntimeCmd(exec.CommandContext(ctx, c.Path, c.Argv(args...)...))
+}
+
+// newRuntimeCmd applies the process-lifecycle defaults every runtime process in
+// this package gets. It runs at construction because both of them have to be in
+// place before the process exists.
+//
+// Both used to be opt-in, and opt-in is why GH #7522 happened. Of the 27 places
+// this package starts a process, 8 asked for a process group; the rest left
+// their CLI in the daemon's group, where a group-wide signal cannot reach it.
+// os/exec's default Cancel is the same leak by another route: it kills the
+// leader alone, so a cancelled task's tool subprocesses — MCP servers, shells,
+// whatever the agent spawned — survive it. On Linux that was #5918. On Windows,
+// where the leader is often a cmd.exe shim and the real CLI is already a
+// grandchild, a cancelled agent kept working for 40 minutes.
+//
+// A backend that wants a graceful shutdown instead of an immediate kill assigns
+// its own cmd.Cancel after construction and wins; claude, dsh and deveco do,
+// because they drive SIGTERM → grace → SIGKILL themselves.
+func newRuntimeCmd(cmd *exec.Cmd) *exec.Cmd {
+	configureProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		signalProcessGroup(cmd, syscall.SIGKILL)
+		return nil
+	}
+	return cmd
 }
 
 // invocationChooser is the shape of the per-tool platform launch rewrites
@@ -127,7 +153,7 @@ type invocationChooser func(execName, lookedUp string, args []string, logger *sl
 func (c Command) execVia(ctx context.Context, choose invocationChooser, lookedUp string, args []string, logger *slog.Logger) (*exec.Cmd, string, []string) {
 	warnLaunchPrefixOverlap(c.Prefix, args, logger)
 	argv0, cmdArgs := choose(c.Path, lookedUp, c.Argv(args...), logger)
-	return exec.CommandContext(ctx, argv0, cmdArgs...), argv0, cmdArgs
+	return newRuntimeCmd(exec.CommandContext(ctx, argv0, cmdArgs...)), argv0, cmdArgs
 }
 
 // withFilteredPrefix returns a copy of the command whose prefix has been

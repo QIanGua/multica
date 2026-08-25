@@ -44,8 +44,8 @@ func hideAgentWindow(cmd *exec.Cmd) {
 
 // configureProcessGroup is a no-op on Windows: there is no Setpgid equivalent,
 // and job membership cannot be requested before the process exists. Ownership
-// is taken by startOwnedProcessTree instead, which a backend opts into by
-// calling it in place of cmd.Start.
+// is taken by startOwnedProcessTree instead, which every backend reaches
+// because it is the only way this package starts a runtime process.
 func configureProcessGroup(cmd *exec.Cmd) {}
 
 // ownedProcessTree is the Windows equivalent of a Unix process group: a Job
@@ -78,8 +78,9 @@ type jobObjectBasicAccountingInformation struct {
 }
 
 // startOwnedProcessTree starts cmd and takes ownership of every process it goes
-// on to create. Backends that need whole-tree cleanup call this instead of
-// cmd.Start.
+// on to create. It is the only way this package starts a runtime process;
+// TestOnlyOwnedProcessTreesAreStarted keeps a new backend from reaching for
+// cmd.Start and quietly reintroducing GH #7522.
 //
 // The child is created suspended and assigned to a Job Object before it runs.
 // That ordering is the whole point: Windows grants membership only to processes

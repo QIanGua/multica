@@ -384,6 +384,124 @@ func TestOnlyLaunchGoSpawnsRuntimeProcesses(t *testing.T) {
 	}
 }
 
+// TestOnlyOwnedProcessTreesAreStarted is the structural half of GH #7522.
+//
+// Whole-tree ownership shipped as an opt-in each backend had to remember, and
+// it rotted exactly the way distributed opt-in always does here: of the 23
+// backends in this package, 3 called startOwnedProcessTree and 20 called
+// cmd.Start. On Windows those 20 own nothing, so cancelling a task kills the
+// direct child — often a cmd.exe shim — and leaves the real CLI running. One of
+// them kept working for forty minutes after it was cancelled.
+//
+// Fixing the reported backend alone would have left 19. So the rule is
+// mechanical instead: startOwnedProcessTree is the only way this package starts
+// a runtime process, and a new backend that reaches for cmd.Start fails here.
+//
+// The exemptions are the two platform implementations of that function, which
+// is where the real Start lives.
+func TestOnlyOwnedProcessTreesAreStarted(t *testing.T) {
+	t.Parallel()
+
+	var offenders []string
+	forEachPackageFile(t, func(name string, fset *token.FileSet, file *ast.File) {
+		if strings.HasPrefix(name, "proc_") {
+			return
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Start" || len(call.Args) != 0 {
+				return true
+			}
+			offenders = append(offenders, fset.Position(call.Pos()).String())
+			return true
+		})
+	})
+
+	if len(offenders) > 0 {
+		t.Fatalf("runtime processes must be started through startOwnedProcessTree, otherwise "+
+			"cancelling a task leaves the CLI's descendants running (GH #7522). Offending sites:\n%s",
+			strings.Join(offenders, "\n"))
+	}
+}
+
+// TestEveryOwnedProcessTreeIsReleased is the other half of the same invariant.
+// Taking ownership without dropping it leaks a Job Object handle per task on
+// Windows, and the release is also what kills whatever outlived the reap — so a
+// backend that starts an owned tree and never releases it is worse off than one
+// that owns nothing.
+//
+// The check is per file rather than per launch because that is the granularity
+// a reviewer can act on: the pairing lives inside one backend's Execute and its
+// result goroutine.
+func TestEveryOwnedProcessTreeIsReleased(t *testing.T) {
+	t.Parallel()
+
+	var offenders []string
+	forEachPackageFile(t, func(name string, fset *token.FileSet, file *ast.File) {
+		if strings.HasPrefix(name, "proc_") {
+			return
+		}
+		starts, releases := 0, 0
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			ident, ok := call.Fun.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			switch ident.Name {
+			case "startOwnedProcessTree":
+				starts++
+			case "releaseProcessGroup":
+				releases++
+			}
+			return true
+		})
+		if starts > 0 && releases == 0 {
+			offenders = append(offenders, name)
+		}
+	})
+
+	if len(offenders) > 0 {
+		t.Fatalf("these files start an owned process tree but never call releaseProcessGroup, "+
+			"which leaks the Windows Job Object handle and skips the final kill of anything that "+
+			"outlived the reap: %s", strings.Join(offenders, ", "))
+	}
+}
+
+// forEachPackageFile parses every non-test source file in this package and
+// hands it to fn.
+func forEachPackageFile(t *testing.T, fn func(name string, fset *token.FileSet, file *ast.File)) {
+	t.Helper()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		file, err := parser.ParseFile(fset, name, src, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		fn(name, fset, file)
+	}
+}
+
 func containsRuntimeArgReference(expr ast.Expr) bool {
 	found := false
 	ast.Inspect(expr, func(n ast.Node) bool {
