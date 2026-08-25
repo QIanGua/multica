@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const redactedAgentCommandArg = "<redacted>"
@@ -148,14 +149,38 @@ func newRuntimeCmd(cmd *exec.Cmd) *exec.Cmd {
 // leaving grandchildren behind. These three helpers are how a synchronous probe
 // gets the same ownership a task launch has.
 func runOwned(cmd *exec.Cmd, logger *slog.Logger) error {
+	// Without a bound this waits for its own cleanup and never returns. A
+	// descendant that inherited the output pipes holds them open after the
+	// leader exits; cmd.Wait blocks until the copy goroutines see EOF; and the
+	// thing that would close those pipes is the release below, which runs
+	// after Wait. WaitDelay is defined for exactly this case — "a child
+	// process that exits but leaves its I/O pipes unclosed" — and cancellation
+	// is no help, because a probe like checkOpenclawVersion runs on the
+	// caller's context before any task timeout exists.
+	//
+	// A caller that set its own bound keeps it; detectCLIVersion has had one
+	// since MUL-3812 for this exact shape.
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = probeWaitDelay
+	}
 	if err := startOwnedProcessTree(cmd, logger); err != nil {
 		return err
 	}
-	// Release after the reap, which on Windows closes the Job Object and takes
-	// any surviving descendant with it.
-	defer releaseProcessGroup(cmd)
-	return cmd.Wait()
+	err := cmd.Wait()
+	// The probe is over the moment its leader is: nothing it spawned should
+	// outlive the answer. Signalling before the release covers Unix, where
+	// releasing a process group is a no-op; on Windows closing the Job Object
+	// would take the tree down on its own.
+	signalProcessGroup(cmd, syscall.SIGKILL)
+	releaseProcessGroup(cmd)
+	return err
 }
+
+// probeWaitDelay bounds how long a finished probe waits on output pipes its
+// descendants left open. It matches the bound detectCLIVersion already sets by
+// hand. The timer only starts once the child has exited or the context is
+// done, so a healthy probe never pays it.
+const probeWaitDelay = 2 * time.Second
 
 // outputOwned is cmd.Output() over an owned process tree. It matches the
 // stdlib's contract — stdout returned, a failed run's stderr attached to the

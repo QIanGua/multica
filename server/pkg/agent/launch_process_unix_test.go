@@ -152,3 +152,51 @@ exit 3
 		}
 	}
 }
+
+// TestProbeReturnsWhenLeaderExitsHoldingPipes is the normal-exit counterpart to
+// the cancellation tests: nobody cancels anything here.
+//
+// The fake exits straight away but leaves a descendant holding the stdout and
+// stderr write ends. cmd.Wait() cannot return until those close, and on Windows
+// what closes them is releaseProcessGroup — which runs after Wait. A probe that
+// waits for its own cleanup never returns, and checkOpenclawVersion runs on the
+// caller's context before any task timeout exists, so the task would hang until
+// someone cancelled it by hand.
+func TestProbeReturnsWhenLeaderExitsHoldingPipes(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	pidFile := filepath.Join(tempDir, "pids")
+	fakePath := filepath.Join(tempDir, "wrapper")
+	// The descendant inherits stdout/stderr on purpose — that is what holds the
+	// pipe open after the leader is gone.
+	writeTestExecutable(t, fakePath, []byte("#!/bin/sh\n"+
+		`( sleep 300 ) &
+printf '%s %s\n' "$$" "$!" > "$1"
+printf 'v1.2.3\n'
+exit 0
+`))
+
+	done := make(chan []byte, 1)
+	go func() {
+		out, _ := outputOwned(NewCommand(fakePath, nil).exec(context.Background(), pidFile), slog.Default())
+		done <- out
+	}()
+
+	pids := waitForPids(t, pidFile)
+
+	select {
+	case out := <-done:
+		if string(out) != "v1.2.3\n" {
+			t.Errorf("stdout = %q, want the version line", out)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("outputOwned never returned: the leader exited, but Wait is still waiting for a pipe " +
+			"that only releaseProcessGroup can close, and releaseProcessGroup runs after Wait")
+	}
+
+	// Nothing the probe spawned may outlive the answer.
+	for _, pid := range pids {
+		waitProcessGone(t, pid)
+	}
+}
