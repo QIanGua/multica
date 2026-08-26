@@ -229,33 +229,60 @@ func (h *Handler) invokeOriginatorFromRequest(r *http.Request, actorType, actorI
 // against, so an unattributed autopilot run can only borrow authority for work
 // it is verifiably doing itself (MUL-6691).
 //
-// Exactly one of the two fields is meaningful, and the zero value grants
-// nothing — a caller that supplies no scope keeps the pre-MUL-4857 behavior of
-// "real originator or deny", which is what the member-only entry points want.
+// Exactly which shape the caller vouched for decides what may be borrowed, so
+// the kinds are distinct rather than a single "some issue" pointer. The zero
+// value grants nothing — a caller that supplies no scope keeps the pre-MUL-4857
+// behavior of "real originator or deny", which is what the member-only entry
+// points want.
 type assignAuthorityScope struct {
 	// Issue is the already-loaded issue the assignment binds to: the PARENT for
-	// child creation, the issue ITSELF for an update. Its workspace must match
-	// the request's, and the speaking run must be verifiably attached to it
-	// (issueBoundToAutopilotTask) before any authority is borrowed.
+	// scopeKindChildOf, the issue ITSELF for scopeKindExistingIssue. Its
+	// workspace must match the request's, and the speaking run must be
+	// verifiably attached to it (issueBoundToAutopilotTask) before any authority
+	// is borrowed.
 	Issue *db.Issue
 
-	// NewTopLevelIssue marks the single case with no issue to bind to at all: a
-	// run_only autopilot leader creating its first, parentless issue (the
-	// reported MUL-6691 / GH #7563 flow). The binding then falls back to the
-	// verified autopilot RUN the speaking task belongs to.
-	NewTopLevelIssue bool
+	Kind assignScopeKind
 }
 
-// scopeBoundToIssue binds the assignment to an existing issue. A nil issue
-// yields the empty scope, which grants nothing.
-func scopeBoundToIssue(issue *db.Issue) assignAuthorityScope {
-	return assignAuthorityScope{Issue: issue}
+// assignScopeKind distinguishes the assignment shapes, because they do NOT admit
+// the same fallbacks: only child creation — the surface MUL-4857 already shipped
+// — may fall back to the coarse autopilot-creator authority.
+type assignScopeKind int
+
+const (
+	// scopeKindNone: no autopilot authority may be borrowed at all.
+	scopeKindNone assignScopeKind = iota
+	// scopeKindChildOf: creating a child under Issue.
+	scopeKindChildOf
+	// scopeKindExistingIssue: assigning Issue itself.
+	scopeKindExistingIssue
+	// scopeKindNewTopLevelIssue: creating a parentless issue, which does not
+	// exist yet, so the binding is the speaking task's own autopilot run.
+	scopeKindNewTopLevelIssue
+)
+
+// scopeChildOf binds the assignment to the parent a child is being created
+// under. A nil parent yields the empty scope, which grants nothing.
+func scopeChildOf(parent *db.Issue) assignAuthorityScope {
+	if parent == nil {
+		return assignAuthorityScope{}
+	}
+	return assignAuthorityScope{Issue: parent, Kind: scopeKindChildOf}
+}
+
+// scopeExistingIssue binds the assignment to the issue being updated.
+func scopeExistingIssue(issue *db.Issue) assignAuthorityScope {
+	if issue == nil {
+		return assignAuthorityScope{}
+	}
+	return assignAuthorityScope{Issue: issue, Kind: scopeKindExistingIssue}
 }
 
 // scopeNewTopLevelIssue marks a create with no parent, where the issue being
 // assigned does not exist yet.
 func scopeNewTopLevelIssue() assignAuthorityScope {
-	return assignAuthorityScope{NewTopLevelIssue: true}
+	return assignAuthorityScope{Kind: scopeKindNewTopLevelIssue}
 }
 
 // scopeNoDelegation disables the autopilot fallback entirely — for entry points
@@ -283,28 +310,33 @@ func (h *Handler) effectiveInvocationAuthorityFromRequest(r *http.Request, scope
 //     precise, already recorded on the task row, and available for both
 //     autopilot execution modes;
 //  2. the autopilot's member creator (autopilotDelegationAuthority, MUL-4857) —
-//     the coarser pre-existing rule, kept as a fallback so a leader task that
-//     predates attribution stamping does not lose the child-creation path it
-//     has today.
+//     the coarser pre-existing rule, kept ONLY where it already shipped: child
+//     creation under an `origin_type=autopilot` issue, so a leader task that
+//     predates attribution stamping does not lose the path it has today.
 //
-// Both require the SAME issue binding; (2) additionally only ever applies to an
-// `origin_type=autopilot` issue. Neither can be reached with a scope the caller
-// did not vouch for, and neither changes attribution.
+// (2) is deliberately NOT available to the newly-wired surfaces. It performs no
+// liveness or attribution check of its own, so extending it to the assign verb
+// would have let a completed task, an `owner_fallback` task, or a task with no
+// attribution at all assign private agents whenever the autopilot's creator
+// happened to have rights — a strictly wider grant than this fix needs. The
+// request path additionally requires the speaking task to still be `running`;
+// the comment-replay resolvers keep their own semantics and are untouched.
 func (h *Handler) autopilotAssignAuthorityFromRequest(r *http.Request, scope assignAuthorityScope, actorType, actorID, workspaceID string) string {
-	if actorType != "agent" {
-		return ""
-	}
-	if scope.Issue == nil && !scope.NewTopLevelIssue {
+	if actorType != "agent" || scope.Kind == scopeKindNone {
 		return ""
 	}
 	task, ok := h.taskFromRequestHeader(r)
 	if !ok {
 		return ""
 	}
+	// A finished run never lends authority over HTTP, on either branch below.
+	if task.Status != "running" {
+		return ""
+	}
 	if user := h.autopilotTaskAssignAuthority(r.Context(), scope, actorType, actorID, workspaceID, task); user != "" {
 		return user
 	}
-	if scope.Issue == nil {
+	if scope.Kind != scopeKindChildOf || scope.Issue == nil {
 		return ""
 	}
 	return h.autopilotDelegationAuthority(r.Context(), *scope.Issue, actorType, actorID, task)
@@ -338,7 +370,9 @@ func (h *Handler) autopilotAssignAuthorityFromRequest(r *http.Request, scope ass
 //     white-list bypass canInvokeAgent exists to prevent. `delegation` is
 //     excluded too, so authority does not propagate to descendant runs;
 //   - the assignment is bound to work this run verifiably owns —
-//     issueBoundToAutopilotTask for an existing issue, or the task's own
+//     issueBoundToAutopilotTask for an existing issue (which for a run_only-created
+//     issue re-proves the run_only lineage, so a create_issue task cannot escape
+//     its same-issue bound via a fresh top-level issue), or the task's own
 //     verified autopilot run when creating a parentless issue;
 //   - the issue (when there is one) is in the request's workspace;
 //   - the accountable human is STILL a member of that workspace.
@@ -368,15 +402,18 @@ func (h *Handler) autopilotTaskAssignAuthority(ctx context.Context, scope assign
 		return ""
 	}
 
-	switch {
-	case scope.Issue != nil:
+	switch scope.Kind {
+	case scopeKindChildOf, scopeKindExistingIssue:
+		if scope.Issue == nil {
+			return ""
+		}
 		if uuidToString(scope.Issue.WorkspaceID) != workspaceID {
 			return ""
 		}
-		if !issueBoundToAutopilotTask(*scope.Issue, task) {
+		if !h.issueBoundToAutopilotTask(ctx, *scope.Issue, task, workspaceID) {
 			return ""
 		}
-	case scope.NewTopLevelIssue:
+	case scopeKindNewTopLevelIssue:
 		if !h.taskRunsAutopilotInWorkspace(ctx, task, workspaceID) {
 			return ""
 		}
@@ -404,14 +441,19 @@ func (h *Handler) autopilotTaskAssignAuthority(ctx context.Context, scope assign
 //     the exact MUL-4857 binding.
 //   - run_only: no autopilot issue exists, so the binding is authorship. The
 //     issue was created by THIS task, which CreateIssue records as
-//     origin_type=agent_create + origin_id=<creating task id> (MUL-4305). Using
-//     the task id rather than the autopilot id also stops two concurrent runs of
-//     the same autopilot from borrowing on each other's issues, and needs no
-//     migration or backfill.
+//     origin_type=agent_create + origin_id=<creating task id> (MUL-4305), AND the
+//     task must independently prove run_only lineage (its own autopilot run, in
+//     this workspace). Without that second half a create_issue-mode task could
+//     escape its `task.issue_id == issue.id` bound simply by creating a fresh
+//     top-level issue — which stamps its own task id — and then assigning that.
+//     Using the task id rather than the autopilot id also stops two concurrent
+//     runs of the same autopilot from borrowing on each other's issues, and needs
+//     no migration or backfill.
 //
 // A run_only leader therefore reaches only the issues it created (and, through
-// the parent scope, their children) — never a pre-existing or foreign issue.
-func issueBoundToAutopilotTask(issue db.Issue, task db.AgentTaskQueue) bool {
+// the child scope, their children) — never a pre-existing or foreign issue. A
+// create_issue leader reaches only the autopilot's own issue.
+func (h *Handler) issueBoundToAutopilotTask(ctx context.Context, issue db.Issue, task db.AgentTaskQueue, workspaceID string) bool {
 	if !issue.OriginType.Valid || !issue.OriginID.Valid || !issue.ID.Valid {
 		return false
 	}
@@ -419,17 +461,20 @@ func issueBoundToAutopilotTask(issue db.Issue, task db.AgentTaskQueue) bool {
 	case "autopilot":
 		return task.IssueID.Valid && uuidToString(task.IssueID) == uuidToString(issue.ID)
 	case "agent_create":
-		return task.ID.Valid && uuidToString(issue.OriginID) == uuidToString(task.ID)
+		if !task.ID.Valid || uuidToString(issue.OriginID) != uuidToString(task.ID) {
+			return false
+		}
+		return h.taskRunsAutopilotInWorkspace(ctx, task, workspaceID)
 	}
 	return false
 }
 
-// taskRunsAutopilotInWorkspace verifies the run_only lineage used when there is
-// no issue to bind to yet: the task must belong to an autopilot RUN whose
-// autopilot lives in the request's workspace. A create_issue-mode leader task
-// carries no autopilot_run_id (it is enqueued through the ordinary
-// issue-assignment path), so it never qualifies here and must go through the
-// issue binding instead.
+// taskRunsAutopilotInWorkspace verifies run_only lineage: the task must belong to
+// an autopilot RUN whose autopilot lives in the request's workspace. Used both
+// when there is no issue to bind to yet and when binding to a run_only-created
+// issue. A create_issue-mode leader task carries no autopilot_run_id (it is
+// enqueued through the ordinary issue-assignment path), so it never qualifies
+// here and must go through the `origin_type=autopilot` binding instead.
 func (h *Handler) taskRunsAutopilotInWorkspace(ctx context.Context, task db.AgentTaskQueue, workspaceID string) bool {
 	if !task.AutopilotRunID.Valid {
 		return false

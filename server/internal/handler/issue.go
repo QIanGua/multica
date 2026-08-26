@@ -2965,7 +2965,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	// verified, still-running run_only autopilot task may borrow there
 	// (MUL-6691 — the reported flow, where the leader creates DRA-109/DRA-110
 	// from scratch rather than under an autopilot-created issue).
-	assignScope := scopeBoundToIssue(parentIssue)
+	assignScope := scopeChildOf(parentIssue)
 	if req.ParentIssueID == nil {
 		assignScope = scopeNewTopLevelIssue()
 	}
@@ -3617,7 +3617,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	_, touchedType := rawFields["assignee_type"]
 	_, touchedID := rawFields["assignee_id"]
 	if touchedType || touchedID {
-		if status, msg := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID, scopeBoundToIssue(&prevIssue)); status != 0 {
+		if status, msg := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID, scopeExistingIssue(&prevIssue)); status != 0 {
 			writeError(w, status, msg)
 			return
 		}
@@ -4356,13 +4356,14 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		//
 		// Scoped PER ISSUE (prevIssue is this iteration's row), so one bound
 		// issue in the batch can never lend its authority to the others: an
-		// unbound entry simply fails the check and is skipped. Defence in depth
-		// — this endpoint requires an authenticated member (requireUserID
-		// above), so no agent run reaches it today (MUL-6691).
+		// unbound entry simply fails the check and is skipped. This IS a real
+		// agent-reachable authorization point — a task token authenticates as its
+		// bound workspace member, so requireUserID above is satisfied and
+		// resolveActor still classifies the caller as an agent (MUL-6691).
 		_, batchTouchedType := rawUpdates["assignee_type"]
 		_, batchTouchedID := rawUpdates["assignee_id"]
 		if batchTouchedType || batchTouchedID {
-			if status, _ := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID, scopeBoundToIssue(&prevIssue)); status != 0 {
+			if status, _ := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID, scopeExistingIssue(&prevIssue)); status != 0 {
 				continue
 			}
 		}
