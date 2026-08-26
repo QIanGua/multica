@@ -1583,15 +1583,20 @@ WHERE id = (
           WHERE a.id = atq.agent_id
             -- A task's persisted runtime is not authority after an agent rebind.
             AND a.runtime_id = atq.runtime_id
-            -- Private runtimes only execute their owner's agents. An ownerless
-            -- private runtime remains claimable only so the handler can cancel
-            -- it through the existing missing-owner path before daemon delivery.
+            -- Private runtimes only execute their owner's agents. Ownerless
+            -- runtime/agent rows remain claimable only so the handler can
+            -- settle them explicitly before daemon delivery; filtering them
+            -- here would leave every task silently queued until the TTL.
             -- Public runtimes remain shareable across agent owners.
             AND (
                 r.visibility = 'public'
                 OR (
                     r.visibility = 'private'
-                    AND (r.owner_id IS NULL OR r.owner_id = a.owner_id)
+                    AND (
+                        r.owner_id IS NULL
+                        OR a.owner_id IS NULL
+                        OR r.owner_id = a.owner_id
+                    )
                 )
             )
             AND r.status = 'online'
@@ -5809,6 +5814,7 @@ SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatc
 WHERE atq.runtime_id = $1
   AND atq.status = 'queued'
   AND EXISTS (
+      -- Keep this authorization fence in sync with ClaimAgentTask.
       SELECT 1
       FROM agent a
       JOIN agent_runtime r ON r.id = atq.runtime_id
@@ -5818,7 +5824,11 @@ WHERE atq.runtime_id = $1
             r.visibility = 'public'
             OR (
                 r.visibility = 'private'
-                AND (r.owner_id IS NULL OR r.owner_id = a.owner_id)
+                AND (
+                    r.owner_id IS NULL
+                    OR a.owner_id IS NULL
+                    OR r.owner_id = a.owner_id
+                )
             )
         )
   )
@@ -5913,6 +5923,7 @@ SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatc
 WHERE atq.runtime_id = ANY($1::uuid[])
   AND atq.status = 'queued'
   AND EXISTS (
+      -- Keep this authorization fence in sync with ClaimAgentTask.
       SELECT 1
       FROM agent a
       JOIN agent_runtime r ON r.id = atq.runtime_id
@@ -5922,7 +5933,11 @@ WHERE atq.runtime_id = ANY($1::uuid[])
             r.visibility = 'public'
             OR (
                 r.visibility = 'private'
-                AND (r.owner_id IS NULL OR r.owner_id = a.owner_id)
+                AND (
+                    r.owner_id IS NULL
+                    OR a.owner_id IS NULL
+                    OR r.owner_id = a.owner_id
+                )
             )
         )
   )
@@ -7314,6 +7329,7 @@ WHERE id = (
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
       AND EXISTS (
+          -- Keep this authorization fence in sync with ClaimAgentTask.
           SELECT 1
           FROM agent a
           JOIN agent_runtime r ON r.id = atq.runtime_id
@@ -7323,7 +7339,11 @@ WHERE id = (
                 r.visibility = 'public'
                 OR (
                     r.visibility = 'private'
-                    AND (r.owner_id IS NULL OR r.owner_id = a.owner_id)
+                    AND (
+                        r.owner_id IS NULL
+                        OR a.owner_id IS NULL
+                        OR r.owner_id = a.owner_id
+                    )
                 )
             )
             AND r.status = 'online'
@@ -7428,6 +7448,7 @@ WHERE id IN (
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
       AND EXISTS (
+          -- Keep this authorization fence in sync with ClaimAgentTask.
           SELECT 1
           FROM agent a
           JOIN agent_runtime r ON r.id = atq.runtime_id
@@ -7437,7 +7458,11 @@ WHERE id IN (
                 r.visibility = 'public'
                 OR (
                     r.visibility = 'private'
-                    AND (r.owner_id IS NULL OR r.owner_id = a.owner_id)
+                    AND (
+                        r.owner_id IS NULL
+                        OR a.owner_id IS NULL
+                        OR r.owner_id = a.owner_id
+                    )
                 )
             )
             AND r.status = 'online'

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -98,10 +99,12 @@ func TestRuntimeAccessGatesQueuedTaskClaims(t *testing.T) {
 		visibility      string
 		sameOwner       bool
 		matchingBinding bool
+		ownerlessAgent  bool
 		wantClaim       bool
 	}{
 		{name: "private runtime rejects foreign agent", visibility: "private", wantClaim: false, matchingBinding: true},
 		{name: "private runtime accepts owner agent", visibility: "private", sameOwner: true, matchingBinding: true, wantClaim: true},
+		{name: "private runtime routes ownerless agent to handler", visibility: "private", sameOwner: true, matchingBinding: true, ownerlessAgent: true, wantClaim: true},
 		{name: "public runtime accepts foreign agent", visibility: "public", wantClaim: true, matchingBinding: true},
 		{name: "task runtime must match agent binding", visibility: "public", wantClaim: false, matchingBinding: false},
 	}
@@ -109,6 +112,11 @@ func TestRuntimeAccessGatesQueuedTaskClaims(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fixture := newRuntimeClaimAccessFixture(t, tt.visibility, tt.sameOwner, tt.matchingBinding, "queued")
+			if tt.ownerlessAgent {
+				if _, err := fixture.pool.Exec(ctx, `UPDATE agent SET owner_id = NULL WHERE id = $1`, fixture.agentID); err != nil {
+					t.Fatalf("clear agent owner: %v", err)
+				}
+			}
 			q := db.New(fixture.pool)
 
 			candidates, err := q.ListQueuedClaimCandidatesByRuntime(ctx, fixture.runtimeID)
@@ -167,10 +175,12 @@ func TestRuntimeAccessGatesStaleDispatchReclaim(t *testing.T) {
 		visibility      string
 		sameOwner       bool
 		matchingBinding bool
+		ownerlessAgent  bool
 		wantReclaim     bool
 	}{
 		{name: "private runtime rejects foreign agent", visibility: "private", wantReclaim: false, matchingBinding: true},
 		{name: "private runtime accepts owner agent", visibility: "private", sameOwner: true, matchingBinding: true, wantReclaim: true},
+		{name: "private runtime routes ownerless agent to handler", visibility: "private", sameOwner: true, matchingBinding: true, ownerlessAgent: true, wantReclaim: true},
 		{name: "public runtime accepts foreign agent", visibility: "public", wantReclaim: true, matchingBinding: true},
 		{name: "task runtime must match agent binding", visibility: "public", wantReclaim: false, matchingBinding: false},
 	}
@@ -178,6 +188,11 @@ func TestRuntimeAccessGatesStaleDispatchReclaim(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fixture := newRuntimeClaimAccessFixture(t, tt.visibility, tt.sameOwner, tt.matchingBinding, "dispatched")
+			if tt.ownerlessAgent {
+				if _, err := fixture.pool.Exec(ctx, `UPDATE agent SET owner_id = NULL WHERE id = $1`, fixture.agentID); err != nil {
+					t.Fatalf("clear agent owner: %v", err)
+				}
+			}
 			q := db.New(fixture.pool)
 			params := db.ReclaimStaleDispatchedTaskForRuntimeParams{
 				RuntimeID:         fixture.runtimeID,
@@ -232,7 +247,7 @@ func TestRuntimeAccessGatesStaleDispatchReclaim(t *testing.T) {
 func TestClaimTaskRejectsMismatchedAgentRuntime(t *testing.T) {
 	ctx := context.Background()
 	fixture := newRuntimeClaimAccessFixture(t, "public", false, false, "queued")
-	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, nil)
+	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, events.New())
 
 	claimed, err := svc.claimTask(ctx, fixture.agentID, fixture.runtimeID)
 	if err != nil {
@@ -248,5 +263,22 @@ func TestClaimTaskRejectsMismatchedAgentRuntime(t *testing.T) {
 	}
 	if status != "queued" {
 		t.Fatalf("task status = %q, want queued", status)
+	}
+}
+
+func TestClaimTaskUsesCurrentAgentRuntimeWhenRuntimeIDIsOmitted(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRuntimeClaimAccessFixture(t, "public", true, true, "queued")
+	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, events.New())
+
+	claimed, err := svc.ClaimTask(ctx, fixture.agentID)
+	if err != nil {
+		t.Fatalf("claim task: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("ClaimTask returned nil, want task from the agent's current runtime")
+	}
+	if util.UUIDToString(claimed.ID) != fixture.taskID {
+		t.Fatalf("claimed task = %s, want %s", util.UUIDToString(claimed.ID), fixture.taskID)
 	}
 }
