@@ -127,7 +127,25 @@ func (h *Handler) consumeInvitationAdmission(r *http.Request, admission *invitat
 	if admission == nil {
 		return
 	}
+	h.consumeInvitationGates(r, admission.gates)
+}
+
+// consumeInvitationActorAdmission charges persistent capacity-full retries to
+// the caller without spending the shared workspace or recipient email budgets.
+func (h *Handler) consumeInvitationActorAdmission(r *http.Request, admission *invitationAdmission) {
+	if admission == nil {
+		return
+	}
 	for _, gate := range admission.gates {
+		if gate.name == "actor" {
+			h.consumeInvitationGates(r, []invitationRateLimitGate{gate})
+			return
+		}
+	}
+}
+
+func (h *Handler) consumeInvitationGates(r *http.Request, gates []invitationRateLimitGate) {
+	for _, gate := range gates {
 		allowed, err := slidingWindowLimiterAllow(r.Context(), gate.limiter, gate.key)
 		if err != nil {
 			// All gates passed the non-consuming checks, so this failure began in

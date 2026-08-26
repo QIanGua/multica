@@ -277,7 +277,10 @@ func IsCapacityOvercommitted(err error) bool {
 
 func IsRateLimited(err error) bool {
 	var remote *HTTPError
-	return errors.As(err, &remote) && remote.StatusCode == http.StatusTooManyRequests && remote.Code == "capacity_rate_limited"
+	// A proxy, ingress, or WAF may generate the 429 before the request reaches
+	// Cloud and therefore cannot attach Cloud's JSON error code. HTTP 429 is
+	// sufficient to preserve the retryable semantics and Retry-After value.
+	return errors.As(err, &remote) && remote.StatusCode == http.StatusTooManyRequests
 }
 
 func RateLimitRetryAfter(err error) time.Duration {
@@ -289,9 +292,25 @@ func RateLimitRetryAfter(err error) time.Duration {
 }
 
 func retryAfterDuration(value string) time.Duration {
-	seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-	if err != nil || seconds < 1 {
+	return retryAfterDurationAt(value, time.Now())
+}
+
+func retryAfterDurationAt(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err == nil {
+		if seconds < 1 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	retryAt, err := http.ParseTime(value)
+	if err != nil {
 		return 0
 	}
-	return time.Duration(seconds) * time.Second
+	delay := retryAt.Sub(now)
+	if delay <= 0 {
+		return 0
+	}
+	return delay
 }

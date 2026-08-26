@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -148,6 +149,13 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 	invitationID := uuid.New()
 	expiresAt := time.Now().Add(7 * 24 * time.Hour)
 	if err := h.reserveInvitationCapacity(r.Context(), uuid.UUID(requester.WorkspaceID.Bytes), invitationID, expiresAt); err != nil {
+		if errors.Is(err, errSeatCapacityFull) {
+			// A full workspace is persistent until seats are purchased. Charge
+			// repeated attempts to the actor budget so this endpoint cannot be
+			// used to hammer the capacity service, while preserving workspace and
+			// recipient budgets for the post-purchase invitation.
+			h.consumeInvitationActorAdmission(r, admission)
+		}
 		writeSeatCapacityError(w, err)
 		return
 	}

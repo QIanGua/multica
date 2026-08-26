@@ -245,11 +245,14 @@ func TestCreateInvitation_BlocksWhenPurchasedCapacityIsFull(t *testing.T) {
 			t.Errorf("%s = %d, want 1", name, calls)
 		}
 	}
+	if calls := len(actor.allowKeys); calls != 1 {
+		t.Errorf("actor allows = %d, want 1 when persistent capacity_full is rejected", calls)
+	}
 	for name, calls := range map[string]int{
-		"actor allows": len(actor.allowKeys), "workspace allows": len(workspace.allowKeys), "recipient allows": len(recipient.allowKeys),
+		"workspace allows": len(workspace.allowKeys), "recipient allows": len(recipient.allowKeys),
 	} {
 		if calls != 0 {
-			t.Errorf("%s = %d, want 0 when Cloud rejects capacity", name, calls)
+			t.Errorf("%s = %d, want 0 so a later purchased-seat invitation keeps shared budget", name, calls)
 		}
 	}
 	var invitationCount, outboxCount int
@@ -303,7 +306,6 @@ func TestCreateInvitation_MapsCloudCapacityRateLimitWithoutConsumingInvitationBu
 	}
 	capacity := &stubSeatCapacity{reserveErr: &seatcapacity.HTTPError{
 		StatusCode: http.StatusTooManyRequests,
-		Code:       "capacity_rate_limited",
 		RetryAfter: 3 * time.Second,
 	}}
 	useSeatCapacity(t, capacity)

@@ -342,6 +342,24 @@ func strictPositiveDurationEnv(name string, fallback time.Duration) (time.Durati
 	return value, nil
 }
 
+func seatCapacityExecutorFromEnv(cloudURL string) seatcapacity.Executor {
+	executor, err := seatcapacity.New(seatcapacity.Config{
+		BaseURL:      cloudURL,
+		ServiceToken: os.Getenv("MULTICA_SUBSCRIPTION_CAPACITY_SERVICE_TOKEN"),
+		Timeout:      envDuration("MULTICA_SUBSCRIPTION_CAPACITY_TIMEOUT", 3*time.Second),
+	})
+	if err == nil {
+		return executor
+	}
+	// A Cloud-connected deployment with malformed credentials must not
+	// silently restore unlimited membership. The fail-closed executor returns
+	// 503 until the operator repairs the machine credential; it is deliberately
+	// ineligible for recovery-worker startup so queued intents keep their retry
+	// budget while configuration is broken.
+	slog.Error("subscription seat capacity executor unavailable", "error", err)
+	return seatcapacity.NewUnavailable(err)
+}
+
 // NewRouterWithOptions builds the fully-configured Chi router and
 // returns the *handler.Handler it was constructed from. Callers that
 // need to drive background lifecycle on services attached to the
@@ -424,20 +442,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// Cloud Runtime and strict seat capacity are one managed deployment. Reuse
 	// the same base URL so Billing cannot be readable while invitation writes
 	// silently skip Cloud's authoritative seat policy.
-	capacityClient, capacityErr := seatcapacity.New(seatcapacity.Config{
-		BaseURL:      signupConfig.CloudURL,
-		ServiceToken: os.Getenv("MULTICA_SUBSCRIPTION_CAPACITY_SERVICE_TOKEN"),
-		Timeout:      envDuration("MULTICA_SUBSCRIPTION_CAPACITY_TIMEOUT", 3*time.Second),
-	})
-	if capacityErr != nil {
-		// A Cloud-connected deployment with malformed credentials must not
-		// silently restore unlimited membership. The fail-closed executor returns
-		// 503 until the operator repairs the machine credential.
-		slog.Error("subscription seat capacity executor unavailable", "error", capacityErr)
-		h.SeatCapacity = seatcapacity.NewUnavailable(capacityErr)
-	} else {
-		h.SeatCapacity = capacityClient
-	}
+	h.SeatCapacity = seatCapacityExecutorFromEnv(signupConfig.CloudURL)
 	capacityLocker := seatcapacity.NewWorkspaceLocker(pool)
 	h.SeatCapacityLocker = capacityLocker
 	if seatcapacity.CanRunWorker(h.SeatCapacity) {

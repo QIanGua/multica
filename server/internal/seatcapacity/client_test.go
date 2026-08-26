@@ -78,7 +78,8 @@ func TestClientPreservesCapacityRateLimit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "3")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"code":"capacity_rate_limited","error":"capacity service rate limit exceeded"}`))
+		// Simulate a proxy-generated response with no Cloud JSON error code.
+		_, _ = w.Write([]byte(`rate limited by ingress`))
 	}))
 	defer server.Close()
 
@@ -92,6 +93,14 @@ func TestClientPreservesCapacityRateLimit(t *testing.T) {
 	}
 	if retry := RateLimitRetryAfter(err); retry != 3*time.Second {
 		t.Fatalf("retry after = %s, want 3s", retry)
+	}
+}
+
+func TestRetryAfterDurationAcceptsHTTPDate(t *testing.T) {
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	retryAt := now.Add(7 * time.Second)
+	if got := retryAfterDurationAt(retryAt.Format(http.TimeFormat), now); got != 7*time.Second {
+		t.Fatalf("retry after = %s, want 7s", got)
 	}
 }
 
