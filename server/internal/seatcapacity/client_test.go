@@ -94,6 +94,27 @@ func TestClientPreservesCapacityRateLimit(t *testing.T) {
 	if retry := RateLimitRetryAfter(err); retry != 3*time.Second {
 		t.Fatalf("retry after = %s, want 3s", retry)
 	}
+	if scope := RateLimitScopeOf(err); scope != "" {
+		t.Fatalf("proxy rate-limit scope = %q, want unknown", scope)
+	}
+}
+
+func TestClientPreservesCloudWorkspaceRateLimitScope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.Header().Set(rateLimitScopeHeader, RateLimitScopeWorkspace)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	client, err := New(Config{BaseURL: server.URL, ServiceToken: strings.Repeat("s", 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ReserveInvitation(context.Background(), uuid.New(), uuid.New(), time.Now().Add(time.Hour))
+	if scope := RateLimitScopeOf(err); scope != RateLimitScopeWorkspace {
+		t.Fatalf("rate-limit scope = %q, want %q", scope, RateLimitScopeWorkspace)
+	}
 }
 
 func TestRetryAfterDurationAcceptsHTTPDate(t *testing.T) {

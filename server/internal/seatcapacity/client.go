@@ -19,10 +19,14 @@ import (
 )
 
 const (
-	defaultTimeout      = 3 * time.Second
-	maxTimeout          = 5 * time.Second
-	maxResponseBodySize = 64 << 10
-	minServiceTokenSize = 32
+	defaultTimeout       = 3 * time.Second
+	maxTimeout           = 5 * time.Second
+	maxResponseBodySize  = 64 << 10
+	minServiceTokenSize  = 32
+	rateLimitScopeHeader = "X-Multica-RateLimit-Scope"
+
+	RateLimitScopeGlobal    = "global"
+	RateLimitScopeWorkspace = "workspace"
 )
 
 var ErrInvalidConfig = errors.New("seat capacity: invalid configuration")
@@ -59,6 +63,11 @@ type Decision struct {
 }
 
 type Executor interface {
+	// RecoveryAvailable reports whether this executor may settle durable
+	// product-side intents. Implementations and decorators must forward this
+	// capability explicitly, so an unavailable executor cannot be hidden by a
+	// wrapper and accidentally start the recovery worker.
+	RecoveryAvailable() bool
 	ReserveInvitation(context.Context, uuid.UUID, uuid.UUID, time.Time) (Decision, error)
 	ClaimShareJoin(context.Context, uuid.UUID, uuid.UUID) (Decision, error)
 	Consume(context.Context, uuid.UUID, uuid.UUID) (Decision, error)
@@ -75,15 +84,11 @@ type unavailableExecutor struct{ err error }
 func NewUnavailable(err error) Executor { return &unavailableExecutor{err: err} }
 
 // CanRunWorker reports whether executor can safely settle durable intents.
-// The unavailable executor must remain installed on request paths so admission
-// fails closed, but a recovery worker using it would only burn retry budgets.
 func CanRunWorker(executor Executor) bool {
-	if executor == nil {
-		return false
-	}
-	_, unavailable := executor.(*unavailableExecutor)
-	return !unavailable
+	return executor != nil && executor.RecoveryAvailable()
 }
+
+func (*unavailableExecutor) RecoveryAvailable() bool { return false }
 
 func (u *unavailableExecutor) fail() (Decision, error) {
 	return Decision{}, fmt.Errorf("seat capacity executor unavailable: %w", u.err)
@@ -118,6 +123,8 @@ type Client struct {
 }
 
 var _ Executor = (*Client)(nil)
+
+func (*Client) RecoveryAvailable() bool { return true }
 
 func New(cfg Config) (Executor, error) {
 	rawURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
@@ -238,10 +245,11 @@ func (c *Client) do(ctx context.Context, method string, workspaceID uuid.UUID, s
 		}
 		_ = json.Unmarshal(payload, &remote)
 		return Decision{}, &HTTPError{
-			StatusCode: resp.StatusCode,
-			Code:       remote.Code,
-			Message:    remote.Error,
-			RetryAfter: retryAfterDuration(resp.Header.Get("Retry-After")),
+			StatusCode:     resp.StatusCode,
+			Code:           remote.Code,
+			Message:        remote.Error,
+			RetryAfter:     retryAfterDuration(resp.Header.Get("Retry-After")),
+			RateLimitScope: normalizedRateLimitScope(resp.Header.Get(rateLimitScopeHeader)),
 		}
 	}
 	var out Decision
@@ -252,10 +260,11 @@ func (c *Client) do(ctx context.Context, method string, workspaceID uuid.UUID, s
 }
 
 type HTTPError struct {
-	StatusCode int
-	Code       string
-	Message    string
-	RetryAfter time.Duration
+	StatusCode     int
+	Code           string
+	Message        string
+	RetryAfter     time.Duration
+	RateLimitScope string
 }
 
 func (e *HTTPError) Error() string {
@@ -289,6 +298,27 @@ func RateLimitRetryAfter(err error) time.Duration {
 		return 0
 	}
 	return remote.RetryAfter
+}
+
+// RateLimitScopeOf returns a trusted Cloud scope hint. Proxy-generated 429s
+// normally have no scope and remain conservatively global to the caller.
+func RateLimitScopeOf(err error) string {
+	var remote *HTTPError
+	if !errors.As(err, &remote) || !IsRateLimited(remote) {
+		return ""
+	}
+	return normalizedRateLimitScope(remote.RateLimitScope)
+}
+
+func normalizedRateLimitScope(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case RateLimitScopeGlobal:
+		return RateLimitScopeGlobal
+	case RateLimitScopeWorkspace:
+		return RateLimitScopeWorkspace
+	default:
+		return ""
+	}
 }
 
 func retryAfterDuration(value string) time.Duration {

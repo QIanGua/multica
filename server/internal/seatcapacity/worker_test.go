@@ -15,10 +15,13 @@ import (
 )
 
 type workerTestExecutor struct {
-	decision Decision
-	err      error
-	confirms int
+	decision          Decision
+	err               error
+	errorsByWorkspace map[uuid.UUID]error
+	confirmWorkspaces []uuid.UUID
 }
+
+func (*workerTestExecutor) RecoveryAvailable() bool { return true }
 
 type workerTestLocker struct {
 	locks   int
@@ -39,8 +42,12 @@ func (e *workerTestExecutor) ClaimShareJoin(context.Context, uuid.UUID, uuid.UUI
 func (e *workerTestExecutor) Consume(context.Context, uuid.UUID, uuid.UUID) (Decision, error) {
 	return Decision{}, nil
 }
-func (e *workerTestExecutor) Confirm(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (Decision, error) {
-	e.confirms++
+
+func (e *workerTestExecutor) Confirm(_ context.Context, workspaceID, _, _ uuid.UUID) (Decision, error) {
+	e.confirmWorkspaces = append(e.confirmWorkspaces, workspaceID)
+	if err := e.errorsByWorkspace[workspaceID]; err != nil {
+		return Decision{}, err
+	}
 	return e.decision, e.err
 }
 func (e *workerTestExecutor) Release(context.Context, uuid.UUID, uuid.UUID) (Decision, error) {
@@ -57,11 +64,14 @@ type workerTestQueries struct {
 	mu sync.Mutex
 
 	intent          db.SeatCapacityOutbox
+	intents         []db.SeatCapacityOutbox
+	nextIntent      int
 	claimAvailable  bool
 	invitation      db.WorkspaceInvitation
 	invitationError error
 	stats           []db.SeatCapacityOutboxStatsRow
 	deferredUntil   pgtype.Timestamptz
+	deferredUntils  []pgtype.Timestamptz
 
 	claimCalls  int
 	transitions int
@@ -76,6 +86,15 @@ func (q *workerTestQueries) ClaimNextDueSeatCapacityIntent(context.Context, pgty
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.claimCalls++
+	if len(q.intents) > 0 {
+		if q.nextIntent >= len(q.intents) {
+			return db.SeatCapacityOutbox{}, pgx.ErrNoRows
+		}
+		q.intent = q.intents[q.nextIntent]
+		q.nextIntent++
+		q.intent.LeaseToken = uuidToTestPG(uuid.New())
+		return q.intent, nil
+	}
 	if !q.claimAvailable {
 		return db.SeatCapacityOutbox{}, pgx.ErrNoRows
 	}
@@ -92,6 +111,7 @@ func (q *workerTestQueries) DeferClaimedSeatCapacityIntent(_ context.Context, ar
 	}
 	q.deferrals++
 	q.deferredUntil = arg.NextAttemptAt
+	q.deferredUntils = append(q.deferredUntils, arg.NextAttemptAt)
 	q.intent.LeaseToken = pgtype.UUID{}
 	return 1, nil
 }
@@ -345,6 +365,48 @@ func TestWorkerDefersCloudRateLimitWithoutSpendingRetryBudget(t *testing.T) {
 	}
 }
 
+func TestWorkerWorkspaceRateLimitDoesNotStopOtherTenants(t *testing.T) {
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	limitedWorkspace, healthyWorkspace := uuid.New(), uuid.New()
+	limitedA := workerTestIntent(ActionConfirm)
+	limitedA.WorkspaceID = uuidToTestPG(limitedWorkspace)
+	limitedB := workerTestIntent(ActionConfirm)
+	limitedB.WorkspaceID = uuidToTestPG(limitedWorkspace)
+	healthy := workerTestIntent(ActionConfirm)
+	healthy.WorkspaceID = uuidToTestPG(healthyWorkspace)
+	queries := &workerTestQueries{intents: []db.SeatCapacityOutbox{limitedA, limitedB, healthy}}
+	executor := &workerTestExecutor{
+		decision: Decision{Managed: true, Allowed: true},
+		errorsByWorkspace: map[uuid.UUID]error{
+			limitedWorkspace: &HTTPError{
+				StatusCode:     http.StatusTooManyRequests,
+				RetryAfter:     2 * time.Second,
+				RateLimitScope: RateLimitScopeWorkspace,
+			},
+		},
+	}
+	worker := newWorker(queries, executor, WorkerConfig{BatchSize: 10})
+	worker.now = func() time.Time { return now }
+
+	if err := worker.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := executor.confirmWorkspaces; len(got) != 2 || got[0] != limitedWorkspace || got[1] != healthyWorkspace {
+		t.Fatalf("Cloud confirm workspaces = %v, want one limited call followed by healthy tenant", got)
+	}
+	if queries.deferrals != 2 || queries.deletes != 1 {
+		t.Fatalf("deferrals=%d deletes=%d, want 2/1", queries.deferrals, queries.deletes)
+	}
+	if queries.claimCalls != 4 {
+		t.Fatalf("claim calls=%d, want three intents plus end-of-queue check", queries.claimCalls)
+	}
+	for _, deferred := range queries.deferredUntils {
+		if want := now.Add(2 * time.Second); !deferred.Time.Equal(want) {
+			t.Fatalf("deferred until=%s, want %s", deferred.Time, want)
+		}
+	}
+}
+
 func TestUnavailableExecutorDisablesWorkerRecovery(t *testing.T) {
 	unavailable := NewUnavailable(errors.New("invalid capacity credentials"))
 	if CanRunWorker(unavailable) {
@@ -385,8 +447,8 @@ func TestWorkerSkipsCloudCallWhenClaimWasReactivatedBeforeWorkspaceLock(t *testi
 	if err := worker.settleWithWorkspaceLimit(context.Background(), intent); err != nil {
 		t.Fatal(err)
 	}
-	if executor.confirms != 0 {
-		t.Fatalf("stale worker made %d Cloud confirm calls, want 0", executor.confirms)
+	if len(executor.confirmWorkspaces) != 0 {
+		t.Fatalf("stale worker made %d Cloud confirm calls, want 0", len(executor.confirmWorkspaces))
 	}
 }
 

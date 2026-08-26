@@ -2,7 +2,6 @@ package handler
 
 import (
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -149,20 +148,21 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 	invitationID := uuid.New()
 	expiresAt := time.Now().Add(7 * 24 * time.Hour)
 	if err := h.reserveInvitationCapacity(r.Context(), uuid.UUID(requester.WorkspaceID.Bytes), invitationID, expiresAt); err != nil {
-		if errors.Is(err, errSeatCapacityFull) {
-			// A full workspace is persistent until seats are purchased. Charge
-			// repeated attempts to the actor budget so this endpoint cannot be
-			// used to hammer the capacity service, while preserving workspace and
-			// recipient budgets for the post-purchase invitation.
+		if isPersistentSeatCapacityAdmissionRejection(err) {
+			// Full and overcommitted workspaces cannot admit another member until
+			// their durable capacity facts change. Charge repeated attempts to the
+			// actor budget so this endpoint cannot hammer the capacity service,
+			// while preserving workspace and recipient budgets for a later valid
+			// invitation.
 			h.consumeInvitationActorAdmission(r, admission)
 		}
 		writeSeatCapacityError(w, err)
 		return
 	}
 
-	// The non-consuming abuse checks run before Cloud. Spend their budgets only
-	// after Cloud has secured capacity: rate-limited requests never call Cloud,
-	// and capacity-rejected requests never consume an invitation allowance.
+	// The non-consuming abuse checks run before Cloud. Spend all budgets only
+	// after Cloud has secured capacity. Persistent capacity rejections spend the
+	// actor budget only in the branch above; transient failures spend none.
 	h.consumeInvitationAdmission(r, admission)
 
 	createParams := db.CreateInvitationParams{

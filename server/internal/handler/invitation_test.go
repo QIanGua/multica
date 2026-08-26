@@ -33,6 +33,8 @@ type stubSeatCapacity struct {
 	consumeErr      error
 }
 
+func (*stubSeatCapacity) RecoveryAvailable() bool { return true }
+
 func (s *stubSeatCapacity) ReserveInvitation(context.Context, uuid.UUID, uuid.UUID, time.Time) (seatcapacity.Decision, error) {
 	s.reserveCalls++
 	return s.reserveDecision, s.reserveErr
@@ -274,6 +276,10 @@ func TestCreateInvitation_BlocksOvercommittedCapacityWithoutOfferingSingleSeatSe
 		Code:       "capacity_overcommitted",
 	}}
 	useSeatCapacity(t, capacity)
+	actor := &stubInvitationRateLimiter{allowed: true}
+	workspace := &stubInvitationRateLimiter{allowed: true}
+	recipient := &stubInvitationRateLimiter{allowed: true}
+	useInvitationRateLimiters(t, InvitationRateLimiters{Actor: actor, Workspace: workspace, Recipient: recipient})
 
 	req := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/members", CreateMemberRequest{
 		Email: "capacity-overcommitted-invite@multica.ai", Role: "member",
@@ -296,6 +302,16 @@ func TestCreateInvitation_BlocksOvercommittedCapacityWithoutOfferingSingleSeatSe
 	}
 	if capacity.reserveCalls != 1 {
 		t.Fatalf("reserve calls = %d, want 1", capacity.reserveCalls)
+	}
+	if calls := len(actor.allowKeys); calls != 1 {
+		t.Errorf("actor allows = %d, want 1 when persistent capacity_overcommitted is rejected", calls)
+	}
+	for name, calls := range map[string]int{
+		"workspace allows": len(workspace.allowKeys), "recipient allows": len(recipient.allowKeys),
+	} {
+		if calls != 0 {
+			t.Errorf("%s = %d, want 0 while capacity remains overcommitted", name, calls)
+		}
 	}
 }
 

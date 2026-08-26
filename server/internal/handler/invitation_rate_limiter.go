@@ -42,6 +42,14 @@ type InvitationRateLimiters struct {
 	Recipient SlidingWindowRateLimiter
 }
 
+type invitationRateLimitDimension string
+
+const (
+	invitationRateLimitActor     invitationRateLimitDimension = "actor"
+	invitationRateLimitWorkspace invitationRateLimitDimension = "workspace"
+	invitationRateLimitRecipient invitationRateLimitDimension = "recipient"
+)
+
 // NewMemoryInvitationRateLimiters builds single-process gates for local and
 // Redis-less deployments.
 func NewMemoryInvitationRateLimiters(limits InvitationRateLimits) InvitationRateLimiters {
@@ -63,9 +71,9 @@ func NewRedisInvitationRateLimiters(rdb *redis.Client, limits InvitationRateLimi
 }
 
 type invitationRateLimitGate struct {
-	name    string
-	key     string
-	limiter SlidingWindowRateLimiter
+	dimension invitationRateLimitDimension
+	key       string
+	limiter   SlidingWindowRateLimiter
 }
 
 type invitationAdmission struct {
@@ -80,9 +88,9 @@ func invitationRecipientKey(email string) string {
 
 func (h *Handler) checkInvitationAdmission(w http.ResponseWriter, r *http.Request, actorID, workspaceID, email string) (*invitationAdmission, bool) {
 	gates := []invitationRateLimitGate{
-		{name: "actor", key: actorID, limiter: h.InvitationRateLimiters.Actor},
-		{name: "workspace", key: workspaceID, limiter: h.InvitationRateLimiters.Workspace},
-		{name: "recipient", key: invitationRecipientKey(email), limiter: h.InvitationRateLimiters.Recipient},
+		{dimension: invitationRateLimitActor, key: actorID, limiter: h.InvitationRateLimiters.Actor},
+		{dimension: invitationRateLimitWorkspace, key: workspaceID, limiter: h.InvitationRateLimiters.Workspace},
+		{dimension: invitationRateLimitRecipient, key: invitationRecipientKey(email), limiter: h.InvitationRateLimiters.Recipient},
 	}
 
 	var checkErr error
@@ -95,7 +103,7 @@ func (h *Handler) checkInvitationAdmission(w http.ResponseWriter, r *http.Reques
 			if checkErr == nil {
 				checkErr = err
 			}
-			checkErrorGates = append(checkErrorGates, gate.name)
+			checkErrorGates = append(checkErrorGates, string(gate.dimension))
 			continue
 		}
 		if allowed {
@@ -115,7 +123,7 @@ func (h *Handler) checkInvitationAdmission(w http.ResponseWriter, r *http.Reques
 	}
 	if len(deniedGates) > 0 {
 		for _, gate := range deniedGates {
-			h.Metrics.RecordEmailRateLimited("workspace_invitation", gate.name)
+			h.Metrics.RecordEmailRateLimited("workspace_invitation", string(gate.dimension))
 		}
 		writeInvitationRateLimited(w, retryAfter)
 		return nil, false
@@ -130,14 +138,14 @@ func (h *Handler) consumeInvitationAdmission(r *http.Request, admission *invitat
 	h.consumeInvitationGates(r, admission.gates)
 }
 
-// consumeInvitationActorAdmission charges persistent capacity-full retries to
+// consumeInvitationActorAdmission charges persistent capacity rejections to
 // the caller without spending the shared workspace or recipient email budgets.
 func (h *Handler) consumeInvitationActorAdmission(r *http.Request, admission *invitationAdmission) {
 	if admission == nil {
 		return
 	}
 	for _, gate := range admission.gates {
-		if gate.name == "actor" {
+		if gate.dimension == invitationRateLimitActor {
 			h.consumeInvitationGates(r, []invitationRateLimitGate{gate})
 			return
 		}
@@ -152,7 +160,7 @@ func (h *Handler) consumeInvitationGates(r *http.Request, gates []invitationRate
 			// the narrow Check-to-Allow window. Admit this in-flight request rather
 			// than return an error after an earlier gate may have consumed. A
 			// sustained backend failure is caught by Phase 1 on later requests.
-			slog.Warn("invitation rate limiter consume failed after successful checks; allowing bounded overshoot", append(logger.RequestAttrs(r), "gate", gate.name, "error", err)...)
+			slog.Warn("invitation rate limiter consume failed after successful checks; allowing bounded overshoot", append(logger.RequestAttrs(r), "gate", string(gate.dimension), "error", err)...)
 			continue
 		}
 		if !allowed {

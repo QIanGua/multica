@@ -20,6 +20,10 @@ var (
 	errSeatCapacityUnavailable   = errors.New("seat capacity service is unavailable")
 )
 
+func isPersistentSeatCapacityAdmissionRejection(err error) bool {
+	return errors.Is(err, errSeatCapacityFull) || errors.Is(err, errSeatCapacityOvercommitted)
+}
+
 const seatCapacityWorkspaceLockWait = 2 * time.Second
 
 func (h *Handler) seatCapacityEnabled() bool {
