@@ -270,7 +270,7 @@ export function createJaDict(allowSignup: boolean): LandingDict {
       },
       entries: [
         {
-          version: "0.5.0",
+          version: "0.4.35",
           date: "2026-08-26",
           title: "全チャネルの /new と /clear、会話スターター、受信トレイのフィルター",
           changes: [],

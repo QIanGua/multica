@@ -294,7 +294,7 @@ export function createEnDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
-        version: "0.5.0",
+        version: "0.4.35",
         date: "2026-08-26",
         title: "Session controls in every chat channel, agent conversation starters, and Inbox filters",
         changes: [],

@@ -269,7 +269,7 @@ export function createKoDict(allowSignup: boolean): LandingDict {
       },
       entries: [
         {
-          version: "0.5.0",
+          version: "0.4.35",
           date: "2026-08-26",
           title: "모든 채널의 /new와 /clear, 대화 스타터, 받은 편지함 필터",
           changes: [],

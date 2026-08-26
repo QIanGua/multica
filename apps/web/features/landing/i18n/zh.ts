@@ -294,7 +294,7 @@ export function createZhDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
-        version: "0.5.0",
+        version: "0.4.35",
         date: "2026-08-26",
         title: "全渠道 /new 与 /clear、智能体开场建议、收件箱筛选",
         changes: [],
