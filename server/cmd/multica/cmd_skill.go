@@ -176,6 +176,25 @@ func init() {
 // Skill commands
 // ---------------------------------------------------------------------------
 
+// newSkillAPIClient is newAPIClient with the transport swapped for the
+// stall-aware one (see internal/cli/stall.go). Skill payloads are the largest
+// responses the CLI reads, so they are where a total-elapsed deadline breaks
+// first — a 599KB skill could not be fetched at all over a link that was
+// delivering it perfectly well, just not within 30s (GH #7498).
+//
+// It reuses newAPIClient rather than duplicating credential and header
+// resolution: this is a pilot of which commands adopt the mechanism, not a
+// second CLI client. Graduating it means moving the transport into
+// cli.NewAPIClient and deleting this function.
+func newSkillAPIClient(cmd *cobra.Command) (*cli.APIClient, error) {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return nil, err
+	}
+	client.HTTPClient = cli.NewStallAwareHTTPClient()
+	return client, nil
+}
+
 // skillFileSizeCell renders the `size` field of a file-metadata response.
 //
 // It cannot go through strVal: JSON numbers decode as float64, and strVal's
@@ -290,12 +309,12 @@ func runSkillList(cmd *cobra.Command, _ []string) error {
 }
 
 func runSkillGet(cmd *cobra.Command, args []string) error {
-	client, err := newAPIClient(cmd)
+	client, err := newSkillAPIClient(cmd)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := cli.APIContext(context.Background())
+	ctx, cancel := cli.StallAwareContext(context.Background())
 	defer cancel()
 
 	var skill map[string]any
@@ -665,12 +684,12 @@ func runSkillSearch(cmd *cobra.Command, args []string) error {
 // ---------------------------------------------------------------------------
 
 func runSkillFilesList(cmd *cobra.Command, args []string) error {
-	client, err := newAPIClient(cmd)
+	client, err := newSkillAPIClient(cmd)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := cli.APIContext(context.Background())
+	ctx, cancel := cli.StallAwareContext(context.Background())
 	defer cancel()
 
 	var files []map[string]any

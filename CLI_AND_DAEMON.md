@@ -989,6 +989,31 @@ always at least this value, so raising it takes effect across all commands.
 MULTICA_HTTP_TIMEOUT=60s multica issue list
 ```
 
+### Stall detection (skill commands)
+
+A total-elapsed timeout punishes the transfer that is working: a large skill
+arriving steadily over a slow link is cut off mid-body, while a dead connection
+is held open for the full budget. The `skill` commands therefore fail on a lack
+of *progress* instead:
+
+- A read that receives no bytes for **15 seconds** fails immediately, reported
+  as a stalled transfer rather than a timeout.
+- A transfer that keeps producing bytes runs to completion, however long it
+  takes, behind a loose **10 minute** whole-request ceiling.
+
+Override the no-progress budget with `MULTICA_HTTP_STALL_TIMEOUT` (same format
+as `MULTICA_HTTP_TIMEOUT`). If only `MULTICA_HTTP_TIMEOUT` is set it applies on
+this path too, as the no-progress budget — it keeps meaning "the longest I will
+wait for this server", not "the longest this download may take".
+
+```bash
+MULTICA_HTTP_STALL_TIMEOUT=45s multica skill get <id>
+```
+
+Every other command still uses the total-elapsed timeout above. Stall detection
+starts here because skill payloads are the largest responses the CLI reads; the
+mechanism itself is not skill-specific.
+
 ### Skill payload size
 
 `multica skill get` and `multica skill files list` return **metadata only** by
