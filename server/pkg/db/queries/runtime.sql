@@ -388,11 +388,11 @@ SET runtime_id = NULL, updated_at = now()
 WHERE runtime_id = $1 AND kind = 'user'
 RETURNING *;
 
--- name: ListForeignAgentsByRuntime :many
+-- name: LockForeignAgentsByRuntime :many
 -- MUL-6704: every agent bound to this runtime whose owner is NOT the runtime
--- owner — the set a public → private revoke has to deal with. Active and
--- archived, both kinds: the handler splits them (user agents are unbound,
--- `kind = 'system'` carriers keep their binding, see
+-- owner — the set a public → private revoke has to deal with — locked FOR
+-- UPDATE. Active and archived, both kinds: the handler splits them (user agents
+-- are unbound, `kind = 'system'` carriers keep their binding, see
 -- UnbindForeignUserAgentsFromRuntime) and the counts feed the confirmation
 -- dialog.
 --
@@ -402,18 +402,14 @@ RETURNING *;
 -- such an agent can never actually run on a private runtime, so the plan the
 -- user confirms must include it rather than leave it silently stuck.
 --
--- Ordered by name for a deterministic dialog; the locking variant orders by id
--- instead (stable lock order).
-SELECT * FROM agent
-WHERE runtime_id = $1 AND owner_id IS DISTINCT FROM @owner_id
-ORDER BY name ASC;
-
--- name: LockForeignAgentsByRuntime :many
--- FOR UPDATE variant of ListForeignAgentsByRuntime, used inside the revoke
--- transaction. Pair with LockAgentRuntime (which blocks FK-validated INSERTs
--- and runtime_id UPDATEs that would add an agent mid-teardown); this locks the
--- rows that already exist so a concurrent archive / restore / rebind of one of
--- them blocks until we commit. Ordered by id — the same order
+-- There is deliberately NO unlocked variant. Every read of this set decides
+-- whether to write — either the teardown or the bare visibility flip — and an
+-- unlocked read leaves the bind race described in
+-- handler.makeRuntimePrivateIfUnaffected open. Pair with LockAgentRuntime
+-- (FOR UPDATE, taken first), which blocks the FK-validated INSERTs and
+-- runtime_id UPDATEs that would add an agent mid-teardown; this locks the rows
+-- that already exist so a concurrent archive / restore / rebind of one of them
+-- blocks until we commit. Ordered by id — the same order
 -- ListUserAgentsByRuntimeForUpdate uses — so the revoke and delete paths can
 -- never deadlock against each other.
 SELECT * FROM agent
@@ -599,9 +595,13 @@ FOR KEY SHARE;
 -- Both runtimes are locked in one ordered statement so two merges running in
 -- opposite directions cannot take the same pair in opposite orders.
 --
--- Returns the ids it actually locked: a caller that asked for two and got fewer
+-- Returns the rows it actually locked: a caller that asked for two and got fewer
 -- knows a runtime disappeared before it got there and must abandon the merge.
-SELECT id FROM agent_runtime
+-- Full rows rather than ids because the merge also has to read the locked
+-- pre-merge state — the legacy row's `visibility`, which the surviving row
+-- inherits when it was `public` (MUL-6704) — and reading that outside the lock
+-- would reintroduce the race this lock exists to close.
+SELECT * FROM agent_runtime
 WHERE id = ANY(@runtime_ids::uuid[])
 ORDER BY id
 FOR UPDATE;

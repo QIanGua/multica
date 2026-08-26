@@ -266,16 +266,93 @@ describe("parseRuntimeRevokeConflict", () => {
     expect(parseRuntimeRevokeConflict(new Error("network"))).toBeNull();
   });
 
-  it("tolerates a malformed payload instead of throwing", () => {
-    const conflict = parseRuntimeRevokeConflict(
+  // Fail closed, not "best effort" (MUL-6704 review). The server's set comparison
+  // only covers active agent ids — `archived_agent_count` and
+  // `retained_agent_count` are NOT in `expected_active_agent_ids`. So a body that
+  // dropped or mistyped those counts would render "nothing else affected" while a
+  // confirm still unbinds archived agents and cancels a retained carrier's work:
+  // the user would have approved something they were never shown. Every one of
+  // these must refuse to produce a plan.
+  it.each([
+    [
+      "active_agents is not an array",
+      { code: "runtime_visibility_plan_changed", active_agents: "not-an-array" },
+    ],
+    [
+      "an agent entry is missing its name",
+      {
+        code: "runtime_visibility_plan_changed",
+        active_agents: [{ id: "agent-1" }],
+        archived_agent_count: 0,
+        retained_agent_count: 0,
+        mika_affected: false,
+      },
+    ],
+    [
+      "archived_agent_count is the wrong type",
+      {
+        code: "runtime_visibility_plan_changed",
+        active_agents: [],
+        archived_agent_count: "many",
+        retained_agent_count: 0,
+        mika_affected: false,
+      },
+    ],
+    [
+      "retained_agent_count is missing",
+      {
+        code: "runtime_visibility_plan_changed",
+        active_agents: [],
+        archived_agent_count: 0,
+        mika_affected: false,
+      },
+    ],
+    [
+      "a count is negative",
+      {
+        code: "runtime_visibility_plan_changed",
+        active_agents: [],
+        archived_agent_count: -1,
+        retained_agent_count: 0,
+        mika_affected: false,
+      },
+    ],
+    [
+      "mika_affected is not a boolean",
+      {
+        code: "runtime_visibility_plan_changed",
+        active_agents: [],
+        archived_agent_count: 0,
+        retained_agent_count: 0,
+        mika_affected: "yes",
+      },
+    ],
+  ])("refuses a malformed payload: %s", (_name, body) => {
+    expect(parseRuntimeRevokeConflict(new MockApiError(409, body))).toBeNull();
+  });
+});
+
+// A refused parse must reach the user as a plain failure, never as a dialog with
+// an under-reported plan.
+describe("VisibilityEditor + malformed 409", () => {
+  it("does not open a confirmation when the plan cannot be trusted", async () => {
+    mockRevoke.mockRejectedValueOnce(
       new MockApiError(409, {
         code: "runtime_visibility_plan_changed",
-        active_agents: "not-an-array",
-        archived_agent_count: "many",
+        active_agents: [{ id: "agent-1", name: "Teammate Agent" }],
+        // Counts dropped: the server's id comparison would not catch this.
+        mika_affected: false,
       }),
     );
-    expect(conflict?.plan.activeAgents).toEqual([]);
-    expect(conflict?.plan.archivedAgentCount).toBe(0);
-    expect(conflict?.plan.mikaAffected).toBe(false);
+
+    const { onRevoked } = renderDialog(makePlan());
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Make private" }));
+
+    await waitFor(() => expect(mockToastError).toHaveBeenCalled());
+    expect(
+      screen.queryByText(/The affected agent set changed/i),
+    ).not.toBeInTheDocument();
+    expect(onRevoked).not.toHaveBeenCalled();
   });
 });

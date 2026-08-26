@@ -1990,7 +1990,8 @@ export class ApiClient {
     });
   }
 
-  async updateRuntime(    runtimeId: string,
+  async updateRuntime(
+    runtimeId: string,
     patch: {
       visibility?: "private" | "public";
       /**

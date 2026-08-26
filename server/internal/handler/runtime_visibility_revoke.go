@@ -65,6 +65,25 @@ const (
 	RebindStrandedTaskError = "The agent moved to another runtime before this task started, so it could no longer be claimed. Retry it to run on the agent's current runtime."
 )
 
+// runtimeRevokeAgentDTO is what the impact plan says about an affected agent,
+// and it is deliberately two fields.
+//
+// The plan is readable by whoever owns the MACHINE, who is frequently not the
+// owner of these agents and may have no right to read them at all — a private
+// agent is owner/admin-only on every other surface. Serialising them with
+// agentToResponse (as the first version of this endpoint did) handed out
+// instructions, runtime_config, mcp_config and the Composio allowlist to anyone
+// who merely ATTEMPTED to flip their own runtime to private. There is no
+// redaction to get right here: the dialog needs a name to show and an id to
+// echo back as the confirmed set, so that is all this carries.
+type runtimeRevokeAgentDTO struct {
+	ID string `json:"id"`
+	// Name is the one piece of the agent the machine owner unavoidably learns —
+	// they have to be told WHAT they are about to unbind for the confirmation to
+	// mean anything.
+	Name string `json:"name"`
+}
+
 // runtimeRevokePlan is what a public → private revoke will do, computed from the
 // agents currently bound to the runtime whose owner is not the runtime owner.
 type runtimeRevokePlan struct {
@@ -121,27 +140,87 @@ func splitForeignAgents(agents []db.Agent) (plan runtimeRevokePlan, unboundIDs, 
 	return plan, unboundIDs, retainedIDs
 }
 
-// buildRuntimeRevokePlan reads the foreign-agent set for a runtime. q is the
-// caller's query handle so the confirm path can pass its transaction.
-func (h *Handler) buildRuntimeRevokePlan(ctx context.Context, q *db.Queries, rt db.AgentRuntime) (runtimeRevokePlan, error) {
-	agents, err := q.ListForeignAgentsByRuntime(ctx, db.ListForeignAgentsByRuntimeParams{
-		RuntimeID: rt.ID,
-		OwnerID:   rt.OwnerID,
+// errRuntimeRevokeNeedsConfirmation reports that making this runtime private
+// affects agents that are not the owner's, so the plain PATCH must refuse and
+// hand the plan to the user.
+var errRuntimeRevokeNeedsConfirmation = errors.New("runtime visibility change needs confirmation")
+
+// makeRuntimePrivateIfUnaffected performs the "nothing to tear down" half of the
+// visibility flip, and it has to be transactional even though it writes one
+// column.
+//
+// The obvious shape — read the foreign set, then UPDATE the visibility — is
+// racy, and in a way the lock modes hide. A concurrent bind holds FOR KEY SHARE
+// on the runtime row (its FK validation), while a plain UPDATE of a non-key
+// column takes FOR NO KEY UPDATE, and those two do NOT conflict. So the bind
+// could pass its own check against the `public` snapshot, this PATCH could flip
+// the row to private in parallel, and both commit: a private runtime with a
+// foreign agent bound and no teardown — exactly the state this issue exists to
+// eliminate, reachable through the path that looked harmless.
+//
+// Taking LockAgentRuntime (FOR UPDATE) first is what conflicts with that KEY
+// SHARE. Combined with revalidateRuntimeForBind re-reading the row after the
+// wait, the two orderings both end safely: bind-first means we recompute and see
+// its agent (→ 409), revoke-first means the bind wakes up, re-reads `private`,
+// and is refused.
+func (h *Handler) makeRuntimePrivateIfUnaffected(ctx context.Context, rt db.AgentRuntime) (db.AgentRuntime, runtimeRevokePlan, error) {
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return rt, runtimeRevokePlan{}, fmt.Errorf("begin visibility tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := h.Queries.WithTx(tx)
+
+	locked, err := qtx.LockAgentRuntime(ctx, rt.ID)
+	if err != nil {
+		return rt, runtimeRevokePlan{}, fmt.Errorf("lock runtime: %w", err)
+	}
+	if locked.Visibility == "private" {
+		// Someone else got there first. The requested end state holds and there
+		// is nothing left to tear down.
+		if err := tx.Commit(ctx); err != nil {
+			return rt, runtimeRevokePlan{}, fmt.Errorf("commit visibility tx: %w", err)
+		}
+		return locked, runtimeRevokePlan{}, nil
+	}
+
+	// Row-lock the existing agents too, in id order, matching the confirm and
+	// delete paths: a concurrent archive/restore of one of them must not change
+	// the set between this recount and the commit.
+	foreign, err := qtx.LockForeignAgentsByRuntime(ctx, db.LockForeignAgentsByRuntimeParams{
+		RuntimeID: locked.ID,
+		OwnerID:   locked.OwnerID,
 	})
 	if err != nil {
-		return runtimeRevokePlan{}, err
+		return rt, runtimeRevokePlan{}, fmt.Errorf("lock foreign agents: %w", err)
 	}
-	plan, _, _ := splitForeignAgents(agents)
-	return plan, nil
+	plan, _, _ := splitForeignAgents(foreign)
+	if !plan.empty() {
+		// Zero writes: the user has to see and confirm this.
+		return rt, plan, errRuntimeRevokeNeedsConfirmation
+	}
+
+	updated, err := qtx.UpdateAgentRuntimeVisibility(ctx, db.UpdateAgentRuntimeVisibilityParams{
+		ID:         locked.ID,
+		Visibility: "private",
+	})
+	if err != nil {
+		return rt, runtimeRevokePlan{}, fmt.Errorf("update visibility: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return rt, runtimeRevokePlan{}, fmt.Errorf("commit visibility tx: %w", err)
+	}
+	return updated, runtimeRevokePlan{}, nil
 }
 
 // runtimeRevokePlanResponse is the 409 body for both codes. Shape mirrors
 // runtimeHasActiveAgentsResponse (`error` + `code` + agent list) so clients keep
-// one 409 handling pattern, with the revoke-specific counts alongside.
+// one 409 handling pattern, but the agent entries are the minimal
+// runtimeRevokeAgentDTO rather than full AgentResponse — see that type for why.
 func (h *Handler) runtimeRevokePlanResponse(plan runtimeRevokePlan, code string) map[string]any {
-	agents := make([]AgentResponse, len(plan.UnboundAgents))
+	agents := make([]runtimeRevokeAgentDTO, len(plan.UnboundAgents))
 	for i, a := range plan.UnboundAgents {
-		agents[i] = h.agentToResponse(a)
+		agents[i] = runtimeRevokeAgentDTO{ID: uuidToString(a.ID), Name: a.Name}
 	}
 	message := "making this runtime private affects agents that are not yours. Review and confirm the impact first."
 	if code == runtimeVisibilityPlanChangedCode {

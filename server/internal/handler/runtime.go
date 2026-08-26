@@ -559,29 +559,36 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		// The confirmation set deliberately stays OUT of this PATCH: an older
 		// client that cannot send it would otherwise 409 forever with no way
 		// through, which is the compatibility trap runtime delete documents.
+		//
+		// Even the "nothing to tear down" case goes through the locked helper —
+		// see makeRuntimePrivateIfUnaffected for the bind race an unlocked
+		// read-then-update leaves open.
 		if newVisibility == "private" {
-			plan, err := h.buildRuntimeRevokePlan(r.Context(), h.Queries, rt)
+			updated, plan, err := h.makeRuntimePrivateIfUnaffected(r.Context(), rt)
 			if err != nil {
-				slog.Error("visibility revoke plan failed", "error", err, "runtime_id", runtimeID)
-				writeError(w, http.StatusInternalServerError, "failed to check runtime dependencies")
+				if errors.Is(err, errRuntimeRevokeNeedsConfirmation) {
+					writeJSON(w, http.StatusConflict, h.runtimeRevokePlanResponse(plan, runtimeVisibilityHasForeignAgentsCode))
+					return
+				}
+				slog.Error("make runtime private failed", "error", err, "runtime_id", runtimeID)
+				writeError(w, http.StatusInternalServerError, "failed to update runtime")
 				return
 			}
-			if !plan.empty() {
-				writeJSON(w, http.StatusConflict, h.runtimeRevokePlanResponse(plan, runtimeVisibilityHasForeignAgentsCode))
+			rt = updated
+			changed = true
+		} else {
+			updated, err := h.Queries.UpdateAgentRuntimeVisibility(r.Context(), db.UpdateAgentRuntimeVisibilityParams{
+				ID:         runtimeUUID,
+				Visibility: newVisibility,
+			})
+			if err != nil {
+				slog.Error("UpdateAgentRuntimeVisibility failed", "error", err, "runtime_id", runtimeID)
+				writeError(w, http.StatusInternalServerError, "failed to update runtime")
 				return
 			}
+			rt = updated
+			changed = true
 		}
-		updated, err := h.Queries.UpdateAgentRuntimeVisibility(r.Context(), db.UpdateAgentRuntimeVisibilityParams{
-			ID:         runtimeUUID,
-			Visibility: newVisibility,
-		})
-		if err != nil {
-			slog.Error("UpdateAgentRuntimeVisibility failed", "error", err, "runtime_id", runtimeID)
-			writeError(w, http.StatusInternalServerError, "failed to update runtime")
-			return
-		}
-		rt = updated
-		changed = true
 	}
 
 	if req.CustomName != nil {

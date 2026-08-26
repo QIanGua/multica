@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -149,6 +150,74 @@ func TestUpdateRuntimeVisibility_RefusesWithPlan(t *testing.T) {
 	dbfx.QueryRow(t, `SELECT visibility FROM agent_runtime WHERE id = $1`, runtimeID).Scan(&visibility)
 	if visibility != "public" {
 		t.Fatalf("visibility = %q after a refused PATCH, want unchanged 'public'", visibility)
+	}
+}
+
+// TestUpdateRuntimeVisibility_PlanDisclosesOnlyIdAndName is the negative test for
+// the disclosure boundary. The machine owner here is a plain workspace member who
+// does not own — and has no read access to — the private agent in the plan, yet
+// merely ATTEMPTING to make their own runtime private renders it. If this body
+// ever grows to the full AgentResponse again, that attempt hands out the
+// teammate's instructions, runtime config, MCP servers and Composio allowlist.
+func TestUpdateRuntimeVisibility_PlanDisclosesOnlyIdAndName(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	runtimeID, foreignUserID := publicRuntimeWithForeignAgent(t, ctx, "Revoke Disclosure Runtime")
+	foreignAgentID := dbfx.Agent(t, "Revoke Disclosure Foreign Agent", runtimeID, testutil.Cols{
+		"owner_id":     foreignUserID,
+		"visibility":   "private",
+		"instructions": "SENTINEL_INSTRUCTIONS do not disclose",
+		"mcp_config": testutil.Raw(
+			`'{"servers":{"secret":{"command":"SENTINEL_MCP_COMMAND"}}}'::jsonb`),
+		"runtime_config":             testutil.Raw(`'{"gateway":{"token":"SENTINEL_TOKEN"}}'::jsonb`),
+		"composio_toolkit_allowlist": testutil.Raw(`ARRAY['sentinel_toolkit']::text[]`),
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("PATCH", "/api/runtimes/"+runtimeID, map[string]any{"visibility": "private"})
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.UpdateAgentRuntime(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("PATCH visibility=private: got %d, want 409: %s", w.Code, w.Body.String())
+	}
+
+	raw := w.Body.String()
+	for _, sentinel := range []string{
+		"SENTINEL_INSTRUCTIONS",
+		"SENTINEL_MCP_COMMAND",
+		"SENTINEL_TOKEN",
+		"sentinel_toolkit",
+		// Field names too: an empty or redacted value still means the shape grew
+		// back, and the next config written to it would leak.
+		"instructions",
+		"mcp_config",
+		"runtime_config",
+		"composio_toolkit_allowlist",
+	} {
+		if strings.Contains(raw, sentinel) {
+			t.Fatalf("409 plan discloses %q; it must carry only id and name.\nbody: %s", sentinel, raw)
+		}
+	}
+
+	// And it still says enough for the confirmation to be meaningful.
+	var body struct {
+		ActiveAgents []map[string]any `json:"active_agents"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode 409 body: %v", err)
+	}
+	if len(body.ActiveAgents) != 1 {
+		t.Fatalf("active_agents = %d, want 1", len(body.ActiveAgents))
+	}
+	entry := body.ActiveAgents[0]
+	if len(entry) != 2 {
+		t.Fatalf("agent entry has %d fields (%v), want exactly id + name", len(entry), entry)
+	}
+	if entry["id"] != foreignAgentID || entry["name"] != "Revoke Disclosure Foreign Agent" {
+		t.Fatalf("agent entry = %v, want the affected agent's id and name", entry)
 	}
 }
 

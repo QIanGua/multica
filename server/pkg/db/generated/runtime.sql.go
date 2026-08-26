@@ -1080,82 +1080,6 @@ func (q *Queries) ListDaemonCustomNames(ctx context.Context, arg ListDaemonCusto
 	return items, nil
 }
 
-const listForeignAgentsByRuntime = `-- name: ListForeignAgentsByRuntime :many
-SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, starter_prompts FROM agent
-WHERE runtime_id = $1 AND owner_id IS DISTINCT FROM $2
-ORDER BY name ASC
-`
-
-type ListForeignAgentsByRuntimeParams struct {
-	RuntimeID pgtype.UUID `json:"runtime_id"`
-	OwnerID   pgtype.UUID `json:"owner_id"`
-}
-
-// MUL-6704: every agent bound to this runtime whose owner is NOT the runtime
-// owner — the set a public → private revoke has to deal with. Active and
-// archived, both kinds: the handler splits them (user agents are unbound,
-// `kind = 'system'` carriers keep their binding, see
-// UnbindForeignUserAgentsFromRuntime) and the counts feed the confirmation
-// dialog.
-//
-// The predicate is `IS DISTINCT FROM`, not `<>`, so an ownerless agent row is
-// part of the set. That matches the claim fence added in #7571, which lets a
-// NULL-owner agent through the SQL and then settles it explicitly at delivery:
-// such an agent can never actually run on a private runtime, so the plan the
-// user confirms must include it rather than leave it silently stuck.
-//
-// Ordered by name for a deterministic dialog; the locking variant orders by id
-// instead (stable lock order).
-func (q *Queries) ListForeignAgentsByRuntime(ctx context.Context, arg ListForeignAgentsByRuntimeParams) ([]Agent, error) {
-	rows, err := q.db.Query(ctx, listForeignAgentsByRuntime, arg.RuntimeID, arg.OwnerID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []Agent{}
-	for rows.Next() {
-		var i Agent
-		if err := rows.Scan(
-			&i.ID,
-			&i.WorkspaceID,
-			&i.Name,
-			&i.AvatarUrl,
-			&i.RuntimeMode,
-			&i.RuntimeConfig,
-			&i.Visibility,
-			&i.Status,
-			&i.MaxConcurrentTasks,
-			&i.OwnerID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.Description,
-			&i.RuntimeID,
-			&i.Instructions,
-			&i.ArchivedAt,
-			&i.ArchivedBy,
-			&i.CustomEnv,
-			&i.CustomArgs,
-			&i.McpConfig,
-			&i.Model,
-			&i.ThinkingLevel,
-			&i.ComposioToolkitAllowlist,
-			&i.PermissionMode,
-			&i.Kind,
-			&i.SystemKey,
-			&i.DisabledRuntimeSkills,
-			&i.ServiceTier,
-			&i.StarterPrompts,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listStaleOfflineRuntimeGCCandidates = `-- name: ListStaleOfflineRuntimeGCCandidates :many
 SELECT id FROM agent_runtime
 WHERE status = 'offline'
@@ -1360,11 +1284,27 @@ type LockForeignAgentsByRuntimeParams struct {
 	OwnerID   pgtype.UUID `json:"owner_id"`
 }
 
-// FOR UPDATE variant of ListForeignAgentsByRuntime, used inside the revoke
-// transaction. Pair with LockAgentRuntime (which blocks FK-validated INSERTs
-// and runtime_id UPDATEs that would add an agent mid-teardown); this locks the
-// rows that already exist so a concurrent archive / restore / rebind of one of
-// them blocks until we commit. Ordered by id — the same order
+// MUL-6704: every agent bound to this runtime whose owner is NOT the runtime
+// owner — the set a public → private revoke has to deal with — locked FOR
+// UPDATE. Active and archived, both kinds: the handler splits them (user agents
+// are unbound, `kind = 'system'` carriers keep their binding, see
+// UnbindForeignUserAgentsFromRuntime) and the counts feed the confirmation
+// dialog.
+//
+// The predicate is `IS DISTINCT FROM`, not `<>`, so an ownerless agent row is
+// part of the set. That matches the claim fence added in #7571, which lets a
+// NULL-owner agent through the SQL and then settles it explicitly at delivery:
+// such an agent can never actually run on a private runtime, so the plan the
+// user confirms must include it rather than leave it silently stuck.
+//
+// There is deliberately NO unlocked variant. Every read of this set decides
+// whether to write — either the teardown or the bare visibility flip — and an
+// unlocked read leaves the bind race described in
+// handler.makeRuntimePrivateIfUnaffected open. Pair with LockAgentRuntime
+// (FOR UPDATE, taken first), which blocks the FK-validated INSERTs and
+// runtime_id UPDATEs that would add an agent mid-teardown; this locks the rows
+// that already exist so a concurrent archive / restore / rebind of one of them
+// blocks until we commit. Ordered by id — the same order
 // ListUserAgentsByRuntimeForUpdate uses — so the revoke and delete paths can
 // never deadlock against each other.
 func (q *Queries) LockForeignAgentsByRuntime(ctx context.Context, arg LockForeignAgentsByRuntimeParams) ([]Agent, error) {
@@ -1418,7 +1358,7 @@ func (q *Queries) LockForeignAgentsByRuntime(ctx context.Context, arg LockForeig
 }
 
 const lockRuntimesForMerge = `-- name: LockRuntimesForMerge :many
-SELECT id FROM agent_runtime
+SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name FROM agent_runtime
 WHERE id = ANY($1::uuid[])
 ORDER BY id
 FOR UPDATE
@@ -1438,21 +1378,43 @@ FOR UPDATE
 // Both runtimes are locked in one ordered statement so two merges running in
 // opposite directions cannot take the same pair in opposite orders.
 //
-// Returns the ids it actually locked: a caller that asked for two and got fewer
+// Returns the rows it actually locked: a caller that asked for two and got fewer
 // knows a runtime disappeared before it got there and must abandon the merge.
-func (q *Queries) LockRuntimesForMerge(ctx context.Context, runtimeIds []pgtype.UUID) ([]pgtype.UUID, error) {
+// Full rows rather than ids because the merge also has to read the locked
+// pre-merge state — the legacy row's `visibility`, which the surviving row
+// inherits when it was `public` (MUL-6704) — and reading that outside the lock
+// would reintroduce the race this lock exists to close.
+func (q *Queries) LockRuntimesForMerge(ctx context.Context, runtimeIds []pgtype.UUID) ([]AgentRuntime, error) {
 	rows, err := q.db.Query(ctx, lockRuntimesForMerge, runtimeIds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []pgtype.UUID{}
+	items := []AgentRuntime{}
 	for rows.Next() {
-		var id pgtype.UUID
-		if err := rows.Scan(&id); err != nil {
+		var i AgentRuntime
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.DaemonID,
+			&i.Name,
+			&i.RuntimeMode,
+			&i.Provider,
+			&i.Status,
+			&i.DeviceInfo,
+			&i.Metadata,
+			&i.LastSeenAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.OwnerID,
+			&i.LegacyDaemonID,
+			&i.Visibility,
+			&i.ProfileID,
+			&i.CustomName,
+		); err != nil {
 			return nil, err
 		}
-		items = append(items, id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

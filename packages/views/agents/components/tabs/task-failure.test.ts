@@ -215,4 +215,3 @@ describe("runtime access reasons (MUL-6704)", () => {
     ).toBe(failureReasonLabel("agent_runtime_required", enT));
   });
 });
-

@@ -197,6 +197,45 @@ describe("RuntimePicker (agent settings)", () => {
     ).toBeTruthy();
   });
 
+  // MUL-6704: which agents a machine may RUN is decided by the agent's owner.
+  // When the operator is not that owner — an admin, or the machine's owner,
+  // editing a teammate's agent — the picker must lock its OWN private runtimes
+  // too. Before this it offered them and the PATCH answered 403 on submit.
+  it("locks the caller's own private runtimes when the agent belongs to someone else", () => {
+    renderPicker({ agentOwnerId: OTHER });
+    openPicker();
+
+    // My own private runtimes: selectable for my own agent, locked for theirs.
+    const mine = screen.getByRole("button", { name: /^Claude/ });
+    expect((mine as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to machines" }));
+    fireEvent.click(screen.getByRole("button", { name: "All" }));
+    fireEvent.click(screen.getByRole("button", { name: /^other\.local/ }));
+    // Their own public machine stays available — public runs any owner's agent.
+    const theirPublic = screen.getByRole("button", { name: /^Claude/ });
+    expect((theirPublic as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("leaves the caller's own private runtimes selectable for their own agent", () => {
+    // The create-style default (no agentOwnerId) and the explicit self case must
+    // both behave exactly as before.
+    renderPicker({ agentOwnerId: ME });
+    openPicker();
+    expect(
+      (screen.getByRole("button", { name: /^Claude/ }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    cleanup();
+
+    renderPicker();
+    openPicker();
+    expect(
+      (screen.getByRole("button", { name: /^Claude/ }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
   it("keeps other members' private runtimes locked", () => {
     const { onChange } = renderPicker();
     openPicker();

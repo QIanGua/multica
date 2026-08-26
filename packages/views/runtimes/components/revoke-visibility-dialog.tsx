@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, Info } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@multica/core/api";
-import type { Agent, AgentRuntime } from "@multica/core/types";
+import type { AgentRuntime } from "@multica/core/types";
 import { runtimeDisplayLabel } from "@multica/core/runtimes";
 import { useRevokeRuntimeAndMakePrivate } from "@multica/core/runtimes/mutations";
 import {
@@ -28,8 +28,23 @@ import { useT } from "../../i18n";
 // Shape mirrors DeleteRuntimeDialog's cascade mode on purpose — same 409 → plan
 // → checkbox → re-confirm-on-plan-changed flow — because it is the same class of
 // decision and users have already learned it.
+
+/**
+ * What the server discloses about an affected agent, and all this dialog needs.
+ *
+ * Deliberately not the full `Agent`: the reader here owns the MACHINE, not these
+ * agents, and often has no right to read them at all. The endpoint returns only
+ * id + name so a machine owner cannot harvest a teammate's instructions, runtime
+ * config, MCP config or Composio allowlist by merely attempting to make their
+ * own runtime private.
+ */
+export interface RuntimeRevokeAgent {
+  id: string;
+  name: string;
+}
+
 export interface RuntimeRevokePlan {
-  activeAgents: Agent[];
+  activeAgents: RuntimeRevokeAgent[];
   archivedAgentCount: number;
   retainedAgentCount: number;
   mikaAffected: boolean;
@@ -247,10 +262,17 @@ export interface RuntimeRevokeConflict {
 }
 
 /**
- * Reads the structured 409 the visibility endpoints return. Anything else — a
- * different status, a different code, a missing body — collapses to `null` so
- * callers fall through to their generic error handling and never open a
- * confirmation dialog on a plan they did not receive.
+ * Reads the structured 409 the visibility endpoints return, strictly.
+ *
+ * Fail closed, on purpose: anything unexpected — a different status, an unknown
+ * code, a missing field, a wrong type — returns `null`, the caller falls through
+ * to its generic error path, and no confirmation dialog opens. A tolerant parser
+ * is not harmless here. `archived_agent_count` and `retained_agent_count` are NOT
+ * part of `expected_active_agent_ids`, so the server's set comparison cannot
+ * catch a plan that under-reports them: a body that dropped or mistyped those
+ * counts would render "0 affected", and confirming it would still unbind
+ * archived agents and cancel a retained carrier's work. The user would have
+ * approved something they were never shown.
  */
 export function parseRuntimeRevokeConflict(
   err: unknown,
@@ -258,7 +280,7 @@ export function parseRuntimeRevokeConflict(
   if (!(err instanceof ApiError)) return null;
   if (err.status !== 409) return null;
   const body = err.body;
-  if (!body || typeof body !== "object") return null;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
   const record = body as Record<string, unknown>;
   const code = record.code;
   if (
@@ -267,27 +289,34 @@ export function parseRuntimeRevokeConflict(
   ) {
     return null;
   }
-  const rawAgents = record.active_agents;
-  const activeAgents = Array.isArray(rawAgents)
-    ? rawAgents.filter(
-        (a): a is Agent =>
-          typeof a === "object" &&
-          a !== null &&
-          typeof (a as Record<string, unknown>).id === "string" &&
-          typeof (a as Record<string, unknown>).name === "string",
-      )
-    : [];
+  if (!Array.isArray(record.active_agents)) return null;
+  const activeAgents: RuntimeRevokeAgent[] = [];
+  for (const raw of record.active_agents) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const entry = raw as Record<string, unknown>;
+    if (typeof entry.id !== "string" || entry.id === "") return null;
+    if (typeof entry.name !== "string") return null;
+    activeAgents.push({ id: entry.id, name: entry.name });
+  }
+  const archivedAgentCount = strictCount(record.archived_agent_count);
+  const retainedAgentCount = strictCount(record.retained_agent_count);
+  if (archivedAgentCount === null || retainedAgentCount === null) return null;
+  if (typeof record.mika_affected !== "boolean") return null;
   return {
     code,
     plan: {
       activeAgents,
-      archivedAgentCount: numberOrZero(record.archived_agent_count),
-      retainedAgentCount: numberOrZero(record.retained_agent_count),
-      mikaAffected: record.mika_affected === true,
+      archivedAgentCount,
+      retainedAgentCount,
+      mikaAffected: record.mika_affected,
     },
   };
 }
 
-function numberOrZero(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+/** A count is a non-negative integer or the body is not trustworthy. */
+function strictCount(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    return null;
+  }
+  return value;
 }
