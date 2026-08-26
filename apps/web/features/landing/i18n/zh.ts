@@ -304,10 +304,8 @@ export function createZhDict(allowSignup: boolean): LandingDict {
           "可以给智能体设置最多 3 条开场建议，空白聊天里会直接显示。",
           "点击开场建议只会填入输入框，你可以改完再发送。",
           "收件箱通知可以按发起人筛选，也能只看未读。",
-          "聊天里的 HTML 可以边改边预览，原消息保持不变。",
         ],
         improvements: [
-          "Codex 容量不足时会自动重试，不用再手动重跑任务。",
           "Qwen、Kimi、Ark 模型的运行成本显示更准确。",
           "Autopilot 列表会显示订阅者和下次运行时间。",
           "只需填一个 Cloud 地址，云端运行时、账单和席位管理会一起启用。",

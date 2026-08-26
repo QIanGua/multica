@@ -304,10 +304,8 @@ export function createEnDict(allowSignup: boolean): LandingDict {
           "Give an agent up to three conversation starters, shown in every empty chat.",
           "Tapping a starter fills the composer, so you can edit it before sending.",
           "Filter Inbox notifications by who started them, or show only unread ones.",
-          "Edit HTML from a chat with a live preview, leaving the original message untouched.",
         ],
         improvements: [
-          "Codex retries on its own when capacity runs short, so fewer runs need a restart.",
           "Run costs for Qwen, Kimi, and Ark models are now accurate.",
           "The Autopilot list shows subscribers and the next scheduled run.",
           "A single Cloud address turns on cloud runtimes, billing, and seat management together.",
