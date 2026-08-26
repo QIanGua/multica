@@ -813,9 +813,11 @@ func TestParseFromEmail(t *testing.T) {
 			wantOK:      false,
 		},
 		{
-			// The value is operator-controlled, but parsing means a CRLF payload can
-			// no longer reach the header block verbatim.
-			name:        "CRLF header injection is rejected",
+			// Note this is a pass-through, not a sanitization: parseFromEmail
+			// returns unparseable input verbatim. Such a value never reaches the
+			// header block because net/smtp.Client.Mail rejects CR/LF before the
+			// envelope is sent — see TestSendSMTP_CRLFInSenderAbortsBeforeData.
+			name:        "CRLF payload passes through unparsed",
 			raw:         "Team <sender@example.com>\r\nBcc: evil@example.com",
 			wantAddress: "Team <sender@example.com>\r\nBcc: evil@example.com",
 			wantHeader:  "Team <sender@example.com>\r\nBcc: evil@example.com",
@@ -908,6 +910,35 @@ func TestSendSMTP_UnparseableFromIsPassedThrough(t *testing.T) {
 	}
 	if !strings.Contains(data, "From: root\r\n") {
 		t.Errorf("From: header = unexpected, got:\n%s", data)
+	}
+}
+
+// The configured sender is operator-controlled, so this is defense in depth
+// rather than a user-facing trust boundary. parseFromEmail does NOT sanitize —
+// it returns an unparseable value verbatim. What actually stops a CRLF payload
+// is net/smtp.Client.Mail, which rejects CR/LF before the envelope goes out, so
+// the send aborts at MAIL FROM and nothing reaches the header block.
+func TestSendSMTP_CRLFInSenderAbortsBeforeData(t *testing.T) {
+	srv, cleanup := startTestSMTPServer(t, testSMTPServer{})
+	defer cleanup()
+	host, port, _ := net.SplitHostPort(srv.Addr)
+
+	s := &EmailService{
+		fromEmail: "Team <sender@example.com>\r\nBcc: evil@example.com",
+		smtpHost:  host,
+		smtpPort:  port,
+	}
+	err := s.sendSMTP("to@example.com", "Test Subject", "<p>Hello</p>")
+	if err == nil {
+		t.Fatal("expected sendSMTP to reject a CR/LF sender")
+	}
+	if !strings.Contains(err.Error(), "MAIL FROM") {
+		t.Errorf("expected the failure at MAIL FROM, got: %v", err)
+	}
+	select {
+	case data := <-srv.ReceivedData:
+		t.Fatalf("no message should have been delivered, got:\n%s", data)
+	default:
 	}
 }
 
