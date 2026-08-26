@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
@@ -38,8 +39,64 @@ func TestClaimTaskByRuntime_OwnerlessAgentOnPrivateRuntimeFailsExplicitly(t *tes
 	if status != "failed" {
 		t.Fatalf("task status = %q, want failed", status)
 	}
-	if !strings.Contains(errorMessage, "agent has no matching owner") {
-		t.Fatalf("task error = %q, want actionable owner mismatch", errorMessage)
+	if !strings.Contains(errorMessage, "agent has no owner") {
+		t.Fatalf("task error = %q, want actionable missing-owner error", errorMessage)
+	}
+	if failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
+		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonInvalidTaskIdentity)
+	}
+}
+
+func TestBuildClaimedTaskResponseRejectsAgentOwnerChangedAfterClaim(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	newOwnerID := dbfx.User(t, "Claim owner mismatch", "claim-owner-mismatch-"+uuid.NewString()+"@example.com")
+	dbfx.Member(t, testWorkspaceID, newOwnerID, "member")
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Claim then change owner runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Claim then change owner agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+
+	task, err := testHandler.TaskService.ClaimTaskForRuntime(ctx, parseUUID(runtimeID))
+	if err != nil {
+		t.Fatalf("claim task: %v", err)
+	}
+	if task == nil || uuidToString(task.ID) != taskID {
+		t.Fatalf("claimed task = %+v, want %s", task, taskID)
+	}
+	dbfx.Exec(t, `UPDATE agent SET owner_id = $1 WHERE id = $2`, newOwnerID, agentID)
+
+	runtime, err := testHandler.Queries.GetAgentRuntimeForWorkspace(ctx, db.GetAgentRuntimeForWorkspaceParams{
+		ID:          parseUUID(runtimeID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load runtime: %v", err)
+	}
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
+		testWorkspaceID, "claim-then-owner-change")
+	_, _, _, _, failure := testHandler.buildClaimedTaskResponse(
+		req, task, runtime, runtimeID, testWorkspaceID,
+	)
+	if failure == nil || failure.status != http.StatusForbidden || failure.outcome != "error_runtime_access_denied" {
+		t.Fatalf("failure = %+v, want runtime-access forbidden", failure)
+	}
+
+	var status, errorMessage, failureReason string
+	dbfx.QueryRow(t, `
+		SELECT status, error, failure_reason
+		FROM agent_task_queue
+		WHERE id = $1
+	`, taskID).Scan(&status, &errorMessage, &failureReason)
+	if status != "failed" {
+		t.Fatalf("task status = %q, want failed", status)
+	}
+	if !strings.Contains(errorMessage, "agent and runtime have different owners") {
+		t.Fatalf("task error = %q, want actionable owner-mismatch error", errorMessage)
+	}
+	if strings.Contains(errorMessage, "agent has no owner") {
+		t.Fatalf("task error = %q, must not describe a non-null owner as missing", errorMessage)
 	}
 	if failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
 		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonInvalidTaskIdentity)
