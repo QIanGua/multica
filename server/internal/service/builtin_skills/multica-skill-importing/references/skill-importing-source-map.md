@@ -156,3 +156,16 @@ Behavior is path-shape-dependent. On **import or create** a manifest's `SKILL.md
 supporting file is dropped (it will not appear in the returned `files`), so the
 import still succeeds — it does not 400. The hard 400 rejection fires only on the
 dedicated single-file endpoint `PUT /api/skills/{id}/files`.
+
+## Reading a skill back (`?include=`)
+
+| Behavior | File:line |
+|---|---|
+| `resolveSkillInclude` parses `?include=content\|metadata`, 400 on anything else | `server/internal/handler/skill.go`, grep `func resolveSkillInclude` |
+| `GET /api/skills/{id}` defaults to `content` (installed web/desktop clients depend on it) | `GetSkill`, grep `func (h *Handler) GetSkill` |
+| `GET /api/skills/{id}/files` defaults to `metadata` | `ListSkillFiles`, grep `func (h *Handler) ListSkillFiles` |
+| Metadata shapes (`size`, `content_hash`, `content_size`) | `SkillFileMetadataResponse` / `SkillWithFileMetadataResponse` in `server/internal/handler/skill.go` |
+| Size + hash computed in Postgres, bodies never leave the DB | `ListSkillFileMetadata`, `server/pkg/db/queries/skill.sql` |
+| CLI sends `include=metadata` unless `--with-content` | `skillIncludeQuery`, `server/cmd/multica/cmd_skill.go` |
+| Handler tests | `server/internal/handler/skill_metadata_test.go` |
+| CLI tests | `server/cmd/multica/cmd_skill_test.go`, grep `AsksForMetadataUnlessContentRequested` |

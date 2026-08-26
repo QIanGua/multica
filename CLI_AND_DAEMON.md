@@ -988,3 +988,21 @@ always at least this value, so raising it takes effect across all commands.
 ```bash
 MULTICA_HTTP_TIMEOUT=60s multica issue list
 ```
+
+### Skill payload size
+
+`multica skill get` and `multica skill files list` return **metadata only** by
+default — path, byte size and content hash for each file, plus the size and
+hash of the SKILL.md body. Sizes are what tell you which file makes a skill
+large, and they stay available no matter how large it gets.
+
+Pass `--with-content` when you actually need the bodies:
+
+```bash
+multica skill files list <id>                  # paths and sizes
+multica skill files list <id> --with-content   # bodies inlined
+```
+
+On the API, both endpoints accept `?include=content` and `?include=metadata`.
+`GET /api/skills/{id}` still defaults to `content` so existing clients are
+unaffected; `GET /api/skills/{id}/files` defaults to `metadata`.

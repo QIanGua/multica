@@ -55,6 +55,21 @@ SELECT * FROM skill_file
 WHERE skill_id = $1
 ORDER BY path ASC;
 
+-- name: ListSkillFileMetadata :many
+-- Metadata-only variant of ListSkillFiles: path, byte size and content hash
+-- without the body. Same reason as ListSkillSummariesByWorkspace — a skill
+-- whose supporting files total ~600KB cannot be listed at all when every row
+-- carries its full content, and the one command that would show which file is
+-- oversized was the command that timed out (GH multica-ai/multica#7498).
+-- size/hash are computed in Postgres so the bodies never leave the database.
+SELECT id, skill_id, path,
+       octet_length(content)::bigint AS size,
+       encode(sha256(content::bytea), 'hex') AS content_hash,
+       created_at, updated_at
+FROM skill_file
+WHERE skill_id = $1
+ORDER BY path ASC;
+
 -- name: GetSkillFile :one
 SELECT * FROM skill_file
 WHERE id = $1;
