@@ -170,3 +170,49 @@ describe("failureReasonLabel", () => {
     expect(failureReasonLabel("", enT)).toBeNull();
   });
 });
+
+// MUL-6704 adds three runtime-ACCESS reasons, and they are written on CANCELLED
+// rows as well as failed ones — a reclaimed machine settles work by cancelling
+// it. Without copy for them the revoke would land the user on a cancelled task
+// with either a raw wire string or the generic "Cancelled by the system", which
+// is the unexplained state this work exists to remove.
+describe("runtime access reasons (MUL-6704)", () => {
+  const reasons = [
+    "agent_runtime_required",
+    "runtime_access_revoked",
+    "agent_runtime_changed",
+  ] as const;
+
+  it("is registered in the i18n key map", () => {
+    for (const reason of reasons) {
+      expect(FAILURE_REASON_I18N_KEYS).toHaveProperty(reason);
+    }
+  });
+
+  it("renders localized copy in every shipped locale, never the raw wire value", () => {
+    for (const locale of ["en", "zh-Hans", "ja", "ko"] as const) {
+      const t = fixedT(locale);
+      for (const reason of reasons) {
+        const label = failureReasonLabel(reason, t);
+        expect(label).toBeTruthy();
+        expect(label).not.toBe(reason);
+      }
+    }
+  });
+
+  it("explains a task the server cancelled to reclaim a runtime", () => {
+    // The revoke teardown cancels rather than fails, so this is the path that
+    // decides whether the user can see why their queued work disappeared.
+    expect(
+      cancelReasonLabel(
+        {
+          status: "cancelled",
+          error: "The runtime was made private by its owner.",
+          failure_reason: "agent_runtime_required",
+        },
+        enT,
+      ),
+    ).toBe(failureReasonLabel("agent_runtime_required", enT));
+  });
+});
+

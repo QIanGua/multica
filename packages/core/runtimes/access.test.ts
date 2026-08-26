@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { AgentRuntime } from "../types";
-import { isRuntimeUsableForUser } from "./access";
+import {
+  isRuntimeUsableForAgentOwner,
+  isRuntimeUsableForUser,
+} from "./access";
 
 const OWNER = "user-owner";
 const OTHER = "user-other";
@@ -62,5 +65,39 @@ describe("isRuntimeUsableForUser", () => {
 
   it("allows everything while the viewer is unknown, so a loading session never hides the user's own runtime", () => {
     expect(isRuntimeUsableForUser(makeRuntime(), null)).toBe(true);
+  });
+});
+
+// The agent-owner half of the same contract (MUL-6704). The server checks it in
+// service.RuntimeAllowsAgentOwner, in the SQL claim fence and again after the
+// claim, so a picker that offered a target this rejects would bind an agent
+// whose every task is then refused — the silent-queue bug the teardown exists
+// to end.
+describe("isRuntimeUsableForAgentOwner", () => {
+  it("lets a private runtime run its own owner's agent", () => {
+    expect(isRuntimeUsableForAgentOwner(makeRuntime(), OWNER)).toBe(true);
+  });
+
+  it("refuses a private runtime for another member's agent", () => {
+    // This is the case that differs from isRuntimeUsableForUser: the runtime
+    // owner IS allowed to operate here, but the machine may not run the other
+    // member's agent.
+    expect(isRuntimeUsableForAgentOwner(makeRuntime(), OTHER)).toBe(false);
+  });
+
+  it("lets a public runtime run any owner's agent", () => {
+    expect(
+      isRuntimeUsableForAgentOwner(makeRuntime({ visibility: "public" }), OTHER),
+    ).toBe(true);
+  });
+
+  it("refuses an ownerless runtime whatever its visibility", () => {
+    expect(
+      isRuntimeUsableForAgentOwner(makeRuntime({ owner_id: null }), OWNER),
+    ).toBe(false);
+  });
+
+  it("allows everything while the agent owner is unknown", () => {
+    expect(isRuntimeUsableForAgentOwner(makeRuntime(), null)).toBe(true);
   });
 });

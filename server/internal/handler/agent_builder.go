@@ -104,6 +104,18 @@ func (h *Handler) CreateAgentBuilderSession(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Re-read the runtime under the FK lock before the carrier row is inserted:
+	// resolveBuilderRuntime ran outside this transaction and a public → private
+	// revoke can commit in between (MUL-6704). The carrier's owner is the caller.
+	if _, bindErr := revalidateRuntimeForBind(r.Context(), qtx, runtime.ID, ownerUUID); bindErr != nil {
+		if errors.Is(bindErr, errRuntimeBindMissing) || errors.Is(bindErr, errRuntimeBindForbidden) {
+			writeError(w, http.StatusForbidden, "this runtime is private; only its owner can use it")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to validate runtime")
+		}
+		return
+	}
+
 	builder, err := qtx.CreateAgentBuilder(r.Context(), db.CreateAgentBuilderParams{
 		WorkspaceID:  workspaceUUID,
 		Name:         fmt.Sprintf(".multica-agent-builder-%s", flowID),
@@ -473,6 +485,19 @@ func (h *Handler) SwitchAgentBuilderRuntime(w http.ResponseWriter, r *http.Reque
 		return
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusInternalServerError, "failed to check pending builder task")
+		return
+	}
+
+	// Same transactional re-check as session create (MUL-6704): the carrier must
+	// not land on a runtime that stopped permitting its owner while this request
+	// was in flight. This is also the repair path a builder session stranded by a
+	// revoke uses, so it has to be authoritative about the new target.
+	if _, bindErr := revalidateRuntimeForBind(r.Context(), qtx, runtime.ID, agent.OwnerID); bindErr != nil {
+		if errors.Is(bindErr, errRuntimeBindMissing) || errors.Is(bindErr, errRuntimeBindForbidden) {
+			writeError(w, http.StatusForbidden, "this runtime is private; only its owner can use it")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to validate runtime")
+		}
 		return
 	}
 

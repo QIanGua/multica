@@ -11,6 +11,117 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelAgentTasksByAgentsWithReason = `-- name: CancelAgentTasksByAgentsWithReason :many
+UPDATE agent_task_queue
+SET status = 'cancelled',
+    completed_at = now(),
+    error = $1,
+    failure_reason = $2,
+    wait_reason = NULL,
+    prepare_lease_expires_at = NULL
+WHERE agent_id = ANY($3::uuid[])
+  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision
+`
+
+type CancelAgentTasksByAgentsWithReasonParams struct {
+	Error         pgtype.Text   `json:"error"`
+	FailureReason pgtype.Text   `json:"failure_reason"`
+	AgentIds      []pgtype.UUID `json:"agent_ids"`
+}
+
+// Cancels every non-terminal task of the given agents and records WHY.
+//
+// Deliberately separate from CancelAgentTasksByRuntimeOrAgent rather than
+// adding a reason parameter to it: that query is shared by runtime delete and
+// member revocation, whose reasons are a different decision, and it also
+// carries a runtime-side leg this caller must NOT use (a visibility revoke
+// keeps the runtime, so matching on runtime_id would cancel the owner's own
+// tasks on their own machine).
+//
+// error + failure_reason are reused instead of adding a cancel-reason column
+// (MUL-6704 decision C): failure_reason is an open string, and the clients
+// already render it for cancelled rows (cancelReasonLabel). Dashboards only
+// read it for status='failed', so a cancelled row cannot inflate error rates.
+//
+// The status list mirrors CancelAgentTasksByRuntimeOrAgent — every non-terminal
+// status. wait_reason and the prepare lease are cleared: the row is terminal
+// now and a stale lease would make it look claimable to a human reading it.
+func (q *Queries) CancelAgentTasksByAgentsWithReason(ctx context.Context, arg CancelAgentTasksByAgentsWithReasonParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, cancelAgentTasksByAgentsWithReason, arg.Error, arg.FailureReason, arg.AgentIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+			&i.ChatSessionID,
+			&i.AutopilotRunID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.ParentTaskID,
+			&i.FailureReason,
+			&i.TriggerSummary,
+			&i.ForceFreshSession,
+			&i.IsLeaderTask,
+			&i.WaitReason,
+			&i.InitiatorUserID,
+			&i.HandoffNote,
+			&i.PrepareLeaseExpiresAt,
+			&i.SquadID,
+			&i.RuntimeMcpOverlay,
+			&i.EscalationForTaskID,
+			&i.FireAt,
+			&i.OriginatorUserID,
+			&i.RuntimeConnectedApps,
+			&i.CoalescedCommentIds,
+			&i.DeliveredCommentIds,
+			&i.ChatInputTaskID,
+			&i.ChatFinalizeDeferredAt,
+			&i.OriginatorSource,
+			&i.DelegatedFromTaskID,
+			&i.RetryOfTaskID,
+			&i.RerunOfTaskID,
+			&i.RuleVersionID,
+			&i.TriggerEvidenceKind,
+			&i.TriggerEvidenceRefID,
+			&i.AccountableUserID,
+			&i.SessionRolloutMissing,
+			&i.RetiredSessionID,
+			&i.QuickActionsDisabled,
+			&i.RegenerateQuickActionsFor,
+			&i.BranchName,
+			&i.DurableWorkDir,
+			&i.ChannelContextRevision,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const cancelAgentTasksByRuntimeOrAgent = `-- name: CancelAgentTasksByRuntimeOrAgent :many
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now()
@@ -48,6 +159,246 @@ type CancelAgentTasksByRuntimeOrAgentParams struct {
 // a failed delete (runtime_delete_not_drained) instead of silent data loss.
 func (q *Queries) CancelAgentTasksByRuntimeOrAgent(ctx context.Context, arg CancelAgentTasksByRuntimeOrAgentParams) ([]AgentTaskQueue, error) {
 	rows, err := q.db.Query(ctx, cancelAgentTasksByRuntimeOrAgent, arg.RuntimeIds, arg.AgentIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+			&i.ChatSessionID,
+			&i.AutopilotRunID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.ParentTaskID,
+			&i.FailureReason,
+			&i.TriggerSummary,
+			&i.ForceFreshSession,
+			&i.IsLeaderTask,
+			&i.WaitReason,
+			&i.InitiatorUserID,
+			&i.HandoffNote,
+			&i.PrepareLeaseExpiresAt,
+			&i.SquadID,
+			&i.RuntimeMcpOverlay,
+			&i.EscalationForTaskID,
+			&i.FireAt,
+			&i.OriginatorUserID,
+			&i.RuntimeConnectedApps,
+			&i.CoalescedCommentIds,
+			&i.DeliveredCommentIds,
+			&i.ChatInputTaskID,
+			&i.ChatFinalizeDeferredAt,
+			&i.OriginatorSource,
+			&i.DelegatedFromTaskID,
+			&i.RetryOfTaskID,
+			&i.RerunOfTaskID,
+			&i.RuleVersionID,
+			&i.TriggerEvidenceKind,
+			&i.TriggerEvidenceRefID,
+			&i.AccountableUserID,
+			&i.SessionRolloutMissing,
+			&i.RetiredSessionID,
+			&i.QuickActionsDisabled,
+			&i.RegenerateQuickActionsFor,
+			&i.BranchName,
+			&i.DurableWorkDir,
+			&i.ChannelContextRevision,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const cancelPreClaimTasksOnOtherRuntimes = `-- name: CancelPreClaimTasksOnOtherRuntimes :many
+UPDATE agent_task_queue
+SET status = 'cancelled',
+    completed_at = now(),
+    error = $1,
+    failure_reason = $2,
+    wait_reason = NULL,
+    prepare_lease_expires_at = NULL
+WHERE agent_id = $3
+  AND runtime_id IS DISTINCT FROM $4
+  AND status IN ('queued', 'waiting_local_directory', 'deferred')
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision
+`
+
+type CancelPreClaimTasksOnOtherRuntimesParams struct {
+	Error         pgtype.Text `json:"error"`
+	FailureReason pgtype.Text `json:"failure_reason"`
+	AgentID       pgtype.UUID `json:"agent_id"`
+	RuntimeID     pgtype.UUID `json:"runtime_id"`
+}
+
+// MUL-6704: the rebind cleanup. When UpdateAgent moves an agent to another
+// runtime, agent_task_queue.runtime_id is NOT rewritten, and since #7571 the
+// claim fence requires agent.runtime_id = agent_task_queue.runtime_id. So rows
+// left pinned to the previous runtime become unclaimable from both sides — the
+// old machine is refused, the new machine never sees them — and used to sit
+// there until the 2h queue TTL failed them as the misleading `queued_expired`.
+//
+// Restricted to the pre-claim statuses on purpose. A `dispatched` or `running`
+// task is already executing on the old machine and still completes correctly
+// (CompleteAgentTask does not check the binding), so cancelling it here would
+// throw away work the user never asked to stop by editing an agent. The
+// residual case — a dispatched row whose daemon never started it — is settled
+// by CancelStaleMismatchedDispatchedTasks.
+func (q *Queries) CancelPreClaimTasksOnOtherRuntimes(ctx context.Context, arg CancelPreClaimTasksOnOtherRuntimesParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, cancelPreClaimTasksOnOtherRuntimes,
+		arg.Error,
+		arg.FailureReason,
+		arg.AgentID,
+		arg.RuntimeID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+			&i.ChatSessionID,
+			&i.AutopilotRunID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.ParentTaskID,
+			&i.FailureReason,
+			&i.TriggerSummary,
+			&i.ForceFreshSession,
+			&i.IsLeaderTask,
+			&i.WaitReason,
+			&i.InitiatorUserID,
+			&i.HandoffNote,
+			&i.PrepareLeaseExpiresAt,
+			&i.SquadID,
+			&i.RuntimeMcpOverlay,
+			&i.EscalationForTaskID,
+			&i.FireAt,
+			&i.OriginatorUserID,
+			&i.RuntimeConnectedApps,
+			&i.CoalescedCommentIds,
+			&i.DeliveredCommentIds,
+			&i.ChatInputTaskID,
+			&i.ChatFinalizeDeferredAt,
+			&i.OriginatorSource,
+			&i.DelegatedFromTaskID,
+			&i.RetryOfTaskID,
+			&i.RerunOfTaskID,
+			&i.RuleVersionID,
+			&i.TriggerEvidenceKind,
+			&i.TriggerEvidenceRefID,
+			&i.AccountableUserID,
+			&i.SessionRolloutMissing,
+			&i.RetiredSessionID,
+			&i.QuickActionsDisabled,
+			&i.RegenerateQuickActionsFor,
+			&i.BranchName,
+			&i.DurableWorkDir,
+			&i.ChannelContextRevision,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const cancelStaleMismatchedDispatchedTasks = `-- name: CancelStaleMismatchedDispatchedTasks :many
+WITH victims AS (
+    SELECT atq.id
+    FROM agent_task_queue atq
+    JOIN agent a ON a.id = atq.agent_id
+    WHERE atq.status = 'dispatched'
+      AND atq.runtime_id IS NOT NULL
+      AND a.runtime_id IS DISTINCT FROM atq.runtime_id
+      AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
+      AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
+    ORDER BY atq.dispatched_at ASC
+    LIMIT $4::int
+    FOR UPDATE OF atq SKIP LOCKED
+)
+UPDATE agent_task_queue
+SET status = 'cancelled',
+    completed_at = now(),
+    error = $1,
+    failure_reason = $2,
+    wait_reason = NULL,
+    prepare_lease_expires_at = NULL
+WHERE id IN (SELECT id FROM victims)
+  AND status = 'dispatched'
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision
+`
+
+type CancelStaleMismatchedDispatchedTasksParams struct {
+	Error             pgtype.Text `json:"error"`
+	FailureReason     pgtype.Text `json:"failure_reason"`
+	ClaimRecoverySecs float64     `json:"claim_recovery_secs"`
+	MaxPerTick        int32       `json:"max_per_tick"`
+}
+
+// Sweeper arm for MUL-6704: a `dispatched` row whose agent has since moved to
+// another runtime can no longer be reclaimed — RecoverStaleDispatchedTask and
+// its batch variant both require agent.runtime_id = agent_task_queue.runtime_id
+// since #7571 — so without this it would drift until FailStaleTasks called it a
+// `timeout`, pointing the user at a hung machine that was never involved.
+//
+// Only rows past the claim-recovery window with no live prepare lease are
+// taken, which is exactly the "the daemon that claimed this is not going to
+// start it" condition the reclaim path uses. `running` is never touched here:
+// a run in flight on the old machine finishes normally.
+//
+// Bounded per tick with FOR UPDATE SKIP LOCKED so a backlog cannot monopolise
+// the sweeper tick or contend with a live claim.
+func (q *Queries) CancelStaleMismatchedDispatchedTasks(ctx context.Context, arg CancelStaleMismatchedDispatchedTasksParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, cancelStaleMismatchedDispatchedTasks,
+		arg.Error,
+		arg.FailureReason,
+		arg.ClaimRecoverySecs,
+		arg.MaxPerTick,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -729,6 +1080,82 @@ func (q *Queries) ListDaemonCustomNames(ctx context.Context, arg ListDaemonCusto
 	return items, nil
 }
 
+const listForeignAgentsByRuntime = `-- name: ListForeignAgentsByRuntime :many
+SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, starter_prompts FROM agent
+WHERE runtime_id = $1 AND owner_id IS DISTINCT FROM $2
+ORDER BY name ASC
+`
+
+type ListForeignAgentsByRuntimeParams struct {
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	OwnerID   pgtype.UUID `json:"owner_id"`
+}
+
+// MUL-6704: every agent bound to this runtime whose owner is NOT the runtime
+// owner — the set a public → private revoke has to deal with. Active and
+// archived, both kinds: the handler splits them (user agents are unbound,
+// `kind = 'system'` carriers keep their binding, see
+// UnbindForeignUserAgentsFromRuntime) and the counts feed the confirmation
+// dialog.
+//
+// The predicate is `IS DISTINCT FROM`, not `<>`, so an ownerless agent row is
+// part of the set. That matches the claim fence added in #7571, which lets a
+// NULL-owner agent through the SQL and then settles it explicitly at delivery:
+// such an agent can never actually run on a private runtime, so the plan the
+// user confirms must include it rather than leave it silently stuck.
+//
+// Ordered by name for a deterministic dialog; the locking variant orders by id
+// instead (stable lock order).
+func (q *Queries) ListForeignAgentsByRuntime(ctx context.Context, arg ListForeignAgentsByRuntimeParams) ([]Agent, error) {
+	rows, err := q.db.Query(ctx, listForeignAgentsByRuntime, arg.RuntimeID, arg.OwnerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Agent{}
+	for rows.Next() {
+		var i Agent
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.Name,
+			&i.AvatarUrl,
+			&i.RuntimeMode,
+			&i.RuntimeConfig,
+			&i.Visibility,
+			&i.Status,
+			&i.MaxConcurrentTasks,
+			&i.OwnerID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Description,
+			&i.RuntimeID,
+			&i.Instructions,
+			&i.ArchivedAt,
+			&i.ArchivedBy,
+			&i.CustomEnv,
+			&i.CustomArgs,
+			&i.McpConfig,
+			&i.Model,
+			&i.ThinkingLevel,
+			&i.ComposioToolkitAllowlist,
+			&i.PermissionMode,
+			&i.Kind,
+			&i.SystemKey,
+			&i.DisabledRuntimeSkills,
+			&i.ServiceTier,
+			&i.StarterPrompts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStaleOfflineRuntimeGCCandidates = `-- name: ListStaleOfflineRuntimeGCCandidates :many
 SELECT id FROM agent_runtime
 WHERE status = 'offline'
@@ -873,6 +1300,121 @@ func (q *Queries) LockAgentRuntime(ctx context.Context, id pgtype.UUID) (AgentRu
 		&i.CustomName,
 	)
 	return i, err
+}
+
+const lockAgentRuntimeForBind = `-- name: LockAgentRuntimeForBind :one
+SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name FROM agent_runtime
+WHERE id = $1
+FOR KEY SHARE
+`
+
+// MUL-6704: re-read + lock the runtime a caller is about to bind an agent to,
+// from inside that caller's own transaction.
+//
+// FOR KEY SHARE is exactly the lock an INSERT/UPDATE of agent.runtime_id takes
+// implicitly for FK validation, so this adds no new contention between binders,
+// but it DOES conflict with the FOR UPDATE that LockAgentRuntime takes in the
+// revoke / delete teardown. That is the point: before this query existed, a
+// binder read the runtime row outside its transaction, blocked on the FK lock
+// while a public → private revoke committed, and then wrote its agent onto the
+// runtime using the stale `public` snapshot — recreating exactly the state the
+// teardown had just cleaned up. Blocking here and re-reading afterwards means
+// the visibility/owner check runs against the committed row.
+//
+// Note it must NOT be LockAgentRuntime (FOR UPDATE): that would serialize every
+// agent create on the same machine behind one another.
+func (q *Queries) LockAgentRuntimeForBind(ctx context.Context, id pgtype.UUID) (AgentRuntime, error) {
+	row := q.db.QueryRow(ctx, lockAgentRuntimeForBind, id)
+	var i AgentRuntime
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.DaemonID,
+		&i.Name,
+		&i.RuntimeMode,
+		&i.Provider,
+		&i.Status,
+		&i.DeviceInfo,
+		&i.Metadata,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OwnerID,
+		&i.LegacyDaemonID,
+		&i.Visibility,
+		&i.ProfileID,
+		&i.CustomName,
+	)
+	return i, err
+}
+
+const lockForeignAgentsByRuntime = `-- name: LockForeignAgentsByRuntime :many
+SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, starter_prompts FROM agent
+WHERE runtime_id = $1 AND owner_id IS DISTINCT FROM $2
+ORDER BY id
+FOR UPDATE
+`
+
+type LockForeignAgentsByRuntimeParams struct {
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	OwnerID   pgtype.UUID `json:"owner_id"`
+}
+
+// FOR UPDATE variant of ListForeignAgentsByRuntime, used inside the revoke
+// transaction. Pair with LockAgentRuntime (which blocks FK-validated INSERTs
+// and runtime_id UPDATEs that would add an agent mid-teardown); this locks the
+// rows that already exist so a concurrent archive / restore / rebind of one of
+// them blocks until we commit. Ordered by id — the same order
+// ListUserAgentsByRuntimeForUpdate uses — so the revoke and delete paths can
+// never deadlock against each other.
+func (q *Queries) LockForeignAgentsByRuntime(ctx context.Context, arg LockForeignAgentsByRuntimeParams) ([]Agent, error) {
+	rows, err := q.db.Query(ctx, lockForeignAgentsByRuntime, arg.RuntimeID, arg.OwnerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Agent{}
+	for rows.Next() {
+		var i Agent
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.Name,
+			&i.AvatarUrl,
+			&i.RuntimeMode,
+			&i.RuntimeConfig,
+			&i.Visibility,
+			&i.Status,
+			&i.MaxConcurrentTasks,
+			&i.OwnerID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Description,
+			&i.RuntimeID,
+			&i.Instructions,
+			&i.ArchivedAt,
+			&i.ArchivedBy,
+			&i.CustomEnv,
+			&i.CustomArgs,
+			&i.McpConfig,
+			&i.Model,
+			&i.ThinkingLevel,
+			&i.ComposioToolkitAllowlist,
+			&i.PermissionMode,
+			&i.Kind,
+			&i.SystemKey,
+			&i.DisabledRuntimeSkills,
+			&i.ServiceTier,
+			&i.StarterPrompts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockRuntimesForMerge = `-- name: LockRuntimesForMerge :many
@@ -1249,6 +1791,80 @@ func (q *Queries) TouchAgentRuntimesLastSeenBatch(ctx context.Context, ids []pgt
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const unbindForeignUserAgentsFromRuntime = `-- name: UnbindForeignUserAgentsFromRuntime :many
+UPDATE agent
+SET runtime_id = NULL, updated_at = now()
+WHERE runtime_id = $1
+  AND kind = 'user'
+  AND owner_id IS DISTINCT FROM $2
+RETURNING id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, starter_prompts
+`
+
+type UnbindForeignUserAgentsFromRuntimeParams struct {
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	OwnerID   pgtype.UUID `json:"owner_id"`
+}
+
+// The revoke counterpart of UnbindUserAgentsFromRuntime: unbinds only the user
+// agents this runtime may no longer execute, leaving the owner's own agents
+// bound. Reusing the delete-path query here would be a serious bug — it has no
+// owner filter, so reclaiming your own machine would first unbind your own
+// agents.
+//
+// Archived rows included (an archived agent is just as much the user's data),
+// `kind = 'system'` excluded: a system carrier has no UI to rebind it, so
+// unbinding one strands a row nobody can repair. Those keep their binding and
+// are refused at admission instead (service.RuntimeAllowsAgentOwner).
+func (q *Queries) UnbindForeignUserAgentsFromRuntime(ctx context.Context, arg UnbindForeignUserAgentsFromRuntimeParams) ([]Agent, error) {
+	rows, err := q.db.Query(ctx, unbindForeignUserAgentsFromRuntime, arg.RuntimeID, arg.OwnerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Agent{}
+	for rows.Next() {
+		var i Agent
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.Name,
+			&i.AvatarUrl,
+			&i.RuntimeMode,
+			&i.RuntimeConfig,
+			&i.Visibility,
+			&i.Status,
+			&i.MaxConcurrentTasks,
+			&i.OwnerID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Description,
+			&i.RuntimeID,
+			&i.Instructions,
+			&i.ArchivedAt,
+			&i.ArchivedBy,
+			&i.CustomEnv,
+			&i.CustomArgs,
+			&i.McpConfig,
+			&i.Model,
+			&i.ThinkingLevel,
+			&i.ComposioToolkitAllowlist,
+			&i.PermissionMode,
+			&i.Kind,
+			&i.SystemKey,
+			&i.DisabledRuntimeSkills,
+			&i.ServiceTier,
+			&i.StarterPrompts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const unbindTasksFromRuntime = `-- name: UnbindTasksFromRuntime :execrows

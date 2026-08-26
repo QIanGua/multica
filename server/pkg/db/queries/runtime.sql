@@ -42,6 +42,26 @@ SELECT * FROM agent_runtime
 WHERE id = $1
 FOR UPDATE;
 
+-- name: LockAgentRuntimeForBind :one
+-- MUL-6704: re-read + lock the runtime a caller is about to bind an agent to,
+-- from inside that caller's own transaction.
+--
+-- FOR KEY SHARE is exactly the lock an INSERT/UPDATE of agent.runtime_id takes
+-- implicitly for FK validation, so this adds no new contention between binders,
+-- but it DOES conflict with the FOR UPDATE that LockAgentRuntime takes in the
+-- revoke / delete teardown. That is the point: before this query existed, a
+-- binder read the runtime row outside its transaction, blocked on the FK lock
+-- while a public → private revoke committed, and then wrote its agent onto the
+-- runtime using the stale `public` snapshot — recreating exactly the state the
+-- teardown had just cleaned up. Blocking here and re-reading afterwards means
+-- the visibility/owner check runs against the committed row.
+--
+-- Note it must NOT be LockAgentRuntime (FOR UPDATE): that would serialize every
+-- agent create on the same machine behind one another.
+SELECT * FROM agent_runtime
+WHERE id = $1
+FOR KEY SHARE;
+
 -- name: GetAgentRuntimeForWorkspace :one
 SELECT * FROM agent_runtime
 WHERE id = $1 AND workspace_id = $2;
@@ -366,6 +386,150 @@ WHERE runtime_id = $1 AND completed_at IS NOT NULL;
 UPDATE agent
 SET runtime_id = NULL, updated_at = now()
 WHERE runtime_id = $1 AND kind = 'user'
+RETURNING *;
+
+-- name: ListForeignAgentsByRuntime :many
+-- MUL-6704: every agent bound to this runtime whose owner is NOT the runtime
+-- owner — the set a public → private revoke has to deal with. Active and
+-- archived, both kinds: the handler splits them (user agents are unbound,
+-- `kind = 'system'` carriers keep their binding, see
+-- UnbindForeignUserAgentsFromRuntime) and the counts feed the confirmation
+-- dialog.
+--
+-- The predicate is `IS DISTINCT FROM`, not `<>`, so an ownerless agent row is
+-- part of the set. That matches the claim fence added in #7571, which lets a
+-- NULL-owner agent through the SQL and then settles it explicitly at delivery:
+-- such an agent can never actually run on a private runtime, so the plan the
+-- user confirms must include it rather than leave it silently stuck.
+--
+-- Ordered by name for a deterministic dialog; the locking variant orders by id
+-- instead (stable lock order).
+SELECT * FROM agent
+WHERE runtime_id = $1 AND owner_id IS DISTINCT FROM @owner_id
+ORDER BY name ASC;
+
+-- name: LockForeignAgentsByRuntime :many
+-- FOR UPDATE variant of ListForeignAgentsByRuntime, used inside the revoke
+-- transaction. Pair with LockAgentRuntime (which blocks FK-validated INSERTs
+-- and runtime_id UPDATEs that would add an agent mid-teardown); this locks the
+-- rows that already exist so a concurrent archive / restore / rebind of one of
+-- them blocks until we commit. Ordered by id — the same order
+-- ListUserAgentsByRuntimeForUpdate uses — so the revoke and delete paths can
+-- never deadlock against each other.
+SELECT * FROM agent
+WHERE runtime_id = $1 AND owner_id IS DISTINCT FROM @owner_id
+ORDER BY id
+FOR UPDATE;
+
+-- name: UnbindForeignUserAgentsFromRuntime :many
+-- The revoke counterpart of UnbindUserAgentsFromRuntime: unbinds only the user
+-- agents this runtime may no longer execute, leaving the owner's own agents
+-- bound. Reusing the delete-path query here would be a serious bug — it has no
+-- owner filter, so reclaiming your own machine would first unbind your own
+-- agents.
+--
+-- Archived rows included (an archived agent is just as much the user's data),
+-- `kind = 'system'` excluded: a system carrier has no UI to rebind it, so
+-- unbinding one strands a row nobody can repair. Those keep their binding and
+-- are refused at admission instead (service.RuntimeAllowsAgentOwner).
+UPDATE agent
+SET runtime_id = NULL, updated_at = now()
+WHERE runtime_id = $1
+  AND kind = 'user'
+  AND owner_id IS DISTINCT FROM @owner_id
+RETURNING *;
+
+-- name: CancelAgentTasksByAgentsWithReason :many
+-- Cancels every non-terminal task of the given agents and records WHY.
+--
+-- Deliberately separate from CancelAgentTasksByRuntimeOrAgent rather than
+-- adding a reason parameter to it: that query is shared by runtime delete and
+-- member revocation, whose reasons are a different decision, and it also
+-- carries a runtime-side leg this caller must NOT use (a visibility revoke
+-- keeps the runtime, so matching on runtime_id would cancel the owner's own
+-- tasks on their own machine).
+--
+-- error + failure_reason are reused instead of adding a cancel-reason column
+-- (MUL-6704 decision C): failure_reason is an open string, and the clients
+-- already render it for cancelled rows (cancelReasonLabel). Dashboards only
+-- read it for status='failed', so a cancelled row cannot inflate error rates.
+--
+-- The status list mirrors CancelAgentTasksByRuntimeOrAgent — every non-terminal
+-- status. wait_reason and the prepare lease are cleared: the row is terminal
+-- now and a stale lease would make it look claimable to a human reading it.
+UPDATE agent_task_queue
+SET status = 'cancelled',
+    completed_at = now(),
+    error = @error,
+    failure_reason = @failure_reason,
+    wait_reason = NULL,
+    prepare_lease_expires_at = NULL
+WHERE agent_id = ANY(@agent_ids::uuid[])
+  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING *;
+
+-- name: CancelPreClaimTasksOnOtherRuntimes :many
+-- MUL-6704: the rebind cleanup. When UpdateAgent moves an agent to another
+-- runtime, agent_task_queue.runtime_id is NOT rewritten, and since #7571 the
+-- claim fence requires agent.runtime_id = agent_task_queue.runtime_id. So rows
+-- left pinned to the previous runtime become unclaimable from both sides — the
+-- old machine is refused, the new machine never sees them — and used to sit
+-- there until the 2h queue TTL failed them as the misleading `queued_expired`.
+--
+-- Restricted to the pre-claim statuses on purpose. A `dispatched` or `running`
+-- task is already executing on the old machine and still completes correctly
+-- (CompleteAgentTask does not check the binding), so cancelling it here would
+-- throw away work the user never asked to stop by editing an agent. The
+-- residual case — a dispatched row whose daemon never started it — is settled
+-- by CancelStaleMismatchedDispatchedTasks.
+UPDATE agent_task_queue
+SET status = 'cancelled',
+    completed_at = now(),
+    error = @error,
+    failure_reason = @failure_reason,
+    wait_reason = NULL,
+    prepare_lease_expires_at = NULL
+WHERE agent_id = @agent_id
+  AND runtime_id IS DISTINCT FROM @runtime_id
+  AND status IN ('queued', 'waiting_local_directory', 'deferred')
+RETURNING *;
+
+-- name: CancelStaleMismatchedDispatchedTasks :many
+-- Sweeper arm for MUL-6704: a `dispatched` row whose agent has since moved to
+-- another runtime can no longer be reclaimed — RecoverStaleDispatchedTask and
+-- its batch variant both require agent.runtime_id = agent_task_queue.runtime_id
+-- since #7571 — so without this it would drift until FailStaleTasks called it a
+-- `timeout`, pointing the user at a hung machine that was never involved.
+--
+-- Only rows past the claim-recovery window with no live prepare lease are
+-- taken, which is exactly the "the daemon that claimed this is not going to
+-- start it" condition the reclaim path uses. `running` is never touched here:
+-- a run in flight on the old machine finishes normally.
+--
+-- Bounded per tick with FOR UPDATE SKIP LOCKED so a backlog cannot monopolise
+-- the sweeper tick or contend with a live claim.
+WITH victims AS (
+    SELECT atq.id
+    FROM agent_task_queue atq
+    JOIN agent a ON a.id = atq.agent_id
+    WHERE atq.status = 'dispatched'
+      AND atq.runtime_id IS NOT NULL
+      AND a.runtime_id IS DISTINCT FROM atq.runtime_id
+      AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
+      AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
+    ORDER BY atq.dispatched_at ASC
+    LIMIT @max_per_tick::int
+    FOR UPDATE OF atq SKIP LOCKED
+)
+UPDATE agent_task_queue
+SET status = 'cancelled',
+    completed_at = now(),
+    error = @error,
+    failure_reason = @failure_reason,
+    wait_reason = NULL,
+    prepare_lease_expires_at = NULL
+WHERE id IN (SELECT id FROM victims)
+  AND status = 'dispatched'
 RETURNING *;
 
 -- name: DeleteAgentRuntime :exec

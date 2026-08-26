@@ -144,6 +144,30 @@ const (
 	// workspace policy changes.
 	ReasonIssueWindowRestricted Reason = "issue_window_restricted"
 
+	// ReasonAgentRuntimeRequired: the task's agent has no runtime bound at
+	// all, which is where an agent lands when its runtime is deleted or when
+	// a shared machine is reclaimed as private (MUL-6704). Nothing will ever
+	// claim work for it; the fix is binding it to a runtime. Mirrors
+	// dispatch.ReasonAgentRuntimeRequired so the admission verdict and the
+	// persisted task reason read the same.
+	ReasonAgentRuntimeRequired Reason = "agent_runtime_required"
+
+	// ReasonRuntimeAccessRevoked: the agent is still bound to a runtime, but
+	// that runtime no longer permits this agent's owner — its owner flipped it
+	// back to `private` (MUL-6704). Distinct from agent_runtime_required
+	// because the binding is intact and only the owner of the machine can
+	// restore access (or the agent must move elsewhere), and distinct from
+	// runtime_offline because waiting changes nothing.
+	ReasonRuntimeAccessRevoked Reason = "runtime_access_revoked"
+
+	// ReasonAgentRuntimeChanged: the task was pinned to the runtime its agent
+	// was bound to when it was enqueued, and the agent has since moved
+	// (MUL-6704). Since #7571 such a row is claimable from neither machine, so
+	// it is cancelled with this reason instead of expiring hours later as a
+	// misleading `queued_expired` / `timeout`. Retrying runs it on the agent's
+	// current runtime.
+	ReasonAgentRuntimeChanged Reason = "agent_runtime_changed"
+
 	// Agent process side: failure surfaced by the agent CLI / SDK as
 	// an error string. Classify(rawError) is responsible for picking
 	// the right sub-reason from the string. IsAgentError returns true
@@ -242,6 +266,9 @@ var allReasons = []Reason{
 	ReasonRuntimeCLITimeout,
 	ReasonInvalidTaskIdentity,
 	ReasonIssueWindowRestricted,
+	ReasonAgentRuntimeRequired,
+	ReasonRuntimeAccessRevoked,
+	ReasonAgentRuntimeChanged,
 
 	// Agent process side: provider errors.
 	ReasonAgentProviderAuthOrAccess,

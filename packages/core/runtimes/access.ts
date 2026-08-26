@@ -1,6 +1,34 @@
 import type { RuntimeDevice } from "../types";
 
 /**
+ * Whether `runtime` may EXECUTE an agent owned by `agentOwnerId`.
+ *
+ * Distinct from isRuntimeUsableForUser, which answers "may the person at the
+ * keyboard bind an agent here". Both gates apply, and they differ exactly when
+ * the operator is not the agent's owner — an admin reassigning a teammate's
+ * agent, say. A private machine spends ITS OWNER's credentials and local files,
+ * so the question of whose agent may run there is a property of the agent's
+ * owner, not of who is clicking (MUL-6704).
+ *
+ * The server enforces the same predicate at three layers
+ * (service.RuntimeAllowsAgentOwner, the SQL claim fence, and the post-claim
+ * recheck), so a picker that ignored it would offer a target the API refuses —
+ * or worse, bind an agent whose every task is then refused at claim time.
+ *
+ * An unknown owner (list still loading) is treated as allowed, same reasoning as
+ * isRuntimeUsableForUser: every write path re-checks server-side.
+ */
+export function isRuntimeUsableForAgentOwner(
+  runtime: RuntimeDevice,
+  agentOwnerId: string | null,
+): boolean {
+  if (!runtime.owner_id) return false;
+  if (runtime.visibility === "public") return true;
+  if (!agentOwnerId) return true;
+  return runtime.owner_id === agentOwnerId;
+}
+
+/**
  * Whether this member may run an agent on `runtime`.
  *
  * A private runtime is usable only by its owner; a public one by anyone in the
