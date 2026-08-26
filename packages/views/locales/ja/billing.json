@@ -118,6 +118,7 @@
       "portal_description": "最新のサブスクリプション情報を下に表示しています。",
       "syncing_title": "サブスクリプションを有効化しています",
       "syncing_description": "支払いが完了しました。Stripe によるプラン変更の確認を待っています。",
+      "access_syncing_description": "Stripe が Pro を確認しました。このワークスペースに Pro のアクセス権を反映しています。",
       "timeout_description": "支払いは受領済みですが、サブスクリプションは同期中です。しばらくしてからページを更新してください。",
       "active_title": "Pro が有効になりました",
       "active_description": "このワークスペースで Pro を利用できます。"
@@ -195,6 +196,7 @@
       "usage_total": "{{total}} / {{limit}}",
       "usage_breakdown": "完了 {{used}} · 実行中 {{reserved}}",
       "resets_at": "{{date}} にリセット",
+      "activation_pending": "Pro の自動化アクセスを有効化しています",
       "usage_unavailable": "使用量は一時的に利用できません"
     },
     "seats": {

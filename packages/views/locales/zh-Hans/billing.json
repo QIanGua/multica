@@ -118,6 +118,7 @@
       "portal_description": "下方显示最新的订阅快照。",
       "syncing_title": "正在启用订阅",
       "syncing_description": "付款已完成，正在等待 Stripe 确认套餐变化。",
+      "access_syncing_description": "Stripe 已确认 Pro，正在为这个工作区启用相应权益。",
       "timeout_description": "付款已收到，但订阅仍在同步。请稍后刷新页面。",
       "active_title": "Pro 已启用",
       "active_description": "这个工作区现在可以使用 Pro。"
@@ -195,6 +196,7 @@
       "usage_total": "{{total}} / {{limit}}",
       "usage_breakdown": "已完成 {{used}} · 进行中 {{reserved}}",
       "resets_at": "{{date}} 重置",
+      "activation_pending": "正在启用 Pro 自动化权益",
       "usage_unavailable": "用量暂时不可用"
     },
     "seats": {

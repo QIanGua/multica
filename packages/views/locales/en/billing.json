@@ -118,6 +118,7 @@
       "portal_description": "The latest subscription snapshot is shown below.",
       "syncing_title": "Activating your subscription",
       "syncing_description": "Payment is complete. We're waiting for Stripe to confirm the plan change.",
+      "access_syncing_description": "Stripe confirmed Pro. We're activating Pro access across this workspace.",
       "timeout_description": "Payment was received, but the subscription is still syncing. Refresh this page in a moment.",
       "active_title": "Pro is active",
       "active_description": "This workspace now has Pro access."
@@ -197,6 +198,7 @@
       "usage_total": "{{total}} / {{limit}}",
       "usage_breakdown": "{{used}} completed · {{reserved}} in progress",
       "resets_at": "Resets {{date}}",
+      "activation_pending": "Activating Pro automation access",
       "usage_unavailable": "Usage is temporarily unavailable"
     },
     "seats": {

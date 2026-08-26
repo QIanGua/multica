@@ -613,7 +613,7 @@ describe("BillingTab", () => {
         "/acme/settings?tab=billing",
       );
 
-      act(() => vi.advanceTimersByTime(30_000));
+      act(() => vi.advanceTimersByTime(90_000));
 
       expect(
         screen.getByText(
@@ -649,6 +649,47 @@ describe("BillingTab", () => {
       expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
       expect(screen.getByText("5 / 7")).toBeInTheDocument();
       expect(mocks.useQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ refetchInterval: 2_000 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hides stale Free quota and polls until Pro automation access is active", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00Z"));
+    navigationState.search = "tab=billing&result=success&session_id=cs_test_1";
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+      issueWindow: null,
+      autopilotRuns: null,
+    });
+    mocks.entitlementsDataUpdatedAt = Date.now() + 1;
+    mocks.entitlementsFetchedAfterMount = true;
+    try {
+      renderWithI18n(<BillingTab />);
+
+      expect(
+        screen.getByText(
+          "Stripe confirmed Pro. We're activating Pro access across this workspace.",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText("Activating Pro automation access"),
+      ).toBeInTheDocument();
+      expect(screen.queryByText("5 / 7")).not.toBeInTheDocument();
+      expect(screen.queryByText("Pro is active")).not.toBeInTheDocument();
+
+      const usageQueryCall = [...mocks.useQuery.mock.calls]
+        .reverse()
+        .find(
+          ([options]) =>
+            (options as { queryKey?: readonly unknown[] }).queryKey?.at(-1) ===
+            "usage",
+        );
+      expect(usageQueryCall?.[0]).toEqual(
         expect.objectContaining({ refetchInterval: 2_000 }),
       );
     } finally {
