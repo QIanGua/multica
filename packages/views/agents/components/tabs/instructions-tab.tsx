@@ -3,12 +3,18 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2, Save } from "lucide-react";
 import { useConfigStore } from "@multica/core/config";
+import { AGENT_FOCUS_STARTER_PROMPTS } from "@multica/core/paths";
 import type { Agent, AgentStarterPrompt } from "@multica/core/types";
 import { Button } from "@multica/ui/components/ui/button";
 import { Textarea } from "@multica/ui/components/ui/textarea";
+import { cn } from "@multica/ui/lib/utils";
 import { useT } from "../../../i18n";
+import { useOptionalNavigation } from "../../../navigation";
 
 import { StarterPromptsEditor } from "../starter-prompts-editor";
+
+/** How long the deep-linked starter-prompts editor stays ringed. */
+const FOCUS_FLASH_MS = 1600;
 
 export function InstructionsTab({
   agent,
@@ -23,6 +29,10 @@ export function InstructionsTab({
   onDirtyChange?: (dirty: boolean) => void;
 }) {
   const { t } = useT("agents");
+  // Optional read: this tab is a leaf that tests mount in isolation, and its
+  // only navigation-dependent behaviour (the deep-link focus below) degrades
+  // to "no highlight" when there is no adapter.
+  const navigation = useOptionalNavigation();
   const starterPromptsSupported = useConfigStore(
     (state) => state.agentStarterPromptsSupported,
   );
@@ -31,6 +41,10 @@ export function InstructionsTab({
     agent.starter_prompts ?? [],
   );
   const [saving, setSaving] = useState(false);
+  const [starterPromptsFocused, setStarterPromptsFocused] = useState(false);
+  const starterPromptsRef = useRef<HTMLDivElement | null>(null);
+  const focusHandledRef = useRef(false);
+  const focusFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [systemOpen, setSystemOpen] = useState(false);
   const persistedStarterPromptsKey = JSON.stringify(
     agent.starter_prompts ?? [],
@@ -98,6 +112,51 @@ export function InstructionsTab({
       );
     }
   }, [agent.id, agent.instructions, persistedStarterPromptsKey, saving]);
+
+  // Arriving from "customize" in a chat's empty state: bring the starter
+  // prompts into view and flash them, so the deep link lands ON the setting
+  // rather than on a long page that happens to contain it. The param is
+  // stripped once handled — a refresh or a later tab switch should not replay
+  // an animation the user did not ask for a second time.
+  useEffect(() => {
+    if (focusHandledRef.current) return;
+    if (!navigation || !starterPromptsSupported) return;
+    if (navigation.searchParams.get("focus") !== AGENT_FOCUS_STARTER_PROMPTS) {
+      return;
+    }
+    // One shot per mount. The adapter object is not referentially stable, so
+    // this effect re-runs on renders the `replace` below itself causes; without
+    // the latch a platform whose searchParams lag the call would loop.
+    focusHandledRef.current = true;
+
+    // `block: "nearest"` deliberately: native scrollIntoView scrolls every
+    // scrollable ancestor, which on desktop drags the shell itself (#3929).
+    starterPromptsRef.current?.scrollIntoView?.({ block: "nearest" });
+    setStarterPromptsFocused(true);
+
+    const params = new URLSearchParams(navigation.searchParams);
+    params.delete("focus");
+    const query = params.toString();
+    navigation.replace(
+      query ? `${navigation.pathname}?${query}` : navigation.pathname,
+    );
+
+    // The timer is held in a ref, NOT returned as this effect's cleanup: the
+    // adapter object is unstable, so a cleanup would be invoked on the very
+    // next render and cancel the flash before it ever ended, leaving the ring
+    // on permanently. Unmount clears it below.
+    focusFlashTimerRef.current = setTimeout(
+      () => setStarterPromptsFocused(false),
+      FOCUS_FLASH_MS,
+    );
+  }, [navigation, starterPromptsSupported]);
+
+  useEffect(
+    () => () => {
+      if (focusFlashTimerRef.current) clearTimeout(focusFlashTimerRef.current);
+    },
+    [],
+  );
 
   // Report dirty state up so the parent can guard tab switches.
   useEffect(() => {
@@ -183,10 +242,18 @@ export function InstructionsTab({
       </div>
 
       {starterPromptsSupported ? (
-        <StarterPromptsEditor
-          value={starterPrompts}
-          onChange={setStarterPrompts}
-        />
+        <div
+          ref={starterPromptsRef}
+          className={cn(
+            "scroll-mt-4 rounded-lg transition-shadow duration-500",
+            starterPromptsFocused && "ring-2 ring-brand/50 ring-offset-2 ring-offset-background",
+          )}
+        >
+          <StarterPromptsEditor
+            value={starterPrompts}
+            onChange={setStarterPrompts}
+          />
+        </div>
       ) : null}
 
       <div className="flex items-center justify-end gap-3">
