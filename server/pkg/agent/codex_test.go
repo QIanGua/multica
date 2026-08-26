@@ -349,6 +349,227 @@ func TestCodexHandleServerRequestUnknownReturnsError(t *testing.T) {
 	}
 }
 
+func TestCodexInitializeClientCapabilitiesOmitInteractiveUserInput(t *testing.T) {
+	t.Parallel()
+
+	caps := codexInitializeClientCapabilities()
+	if caps["experimentalApi"] != true {
+		t.Fatalf("expected experimentalApi=true, got %v", caps["experimentalApi"])
+	}
+	for _, key := range []string{"requestUserInput", "interactiveUserInput"} {
+		if _, ok := caps[key]; ok {
+			t.Fatalf("client capabilities must not advertise %s, got %v", key, caps)
+		}
+	}
+}
+
+func TestCodexInitializeAdvertisesInteractiveUserInput(t *testing.T) {
+	t.Parallel()
+
+	if codexInitializeAdvertisesInteractiveUserInput(nil) {
+		t.Fatal("missing initialize result must not advertise interactive user input")
+	}
+	if codexInitializeAdvertisesInteractiveUserInput(json.RawMessage(`{"userAgent":"codex-cli/0.149.1","platformOs":"macos"}`)) {
+		t.Fatal("Codex 0.149.1-shaped initialize result must not advertise interactive user input")
+	}
+	if !codexInitializeAdvertisesInteractiveUserInput(json.RawMessage(`{"capabilities":{"requestUserInput":true}}`)) {
+		t.Fatal("future initialize result with capabilities.requestUserInput must be detected")
+	}
+	if !codexInitializeAdvertisesInteractiveUserInput(json.RawMessage(`{"capabilities":{"interactiveUserInput":true}}`)) {
+		t.Fatal("future initialize result with capabilities.interactiveUserInput must be detected")
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputDegradesToText(t *testing.T) {
+	t.Parallel()
+
+	c, fs, _ := newTestCodexClient(t)
+	var texts []string
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			texts = append(texts, msg.Content)
+		}
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":21,"method":"item/tool/requestUserInput","params":{"threadId":"thr-1","turnId":"turn-1","itemId":"call-1","questions":[{"id":"mode","header":"Mode","question":"Which sandbox mode should we use?","options":[{"label":"Read-only (Recommended)","description":"Safer default"},{"label":"Workspace write","description":"Allow edits"}]}]}}`)
+
+	if c.getTurnError() != "" {
+		t.Fatalf("degraded requestUserInput must not fail the turn, got %q", c.getTurnError())
+	}
+	if len(texts) != 1 {
+		t.Fatalf("expected one visible text question, got %#v", texts)
+	}
+	got := texts[0]
+	for _, want := range []string{
+		"Which sandbox mode should we use?",
+		"Read-only (Recommended)",
+		"Workspace write",
+		"Reply in this chat",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected degraded text to contain %q, got %q", want, got)
+		}
+	}
+
+	lines := fs.Lines()
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(lines))
+	}
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["error"] != nil {
+		t.Fatalf("expected success result, got error %v", resp["error"])
+	}
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected result object, got %v", resp["result"])
+	}
+	answers, ok := result["answers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected answers object, got %v", result["answers"])
+	}
+	mode, ok := answers["mode"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected mode answer object, got %v", answers["mode"])
+	}
+	vals, ok := mode["answers"].([]any)
+	if !ok || len(vals) != 1 {
+		t.Fatalf("expected one degraded answer string, got %v", mode["answers"])
+	}
+	if vals[0] != codexRequestUserInputDegradedAnswer {
+		t.Fatalf("expected degraded answer, got %v", vals[0])
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputSupportedPathUsesResponder(t *testing.T) {
+	t.Parallel()
+
+	c, fs, _ := newTestCodexClient(t)
+	var texts []string
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			texts = append(texts, msg.Content)
+		}
+	}
+	c.interactiveUserInputResponder = func(params json.RawMessage) (map[string]any, bool) {
+		var payload codexToolRequestUserInputParams
+		if err := json.Unmarshal(params, &payload); err != nil {
+			t.Fatalf("supported path params: %v", err)
+		}
+		if payload.ItemID != "call-native" {
+			t.Fatalf("expected itemId call-native, got %q", payload.ItemID)
+		}
+		return map[string]any{
+			"answers": map[string]any{
+				"mode": map[string]any{"answers": []string{"workspace-write"}},
+			},
+		}, true
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":22,"method":"item/tool/requestUserInput","params":{"itemId":"call-native","questions":[{"id":"mode","question":"Pick a mode"}]}}`)
+
+	if len(texts) != 0 {
+		t.Fatalf("supported path must not convert to assistant text, got %#v", texts)
+	}
+	if c.getTurnError() != "" {
+		t.Fatalf("supported path must not fail the turn, got %q", c.getTurnError())
+	}
+	lines := fs.Lines()
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(lines))
+	}
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	result := resp["result"].(map[string]any)
+	answers := result["answers"].(map[string]any)
+	mode := answers["mode"].(map[string]any)
+	if got := mode["answers"].([]any)[0]; got != "workspace-write" {
+		t.Fatalf("expected native answer, got %v", got)
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputDedupesSameItem(t *testing.T) {
+	t.Parallel()
+
+	c, fs, _ := newTestCodexClient(t)
+	var texts []string
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			texts = append(texts, msg.Content)
+		}
+	}
+	line := `{"jsonrpc":"2.0","id":23,"method":"item/tool/requestUserInput","params":{"itemId":"call-dup","questions":[{"id":"q1","question":"Confirm deploy?"}]}}`
+	c.handleLine(line)
+	c.handleLine(`{"jsonrpc":"2.0","id":24,"method":"item/tool/requestUserInput","params":{"itemId":"call-dup","questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+
+	if len(texts) != 1 {
+		t.Fatalf("duplicate itemId must emit the question once, got %#v", texts)
+	}
+	if len(fs.Lines()) != 2 {
+		t.Fatalf("each RPC still needs a response, got %d lines", len(fs.Lines()))
+	}
+	if c.getTurnError() != "" {
+		t.Fatalf("deduped request must not fail the turn, got %q", c.getTurnError())
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputMalformedParamsStillVisible(t *testing.T) {
+	t.Parallel()
+
+	c, fs, _ := newTestCodexClient(t)
+	var texts []string
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			texts = append(texts, msg.Content)
+		}
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":25,"method":"item/tool/requestUserInput","params":"not-an-object"}`)
+
+	if c.getTurnError() != "" {
+		t.Fatalf("malformed requestUserInput must not fail the turn, got %q", c.getTurnError())
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], "needs your confirmation") {
+		t.Fatalf("malformed params still need a visible fallback question, got %#v", texts)
+	}
+	if len(fs.Lines()) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(fs.Lines()))
+	}
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(fs.Lines()[0]), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["error"] != nil {
+		t.Fatalf("malformed params must still ACK with a result, got %v", resp["error"])
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputMisreportStillDegrades(t *testing.T) {
+	t.Parallel()
+
+	c, _, _ := newTestCodexClient(t)
+	c.serverAdvertisedInteractiveUserInput = true
+	var texts []string
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			texts = append(texts, msg.Content)
+		}
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":26,"method":"item/tool/requestUserInput","params":{"itemId":"call-misreport","questions":[{"id":"q","question":"Continue?"}]}}`)
+
+	if c.getTurnError() != "" {
+		t.Fatalf("capability misreport must still degrade, not fail, got %q", c.getTurnError())
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], "Continue?") {
+		t.Fatalf("misreported capability still needs the question visible, got %#v", texts)
+	}
+}
+
 func TestCodexLegacyEventTaskStarted(t *testing.T) {
 	t.Parallel()
 
@@ -3553,6 +3774,70 @@ func TestCodexExecuteSurfacesUnsupportedServerRequestOnInterruptedTurn(t *testin
 	}
 }
 
+func TestCodexExecuteRequestUserInputDegradesWithoutFailingTurn(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	codexHome := t.TempDir()
+	fakePath := writeFakeCodexAppServer(t, ""+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-cli/0.149.1","platformOs":"macos"}}'`+"\n"+
+		`read line`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-user-input"}}}'`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":3,"result":{}}'`+"\n"+
+		`echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr-user-input","turn":{"id":"turn-user-input"}}}'`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":99,"method":"item/tool/requestUserInput","params":{"threadId":"thr-user-input","turnId":"turn-user-input","itemId":"call-confirm","questions":[{"id":"proceed","header":"Confirm","question":"Should I create the sub-issue now?","options":[{"label":"Yes (Recommended)","description":"Create it"},{"label":"No","description":"Wait"}]}]}}'`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-user-input","turn":{"id":"turn-user-input","status":"completed"}}}'`+"\n")
+
+	result, messages := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
+		Logger: slog.Default(),
+		Env:    map[string]string{"CODEX_HOME": codexHome},
+	}, ExecOptions{
+		Timeout:                   5 * time.Second,
+		SemanticInactivityTimeout: 5 * time.Second,
+	}, 10*time.Second)
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+	}
+	if result.Error != "" {
+		t.Fatalf("degraded requestUserInput must not surface an error, got %q", result.Error)
+	}
+	if strings.Contains(result.Error, "unsupported codex app-server request") {
+		t.Fatalf("requestUserInput must not take the unsupported-request path, got %q", result.Error)
+	}
+	if !strings.Contains(result.Output, "Should I create the sub-issue now?") {
+		t.Fatalf("expected the confirmation question in the deliverable output, got %q", result.Output)
+	}
+
+	var textCount int
+	for _, msg := range messages {
+		if msg.Type == MessageText && strings.Contains(msg.Content, "Should I create the sub-issue now?") {
+			textCount++
+			if !strings.Contains(msg.Content, "Yes (Recommended)") {
+				t.Fatalf("expected options to remain visible, got %q", msg.Content)
+			}
+		}
+	}
+	if textCount != 1 {
+		t.Fatalf("expected the question to be streamed once, got %d matching text messages in %#v", textCount, messages)
+	}
+
+	cfg, err := os.ReadFile(filepath.Join(codexHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read pinned config: %v", err)
+	}
+	body := string(cfg)
+	if !strings.Contains(body, "experimental_request_user_input") || !strings.Contains(body, "enabled = false") {
+		t.Fatalf("expected per-task config to disable request_user_input, got %q", body)
+	}
+}
+
 func TestCodexExecuteTimeoutWinsOverProcessExitDuringActiveTurn(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS == "windows" {
@@ -4814,6 +5099,46 @@ func TestEnsureCodexMcpConfigIdempotent(t *testing.T) {
 	}
 	second, _ := os.ReadFile(tmp)
 
+	if string(first) != string(second) {
+		t.Fatalf("non-idempotent write:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+}
+
+func TestEnsureCodexRequestUserInputDisabledPinsAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	tmp := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(tmp, []byte("[tools.experimental_request_user_input]\nenabled = true\n"), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	if err := ensureCodexRequestUserInputDisabled(tmp, slog.Default()); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	first, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	body := string(first)
+	if strings.Count(body, "[tools.experimental_request_user_input]") != 1 {
+		t.Fatalf("expected a single managed table, got %q", body)
+	}
+	if !strings.Contains(body, "enabled = false") {
+		t.Fatalf("expected enabled = false, got %q", body)
+	}
+	if strings.Contains(body, "enabled = true") {
+		t.Fatalf("user-enabled table must be replaced, got %q", body)
+	}
+	info, err := os.Stat(tmp)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected 0600, got %o", info.Mode().Perm())
+	}
+	if err := ensureCodexRequestUserInputDisabled(tmp, slog.Default()); err != nil {
+		t.Fatalf("second ensure: %v", err)
+	}
+	second, _ := os.ReadFile(tmp)
 	if string(first) != string(second) {
 		t.Fatalf("non-idempotent write:\nfirst:\n%s\nsecond:\n%s", first, second)
 	}
