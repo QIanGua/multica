@@ -83,11 +83,7 @@ import { formatStripeMinorAmount } from "./billing-format";
 
 export { formatStripeMinorAmount } from "./billing-format";
 
-// Cloud's enforcement policy may remain fresh in the Multica server for up to
-// one minute after Stripe activates Pro. Keep checkout synchronization alive
-// long enough to observe that cache roll from a metered policy to `off`.
-const CHECKOUT_SYNC_TIMEOUT_MS = 90_000;
-const CHECKOUT_SYNC_POLL_INTERVAL_MS = 2_000;
+const CHECKOUT_SYNC_TIMEOUT_MS = 30_000;
 const SEAT_PURCHASE_POLL_TIMEOUT_MS = 2 * 60_000;
 const SEAT_PURCHASE_PREVIEW_DEBOUNCE_MS = 800;
 
@@ -284,11 +280,24 @@ function BillingTabContent() {
     );
   }, [callbackKey, navigation, returnResultParam, wsId]);
 
+  useEffect(() => {
+    if (returnResult !== "success") {
+      setIsSyncingCheckout(false);
+      setSyncTimedOut(false);
+      return;
+    }
+    setIsSyncingCheckout(true);
+    setSyncTimedOut(false);
+    const timeout = window.setTimeout(() => {
+      setIsSyncingCheckout(false);
+      setSyncTimedOut(true);
+    }, CHECKOUT_SYNC_TIMEOUT_MS);
+    return () => window.clearTimeout(timeout);
+  }, [returnResult, wsId]);
+
   const entitlementQuery = useQuery({
     ...workspaceSubscriptionEntitlementsOptions(wsId),
-    refetchInterval: isSyncingCheckout
-      ? CHECKOUT_SYNC_POLL_INTERVAL_MS
-      : false,
+    refetchInterval: isSyncingCheckout ? 2_000 : false,
   });
   const entitlements = entitlementQuery.data;
   const isCheckoutProConfirmed =
@@ -306,7 +315,7 @@ function BillingTabContent() {
       isSyncingCheckout ||
       (query.state.data?.seatCapacity?.activePurchase &&
         !seatPurchasePollingTimedOut)
-        ? CHECKOUT_SYNC_POLL_INTERVAL_MS
+        ? 2_000
         : false,
   });
   const activeSeatPurchaseRequestId =
@@ -327,49 +336,7 @@ function BillingTabContent() {
   const summaryUnavailable =
     summaryQuery.isError ||
     (!summaryQuery.isPending && summaryQuery.data == null);
-  const quotaUsageQuery = useQuery({
-    ...autopilotQuotaUsageOptions(wsId),
-    // Entitlements and enforcement policy travel through separate endpoints.
-    // Once Stripe confirms Pro, keep reading quota until the server drops its
-    // possibly cached Free policy. The checkout timeout bounds this polling.
-    refetchInterval:
-      isSyncingCheckout && isCheckoutProConfirmed
-        ? CHECKOUT_SYNC_POLL_INTERVAL_MS
-        : false,
-  });
-  const isCheckoutQuotaConfirmed =
-    isCheckoutProConfirmed && quotaUsageQuery.data?.action === "off";
-  const isCheckoutQuotaPending =
-    returnResult === "success" &&
-    isCheckoutProConfirmed &&
-    !isCheckoutQuotaConfirmed;
-
-  useEffect(() => {
-    if (returnResult !== "success") {
-      setIsSyncingCheckout(false);
-      setSyncTimedOut(false);
-      return;
-    }
-    if (isCheckoutQuotaConfirmed) {
-      setIsSyncingCheckout(false);
-      setSyncTimedOut(false);
-      checkoutIntentRef.current = null;
-      return;
-    }
-    setIsSyncingCheckout(true);
-    setSyncTimedOut(false);
-    const timeout = window.setTimeout(() => {
-      setIsSyncingCheckout(false);
-      setSyncTimedOut(true);
-    }, CHECKOUT_SYNC_TIMEOUT_MS);
-    return () => window.clearTimeout(timeout);
-  }, [
-    isCheckoutProConfirmed,
-    isCheckoutQuotaConfirmed,
-    returnResult,
-    wsId,
-  ]);
-
+  const quotaUsageQuery = useQuery(autopilotQuotaUsageOptions(wsId));
   const hasSeatCapacity = hasActiveWorkspaceSeatCapacity(summaryQuery.data);
   const hasBillingRelationship = hasWorkspaceBillingRelationship(
     summaryQuery.data,
@@ -533,6 +500,14 @@ function BillingTabContent() {
     t,
     wsId,
   ]);
+
+  useEffect(() => {
+    if (isSyncingCheckout && isCheckoutProConfirmed) {
+      setIsSyncingCheckout(false);
+      setSyncTimedOut(false);
+      checkoutIntentRef.current = null;
+    }
+  }, [isCheckoutProConfirmed, isSyncingCheckout]);
 
   useEffect(() => {
     const graceUntil = summaryQuery.data?.graceUntil;
@@ -941,7 +916,7 @@ function BillingTabContent() {
 
       {returnResult === "success" ? (
         <Alert>
-          {isCheckoutQuotaConfirmed ? (
+          {isCheckoutProConfirmed ? (
             <CheckCircle2 />
           ) : (
             <Loader2
@@ -953,17 +928,15 @@ function BillingTabContent() {
             />
           )}
           <AlertTitle>
-            {isCheckoutQuotaConfirmed
+            {isCheckoutProConfirmed
               ? t(($) => $.workspace.return.active_title)
               : t(($) => $.workspace.return.syncing_title)}
           </AlertTitle>
           <AlertDescription>
-            {isCheckoutQuotaConfirmed
+            {isCheckoutProConfirmed
               ? t(($) => $.workspace.return.active_description)
               : syncTimedOut
                 ? t(($) => $.workspace.return.timeout_description)
-                : isCheckoutProConfirmed
-                  ? t(($) => $.workspace.return.access_syncing_description)
                 : t(($) => $.workspace.return.syncing_description)}
           </AlertDescription>
         </Alert>
@@ -1305,39 +1278,7 @@ function BillingTabContent() {
             label={t(($) => $.workspace.limits.autopilots)}
             description={t(($) => $.workspace.limits.autopilots_description)}
           >
-            {isCheckoutQuotaPending ? (
-              <div className="flex flex-col gap-2 sm:items-end">
-                <span
-                  className="inline-flex items-center gap-2 text-caption text-muted-foreground"
-                  role="status"
-                >
-                  {isSyncingCheckout ? (
-                    <Loader2 className="size-4 animate-spin motion-reduce:animate-none" />
-                  ) : (
-                    <AlertCircle className="size-4" />
-                  )}
-                  {t(($) => $.workspace.limits.activation_pending)}
-                </span>
-                {syncTimedOut ? (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    aria-label={t(($) => $.workspace.actions.retry_autopilots)}
-                    aria-busy={quotaUsageQuery.isFetching}
-                    disabled={quotaUsageQuery.isFetching}
-                    onClick={() => void quotaUsageQuery.refetch()}
-                  >
-                    {quotaUsageQuery.isFetching ? (
-                      <Loader2 className="animate-spin motion-reduce:animate-none" />
-                    ) : (
-                      <RefreshCw />
-                    )}
-                    {t(($) => $.workspace.actions.retry)}
-                  </Button>
-                ) : null}
-              </div>
-            ) : quotaUsage.kind === "unlimited" ? (
+            {quotaUsage.kind === "unlimited" ? (
               <span className="tabular-nums">
                 {t(($) => $.workspace.limits.unlimited)}
               </span>
