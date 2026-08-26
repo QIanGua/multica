@@ -162,10 +162,11 @@ dedicated single-file endpoint `PUT /api/skills/{id}/files`.
 | Behavior | File:line |
 |---|---|
 | `resolveSkillInclude` parses `?include=content\|metadata`, 400 on anything else | `server/internal/handler/skill.go`, grep `func resolveSkillInclude` |
-| `GET /api/skills/{id}` defaults to `content` (installed web/desktop clients depend on it) | `GetSkill`, grep `func (h *Handler) GetSkill` |
-| `GET /api/skills/{id}/files` defaults to `metadata` | `ListSkillFiles`, grep `func (h *Handler) ListSkillFiles` |
+| Both endpoints default to `content` when `?include=` is absent — installed desktop builds and older CLIs cannot be asked to send it | `resolveSkillInclude`, `server/internal/handler/skill.go` |
+| Compatibility test for that default | `TestSkillEndpointsWithoutIncludeStillReturnContent`, `server/internal/handler/skill_metadata_test.go` |
 | Metadata shapes (`size`, `content_hash`, `content_size`) | `SkillFileMetadataResponse` / `SkillWithFileMetadataResponse` in `server/internal/handler/skill.go` |
-| Size + hash computed in Postgres, bodies never leave the DB | `ListSkillFileMetadata`, `server/pkg/db/queries/skill.sql` |
+| Size + hash of file bodies computed in Postgres, so those bodies never leave it | `ListSkillFileMetadata`, `server/pkg/db/queries/skill.sql` |
+| Hash is over raw UTF-8 (`convert_to`, never `content::bytea` — the cast reads backslash escapes and rejects a bare `\`) | `server/pkg/db/queries/skill.sql`, test `TestSkillFileHashCoversRawUTF8Bytes` |
 | CLI sends `include=metadata` unless `--with-content` | `skillIncludeQuery`, `server/cmd/multica/cmd_skill.go` |
 | Handler tests | `server/internal/handler/skill_metadata_test.go` |
 | CLI tests | `server/cmd/multica/cmd_skill_test.go`, grep `AsksForMetadataUnlessContentRequested` |

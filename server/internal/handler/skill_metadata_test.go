@@ -42,13 +42,13 @@ func skillRequest(t *testing.T, skillID, path string) *http.Request {
 	return withURLParam(newRequest(http.MethodGet, path, nil), "id", skillID)
 }
 
-func TestListSkillFilesOmitsBodiesByDefault(t *testing.T) {
+func TestListSkillFilesMetadataOmitsBodies(t *testing.T) {
 	if testPool == nil {
 		t.Skip("no database available")
 	}
 	skillID, bodies := newLargeSkillFixture(t)
 
-	req := skillRequest(t, skillID, "/api/skills/"+skillID+"/files")
+	req := skillRequest(t, skillID, "/api/skills/"+skillID+"/files?include=metadata")
 	var resp []SkillFileMetadataResponse
 	res := testutil.Call(t, testHandler.ListSkillFiles, req).Want(http.StatusOK).JSON(&resp)
 
@@ -98,29 +98,42 @@ func TestListSkillFilesIncludeContentReturnsBodies(t *testing.T) {
 	}
 }
 
-// GetSkill keeps its current shape when asked for nothing in particular:
-// installed web and desktop builds call it for the skill editor and cannot be
-// retrofitted with a query parameter.
-func TestGetSkillDefaultStillReturnsContent(t *testing.T) {
+// Neither endpoint may change what a request without `?include=` receives.
+// Their callers are installed software — desktop builds, and older CLI
+// versions whose `skill files list --output json` scripts read `content` — so
+// a server deploy that flipped a default would silently take content away from
+// clients that have no way to ask for it back.
+func TestSkillEndpointsWithoutIncludeStillReturnContent(t *testing.T) {
 	if testPool == nil {
 		t.Skip("no database available")
 	}
 	skillID, bodies := newLargeSkillFixture(t)
 
-	req := skillRequest(t, skillID, "/api/skills/"+skillID)
-	resp := testutil.Decode[SkillWithFilesResponse](t, testHandler.GetSkill, req, http.StatusOK)
-
-	if len(resp.Content) != 4096 {
-		t.Errorf("content length = %d, want 4096", len(resp.Content))
-	}
-	if len(resp.Files) != len(bodies) {
-		t.Fatalf("got %d files, want %d", len(resp.Files), len(bodies))
-	}
-	for _, f := range resp.Files {
-		if want := bodies[f.Path]; f.Content != want {
-			t.Errorf("%s: content length = %d, want %d", f.Path, len(f.Content), len(want))
+	t.Run("files listing", func(t *testing.T) {
+		req := skillRequest(t, skillID, "/api/skills/"+skillID+"/files")
+		resp := testutil.Decode[[]SkillFileResponse](t, testHandler.ListSkillFiles, req, http.StatusOK)
+		if len(resp) != len(bodies) {
+			t.Fatalf("got %d files, want %d", len(resp), len(bodies))
 		}
-	}
+		for _, f := range resp {
+			if want := bodies[f.Path]; f.Content != want {
+				t.Errorf("%s: content length = %d, want %d", f.Path, len(f.Content), len(want))
+			}
+		}
+	})
+
+	t.Run("skill detail", func(t *testing.T) {
+		req := skillRequest(t, skillID, "/api/skills/"+skillID)
+		resp := testutil.Decode[SkillWithFilesResponse](t, testHandler.GetSkill, req, http.StatusOK)
+		if len(resp.Content) != 4096 {
+			t.Errorf("content length = %d, want 4096", len(resp.Content))
+		}
+		for _, f := range resp.Files {
+			if want := bodies[f.Path]; f.Content != want {
+				t.Errorf("%s: content length = %d, want %d", f.Path, len(f.Content), len(want))
+			}
+		}
+	})
 }
 
 func TestGetSkillIncludeMetadataDropsBodies(t *testing.T) {
@@ -170,7 +183,7 @@ func TestSkillMetadataSizeDoesNotTrackContentSize(t *testing.T) {
 	skillID, _ := newLargeSkillFixture(t)
 
 	measure := func() int {
-		req := skillRequest(t, skillID, "/api/skills/"+skillID+"/files")
+		req := skillRequest(t, skillID, "/api/skills/"+skillID+"/files?include=metadata")
 		return testutil.Call(t, testHandler.ListSkillFiles, req).Want(http.StatusOK).Body.Len()
 	}
 
@@ -187,6 +200,71 @@ func TestSkillMetadataSizeDoesNotTrackContentSize(t *testing.T) {
 	// 600KB of new content; the listing may only grow by its 10 new rows.
 	if grew := after - before; grew > 3000 {
 		t.Errorf("listing grew by %d bytes after adding 600KB of content, want a per-row increase", grew)
+	}
+}
+
+// The size and hash are computed in SQL, so they must agree with Go's view of
+// the same bytes for every body a skill can legally hold.
+//
+// `sha256(content::bytea)` did not: that cast runs the bytea *input* parser
+// over the text, so `\x41` hashed as the single byte `A`, and any bare
+// backslash — a regex, a Windows path — failed the whole request with "invalid
+// input syntax for type bytea". Skill files are full of both.
+func TestSkillFileHashCoversRawUTF8Bytes(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database available")
+	}
+
+	const skillBody = `SKILL.md with \x41 and C:\path`
+	bodies := map[string]string{
+		"hex-escape.md":     `\x41`,
+		"invalid-hex.md":    `\xzz`,
+		"bare-backslash.md": `C:\Users\skill`,
+		"regex.md":          `^\d+\s*$`,
+		"unicode.md":        "héllo 世界 🌍",
+		"empty.md":          "",
+	}
+
+	skillID := dbfx.Insert(t, "skill", testutil.Cols{
+		"workspace_id": testWorkspaceID,
+		"name":         "skill-hash-fixture",
+		"description":  "bodies that break a bytea cast",
+		"content":      skillBody,
+		"created_by":   testUserID,
+	})
+	for path, body := range bodies {
+		dbfx.Insert(t, "skill_file", testutil.Cols{
+			"skill_id": skillID,
+			"path":     path,
+			"content":  body,
+		})
+	}
+
+	req := skillRequest(t, skillID, "/api/skills/"+skillID+"/files?include=metadata")
+	resp := testutil.Decode[[]SkillFileMetadataResponse](t, testHandler.ListSkillFiles, req, http.StatusOK)
+
+	if len(resp) != len(bodies) {
+		t.Fatalf("got %d files, want %d", len(resp), len(bodies))
+	}
+	for _, f := range resp {
+		want := bodies[f.Path]
+		if f.Size != int64(len(want)) {
+			t.Errorf("%s: size = %d, want %d", f.Path, f.Size, len(want))
+		}
+		if expect := contentHash(want); f.ContentHash != expect {
+			t.Errorf("%s (%q): content_hash = %q, want %q", f.Path, want, f.ContentHash, expect)
+		}
+	}
+
+	// Same bytes, same rule, for the SKILL.md body — that one is hashed in Go,
+	// so this pins the SQL and Go implementations to each other.
+	detail := testutil.Decode[SkillWithFileMetadataResponse](t,
+		testHandler.GetSkill, skillRequest(t, skillID, "/api/skills/"+skillID+"?include=metadata"), http.StatusOK)
+	if detail.ContentSize != int64(len(skillBody)) {
+		t.Errorf("content_size = %d, want %d", detail.ContentSize, len(skillBody))
+	}
+	if want := contentHash(skillBody); detail.ContentHash != want {
+		t.Errorf("content_hash = %q, want %q", detail.ContentHash, want)
 	}
 }
 

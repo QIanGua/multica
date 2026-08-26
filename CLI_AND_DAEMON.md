@@ -1029,5 +1029,6 @@ multica skill files list <id> --with-content   # bodies inlined
 ```
 
 On the API, both endpoints accept `?include=content` and `?include=metadata`.
-`GET /api/skills/{id}` still defaults to `content` so existing clients are
-unaffected; `GET /api/skills/{id}/files` defaults to `metadata`.
+A request that sends neither still gets `content`, on both endpoints, so a
+server upgrade never changes what an un-upgraded client receives — it is the
+CLI that asks for the smaller shape.

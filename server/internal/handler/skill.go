@@ -387,21 +387,24 @@ const (
 )
 
 // resolveSkillInclude reads `?include=`. `content` inlines the SKILL.md body
-// and every file body; `metadata` returns path/size/hash only. An absent
-// parameter falls back to defaultContent, which differs per endpoint on
-// purpose:
+// and every file body; `metadata` returns path/size/hash only.
 //
-//   - GET /api/skills/{id}/files defaults to metadata. It is a list endpoint,
-//     the CLI is its only caller, and `GET /api/skills` already dropped
-//     content for the same reason (GH #2174).
-//   - GET /api/skills/{id} defaults to content. Installed web and desktop
-//     builds call it for the skill editor and cannot be asked retroactively to
-//     send `?include=content`, so flipping its default here would break them.
-//     Callers that only need to describe a skill pass `?include=metadata`.
-func resolveSkillInclude(w http.ResponseWriter, r *http.Request, defaultContent bool) (bool, bool) {
+// A request that says nothing keeps getting content, on both endpoints. The
+// clients that call them are installed software — desktop builds for the skill
+// editor, older CLI versions whose `skill files list --output json` scripts
+// read `content` — and none of them can be asked retroactively to send a query
+// parameter. Flipping a default here would make a server deploy silently
+// change what an un-upgraded client receives, which no client-side change can
+// prevent.
+//
+// So the shrink is opt-in and travels with the caller: the CLI sends
+// `include=metadata` itself, which fixes GH #7498 without requiring the server
+// and every client to ship together. The default can flip once clients that
+// send `include=content` have aged in.
+func resolveSkillInclude(w http.ResponseWriter, r *http.Request) (bool, bool) {
 	switch strings.TrimSpace(r.URL.Query().Get("include")) {
 	case "":
-		return defaultContent, true
+		return true, true
 	case skillIncludeContent:
 		return true, true
 	case skillIncludeMetadata:
@@ -414,7 +417,7 @@ func resolveSkillInclude(w http.ResponseWriter, r *http.Request, defaultContent 
 
 func (h *Handler) GetSkill(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	includeContent, ok := resolveSkillInclude(w, r, true)
+	includeContent, ok := resolveSkillInclude(w, r)
 	if !ok {
 		return
 	}
@@ -2426,7 +2429,7 @@ func (h *Handler) finishSkillImport(w http.ResponseWriter, r *http.Request, work
 
 func (h *Handler) ListSkillFiles(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	includeContent, ok := resolveSkillInclude(w, r, false)
+	includeContent, ok := resolveSkillInclude(w, r)
 	if !ok {
 		return
 	}
