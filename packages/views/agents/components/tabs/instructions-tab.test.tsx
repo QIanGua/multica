@@ -210,19 +210,24 @@ describe("InstructionsTab starter-prompts deep link", () => {
     const scrollIntoView = vi.fn();
     // jsdom has no layout, so the method does not exist at all.
     Element.prototype.scrollIntoView = scrollIntoView;
-    const tree = (value: NavigationAdapter) => (
+    const tree = (value: NavigationAdapter, agent: Agent) => (
       <I18nProvider locale="en" resources={TEST_RESOURCES}>
         <NavigationProvider value={value}>
-          <InstructionsTab agent={baseAgent} onSave={vi.fn()} />
+          <InstructionsTab agent={agent} onSave={vi.fn()} />
         </NavigationProvider>
       </I18nProvider>
     );
-    const { rerender } = render(tree(adapter(search, replace)));
+    const { rerender } = render(tree(adapter(search, replace), baseAgent));
     return {
       replace,
       scrollIntoView,
-      /** Re-render as the platform does after `replace` lands: new adapter. */
-      settleUrl: (next: string) => rerender(tree(adapter(next, replace))),
+      /**
+       * Re-render as the platform does: a new adapter object every time, and
+       * optionally a different agent for an in-place navigation between two
+       * agent pages on the same route.
+       */
+      settleUrl: (next: string, agent: Agent = baseAgent) =>
+        rerender(tree(adapter(next, replace), agent)),
     };
   }
 
@@ -263,6 +268,38 @@ describe("InstructionsTab starter-prompts deep link", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Regression: the guard against re-firing before the stripped URL lands must
+  // not become a one-shot-per-mount latch. A chat window left open beside this
+  // page can send the very same link again, and it has to land again.
+  it("focuses again when the link is clicked a second time", () => {
+    const { replace, scrollIntoView, settleUrl } = renderWithSearch(
+      "view=instructions&focus=starter_prompts",
+    );
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+
+    act(() => settleUrl("view=instructions"));
+    act(() => settleUrl("view=instructions&focus=starter_prompts"));
+
+    expect(scrollIntoView).toHaveBeenCalledTimes(2);
+    expect(replace).toHaveBeenCalledTimes(2);
+    expect(ringed()).not.toBeNull();
+  });
+
+  // Regression: the same guard is keyed by agent, so navigating between two
+  // agent pages on this route does not swallow the second agent's link.
+  it("focuses a link aimed at a different agent", () => {
+    const other: Agent = { ...baseAgent, id: "agent-2" };
+    const { scrollIntoView, settleUrl } = renderWithSearch(
+      "view=instructions&focus=starter_prompts",
+    );
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+
+    // The URL still carries focus — it is the NEXT agent's deep link.
+    act(() => settleUrl("view=instructions&focus=starter_prompts", other));
+
+    expect(scrollIntoView).toHaveBeenCalledTimes(2);
   });
 
   it("ignores an ordinary visit", () => {

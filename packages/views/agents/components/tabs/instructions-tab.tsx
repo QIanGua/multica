@@ -43,7 +43,7 @@ export function InstructionsTab({
   const [saving, setSaving] = useState(false);
   const [starterPromptsFocused, setStarterPromptsFocused] = useState(false);
   const starterPromptsRef = useRef<HTMLDivElement | null>(null);
-  const focusHandledRef = useRef(false);
+  const focusHandledForAgentRef = useRef<string | null>(null);
   const focusFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [systemOpen, setSystemOpen] = useState(false);
   const persistedStarterPromptsKey = JSON.stringify(
@@ -116,18 +116,24 @@ export function InstructionsTab({
   // Arriving from "customize" in a chat's empty state: bring the starter
   // prompts into view and flash them, so the deep link lands ON the setting
   // rather than on a long page that happens to contain it. The param is
-  // stripped once handled — a refresh or a later tab switch should not replay
-  // an animation the user did not ask for a second time.
+  // consumed on arrival, so a refresh never replays an animation nobody asked
+  // for — but every fresh click must land, including a second one from a chat
+  // window still open beside this page, and one aimed at a different agent.
   useEffect(() => {
-    if (focusHandledRef.current) return;
     if (!navigation || !starterPromptsSupported) return;
+
     if (navigation.searchParams.get("focus") !== AGENT_FOCUS_STARTER_PROMPTS) {
+      // The param is gone: either this is an ordinary visit, or the `replace`
+      // below has landed. Re-arm so the next click focuses again.
+      focusHandledForAgentRef.current = null;
       return;
     }
-    // One shot per mount. The adapter object is not referentially stable, so
-    // this effect re-runs on renders the `replace` below itself causes; without
-    // the latch a platform whose searchParams lag the call would loop.
-    focusHandledRef.current = true;
+    // Guard against re-running before the stripped URL arrives — the adapter
+    // object is not referentially stable, so this effect re-runs on renders
+    // the `replace` below itself causes. Keyed by agent so a deep link aimed
+    // at a DIFFERENT agent is never swallowed by this latch.
+    if (focusHandledForAgentRef.current === agent.id) return;
+    focusHandledForAgentRef.current = agent.id;
 
     // `block: "nearest"` deliberately: native scrollIntoView scrolls every
     // scrollable ancestor, which on desktop drags the shell itself (#3929).
@@ -144,12 +150,14 @@ export function InstructionsTab({
     // The timer is held in a ref, NOT returned as this effect's cleanup: the
     // adapter object is unstable, so a cleanup would be invoked on the very
     // next render and cancel the flash before it ever ended, leaving the ring
-    // on permanently. Unmount clears it below.
+    // on permanently. Unmount clears it below. A repeat focus restarts the
+    // window rather than inheriting the previous one's remaining time.
+    if (focusFlashTimerRef.current) clearTimeout(focusFlashTimerRef.current);
     focusFlashTimerRef.current = setTimeout(
       () => setStarterPromptsFocused(false),
       FOCUS_FLASH_MS,
     );
-  }, [navigation, starterPromptsSupported]);
+  }, [agent.id, navigation, starterPromptsSupported]);
 
   useEffect(
     () => () => {
