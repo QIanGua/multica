@@ -3374,6 +3374,13 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 			outcome = "no_runtime"
 			return nil
 		}
+		// A daemon may still hold a stale candidate after the agent is rebound.
+		// Reject it before doing capacity work; ClaimAgentTask repeats this fence
+		// atomically so a concurrent rebind cannot dispatch the stale task.
+		if runtimeID.Valid && agent.RuntimeID != runtimeID {
+			outcome = "runtime_mismatch"
+			return nil
+		}
 
 		t0 = time.Now()
 		running, err := qtx.CountRunningTasks(ctx, agentID)

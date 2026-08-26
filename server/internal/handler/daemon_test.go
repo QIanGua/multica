@@ -2723,11 +2723,11 @@ func createRuntimeGuardAgent(t *testing.T, ctx context.Context) (agentID, runtim
 	dbfx.QueryRow(t, `
 		INSERT INTO agent (
 			workspace_id, name, runtime_mode, runtime_config,
-			runtime_id, visibility, max_concurrent_tasks
+			runtime_id, visibility, max_concurrent_tasks, owner_id
 		)
-		VALUES ($1, $2, 'local', '{}'::jsonb, $3, 'workspace', 3)
+		VALUES ($1, $2, 'local', '{}'::jsonb, $3, 'workspace', 3, $4)
 		RETURNING id
-	`, testWorkspaceID, "Runtime Guard Agent "+t.Name(), runtimeID).Scan(&agentID)
+	`, testWorkspaceID, "Runtime Guard Agent "+t.Name(), runtimeID, testUserID).Scan(&agentID)
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1`, agentID) })
 
 	return agentID, runtimeID, daemonID
