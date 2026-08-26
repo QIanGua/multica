@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/attribution"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -224,16 +225,232 @@ func (h *Handler) invokeOriginatorFromRequest(r *http.Request, actorType, actorI
 	return ""
 }
 
+// assignAuthorityScope tells the invoke gate WHAT an assignment is being made
+// against, so an unattributed autopilot run can only borrow authority for work
+// it is verifiably doing itself (MUL-6691).
+//
+// Exactly one of the two fields is meaningful, and the zero value grants
+// nothing — a caller that supplies no scope keeps the pre-MUL-4857 behavior of
+// "real originator or deny", which is what the member-only entry points want.
+type assignAuthorityScope struct {
+	// Issue is the already-loaded issue the assignment binds to: the PARENT for
+	// child creation, the issue ITSELF for an update. Its workspace must match
+	// the request's, and the speaking run must be verifiably attached to it
+	// (issueBoundToAutopilotTask) before any authority is borrowed.
+	Issue *db.Issue
+
+	// NewTopLevelIssue marks the single case with no issue to bind to at all: a
+	// run_only autopilot leader creating its first, parentless issue (the
+	// reported MUL-6691 / GH #7563 flow). The binding then falls back to the
+	// verified autopilot RUN the speaking task belongs to.
+	NewTopLevelIssue bool
+}
+
+// scopeBoundToIssue binds the assignment to an existing issue. A nil issue
+// yields the empty scope, which grants nothing.
+func scopeBoundToIssue(issue *db.Issue) assignAuthorityScope {
+	return assignAuthorityScope{Issue: issue}
+}
+
+// scopeNewTopLevelIssue marks a create with no parent, where the issue being
+// assigned does not exist yet.
+func scopeNewTopLevelIssue() assignAuthorityScope {
+	return assignAuthorityScope{NewTopLevelIssue: true}
+}
+
+// scopeNoDelegation disables the autopilot fallback entirely — for entry points
+// that only ever run as a member and must not gain an agent-borrowed path.
+func scopeNoDelegation() assignAuthorityScope {
+	return assignAuthorityScope{}
+}
+
 // effectiveInvocationAuthorityFromRequest returns the human principal used by
 // canInvokeAgent without changing attribution. A real top-of-chain originator
-// always wins. Only an unattributed agent request may fall back to the creator
-// of a lineage-verified autopilot issue supplied by the caller.
-func (h *Handler) effectiveInvocationAuthorityFromRequest(r *http.Request, delegationIssue *db.Issue, actorType, actorID string) string {
+// always wins. Only an unattributed AGENT request may fall back to an autopilot
+// authority, and only within the scope the caller vouched for.
+func (h *Handler) effectiveInvocationAuthorityFromRequest(r *http.Request, scope assignAuthorityScope, actorType, actorID, workspaceID string) string {
 	originatorUserID := h.invokeOriginatorFromRequest(r, actorType, actorID)
-	if originatorUserID != "" || delegationIssue == nil {
+	if originatorUserID != "" {
 		return originatorUserID
 	}
-	return h.autopilotDelegationAuthorityFromRequest(r, *delegationIssue, actorType, actorID)
+	return h.autopilotAssignAuthorityFromRequest(r, scope, actorType, actorID, workspaceID)
+}
+
+// autopilotAssignAuthorityFromRequest resolves the borrowed authority for an
+// assignment made by an unattributed agent run, in precedence order:
+//
+//  1. the speaking task's OWN accountable human (autopilotTaskAssignAuthority) —
+//     precise, already recorded on the task row, and available for both
+//     autopilot execution modes;
+//  2. the autopilot's member creator (autopilotDelegationAuthority, MUL-4857) —
+//     the coarser pre-existing rule, kept as a fallback so a leader task that
+//     predates attribution stamping does not lose the child-creation path it
+//     has today.
+//
+// Both require the SAME issue binding; (2) additionally only ever applies to an
+// `origin_type=autopilot` issue. Neither can be reached with a scope the caller
+// did not vouch for, and neither changes attribution.
+func (h *Handler) autopilotAssignAuthorityFromRequest(r *http.Request, scope assignAuthorityScope, actorType, actorID, workspaceID string) string {
+	if actorType != "agent" {
+		return ""
+	}
+	if scope.Issue == nil && !scope.NewTopLevelIssue {
+		return ""
+	}
+	task, ok := h.taskFromRequestHeader(r)
+	if !ok {
+		return ""
+	}
+	if user := h.autopilotTaskAssignAuthority(r.Context(), scope, actorType, actorID, workspaceID, task); user != "" {
+		return user
+	}
+	if scope.Issue == nil {
+		return ""
+	}
+	return h.autopilotDelegationAuthority(r.Context(), *scope.Issue, actorType, actorID, task)
+}
+
+// autopilotTaskAssignAuthority resolves the effective invoking human for an
+// assignment performed by an unattributed autopilot run, keyed on the run's OWN
+// accountable human rather than on the autopilot's creator (MUL-6691).
+//
+// WHY the accountable user and not autopilot.created_by_id: since MUL-4302 the
+// accountable human for a schedule/webhook run is the trigger_owner — whoever
+// last shaped the firing trigger — which need NOT be the autopilot's original
+// creator. Keying authorization on the creator while the audit trail names the
+// trigger owner would let the audit record one human and the private-agent /
+// OAuth access come from another. The task row already carries the resolved
+// value, so this reads it instead of re-deriving a different one.
+//
+// SECURITY. The gate is unchanged; only the human handed to it is. Every one of
+// these must hold, and anything missing, mismatched, or unreadable returns ""
+// and leaves canInvokeAgent fail-closed:
+//
+//   - the actor is an agent and IS the speaking task's agent;
+//   - the task is still `running` — a finished run cannot keep lending rights;
+//   - the task carries NO originator (a real one is preferred by the caller and
+//     must never be silently replaced by this coarser value);
+//   - originator_source is `trigger_owner` or `rule_owner`. This IS the
+//     autopilot-lineage proof: only the autopilot enqueue paths stamp those two
+//     labels. `owner_fallback` is deliberately excluded — that value is the
+//     AGENT OWNER, and borrowing it would let any unattributed autopilot run
+//     invoke its own owner's private agents, which is precisely the owner
+//     white-list bypass canInvokeAgent exists to prevent. `delegation` is
+//     excluded too, so authority does not propagate to descendant runs;
+//   - the assignment is bound to work this run verifiably owns —
+//     issueBoundToAutopilotTask for an existing issue, or the task's own
+//     verified autopilot run when creating a parentless issue;
+//   - the issue (when there is one) is in the request's workspace;
+//   - the accountable human is STILL a member of that workspace.
+//
+// The returned id is used for AUTHORIZATION only: the new issue and any task it
+// enqueues are attributed separately and stay unattributed, so the audit
+// semantics of "no human directly started this" are preserved.
+func (h *Handler) autopilotTaskAssignAuthority(ctx context.Context, scope assignAuthorityScope, actorType, actorID, workspaceID string, task db.AgentTaskQueue) string {
+	if actorType != "agent" {
+		return ""
+	}
+	if !task.AgentID.Valid || uuidToString(task.AgentID) != actorID {
+		return ""
+	}
+	if task.Status != "running" {
+		return ""
+	}
+	if task.OriginatorUserID.Valid || !task.AccountableUserID.Valid {
+		return ""
+	}
+	if !task.OriginatorSource.Valid {
+		return ""
+	}
+	switch attribution.Source(task.OriginatorSource.String) {
+	case attribution.SourceTriggerOwner, attribution.SourceRuleOwner:
+	default:
+		return ""
+	}
+
+	switch {
+	case scope.Issue != nil:
+		if uuidToString(scope.Issue.WorkspaceID) != workspaceID {
+			return ""
+		}
+		if !issueBoundToAutopilotTask(*scope.Issue, task) {
+			return ""
+		}
+	case scope.NewTopLevelIssue:
+		if !h.taskRunsAutopilotInWorkspace(ctx, task, workspaceID) {
+			return ""
+		}
+	default:
+		return ""
+	}
+
+	accountable := uuidToString(task.AccountableUserID)
+	if accountable == "" {
+		return ""
+	}
+	if _, err := h.getWorkspaceMember(ctx, accountable, workspaceID); err != nil {
+		return ""
+	}
+	return accountable
+}
+
+// issueBoundToAutopilotTask reports whether `task` verifiably owns the work on
+// `issue`, which is what keeps a borrowed autopilot authority from becoming a
+// workspace-wide capability (the confused-deputy bound MUL-4857 established).
+// Two shapes, one per autopilot execution mode:
+//
+//   - create_issue: the autopilot created the issue (origin_type=autopilot) and
+//     the speaking task is the run working ON it (task.issue_id == issue.id) —
+//     the exact MUL-4857 binding.
+//   - run_only: no autopilot issue exists, so the binding is authorship. The
+//     issue was created by THIS task, which CreateIssue records as
+//     origin_type=agent_create + origin_id=<creating task id> (MUL-4305). Using
+//     the task id rather than the autopilot id also stops two concurrent runs of
+//     the same autopilot from borrowing on each other's issues, and needs no
+//     migration or backfill.
+//
+// A run_only leader therefore reaches only the issues it created (and, through
+// the parent scope, their children) — never a pre-existing or foreign issue.
+func issueBoundToAutopilotTask(issue db.Issue, task db.AgentTaskQueue) bool {
+	if !issue.OriginType.Valid || !issue.OriginID.Valid || !issue.ID.Valid {
+		return false
+	}
+	switch issue.OriginType.String {
+	case "autopilot":
+		return task.IssueID.Valid && uuidToString(task.IssueID) == uuidToString(issue.ID)
+	case "agent_create":
+		return task.ID.Valid && uuidToString(issue.OriginID) == uuidToString(task.ID)
+	}
+	return false
+}
+
+// taskRunsAutopilotInWorkspace verifies the run_only lineage used when there is
+// no issue to bind to yet: the task must belong to an autopilot RUN whose
+// autopilot lives in the request's workspace. A create_issue-mode leader task
+// carries no autopilot_run_id (it is enqueued through the ordinary
+// issue-assignment path), so it never qualifies here and must go through the
+// issue binding instead.
+func (h *Handler) taskRunsAutopilotInWorkspace(ctx context.Context, task db.AgentTaskQueue, workspaceID string) bool {
+	if !task.AutopilotRunID.Valid {
+		return false
+	}
+	wsUUID, err := util.ParseUUID(workspaceID)
+	if err != nil {
+		return false
+	}
+	run, err := h.Queries.GetAutopilotRun(ctx, task.AutopilotRunID)
+	if err != nil || !run.AutopilotID.Valid {
+		return false
+	}
+	// Workspace-scoped read: an autopilot run from another tenant resolves to
+	// no autopilot here, so a foreign run id cannot lend authority (MUL-4252).
+	if _, err := h.Queries.GetAutopilotInWorkspace(ctx, db.GetAutopilotInWorkspaceParams{
+		ID:          run.AutopilotID,
+		WorkspaceID: wsUUID,
+	}); err != nil {
+		return false
+	}
+	return true
 }
 
 // autopilotDelegationAuthority resolves the effective invoking human for the A2A
