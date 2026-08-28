@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -352,7 +353,7 @@ func TestCodexHandleServerRequestUnknownReturnsError(t *testing.T) {
 func TestCodexInitializeClientCapabilitiesOmitInteractiveUserInput(t *testing.T) {
 	t.Parallel()
 
-	caps := codexInitializeClientCapabilities()
+	caps := codexInitializeClientCapabilities(false)
 	if caps["experimentalApi"] != true {
 		t.Fatalf("expected experimentalApi=true, got %v", caps["experimentalApi"])
 	}
@@ -360,6 +361,11 @@ func TestCodexInitializeClientCapabilitiesOmitInteractiveUserInput(t *testing.T)
 		if _, ok := caps[key]; ok {
 			t.Fatalf("client capabilities must not advertise %s, got %v", key, caps)
 		}
+	}
+
+	hostCaps := codexInitializeClientCapabilities(true)
+	if hostCaps["requestUserInput"] != true {
+		t.Fatalf("host collector must advertise requestUserInput, got %v", hostCaps)
 	}
 }
 
@@ -443,7 +449,7 @@ func TestCodexHandleServerRequestRequestUserInputDegradesToText(t *testing.T) {
 	}
 }
 
-func TestCodexHandleServerRequestRequestUserInputSupportedPathUsesResponder(t *testing.T) {
+func TestCodexHandleServerRequestRequestUserInputSupportedPathUsesHostCollector(t *testing.T) {
 	t.Parallel()
 
 	c, fs, _ := newTestCodexClient(t)
@@ -453,7 +459,8 @@ func TestCodexHandleServerRequestRequestUserInputSupportedPathUsesResponder(t *t
 			texts = append(texts, msg.Content)
 		}
 	}
-	c.interactiveUserInputResponder = func(params json.RawMessage) (map[string]any, bool) {
+	c.serverAdvertisedInteractiveUserInput = true
+	c.cfg.CollectCodexInteractiveUserInput = func(params json.RawMessage) (map[string]any, bool) {
 		var payload codexToolRequestUserInputParams
 		if err := json.Unmarshal(params, &payload); err != nil {
 			t.Fatalf("supported path params: %v", err)
@@ -515,6 +522,101 @@ func TestCodexHandleServerRequestRequestUserInputDedupesSameItem(t *testing.T) {
 	if c.getTurnError() != "" {
 		t.Fatalf("deduped request must not fail the turn, got %q", c.getTurnError())
 	}
+	for _, line := range fs.Lines() {
+		if strings.Contains(line, `"error"`) {
+			t.Fatalf("same-item retries under the cap must still ACK, got %s", line)
+		}
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputDedupesAcrossAndEmptyItemIDs(t *testing.T) {
+	t.Parallel()
+
+	c, fs, _ := newTestCodexClient(t)
+	var texts []string
+	var activities []string
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			texts = append(texts, msg.Content)
+		}
+	}
+	c.onSemanticActivity = func(description string) {
+		activities = append(activities, description)
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":31,"method":"item/tool/requestUserInput","params":{"itemId":"call-a","questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+	c.handleLine(`{"jsonrpc":"2.0","id":32,"method":"item/tool/requestUserInput","params":{"itemId":"call-b","questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+	c.handleLine(`{"jsonrpc":"2.0","id":33,"method":"item/tool/requestUserInput","params":{"questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+	c.handleLine(`{"jsonrpc":"2.0","id":34,"method":"item/tool/requestUserInput","params":{"questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+
+	if len(texts) != 1 {
+		t.Fatalf("same question across new/empty itemId must emit once, got %#v", texts)
+	}
+	if len(activities) != 1 {
+		t.Fatalf("retries must not keep recording semantic activity, got %#v", activities)
+	}
+	if len(fs.Lines()) != 4 {
+		t.Fatalf("expected 4 RPC replies (3 ACK + 1 circuit-break), got %d", len(fs.Lines()))
+	}
+	var errors int
+	for _, line := range fs.Lines() {
+		if strings.Contains(line, `"error"`) {
+			errors++
+			if !strings.Contains(line, "retry limit exceeded") {
+				t.Fatalf("over-cap reply should reject, got %s", line)
+			}
+		}
+	}
+	if errors != 1 {
+		t.Fatalf("expected the 4th RPC to stop ACK-ing, got %d errors in %#v", errors, fs.Lines())
+	}
+	if c.getTurnError() != "" {
+		t.Fatalf("circuit breaker must not fail the turn, got %q", c.getTurnError())
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputSecretDoesNotSolicitChatSecret(t *testing.T) {
+	t.Parallel()
+
+	c, fs, _ := newTestCodexClient(t)
+	var texts []string
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			texts = append(texts, msg.Content)
+		}
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":41,"method":"item/tool/requestUserInput","params":{"itemId":"call-secret","questions":[{"id":"token","question":"Paste the dummy API token fixture","isSecret":true}]}}`)
+
+	if c.getTurnError() != "" {
+		t.Fatalf("secret degrade must not fail the turn, got %q", c.getTurnError())
+	}
+	if len(texts) != 1 {
+		t.Fatalf("expected one visible secret warning, got %#v", texts)
+	}
+	got := texts[0]
+	if !strings.Contains(got, "cannot collect secrets") {
+		t.Fatalf("secret path must warn that secrets cannot be collected, got %q", got)
+	}
+	if !strings.Contains(got, "Paste the dummy API token fixture") {
+		t.Fatalf("secret path must still name the asked question, got %q", got)
+	}
+	for _, banned := range []string{"Reply in this chat", "password123", "sk-live", "AKIA"} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("secret path must not solicit or include %q, got %q", banned, got)
+		}
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(fs.Lines()[0]), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	result := resp["result"].(map[string]any)
+	answers := result["answers"].(map[string]any)
+	token := answers["token"].(map[string]any)
+	if got := token["answers"].([]any)[0]; got != codexRequestUserInputSecretDeclinedAnswer {
+		t.Fatalf("expected declined secret answer, got %v", got)
+	}
 }
 
 func TestCodexHandleServerRequestRequestUserInputMalformedParamsStillVisible(t *testing.T) {
@@ -567,6 +669,28 @@ func TestCodexHandleServerRequestRequestUserInputMisreportStillDegrades(t *testi
 	}
 	if len(texts) != 1 || !strings.Contains(texts[0], "Continue?") {
 		t.Fatalf("misreported capability still needs the question visible, got %#v", texts)
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputHostCollectorWithoutServerAdvertiseDegrades(t *testing.T) {
+	t.Parallel()
+
+	c, _, _ := newTestCodexClient(t)
+	c.cfg.CollectCodexInteractiveUserInput = func(json.RawMessage) (map[string]any, bool) {
+		t.Fatal("collector must not run unless initialize advertised the capability")
+		return nil, false
+	}
+	var texts []string
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			texts = append(texts, msg.Content)
+		}
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":27,"method":"item/tool/requestUserInput","params":{"itemId":"call-no-server","questions":[{"id":"q","question":"Continue?"}]}}`)
+
+	if len(texts) != 1 || !strings.Contains(texts[0], "Continue?") {
+		t.Fatalf("host collector without server advertisement must degrade, got %#v", texts)
 	}
 }
 
@@ -3838,6 +3962,134 @@ func TestCodexExecuteRequestUserInputDegradesWithoutFailingTurn(t *testing.T) {
 	}
 }
 
+func TestCodexExecuteRequestUserInputKeepsQuestionAfterFinalAnswer(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	codexHome := t.TempDir()
+	fakePath := writeFakeCodexAppServer(t, ""+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-cli/0.149.1","platformOs":"macos"}}'`+"\n"+
+		`read line`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-user-input-final"}}}'`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":3,"result":{}}'`+"\n"+
+		`echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr-user-input-final","turn":{"id":"turn-user-input-final"}}}'`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":99,"method":"item/tool/requestUserInput","params":{"threadId":"thr-user-input-final","turnId":"turn-user-input-final","itemId":"call-confirm","questions":[{"id":"proceed","header":"Confirm","question":"Should I create the sub-issue now?","options":[{"label":"Yes (Recommended)","description":"Create it"},{"label":"No","description":"Wait"}]}]}}'`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","id":"m-final","text":"I will wait for your next message.","phase":"final_answer"}}}'`+"\n"+
+		`echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-user-input-final","turn":{"id":"turn-user-input-final","status":"completed"}}}'`+"\n")
+
+	result := executeFakeCodexCollectingResult(t, fakePath, Config{
+		Logger: slog.Default(),
+		Env:    map[string]string{"CODEX_HOME": codexHome},
+	}, ExecOptions{
+		Timeout:                   5 * time.Second,
+		SemanticInactivityTimeout: 5 * time.Second,
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+	}
+	if result.Error != "" {
+		t.Fatalf("degraded requestUserInput must not surface an error, got %q", result.Error)
+	}
+	for _, want := range []string{
+		"Should I create the sub-issue now?",
+		"Yes (Recommended)",
+		"I will wait for your next message.",
+	} {
+		if !strings.Contains(result.Output, want) {
+			t.Fatalf("final Result.Output must keep the question/options after final_answer; missing %q in %q", want, result.Output)
+		}
+	}
+}
+
+func TestCodexExecuteRequestUserInputSupportedAndMisreportFollowInitializeContract(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	script := "" +
+		`read line` + "\n" +
+		`echo '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"requestUserInput":true}}}'` + "\n" +
+		`read line` + "\n" +
+		`read line` + "\n" +
+		`echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-cap"}}}'` + "\n" +
+		`read line` + "\n" +
+		`echo '{"jsonrpc":"2.0","id":3,"result":{}}'` + "\n" +
+		`echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr-cap","turn":{"id":"turn-cap"}}}'` + "\n" +
+		`echo '{"jsonrpc":"2.0","id":99,"method":"item/tool/requestUserInput","params":{"itemId":"call-cap","questions":[{"id":"proceed","question":"Should I create the sub-issue now?"}]}}'` + "\n" +
+		`read line` + "\n" +
+		`echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","id":"m-final","text":"Native collection completed.","phase":"final_answer"}}}'` + "\n" +
+		`echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-cap","turn":{"id":"turn-cap","status":"completed"}}}'` + "\n"
+
+	t.Run("supported", func(t *testing.T) {
+		t.Parallel()
+		fakePath := writeFakeCodexAppServer(t, script)
+		result, messages := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
+			Logger: slog.Default(),
+			CollectCodexInteractiveUserInput: func(params json.RawMessage) (map[string]any, bool) {
+				return map[string]any{
+					"answers": map[string]any{
+						"proceed": map[string]any{"answers": []string{"yes"}},
+					},
+				}, true
+			},
+		}, ExecOptions{
+			Timeout:                   5 * time.Second,
+			SemanticInactivityTimeout: 5 * time.Second,
+		}, 10*time.Second)
+		if result.Status != "completed" {
+			t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+		}
+		if result.Output != "Native collection completed." {
+			t.Fatalf("supported path Result.Output should be the final answer, got %q", result.Output)
+		}
+		for _, msg := range messages {
+			if msg.Type == MessageText && strings.Contains(msg.Content, "Should I create the sub-issue now?") {
+				t.Fatalf("supported path must not degrade to assistant text, got %#v", messages)
+			}
+		}
+	})
+
+	t.Run("misreport", func(t *testing.T) {
+		t.Parallel()
+		fakePath := writeFakeCodexAppServer(t, script)
+		result, messages := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
+			Logger: slog.Default(),
+		}, ExecOptions{
+			Timeout:                   5 * time.Second,
+			SemanticInactivityTimeout: 5 * time.Second,
+		}, 10*time.Second)
+		if result.Status != "completed" {
+			t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Output, "Should I create the sub-issue now?") {
+			t.Fatalf("misreport must still keep the question visible in Result.Output, got %q", result.Output)
+		}
+		var textCount int
+		for _, msg := range messages {
+			if msg.Type == MessageText && strings.Contains(msg.Content, "Should I create the sub-issue now?") {
+				textCount++
+			}
+		}
+		if textCount != 1 {
+			t.Fatalf("misreport should degrade once, got %d in %#v", textCount, messages)
+		}
+	})
+}
+
+func executeFakeCodexCollectingResult(t *testing.T, fakePath string, cfg Config, opts ExecOptions) Result {
+	t.Helper()
+	result, _ := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, cfg, opts, 10*time.Second)
+	return result
+}
+
 func TestCodexExecuteTimeoutWinsOverProcessExitDuringActiveTurn(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS == "windows" {
@@ -5138,9 +5390,117 @@ func TestEnsureCodexRequestUserInputDisabledPinsAndIsIdempotent(t *testing.T) {
 	if err := ensureCodexRequestUserInputDisabled(tmp, slog.Default()); err != nil {
 		t.Fatalf("second ensure: %v", err)
 	}
-	second, _ := os.ReadFile(tmp)
+	second, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
 	if string(first) != string(second) {
 		t.Fatalf("non-idempotent write:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+}
+
+func TestEnsureCodexRequestUserInputDisabledStripsEquivalentTOML(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "inline table under tools",
+			input: "[tools]\nexperimental_request_user_input={enabled=true}\nweb_search = true\n",
+		},
+		{
+			name:  "compact tools header assignment",
+			input: "[tools] experimental_request_user_input={enabled=true}\n",
+		},
+		{
+			name:  "dotted key",
+			input: "tools.experimental_request_user_input = { enabled = true }\n",
+		},
+		{
+			name:  "dotted enabled key",
+			input: "tools.experimental_request_user_input.enabled = true\n",
+		},
+		{
+			name:  "dotted table",
+			input: "[tools.experimental_request_user_input]\nenabled = true\n",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmp := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(tmp, []byte(tc.input), 0o644); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if err := ensureCodexRequestUserInputDisabled(tmp, slog.Default()); err != nil {
+				t.Fatalf("ensure: %v", err)
+			}
+			body, err := os.ReadFile(tmp)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			got := string(body)
+			if strings.Contains(got, "enabled = true") || strings.Contains(got, "enabled=true") {
+				t.Fatalf("user-enabled equivalent form must be stripped, got %q", got)
+			}
+			if strings.Count(got, "[tools.experimental_request_user_input]") != 1 {
+				t.Fatalf("expected a single managed table, got %q", got)
+			}
+			if !strings.Contains(got, "enabled = false") {
+				t.Fatalf("expected enabled = false, got %q", got)
+			}
+			if tc.name == "inline table under tools" && !strings.Contains(got, "web_search = true") {
+				t.Fatalf("unrelated [tools] keys must survive, got %q", got)
+			}
+		})
+	}
+}
+
+func TestEnsureCodexRequestUserInputDisabledCompatibleWithCodexFeaturesList(t *testing.T) {
+	t.Parallel()
+
+	codexPath, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("codex CLI not installed")
+	}
+
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config.toml")
+	initial := "[tools]\nexperimental_request_user_input={enabled=true}\n"
+	if err := os.WriteFile(configPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := ensureCodexRequestUserInputDisabled(configPath, slog.Default()); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, codexPath, "features", "list")
+	cmd.Env = append(os.Environ(), "CODEX_HOME="+home)
+	out, err := cmd.CombinedOutput()
+	got := string(out)
+	if strings.Contains(strings.ToLower(got), "duplicate key") {
+		t.Fatalf("pinned config must not produce a duplicate key for Codex, output:\n%s", got)
+	}
+	if err != nil {
+		t.Fatalf("codex features list failed: %v\n%s", err, got)
+	}
+}
+
+func TestPreserveCodexUserInputFallbackKeepsQuestionWhenFinalAnswerArrives(t *testing.T) {
+	t.Parallel()
+
+	fallback := "The assistant needs your confirmation.\nShould I create the sub-issue now?"
+	if got := preserveCodexUserInputFallback(fallback, "I will wait for your next message."); !strings.Contains(got, "Should I create the sub-issue now?") || !strings.Contains(got, "I will wait for your next message.") {
+		t.Fatalf("expected both fallback and final answer, got %q", got)
+	}
+	if got := preserveCodexUserInputFallback(fallback, fallback); got != fallback {
+		t.Fatalf("identical output should not duplicate, got %q", got)
 	}
 }
 

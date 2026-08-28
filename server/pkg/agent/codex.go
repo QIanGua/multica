@@ -73,6 +73,15 @@ const (
 	// answers make the model retry request_user_input; this text tells it the
 	// question is already visible as assistant text.
 	codexRequestUserInputDegradedAnswer = "Interactive confirmation is not available in this host. The question was shown as ordinary assistant text. Wait for the user's next chat message; do not call request_user_input again for the same question."
+	// codexRequestUserInputSecretDeclinedAnswer is the structured tool result
+	// for isSecret questions. Chat/comment transcripts are persisted and
+	// broadcast, so this host never solicits the secret there.
+	codexRequestUserInputSecretDeclinedAnswer = "This host cannot collect secrets. Do not expect the secret in chat. Continue without it; do not call request_user_input again for this secret."
+	// codexMaxRequestUserInputRPCs caps item/tool/requestUserInput RPCs in one
+	// turn, including retries that change or omit itemId. Past this limit the
+	// host stops ACKing so a retry loop cannot reset the inactivity timer or
+	// re-display the question forever.
+	codexMaxRequestUserInputRPCs = 3
 )
 
 // codexGracefulShutdownTimeoutNanos optionally overrides
@@ -985,11 +994,13 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 		// Pin request_user_input off in the per-task config so Codex does
 		// not expose the tool (and therefore does not send
-		// item/tool/requestUserInput) unless a later host actually
-		// implements interactive collection. Failure here is fail-soft:
+		// item/tool/requestUserInput) unless this host actually implements
+		// interactive collection. Failure here is fail-soft:
 		// handleServerRequest still degrades the RPC to ordinary text.
-		if err := ensureCodexRequestUserInputDisabled(configPath, b.cfg.Logger); err != nil && b.cfg.Logger != nil {
-			b.cfg.Logger.Warn("codex: failed to pin request_user_input disabled; event-path degradation still applies", "error", err)
+		if !b.hostCollectsInteractiveUserInput() {
+			if err := ensureCodexRequestUserInputDisabled(configPath, b.cfg.Logger); err != nil && b.cfg.Logger != nil {
+				b.cfg.Logger.Warn("codex: failed to pin request_user_input disabled; event-path degradation still applies", "error", err)
+			}
 		}
 	} else if hasManagedCodexMcpConfig(opts.McpConfig) {
 		// Managed mcp_config saved but no CODEX_HOME to anchor it.
@@ -1369,7 +1380,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				"title":   "Multica Agent SDK",
 				"version": "0.2.0",
 			},
-			"capabilities": codexInitializeClientCapabilities(),
+			"capabilities": codexInitializeClientCapabilities(b.hostCollectsInteractiveUserInput()),
 		})
 		if err != nil {
 			initializeLatency := time.Since(initializeStarted)
@@ -1730,8 +1741,9 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			}
 		}
 
+		fallback := c.userInputFallback()
 		outputMu.Lock()
-		finalOutput := codexDeliverableOutput(finalAnswer, lastAgentMessage)
+		finalOutput := preserveCodexUserInputFallback(fallback, codexDeliverableOutput(finalAnswer, lastAgentMessage))
 		outputMu.Unlock()
 
 		// Build usage map from accumulated codex usage.
@@ -2116,6 +2128,28 @@ func codexDeliverableOutput(finalAnswer, lastAgentMessage string) string {
 	return lastAgentMessage
 }
 
+// preserveCodexUserInputFallback keeps a degraded requestUserInput prompt in
+// Result.Output even when a later phase=final_answer overwrites lastAgentMessage.
+// Direct chat persists Result.Output, not the transcript's last text message.
+func preserveCodexUserInputFallback(fallback, output string) string {
+	fallback = strings.TrimSpace(fallback)
+	output = strings.TrimSpace(output)
+	if fallback == "" {
+		return output
+	}
+	if output == "" || output == fallback {
+		return fallback
+	}
+	if strings.Contains(output, fallback) {
+		return output
+	}
+	return fallback + "\n\n" + output
+}
+
+func (b *codexBackend) hostCollectsInteractiveUserInput() bool {
+	return b.cfg.CollectCodexInteractiveUserInput != nil
+}
+
 func logCodexAgentMessage(logger *slog.Logger, msg Message) {
 	if logger == nil {
 		return
@@ -2195,17 +2229,16 @@ type codexClient struct {
 
 	// serverAdvertisedInteractiveUserInput is true when the initialize
 	// result claims a requestUserInput / interactiveUserInput capability.
-	// Codex 0.149.1's public InitializeResponse does not. A true value
-	// without a native responder is treated as a capability misreport and
+	// Codex 0.149.1's public InitializeResponse does not. Native collection
+	// requires this advertisement AND Config.CollectCodexInteractiveUserInput;
+	// a true value without a host collector is a capability misreport and
 	// still degrades to ordinary text.
 	serverAdvertisedInteractiveUserInput bool
-	// interactiveUserInputResponder is the native/support path: it returns
-	// the JSON-RPC result for item/tool/requestUserInput. Nil means this
-	// host cannot collect structured answers (daemon / direct-room), so the
-	// request is converted to assistant text instead of failing the turn.
-	interactiveUserInputResponder func(params json.RawMessage) (map[string]any, bool)
-	userInputMu                   sync.Mutex
-	emittedUserInputItems         map[string]struct{}
+	userInputMu                          sync.Mutex
+	emittedUserInputItems                map[string]struct{}
+	emittedUserInputFingerprints         map[string]struct{}
+	requestUserInputRPCCount             int
+	userInputFallbackText                string
 }
 
 // codexTurnNotificationGate keeps resume-time history replay from mutating the
@@ -2607,13 +2640,17 @@ func (c *codexClient) handleServerRequest(raw map[string]json.RawMessage) {
 
 // codexInitializeClientCapabilities is the initialize payload this host
 // advertises. experimentalApi is required for other experimental methods we
-// already handle (permissions grants). We do not advertise interactive
-// user-input collection: Codex 0.149.1's own initialize response also omits
-// it, and this host has no card UI.
-func codexInitializeClientCapabilities() map[string]any {
-	return map[string]any{
+// already handle (permissions grants). requestUserInput is advertised only
+// when the host collector is present — the same Config field executeOnce
+// uses to route native vs degraded requestUserInput.
+func codexInitializeClientCapabilities(hostCollects bool) map[string]any {
+	caps := map[string]any{
 		"experimentalApi": true,
 	}
+	if hostCollects {
+		caps["requestUserInput"] = true
+	}
+	return caps
 }
 
 func codexInitializeAdvertisesInteractiveUserInput(result json.RawMessage) bool {
@@ -2633,38 +2670,108 @@ func codexInitializeAdvertisesInteractiveUserInput(result json.RawMessage) bool 
 	return payload.RequestUserInput || payload.Capabilities.RequestUserInput || payload.Capabilities.InteractiveUserInput
 }
 
+type codexRequestUserInputAction int
+
+const (
+	codexRequestUserInputEmit codexRequestUserInputAction = iota
+	codexRequestUserInputAckOnly
+	codexRequestUserInputReject
+)
+
+func (c *codexClient) hostCollectsInteractiveUserInput() bool {
+	return c.cfg.CollectCodexInteractiveUserInput != nil
+}
+
+func (c *codexClient) useNativeRequestUserInput() bool {
+	return c.hostCollectsInteractiveUserInput() && c.serverAdvertisedInteractiveUserInput
+}
+
 func (c *codexClient) handleRequestUserInput(id int, params json.RawMessage) {
-	if c.onSemanticActivity != nil {
-		c.onSemanticActivity(codexMethodRequestUserInput)
-	}
-	if c.interactiveUserInputResponder != nil {
-		if result, ok := c.interactiveUserInputResponder(params); ok && result != nil {
+	if c.useNativeRequestUserInput() {
+		if result, ok := c.cfg.CollectCodexInteractiveUserInput(params); ok && result != nil {
+			if c.onSemanticActivity != nil {
+				c.onSemanticActivity(codexMethodRequestUserInput)
+			}
 			c.respond(id, result)
 			return
 		}
 	}
-	text, answers, itemID := codexDegradeRequestUserInput(params)
-	first := c.markRequestUserInputEmitted(itemID)
-	if first && text != "" && c.onMessage != nil {
+	text, answers, itemID, fingerprint := codexDegradeRequestUserInput(params)
+	switch c.trackRequestUserInput(itemID, fingerprint) {
+	case codexRequestUserInputReject:
+		c.respondError(id, -32603, "requestUserInput retry limit exceeded")
+		return
+	case codexRequestUserInputAckOnly:
+		c.respond(id, map[string]any{"answers": answers})
+		return
+	}
+	if text != "" && c.onMessage != nil {
+		if c.onSemanticActivity != nil {
+			c.onSemanticActivity(codexMethodRequestUserInput)
+		}
+		c.rememberUserInputFallback(text)
 		c.onMessage(Message{Type: MessageText, Content: text})
 	}
 	c.respond(id, map[string]any{"answers": answers})
 }
 
-func (c *codexClient) markRequestUserInputEmitted(itemID string) bool {
-	if itemID == "" {
-		return true
-	}
+func (c *codexClient) trackRequestUserInput(itemID, fingerprint string) codexRequestUserInputAction {
 	c.userInputMu.Lock()
 	defer c.userInputMu.Unlock()
 	if c.emittedUserInputItems == nil {
 		c.emittedUserInputItems = make(map[string]struct{})
 	}
-	if _, seen := c.emittedUserInputItems[itemID]; seen {
-		return false
+	if c.emittedUserInputFingerprints == nil {
+		c.emittedUserInputFingerprints = make(map[string]struct{})
 	}
-	c.emittedUserInputItems[itemID] = struct{}{}
-	return true
+	c.requestUserInputRPCCount++
+	if c.requestUserInputRPCCount > codexMaxRequestUserInputRPCs {
+		return codexRequestUserInputReject
+	}
+	seen := false
+	if itemID != "" {
+		if _, ok := c.emittedUserInputItems[itemID]; ok {
+			seen = true
+		}
+	}
+	if fingerprint != "" {
+		if _, ok := c.emittedUserInputFingerprints[fingerprint]; ok {
+			seen = true
+		}
+	}
+	if seen {
+		return codexRequestUserInputAckOnly
+	}
+	if itemID != "" {
+		c.emittedUserInputItems[itemID] = struct{}{}
+	}
+	if fingerprint != "" {
+		c.emittedUserInputFingerprints[fingerprint] = struct{}{}
+	}
+	return codexRequestUserInputEmit
+}
+
+func (c *codexClient) rememberUserInputFallback(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	c.userInputMu.Lock()
+	defer c.userInputMu.Unlock()
+	if c.userInputFallbackText == "" {
+		c.userInputFallbackText = text
+		return
+	}
+	if strings.Contains(c.userInputFallbackText, text) {
+		return
+	}
+	c.userInputFallbackText += "\n\n" + text
+}
+
+func (c *codexClient) userInputFallback() string {
+	c.userInputMu.Lock()
+	defer c.userInputMu.Unlock()
+	return c.userInputFallbackText
 }
 
 type codexToolRequestUserInputOption struct {
@@ -2688,63 +2795,130 @@ type codexToolRequestUserInputParams struct {
 	Questions []codexToolRequestUserInputQuestion `json:"questions"`
 }
 
-func codexDegradeRequestUserInput(params json.RawMessage) (text string, answers map[string]any, itemID string) {
+func codexDegradeRequestUserInput(params json.RawMessage) (text string, answers map[string]any, itemID, fingerprint string) {
 	answers = map[string]any{}
 	var payload codexToolRequestUserInputParams
 	if len(params) > 0 && json.Unmarshal(params, &payload) != nil {
 		payload = codexToolRequestUserInputParams{}
 	}
 	itemID = strings.TrimSpace(payload.ItemID)
+	fingerprint = codexRequestUserInputFingerprint(payload)
 
-	var b strings.Builder
-	b.WriteString("The assistant needs your confirmation. Reply in this chat; interactive cards are not available here.")
+	var visible, secret strings.Builder
+	secretSeen := false
 	for _, q := range payload.Questions {
 		id := strings.TrimSpace(q.ID)
+		header := strings.TrimSpace(q.Header)
+		question := strings.TrimSpace(q.Question)
+		if q.IsSecret {
+			secretSeen = true
+			if id != "" {
+				answers[id] = map[string]any{
+					"answers": []string{codexRequestUserInputSecretDeclinedAnswer},
+				}
+			}
+			if header == "" && question == "" {
+				continue
+			}
+			secret.WriteByte('\n')
+			if header != "" {
+				secret.WriteString("\n**")
+				secret.WriteString(header)
+				secret.WriteString("**")
+			}
+			if question != "" {
+				secret.WriteByte('\n')
+				secret.WriteString(question)
+			}
+			continue
+		}
 		if id != "" {
 			answers[id] = map[string]any{
 				"answers": []string{codexRequestUserInputDegradedAnswer},
 			}
 		}
-		header := strings.TrimSpace(q.Header)
-		question := strings.TrimSpace(q.Question)
 		if header == "" && question == "" {
 			continue
 		}
-		b.WriteByte('\n')
+		visible.WriteByte('\n')
 		if header != "" {
-			b.WriteString("\n**")
-			b.WriteString(header)
-			b.WriteString("**")
+			visible.WriteString("\n**")
+			visible.WriteString(header)
+			visible.WriteString("**")
 		}
 		if question != "" {
-			b.WriteByte('\n')
-			b.WriteString(question)
+			visible.WriteByte('\n')
+			visible.WriteString(question)
 		}
 		for _, opt := range q.Options {
 			label := strings.TrimSpace(opt.Label)
 			if label == "" {
 				continue
 			}
-			b.WriteString("\n- ")
-			b.WriteString(label)
+			visible.WriteString("\n- ")
+			visible.WriteString(label)
 			if desc := strings.TrimSpace(opt.Description); desc != "" {
-				b.WriteString(" — ")
-				b.WriteString(desc)
+				visible.WriteString(" — ")
+				visible.WriteString(desc)
 			}
 		}
 	}
-	if len(payload.Questions) == 0 {
-		b.WriteString("\n\nPlease reply with the information the assistant asked for.")
+
+	var b strings.Builder
+	if visible.Len() > 0 {
+		b.WriteString("The assistant needs your confirmation. Reply in this chat; interactive cards are not available here.")
+		b.WriteString(visible.String())
 	}
-	return b.String(), answers, itemID
+	if secretSeen {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("The assistant asked for a secret. This channel cannot collect secrets. Do not paste passwords, tokens, API keys, or other credentials here. The assistant was told to continue without that secret.")
+		b.WriteString(secret.String())
+	}
+	if b.Len() == 0 {
+		b.WriteString("The assistant needs your confirmation. Reply in this chat; interactive cards are not available here.")
+		if len(payload.Questions) == 0 {
+			b.WriteString("\n\nPlease reply with the information the assistant asked for.")
+		}
+	}
+	return b.String(), answers, itemID, fingerprint
+}
+
+func codexRequestUserInputFingerprint(payload codexToolRequestUserInputParams) string {
+	if len(payload.Questions) == 0 {
+		return "empty"
+	}
+	var b strings.Builder
+	for _, q := range payload.Questions {
+		b.WriteString(strings.ToLower(strings.TrimSpace(q.ID)))
+		b.WriteByte('\n')
+		b.WriteString(strings.ToLower(strings.TrimSpace(q.Header)))
+		b.WriteByte('\n')
+		b.WriteString(strings.ToLower(strings.TrimSpace(q.Question)))
+		b.WriteByte('\n')
+		if q.IsSecret {
+			b.WriteString("secret")
+		}
+		b.WriteByte('\n')
+		for _, opt := range q.Options {
+			b.WriteString(strings.ToLower(strings.TrimSpace(opt.Label)))
+			b.WriteByte('\n')
+		}
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 var codexRequestUserInputBlockRe = regexp.MustCompile(
 	`(?ms)^` + regexp.QuoteMeta(multicaCodexRequestUserInputBeginMarker) +
 		`.*?^` + regexp.QuoteMeta(multicaCodexRequestUserInputEndMarker) + `\n*`)
 
-var userCodexRequestUserInputTableHeaderRe = regexp.MustCompile(
-	`^\s*\[\s*tools\s*\.\s*experimental_request_user_input\s*\]\s*(?:#.*)?$`)
+var userCodexRequestUserInputKeyRe = regexp.MustCompile(
+	`(?i)^experimental_request_user_input(?:\..*)?$`)
+
+var userCodexRequestUserInputDottedKeyRe = regexp.MustCompile(
+	`(?i)^tools\.experimental_request_user_input(?:\..*)?$`)
 
 func ensureCodexRequestUserInputDisabled(configPath string, logger *slog.Logger) error {
 	data, err := os.ReadFile(configPath)
@@ -2753,7 +2927,7 @@ func ensureCodexRequestUserInputDisabled(configPath string, logger *slog.Logger)
 	}
 	existing := string(data)
 	stripped := codexRequestUserInputBlockRe.ReplaceAllString(existing, "")
-	stripped = stripCodexUserRequestUserInputTable(stripped)
+	stripped = stripCodexUserRequestUserInputConfig(stripped)
 	stripped = strings.TrimRight(stripped, "\n")
 	block := multicaCodexRequestUserInputBeginMarker + "\n" +
 		"[tools.experimental_request_user_input]\n" +
@@ -2781,24 +2955,140 @@ func ensureCodexRequestUserInputDisabled(configPath string, logger *slog.Logger)
 	return nil
 }
 
-func stripCodexUserRequestUserInputTable(content string) string {
+func stripCodexUserRequestUserInputConfig(content string) string {
 	lines := strings.Split(content, "\n")
 	out := make([]string, 0, len(lines))
-	skipping := false
+	skippingTable := false
+	inToolsTable := false
+	skippingInline := 0
 	for _, line := range lines {
-		if userCodexRequestUserInputTableHeaderRe.MatchString(line) {
-			skipping = true
+		if skippingInline > 0 {
+			skippingInline += strings.Count(line, "{") - strings.Count(line, "}")
+			if skippingInline < 0 {
+				skippingInline = 0
+			}
 			continue
 		}
-		if skipping {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "[") {
-				skipping = false
-				out = append(out, line)
+		header, rest, isHeader := codexTOMLTableHeader(line)
+		if isHeader {
+			skippingTable = isCodexRequestUserInputTable(header)
+			inToolsTable = !skippingTable && isCodexToolsTable(header)
+			if skippingTable {
+				continue
+			}
+			out = append(out, line)
+			if rest != "" && inToolsTable && isCodexRequestUserInputAssignment(rest) {
+				out[len(out)-1] = strings.TrimRight(line[:strings.Index(line, "]")+1], " ")
+				open := strings.Count(rest, "{") - strings.Count(rest, "}")
+				if open > 0 {
+					skippingInline = open
+				}
+			}
+			continue
+		}
+		if skippingTable {
+			continue
+		}
+		key := codexTOMLAssignmentKey(line)
+		drop := false
+		if inToolsTable && userCodexRequestUserInputKeyRe.MatchString(key) {
+			drop = true
+		}
+		if userCodexRequestUserInputDottedKeyRe.MatchString(key) {
+			drop = true
+		}
+		if drop {
+			open := strings.Count(line, "{") - strings.Count(line, "}")
+			if open > 0 {
+				skippingInline = open
 			}
 			continue
 		}
 		out = append(out, line)
+	}
+	return dropEmptyCodexTOMLTable(strings.Join(out, "\n"), "tools")
+}
+
+func codexTOMLTableHeader(line string) (name, rest string, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	if comment := strings.Index(trimmed, "#"); comment >= 0 {
+		if !strings.Contains(trimmed[:comment], "]") && strings.HasPrefix(trimmed, "[") {
+			trimmed = strings.TrimSpace(trimmed[:comment])
+		}
+	}
+	if !strings.HasPrefix(trimmed, "[") {
+		return "", "", false
+	}
+	end := strings.Index(trimmed, "]")
+	if end < 0 {
+		return "", "", false
+	}
+	name = normalizeCodexTOMLKey(trimmed[1:end])
+	rest = strings.TrimSpace(trimmed[end+1:])
+	if comment := strings.Index(rest, "#"); comment >= 0 {
+		rest = strings.TrimSpace(rest[:comment])
+	}
+	return name, rest, true
+}
+
+func normalizeCodexTOMLKey(key string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), " ", ""))
+}
+
+func isCodexRequestUserInputTable(name string) bool {
+	return name == "tools.experimental_request_user_input" ||
+		strings.HasPrefix(name, "tools.experimental_request_user_input.")
+}
+
+func isCodexToolsTable(name string) bool {
+	return name == "tools"
+}
+
+func codexTOMLAssignmentKey(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "[") {
+		return ""
+	}
+	eq := strings.Index(trimmed, "=")
+	if eq < 0 {
+		return ""
+	}
+	return normalizeCodexTOMLKey(trimmed[:eq])
+}
+
+func isCodexRequestUserInputAssignment(rest string) bool {
+	key := codexTOMLAssignmentKey(rest)
+	return userCodexRequestUserInputKeyRe.MatchString(key)
+}
+
+func dropEmptyCodexTOMLTable(content, name string) string {
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		header, _, isHeader := codexTOMLTableHeader(lines[i])
+		if !isHeader || header != name {
+			out = append(out, lines[i])
+			continue
+		}
+		j := i + 1
+		onlyBlank := true
+		for j < len(lines) {
+			next := strings.TrimSpace(lines[j])
+			if next == "" || strings.HasPrefix(next, "#") {
+				j++
+				continue
+			}
+			if _, _, nextHeader := codexTOMLTableHeader(lines[j]); nextHeader {
+				break
+			}
+			onlyBlank = false
+			break
+		}
+		if onlyBlank {
+			i = j - 1
+			continue
+		}
+		out = append(out, lines[i])
 	}
 	return strings.Join(out, "\n")
 }

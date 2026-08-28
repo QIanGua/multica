@@ -275,6 +275,15 @@ type Config struct {
 	// Command boundary applies it to every process the package spawns, task
 	// launches and CLI probes alike. Backends never read it directly.
 	LaunchPrefix []string
+	// CollectCodexInteractiveUserInput is the host-side Codex
+	// requestUserInput collector. The production daemon leaves this nil:
+	// there is no interactive card UI, so initialize omits the capability,
+	// the per-task config pins the tool off, and arriving RPCs degrade to
+	// ordinary assistant text. A host that can collect structured answers
+	// assigns this field; initialize advertisement and request routing both
+	// read it, so the supported path is the same contract in production and
+	// tests rather than a client-only seam.
+	CollectCodexInteractiveUserInput func(params json.RawMessage) (map[string]any, bool)
 }
 
 // New creates a Backend for the given agent type.
