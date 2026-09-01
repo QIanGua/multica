@@ -2229,10 +2229,10 @@ type codexClient struct {
 
 	// serverAdvertisedInteractiveUserInput is true when the initialize
 	// result claims a requestUserInput / interactiveUserInput capability.
-	// Codex 0.149.1's public InitializeResponse does not. Native collection
-	// requires this advertisement AND Config.CollectCodexInteractiveUserInput;
-	// a true value without a host collector is a capability misreport and
-	// still degrades to ordinary text.
+	// Codex 0.149.1/0.150.1's public InitializeResponse does not. Native
+	// collection is gated only on Config.CollectCodexInteractiveUserInput;
+	// this flag is kept for logging and for the misreport path (server claims
+	// support, host has no collector → still degrade to ordinary text).
 	serverAdvertisedInteractiveUserInput bool
 	userInputMu                          sync.Mutex
 	emittedUserInputItems                map[string]struct{}
@@ -2641,8 +2641,8 @@ func (c *codexClient) handleServerRequest(raw map[string]json.RawMessage) {
 // codexInitializeClientCapabilities is the initialize payload this host
 // advertises. experimentalApi is required for other experimental methods we
 // already handle (permissions grants). requestUserInput is advertised only
-// when the host collector is present — the same Config field executeOnce
-// uses to route native vs degraded requestUserInput.
+// when the host collector is present. Routing does not wait for Codex to
+// echo that capability: 0.149.1/0.150.1 initialize results never include it.
 func codexInitializeClientCapabilities(hostCollects bool) map[string]any {
 	caps := map[string]any{
 		"experimentalApi": true,
@@ -2683,7 +2683,10 @@ func (c *codexClient) hostCollectsInteractiveUserInput() bool {
 }
 
 func (c *codexClient) useNativeRequestUserInput() bool {
-	return c.hostCollectsInteractiveUserInput() && c.serverAdvertisedInteractiveUserInput
+	// Real Codex initialize results do not carry capabilities.requestUserInput.
+	// A configured production collector is the host capability that makes the
+	// native path reachable; without one, every RPC still degrades safely.
+	return c.hostCollectsInteractiveUserInput()
 }
 
 func (c *codexClient) handleRequestUserInput(id int, params json.RawMessage) {
@@ -2960,10 +2963,12 @@ func stripCodexUserRequestUserInputConfig(content string) string {
 	out := make([]string, 0, len(lines))
 	skippingTable := false
 	inToolsTable := false
+	atRoot := true
 	skippingInline := 0
-	for _, line := range lines {
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
 		if skippingInline > 0 {
-			skippingInline += strings.Count(line, "{") - strings.Count(line, "}")
+			skippingInline += tomlBraceDelta(line)
 			if skippingInline < 0 {
 				skippingInline = 0
 			}
@@ -2971,6 +2976,7 @@ func stripCodexUserRequestUserInputConfig(content string) string {
 		}
 		header, rest, isHeader := codexTOMLTableHeader(line)
 		if isHeader {
+			atRoot = false
 			skippingTable = isCodexRequestUserInputTable(header)
 			inToolsTable = !skippingTable && isCodexToolsTable(header)
 			if skippingTable {
@@ -2979,7 +2985,7 @@ func stripCodexUserRequestUserInputConfig(content string) string {
 			out = append(out, line)
 			if rest != "" && inToolsTable && isCodexRequestUserInputAssignment(rest) {
 				out[len(out)-1] = strings.TrimRight(line[:strings.Index(line, "]")+1], " ")
-				open := strings.Count(rest, "{") - strings.Count(rest, "}")
+				open := tomlBraceDelta(rest)
 				if open > 0 {
 					skippingInline = open
 				}
@@ -2988,6 +2994,13 @@ func stripCodexUserRequestUserInputConfig(content string) string {
 		}
 		if skippingTable {
 			continue
+		}
+		if atRoot {
+			if rewritten, last, handled := rewriteRootCodexToolsInlineAssignment(lines, i); handled {
+				out = append(out, rewritten...)
+				i = last
+				continue
+			}
 		}
 		key := codexTOMLAssignmentKey(line)
 		drop := false
@@ -2998,7 +3011,7 @@ func stripCodexUserRequestUserInputConfig(content string) string {
 			drop = true
 		}
 		if drop {
-			open := strings.Count(line, "{") - strings.Count(line, "}")
+			open := tomlBraceDelta(line)
 			if open > 0 {
 				skippingInline = open
 			}
@@ -3032,7 +3045,134 @@ func codexTOMLTableHeader(line string) (name, rest string, ok bool) {
 }
 
 func normalizeCodexTOMLKey(key string) string {
-	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), " ", ""))
+	parts := parseCodexTOMLKeySegments(key)
+	if len(parts) == 0 {
+		return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), " ", ""))
+	}
+	for i := range parts {
+		parts[i] = strings.ToLower(parts[i])
+	}
+	return strings.Join(parts, ".")
+}
+
+func parseCodexTOMLKeySegments(key string) []string {
+	s := strings.TrimSpace(key)
+	if s == "" {
+		return nil
+	}
+	var parts []string
+	i := 0
+	for i < len(s) {
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+		if s[i] == '.' {
+			return nil
+		}
+		var part string
+		var ok bool
+		switch s[i] {
+		case '"':
+			part, i, ok = scanCodexTOMLBasicString(s, i)
+			if !ok {
+				return nil
+			}
+		case '\'':
+			part, i, ok = scanCodexTOMLLiteralString(s, i)
+			if !ok {
+				return nil
+			}
+		default:
+			start := i
+			for i < len(s) && isCodexBareTomlKeyChar(s[i]) {
+				i++
+			}
+			if i == start {
+				return nil
+			}
+			part = s[start:i]
+		}
+		parts = append(parts, part)
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+		if i < len(s) {
+			if s[i] != '.' {
+				return nil
+			}
+			i++
+			if i >= len(s) {
+				return nil
+			}
+		}
+	}
+	return parts
+}
+
+func scanCodexTOMLBasicString(s string, i int) (string, int, bool) {
+	if i >= len(s) || s[i] != '"' {
+		return "", i, false
+	}
+	i++
+	var b strings.Builder
+	esc := false
+	for i < len(s) {
+		c := s[i]
+		if esc {
+			switch c {
+			case 'b':
+				b.WriteByte('\b')
+			case 't':
+				b.WriteByte('\t')
+			case 'n':
+				b.WriteByte('\n')
+			case 'f':
+				b.WriteByte('\f')
+			case 'r':
+				b.WriteByte('\r')
+			case '"', '\\':
+				b.WriteByte(c)
+			default:
+				b.WriteByte(c)
+			}
+			esc = false
+			i++
+			continue
+		}
+		if c == '\\' {
+			esc = true
+			i++
+			continue
+		}
+		if c == '"' {
+			return b.String(), i + 1, true
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return "", i, false
+}
+
+func scanCodexTOMLLiteralString(s string, i int) (string, int, bool) {
+	if i >= len(s) || s[i] != '\'' {
+		return "", i, false
+	}
+	i++
+	start := i
+	for i < len(s) {
+		if s[i] == '\'' {
+			return s[start:i], i + 1, true
+		}
+		i++
+	}
+	return "", i, false
+}
+
+func isCodexBareTomlKeyChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '-'
 }
 
 func isCodexRequestUserInputTable(name string) bool {
@@ -3059,6 +3199,271 @@ func codexTOMLAssignmentKey(line string) string {
 func isCodexRequestUserInputAssignment(rest string) bool {
 	key := codexTOMLAssignmentKey(rest)
 	return userCodexRequestUserInputKeyRe.MatchString(key)
+}
+
+// rewriteRootCodexToolsInlineAssignment converts a root `tools = { ... }`
+// inline table into dotted `tools.<key> = ...` assignments so the managed
+// `[tools.experimental_request_user_input]` table can be appended without
+// TOML's "cannot extend value of type inline table with a dotted key" error.
+// experimental_request_user_input entries are dropped; sibling keys survive.
+func rewriteRootCodexToolsInlineAssignment(lines []string, i int) (replacement []string, last int, ok bool) {
+	if i < 0 || i >= len(lines) {
+		return nil, i, false
+	}
+	if codexTOMLAssignmentKey(lines[i]) != "tools" {
+		return nil, i, false
+	}
+	eq := strings.Index(lines[i], "=")
+	if eq < 0 {
+		return nil, i, false
+	}
+	full, last, found := consumeTOMLInlineTableAssignment(lines, i, eq)
+	if !found {
+		return nil, i, false
+	}
+	open := strings.Index(full[eq+1:], "{")
+	if open < 0 {
+		return nil, i, false
+	}
+	open += eq + 1
+	closeIdx, balanced := matchingTOMLBrace(full, open)
+	if !balanced {
+		return nil, i, false
+	}
+	entries := splitCodexInlineTableEntries(full[open+1 : closeIdx])
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := codexTOMLAssignmentKey(entry)
+		if key == "" || userCodexRequestUserInputKeyRe.MatchString(key) {
+			continue
+		}
+		out = append(out, "tools."+strings.TrimSpace(entry))
+	}
+	return out, last, true
+}
+
+func consumeTOMLInlineTableAssignment(lines []string, i, eq int) (full string, last int, ok bool) {
+	val := strings.TrimSpace(lines[i][eq+1:])
+	if comment := tomlLineCommentIndex(val); comment >= 0 {
+		val = strings.TrimSpace(val[:comment])
+	}
+	if !strings.HasPrefix(val, "{") {
+		return "", i, false
+	}
+	var b strings.Builder
+	for last = i; last < len(lines); last++ {
+		if last > i {
+			b.WriteByte('\n')
+		}
+		b.WriteString(lines[last])
+		text := b.String()
+		open := strings.Index(text[eq+1:], "{")
+		if open < 0 {
+			continue
+		}
+		if _, balanced := matchingTOMLBrace(text, eq+1+open); balanced {
+			return text, last, true
+		}
+	}
+	return "", i, false
+}
+
+func matchingTOMLBrace(s string, openIdx int) (int, bool) {
+	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '{' {
+		return -1, false
+	}
+	depth := 1
+	inDouble, inSingle := false, false
+	esc := false
+	for i := openIdx + 1; i < len(s); i++ {
+		c := s[i]
+		if inDouble {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		case '#':
+			if nl := strings.IndexByte(s[i:], '\n'); nl >= 0 {
+				i += nl
+				continue
+			}
+			return -1, false
+		}
+	}
+	return -1, false
+}
+
+func splitCodexInlineTableEntries(body string) []string {
+	var entries []string
+	start := 0
+	depthBrace, depthBracket := 0, 0
+	inDouble, inSingle := false, false
+	esc := false
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if inDouble {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '#':
+			if nl := strings.IndexByte(body[i:], '\n'); nl >= 0 {
+				i += nl
+			} else {
+				i = len(body) - 1
+			}
+		case ',':
+			if depthBrace == 0 && depthBracket == 0 {
+				entry := strings.TrimSpace(body[start:i])
+				if entry != "" {
+					entries = append(entries, entry)
+				}
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(body[start:]); tail != "" {
+		entries = append(entries, tail)
+	}
+	return entries
+}
+
+func tomlBraceDelta(s string) int {
+	delta := 0
+	inDouble, inSingle := false, false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inDouble {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '{':
+			delta++
+		case '}':
+			delta--
+		case '#':
+			return delta
+		}
+	}
+	return delta
+}
+
+func tomlLineCommentIndex(s string) int {
+	inDouble, inSingle := false, false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inDouble {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '#':
+			return i
+		}
+	}
+	return -1
 }
 
 func dropEmptyCodexTOMLTable(content, name string) string {

@@ -277,12 +277,13 @@ type Config struct {
 	LaunchPrefix []string
 	// CollectCodexInteractiveUserInput is the host-side Codex
 	// requestUserInput collector. The production daemon leaves this nil:
-	// there is no interactive card UI, so initialize omits the capability,
-	// the per-task config pins the tool off, and arriving RPCs degrade to
-	// ordinary assistant text. A host that can collect structured answers
-	// assigns this field; initialize advertisement and request routing both
-	// read it, so the supported path is the same contract in production and
-	// tests rather than a client-only seam.
+	// there is no interactive card UI, so initialize omits the client
+	// capability, the per-task config pins the tool off, and arriving RPCs
+	// degrade to ordinary assistant text. A host that can collect structured
+	// answers assigns this field; request routing uses it alone. Real Codex
+	// 0.149.1/0.150.1 initialize responses do not echo a requestUserInput
+	// capability, so requiring that advertisement would make native collection
+	// unreachable under the production protocol.
 	CollectCodexInteractiveUserInput func(params json.RawMessage) (map[string]any, bool)
 }
 

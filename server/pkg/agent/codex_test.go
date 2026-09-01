@@ -459,7 +459,6 @@ func TestCodexHandleServerRequestRequestUserInputSupportedPathUsesHostCollector(
 			texts = append(texts, msg.Content)
 		}
 	}
-	c.serverAdvertisedInteractiveUserInput = true
 	c.cfg.CollectCodexInteractiveUserInput = func(params json.RawMessage) (map[string]any, bool) {
 		var payload codexToolRequestUserInputParams
 		if err := json.Unmarshal(params, &payload); err != nil {
@@ -672,13 +671,19 @@ func TestCodexHandleServerRequestRequestUserInputMisreportStillDegrades(t *testi
 	}
 }
 
-func TestCodexHandleServerRequestRequestUserInputHostCollectorWithoutServerAdvertiseDegrades(t *testing.T) {
+func TestCodexHandleServerRequestRequestUserInputHostCollectorUsesNativeWithoutServerAdvertise(t *testing.T) {
 	t.Parallel()
 
-	c, _, _ := newTestCodexClient(t)
+	c, fs, _ := newTestCodexClient(t)
+	if c.serverAdvertisedInteractiveUserInput {
+		t.Fatal("real Codex initialize does not set capabilities.requestUserInput")
+	}
 	c.cfg.CollectCodexInteractiveUserInput = func(json.RawMessage) (map[string]any, bool) {
-		t.Fatal("collector must not run unless initialize advertised the capability")
-		return nil, false
+		return map[string]any{
+			"answers": map[string]any{
+				"q": map[string]any{"answers": []string{"yes"}},
+			},
+		}, true
 	}
 	var texts []string
 	c.onMessage = func(msg Message) {
@@ -689,8 +694,24 @@ func TestCodexHandleServerRequestRequestUserInputHostCollectorWithoutServerAdver
 
 	c.handleLine(`{"jsonrpc":"2.0","id":27,"method":"item/tool/requestUserInput","params":{"itemId":"call-no-server","questions":[{"id":"q","question":"Continue?"}]}}`)
 
-	if len(texts) != 1 || !strings.Contains(texts[0], "Continue?") {
-		t.Fatalf("host collector without server advertisement must degrade, got %#v", texts)
+	if len(texts) != 0 {
+		t.Fatalf("host collector must take the native path under the real initialize contract, got %#v", texts)
+	}
+	if c.getTurnError() != "" {
+		t.Fatalf("native path must not fail the turn, got %q", c.getTurnError())
+	}
+	if len(fs.Lines()) != 1 {
+		t.Fatalf("expected 1 native response, got %d", len(fs.Lines()))
+	}
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(fs.Lines()[0]), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	result := resp["result"].(map[string]any)
+	answers := result["answers"].(map[string]any)
+	q := answers["q"].(map[string]any)
+	if got := q["answers"].([]any)[0]; got != "yes" {
+		t.Fatalf("expected native collector answer, got %v", got)
 	}
 }
 
@@ -4014,23 +4035,31 @@ func TestCodexExecuteRequestUserInputSupportedAndMisreportFollowInitializeContra
 		t.Skip("shell-script fixture is POSIX-only")
 	}
 
-	script := "" +
-		`read line` + "\n" +
-		`echo '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"requestUserInput":true}}}'` + "\n" +
-		`read line` + "\n" +
-		`read line` + "\n" +
-		`echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-cap"}}}'` + "\n" +
-		`read line` + "\n" +
-		`echo '{"jsonrpc":"2.0","id":3,"result":{}}'` + "\n" +
-		`echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr-cap","turn":{"id":"turn-cap"}}}'` + "\n" +
-		`echo '{"jsonrpc":"2.0","id":99,"method":"item/tool/requestUserInput","params":{"itemId":"call-cap","questions":[{"id":"proceed","question":"Should I create the sub-issue now?"}]}}'` + "\n" +
-		`read line` + "\n" +
-		`echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","id":"m-final","text":"Native collection completed.","phase":"final_answer"}}}'` + "\n" +
-		`echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-cap","turn":{"id":"turn-cap","status":"completed"}}}'` + "\n"
+	// Codex 0.149.1/0.150.1 initialize results expose userAgent/codexHome/
+	// platformFamily/platformOs only. The supported path must not depend on a
+	// fabricated capabilities.requestUserInput field those versions never send.
+	realInitialize := `{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-cli/0.150.1","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"macos"}}`
+	futureMisreport := `{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-cli/0.150.1","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"macos","capabilities":{"requestUserInput":true}}}`
 
-	t.Run("supported", func(t *testing.T) {
+	scriptFor := func(initializeLine string) string {
+		return "" +
+			`read line` + "\n" +
+			`echo '` + initializeLine + `'` + "\n" +
+			`read line` + "\n" +
+			`read line` + "\n" +
+			`echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-cap"}}}'` + "\n" +
+			`read line` + "\n" +
+			`echo '{"jsonrpc":"2.0","id":3,"result":{}}'` + "\n" +
+			`echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr-cap","turn":{"id":"turn-cap"}}}'` + "\n" +
+			`echo '{"jsonrpc":"2.0","id":99,"method":"item/tool/requestUserInput","params":{"itemId":"call-cap","questions":[{"id":"proceed","question":"Should I create the sub-issue now?"}]}}'` + "\n" +
+			`read line` + "\n" +
+			`echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","id":"m-final","text":"Native collection completed.","phase":"final_answer"}}}'` + "\n" +
+			`echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-cap","turn":{"id":"turn-cap","status":"completed"}}}'` + "\n"
+	}
+
+	t.Run("supported-real-initialize", func(t *testing.T) {
 		t.Parallel()
-		fakePath := writeFakeCodexAppServer(t, script)
+		fakePath := writeFakeCodexAppServer(t, scriptFor(realInitialize))
 		result, messages := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
 			Logger: slog.Default(),
 			CollectCodexInteractiveUserInput: func(params json.RawMessage) (map[string]any, bool) {
@@ -4057,9 +4086,35 @@ func TestCodexExecuteRequestUserInputSupportedAndMisreportFollowInitializeContra
 		}
 	})
 
-	t.Run("misreport", func(t *testing.T) {
+	t.Run("missing-real-initialize", func(t *testing.T) {
 		t.Parallel()
-		fakePath := writeFakeCodexAppServer(t, script)
+		fakePath := writeFakeCodexAppServer(t, scriptFor(realInitialize))
+		result, messages := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
+			Logger: slog.Default(),
+		}, ExecOptions{
+			Timeout:                   5 * time.Second,
+			SemanticInactivityTimeout: 5 * time.Second,
+		}, 10*time.Second)
+		if result.Status != "completed" {
+			t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Output, "Should I create the sub-issue now?") {
+			t.Fatalf("missing collector must keep the question visible, got %q", result.Output)
+		}
+		var textCount int
+		for _, msg := range messages {
+			if msg.Type == MessageText && strings.Contains(msg.Content, "Should I create the sub-issue now?") {
+				textCount++
+			}
+		}
+		if textCount != 1 {
+			t.Fatalf("missing collector should degrade once, got %d in %#v", textCount, messages)
+		}
+	})
+
+	t.Run("misreport-future-capability-without-collector", func(t *testing.T) {
+		t.Parallel()
+		fakePath := writeFakeCodexAppServer(t, scriptFor(futureMisreport))
 		result, messages := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
 			Logger: slog.Default(),
 		}, ExecOptions{
@@ -5403,12 +5458,14 @@ func TestEnsureCodexRequestUserInputDisabledStripsEquivalentTOML(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name  string
-		input string
+		name     string
+		input    string
+		wantKeep []string
 	}{
 		{
-			name:  "inline table under tools",
-			input: "[tools]\nexperimental_request_user_input={enabled=true}\nweb_search = true\n",
+			name:     "inline table under tools",
+			input:    "[tools]\nexperimental_request_user_input={enabled=true}\nweb_search = true\n",
+			wantKeep: []string{"web_search = true"},
 		},
 		{
 			name:  "compact tools header assignment",
@@ -5425,6 +5482,47 @@ func TestEnsureCodexRequestUserInputDisabledStripsEquivalentTOML(t *testing.T) {
 		{
 			name:  "dotted table",
 			input: "[tools.experimental_request_user_input]\nenabled = true\n",
+		},
+		{
+			name:     "root inline table",
+			input:    "model = \"gpt-5\"\ntools={experimental_request_user_input={enabled=true}, web_search=true}\nsandbox_mode = \"workspace-write\"\n",
+			wantKeep: []string{`model = "gpt-5"`, "tools.web_search=true", `sandbox_mode = "workspace-write"`},
+		},
+		{
+			name:  "root inline table only request user input",
+			input: "tools={experimental_request_user_input={enabled=true}}\n",
+		},
+		{
+			name:     "multiline root inline table",
+			input:    "tools = {\n  experimental_request_user_input = { enabled = true },\n  web_search = true\n}\n",
+			wantKeep: []string{"tools.web_search = true"},
+		},
+		{
+			name:     "quoted tools table",
+			input:    "[\"tools\"]\nexperimental_request_user_input={enabled=true}\nweb_search = true\n",
+			wantKeep: []string{"web_search = true"},
+		},
+		{
+			name:  "quoted dotted table",
+			input: "[\"tools\".\"experimental_request_user_input\"]\nenabled = true\n",
+		},
+		{
+			name:  "quoted dotted key",
+			input: "\"tools\".\"experimental_request_user_input\" = { enabled = true }\n",
+		},
+		{
+			name:     "quoted root inline table",
+			input:    "\"tools\"={experimental_request_user_input={enabled=true}, web_search=true}\n",
+			wantKeep: []string{"tools.web_search=true"},
+		},
+		{
+			name:     "quoted inline key under tools",
+			input:    "[tools]\n\"experimental_request_user_input\"={enabled=true}\nweb_search = true\n",
+			wantKeep: []string{"web_search = true"},
+		},
+		{
+			name:  "single-quoted dotted table",
+			input: "['tools'.'experimental_request_user_input']\nenabled = true\n",
 		},
 	}
 
@@ -5447,14 +5545,19 @@ func TestEnsureCodexRequestUserInputDisabledStripsEquivalentTOML(t *testing.T) {
 			if strings.Contains(got, "enabled = true") || strings.Contains(got, "enabled=true") {
 				t.Fatalf("user-enabled equivalent form must be stripped, got %q", got)
 			}
+			if strings.Contains(got, "tools={") || strings.Contains(got, "tools = {") || strings.Contains(got, `"tools"={`) {
+				t.Fatalf("root inline tools table must be rewritten before appending managed dotted table, got %q", got)
+			}
 			if strings.Count(got, "[tools.experimental_request_user_input]") != 1 {
 				t.Fatalf("expected a single managed table, got %q", got)
 			}
 			if !strings.Contains(got, "enabled = false") {
 				t.Fatalf("expected enabled = false, got %q", got)
 			}
-			if tc.name == "inline table under tools" && !strings.Contains(got, "web_search = true") {
-				t.Fatalf("unrelated [tools] keys must survive, got %q", got)
+			for _, keep := range tc.wantKeep {
+				if !strings.Contains(got, keep) {
+					t.Fatalf("unrelated key %q must survive, got %q", keep, got)
+				}
 			}
 		})
 	}
@@ -5468,27 +5571,63 @@ func TestEnsureCodexRequestUserInputDisabledCompatibleWithCodexFeaturesList(t *t
 		t.Skip("codex CLI not installed")
 	}
 
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.toml")
-	initial := "[tools]\nexperimental_request_user_input={enabled=true}\n"
-	if err := os.WriteFile(configPath, []byte(initial), 0o600); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	if err := ensureCodexRequestUserInputDisabled(configPath, slog.Default()); err != nil {
-		t.Fatalf("ensure: %v", err)
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "bare inline under tools",
+			input: "[tools]\nexperimental_request_user_input={enabled=true}\nweb_search = true\n",
+		},
+		{
+			name:  "root inline table",
+			input: "tools={experimental_request_user_input={enabled=true}, web_search=true}\n",
+		},
+		{
+			name:  "quoted tools table",
+			input: "[\"tools\"]\nexperimental_request_user_input={enabled=true}\n",
+		},
+		{
+			name:  "quoted dotted table",
+			input: "[\"tools\".\"experimental_request_user_input\"]\nenabled = true\n",
+		},
+		{
+			name:  "quoted dotted key",
+			input: "\"tools\".\"experimental_request_user_input\"={enabled=true}\n",
+		},
+		{
+			name:  "quoted root inline",
+			input: "\"tools\"={experimental_request_user_input={enabled=true}, web_search=true}\n",
+		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, codexPath, "features", "list")
-	cmd.Env = append(os.Environ(), "CODEX_HOME="+home)
-	out, err := cmd.CombinedOutput()
-	got := string(out)
-	if strings.Contains(strings.ToLower(got), "duplicate key") {
-		t.Fatalf("pinned config must not produce a duplicate key for Codex, output:\n%s", got)
-	}
-	if err != nil {
-		t.Fatalf("codex features list failed: %v\n%s", err, got)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			configPath := filepath.Join(home, "config.toml")
+			if err := os.WriteFile(configPath, []byte(tc.input), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if err := ensureCodexRequestUserInputDisabled(configPath, slog.Default()); err != nil {
+				t.Fatalf("ensure: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, codexPath, "features", "list")
+			cmd.Env = append(os.Environ(), "CODEX_HOME="+home)
+			out, err := cmd.CombinedOutput()
+			got := string(out)
+			lower := strings.ToLower(got)
+			if strings.Contains(lower, "duplicate key") || strings.Contains(lower, "inline table") {
+				t.Fatalf("pinned config must parse in Codex, output:\n%s", got)
+			}
+			if err != nil {
+				t.Fatalf("codex features list failed: %v\n%s", err, got)
+			}
+		})
 	}
 }
 
