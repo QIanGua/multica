@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -77,6 +76,20 @@ func (f *fakeStdinWithHook) Write(p []byte) (int, error) {
 		f.afterWrite()
 	}
 	return n, err
+}
+
+func waitCodexInteractiveCollect(t *testing.T, c *codexClient) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		c.collectWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for interactive user-input collector")
+	}
 }
 
 func splitLines(s string) []string {
@@ -459,7 +472,10 @@ func TestCodexHandleServerRequestRequestUserInputSupportedPathUsesHostCollector(
 			texts = append(texts, msg.Content)
 		}
 	}
-	c.cfg.CollectCodexInteractiveUserInput = func(params json.RawMessage) (map[string]any, bool) {
+	c.cfg.CollectCodexInteractiveUserInput = func(ctx context.Context, params json.RawMessage) (map[string]any, bool) {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("immediate collector must see a live context, got %v", err)
+		}
 		var payload codexToolRequestUserInputParams
 		if err := json.Unmarshal(params, &payload); err != nil {
 			t.Fatalf("supported path params: %v", err)
@@ -475,6 +491,7 @@ func TestCodexHandleServerRequestRequestUserInputSupportedPathUsesHostCollector(
 	}
 
 	c.handleLine(`{"jsonrpc":"2.0","id":22,"method":"item/tool/requestUserInput","params":{"itemId":"call-native","questions":[{"id":"mode","question":"Pick a mode"}]}}`)
+	waitCodexInteractiveCollect(t, c)
 
 	if len(texts) != 0 {
 		t.Fatalf("supported path must not convert to assistant text, got %#v", texts)
@@ -678,7 +695,7 @@ func TestCodexHandleServerRequestRequestUserInputHostCollectorUsesNativeWithoutS
 	if c.serverAdvertisedInteractiveUserInput {
 		t.Fatal("real Codex initialize does not set capabilities.requestUserInput")
 	}
-	c.cfg.CollectCodexInteractiveUserInput = func(json.RawMessage) (map[string]any, bool) {
+	c.cfg.CollectCodexInteractiveUserInput = func(context.Context, json.RawMessage) (map[string]any, bool) {
 		return map[string]any{
 			"answers": map[string]any{
 				"q": map[string]any{"answers": []string{"yes"}},
@@ -693,6 +710,7 @@ func TestCodexHandleServerRequestRequestUserInputHostCollectorUsesNativeWithoutS
 	}
 
 	c.handleLine(`{"jsonrpc":"2.0","id":27,"method":"item/tool/requestUserInput","params":{"itemId":"call-no-server","questions":[{"id":"q","question":"Continue?"}]}}`)
+	waitCodexInteractiveCollect(t, c)
 
 	if len(texts) != 0 {
 		t.Fatalf("host collector must take the native path under the real initialize contract, got %#v", texts)
@@ -713,6 +731,186 @@ func TestCodexHandleServerRequestRequestUserInputHostCollectorUsesNativeWithoutS
 	if got := q["answers"].([]any)[0]; got != "yes" {
 		t.Fatalf("expected native collector answer, got %v", got)
 	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputNativeDedupesSameNewAndEmptyItemIDs(t *testing.T) {
+	t.Parallel()
+
+	c, fs, _ := newTestCodexClient(t)
+	var (
+		mu         sync.Mutex
+		calls      int
+		texts      []string
+		activities []string
+	)
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageText {
+			mu.Lock()
+			texts = append(texts, msg.Content)
+			mu.Unlock()
+		}
+	}
+	c.onSemanticActivity = func(description string) {
+		mu.Lock()
+		activities = append(activities, description)
+		mu.Unlock()
+	}
+	c.cfg.CollectCodexInteractiveUserInput = func(context.Context, json.RawMessage) (map[string]any, bool) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return map[string]any{
+			"answers": map[string]any{
+				"q1": map[string]any{"answers": []string{"yes"}},
+			},
+		}, true
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":61,"method":"item/tool/requestUserInput","params":{"itemId":"call-a","questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+	waitCodexInteractiveCollect(t, c)
+	c.handleLine(`{"jsonrpc":"2.0","id":62,"method":"item/tool/requestUserInput","params":{"itemId":"call-a","questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+	c.handleLine(`{"jsonrpc":"2.0","id":63,"method":"item/tool/requestUserInput","params":{"itemId":"call-b","questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+	c.handleLine(`{"jsonrpc":"2.0","id":64,"method":"item/tool/requestUserInput","params":{"questions":[{"id":"q1","question":"Confirm deploy?"}]}}`)
+	waitCodexInteractiveCollect(t, c)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("native collector must run once for same/new/empty itemId retries, got %d", calls)
+	}
+	if len(texts) != 0 {
+		t.Fatalf("native path must not degrade retries to assistant text, got %#v", texts)
+	}
+	if len(fs.Lines()) != 4 {
+		t.Fatalf("expected 4 RPC replies (3 ACK + 1 circuit-break), got %d: %#v", len(fs.Lines()), fs.Lines())
+	}
+	var errors int
+	for _, line := range fs.Lines() {
+		if strings.Contains(line, `"error"`) {
+			errors++
+			if !strings.Contains(line, "retry limit exceeded") {
+				t.Fatalf("over-cap reply should reject, got %s", line)
+			}
+		}
+	}
+	if errors != 1 {
+		t.Fatalf("expected the 4th RPC to stop ACK-ing, got %d errors in %#v", errors, fs.Lines())
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputCollectorWaitDoesNotBlockStdoutReader(t *testing.T) {
+	t.Parallel()
+
+	c, fs, _ := newTestCodexClient(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	c.cfg.codexCollectHeartbeat = 20 * time.Millisecond
+	c.cfg.CollectCodexInteractiveUserInput = func(ctx context.Context, _ json.RawMessage) (map[string]any, bool) {
+		close(started)
+		select {
+		case <-release:
+			return map[string]any{
+				"answers": map[string]any{
+					"q": map[string]any{"answers": []string{"later"}},
+				},
+			}, true
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
+	var gotStatus bool
+	c.onMessage = func(msg Message) {
+		if msg.Type == MessageStatus && msg.Status == "running" {
+			gotStatus = true
+		}
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","id":71,"method":"item/tool/requestUserInput","params":{"itemId":"call-wait","questions":[{"id":"q","question":"Wait?"}]}}`)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("collector did not start")
+	}
+	if len(fs.Lines()) != 0 {
+		t.Fatalf("collector wait must not respond before returning, got %#v", fs.Lines())
+	}
+	c.handleLine(`{"jsonrpc":"2.0","method":"codex/event","params":{"msg":{"type":"task_started"}}}`)
+	if !gotStatus {
+		t.Fatal("stdout reader must keep handling notifications while the collector waits")
+	}
+	close(release)
+	waitCodexInteractiveCollect(t, c)
+	if len(fs.Lines()) != 1 {
+		t.Fatalf("expected native response after collector returned, got %#v", fs.Lines())
+	}
+}
+
+func TestCodexHandleServerRequestRequestUserInputCollectorCancelAndTimeout(t *testing.T) {
+	t.Parallel()
+
+	t.Run("cancel", func(t *testing.T) {
+		t.Parallel()
+		c, fs, _ := newTestCodexClient(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		c.collectCtx = ctx
+		started := make(chan struct{})
+		c.cfg.CollectCodexInteractiveUserInput = func(collectCtx context.Context, _ json.RawMessage) (map[string]any, bool) {
+			close(started)
+			<-collectCtx.Done()
+			return nil, false
+		}
+		c.handleLine(`{"jsonrpc":"2.0","id":81,"method":"item/tool/requestUserInput","params":{"itemId":"call-cancel","questions":[{"id":"q","question":"Cancel?"}]}}`)
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("collector did not start")
+		}
+		cancel()
+		waitCodexInteractiveCollect(t, c)
+		if len(fs.Lines()) != 1 {
+			t.Fatalf("cancelled collector must still ACK, got %#v", fs.Lines())
+		}
+		if strings.Contains(fs.Lines()[0], `"error"`) {
+			t.Fatalf("cancel should ACK, not fail the RPC, got %s", fs.Lines()[0])
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		t.Parallel()
+		c, fs, _ := newTestCodexClient(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		c.collectCtx = ctx
+		c.cfg.CollectCodexInteractiveUserInput = func(collectCtx context.Context, _ json.RawMessage) (map[string]any, bool) {
+			<-collectCtx.Done()
+			if collectCtx.Err() != context.DeadlineExceeded {
+				t.Errorf("expected deadline exceeded, got %v", collectCtx.Err())
+			}
+			return nil, false
+		}
+		c.handleLine(`{"jsonrpc":"2.0","id":82,"method":"item/tool/requestUserInput","params":{"itemId":"call-timeout","questions":[{"id":"q","question":"Timeout?"}]}}`)
+		waitCodexInteractiveCollect(t, c)
+		if len(fs.Lines()) != 1 {
+			t.Fatalf("timed-out collector must still ACK, got %#v", fs.Lines())
+		}
+	})
+
+	t.Run("complete", func(t *testing.T) {
+		t.Parallel()
+		c, fs, _ := newTestCodexClient(t)
+		c.cfg.CollectCodexInteractiveUserInput = func(context.Context, json.RawMessage) (map[string]any, bool) {
+			return map[string]any{
+				"answers": map[string]any{
+					"q": map[string]any{"answers": []string{"done"}},
+				},
+			}, true
+		}
+		c.handleLine(`{"jsonrpc":"2.0","id":83,"method":"item/tool/requestUserInput","params":{"itemId":"call-complete","questions":[{"id":"q","question":"Done?"}]}}`)
+		waitCodexInteractiveCollect(t, c)
+		if len(fs.Lines()) != 1 || !strings.Contains(fs.Lines()[0], `"done"`) {
+			t.Fatalf("expected completed collector answer, got %#v", fs.Lines())
+		}
+	})
 }
 
 func TestCodexLegacyEventTaskStarted(t *testing.T) {
@@ -4062,7 +4260,7 @@ func TestCodexExecuteRequestUserInputSupportedAndMisreportFollowInitializeContra
 		fakePath := writeFakeCodexAppServer(t, scriptFor(realInitialize))
 		result, messages := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
 			Logger: slog.Default(),
-			CollectCodexInteractiveUserInput: func(params json.RawMessage) (map[string]any, bool) {
+			CollectCodexInteractiveUserInput: func(context.Context, json.RawMessage) (map[string]any, bool) {
 				return map[string]any{
 					"answers": map[string]any{
 						"proceed": map[string]any{"answers": []string{"yes"}},
@@ -4137,6 +4335,57 @@ func TestCodexExecuteRequestUserInputSupportedAndMisreportFollowInitializeContra
 			t.Fatalf("misreport should degrade once, got %d in %#v", textCount, messages)
 		}
 	})
+}
+
+func TestCodexExecuteRequestUserInputCollectorWaitKeepsTurnAlive(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	codexHome := t.TempDir()
+	fakePath := writeFakeCodexAppServer(t, ""+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-cli/0.150.1","platformOs":"macos"}}'`+"\n"+
+		`read line`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-wait"}}}'`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":3,"result":{}}'`+"\n"+
+		`echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr-wait","turn":{"id":"turn-wait"}}}'`+"\n"+
+		`echo '{"jsonrpc":"2.0","id":99,"method":"item/tool/requestUserInput","params":{"itemId":"call-wait","questions":[{"id":"proceed","question":"Should I wait?"}]}}'`+"\n"+
+		`read line`+"\n"+
+		`echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","id":"m-final","text":"Native wait completed.","phase":"final_answer"}}}'`+"\n"+
+		`echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-wait","turn":{"id":"turn-wait","status":"completed"}}}'`+"\n")
+
+	result := executeFakeCodexCollectingResult(t, fakePath, Config{
+		Logger:                slog.Default(),
+		Env:                   map[string]string{"CODEX_HOME": codexHome},
+		codexCollectHeartbeat: 20 * time.Millisecond,
+		CollectCodexInteractiveUserInput: func(ctx context.Context, _ json.RawMessage) (map[string]any, bool) {
+			timer := time.NewTimer(400 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				return map[string]any{
+					"answers": map[string]any{
+						"proceed": map[string]any{"answers": []string{"yes"}},
+					},
+				}, true
+			case <-ctx.Done():
+				return nil, false
+			}
+		},
+	}, ExecOptions{
+		Timeout:                   5 * time.Second,
+		SemanticInactivityTimeout: 200 * time.Millisecond,
+	})
+	if result.Status != "completed" {
+		t.Fatalf("collector wait should keep the turn alive via activity heartbeats, got status=%q error=%q", result.Status, result.Error)
+	}
+	if result.Output != "Native wait completed." {
+		t.Fatalf("expected native final answer, got %q", result.Output)
+	}
 }
 
 func executeFakeCodexCollectingResult(t *testing.T, fakePath string, cfg Config, opts ExecOptions) Result {
@@ -5524,6 +5773,26 @@ func TestEnsureCodexRequestUserInputDisabledStripsEquivalentTOML(t *testing.T) {
 			name:  "single-quoted dotted table",
 			input: "['tools'.'experimental_request_user_input']\nenabled = true\n",
 		},
+		{
+			name:     "unicode escaped root inline key",
+			input:    `"\u0074ools"={experimental_request_user_input={enabled=true}, web_search=true}` + "\n",
+			wantKeep: []string{"tools.web_search=true"},
+		},
+		{
+			name:     "long unicode escaped root inline key",
+			input:    `"\U00000074ools"={experimental_request_user_input={enabled=true}, web_search=true}` + "\n",
+			wantKeep: []string{"tools.web_search=true"},
+		},
+		{
+			name:     "unicode escaped tools table",
+			input:    "[\"\\u0074ools\"]\nexperimental_request_user_input={enabled=true}\nweb_search = true\n",
+			wantKeep: []string{"web_search = true"},
+		},
+		{
+			name:     "unicode escape inside tools key",
+			input:    `"to\u006fls"={experimental_request_user_input={enabled=true}, web_search=true}` + "\n",
+			wantKeep: []string{"tools.web_search=true"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -5563,71 +5832,65 @@ func TestEnsureCodexRequestUserInputDisabledStripsEquivalentTOML(t *testing.T) {
 	}
 }
 
-func TestEnsureCodexRequestUserInputDisabledCompatibleWithCodexFeaturesList(t *testing.T) {
+func TestEnsureCodexRequestUserInputDisabledKeepsCaseSensitiveUnrelatedKeys(t *testing.T) {
 	t.Parallel()
 
-	codexPath, err := exec.LookPath("codex")
-	if err != nil {
-		t.Skip("codex CLI not installed")
+	tmp := filepath.Join(t.TempDir(), "config.toml")
+	input := `"Tools"={experimental_request_user_input={enabled=true}, web_search=true}` + "\n" +
+		"[Tools]\nexperimental_request_user_input={enabled=true}\nkeep_me = 1\n"
+	if err := os.WriteFile(tmp, []byte(input), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
+	if err := ensureCodexRequestUserInputDisabled(tmp, slog.Default()); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	body, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	got := string(body)
+	if !strings.Contains(got, `"Tools"={experimental_request_user_input={enabled=true}, web_search=true}`) {
+		t.Fatalf("case-sensitive Tools inline table must survive, got %q", got)
+	}
+	if !strings.Contains(got, "[Tools]") || !strings.Contains(got, "keep_me = 1") {
+		t.Fatalf("case-sensitive Tools table must survive, got %q", got)
+	}
+	if !strings.Contains(got, "experimental_request_user_input={enabled=true}") {
+		t.Fatalf("unrelated Tools.experimental_request_user_input key must not be stripped, got %q", got)
+	}
+	if strings.Contains(got, "tools.web_search") {
+		t.Fatalf("Tools must not be rewritten as tools, got %q", got)
+	}
+	if strings.Count(got, "[tools.experimental_request_user_input]") != 1 {
+		t.Fatalf("expected a single managed tools table, got %q", got)
+	}
+}
+
+func TestParseCodexTOMLKeySegmentsUnicodeAndCase(t *testing.T) {
+	t.Parallel()
 
 	cases := []struct {
-		name  string
-		input string
+		in   string
+		want []string
 	}{
-		{
-			name:  "bare inline under tools",
-			input: "[tools]\nexperimental_request_user_input={enabled=true}\nweb_search = true\n",
-		},
-		{
-			name:  "root inline table",
-			input: "tools={experimental_request_user_input={enabled=true}, web_search=true}\n",
-		},
-		{
-			name:  "quoted tools table",
-			input: "[\"tools\"]\nexperimental_request_user_input={enabled=true}\n",
-		},
-		{
-			name:  "quoted dotted table",
-			input: "[\"tools\".\"experimental_request_user_input\"]\nenabled = true\n",
-		},
-		{
-			name:  "quoted dotted key",
-			input: "\"tools\".\"experimental_request_user_input\"={enabled=true}\n",
-		},
-		{
-			name:  "quoted root inline",
-			input: "\"tools\"={experimental_request_user_input={enabled=true}, web_search=true}\n",
-		},
+		{`"\u0074ools"`, []string{"tools"}},
+		{`"\U00000074ools"`, []string{"tools"}},
+		{`"to\u006fls"`, []string{"tools"}},
+		{`"Tools"`, []string{"Tools"}},
+		{`["tools"."experimental_request_user_input"]`, nil},
+		{`"tools"."experimental_request_user_input"`, []string{"tools", "experimental_request_user_input"}},
 	}
-
 	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			home := t.TempDir()
-			configPath := filepath.Join(home, "config.toml")
-			if err := os.WriteFile(configPath, []byte(tc.input), 0o600); err != nil {
-				t.Fatalf("seed: %v", err)
-			}
-			if err := ensureCodexRequestUserInputDisabled(configPath, slog.Default()); err != nil {
-				t.Fatalf("ensure: %v", err)
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, codexPath, "features", "list")
-			cmd.Env = append(os.Environ(), "CODEX_HOME="+home)
-			out, err := cmd.CombinedOutput()
-			got := string(out)
-			lower := strings.ToLower(got)
-			if strings.Contains(lower, "duplicate key") || strings.Contains(lower, "inline table") {
-				t.Fatalf("pinned config must parse in Codex, output:\n%s", got)
-			}
-			if err != nil {
-				t.Fatalf("codex features list failed: %v\n%s", err, got)
-			}
-		})
+		got := parseCodexTOMLKeySegments(tc.in)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("parseCodexTOMLKeySegments(%q)=%#v, want %#v", tc.in, got, tc.want)
+		}
+	}
+	if got := normalizeCodexTOMLKey(`"\u0074ools"`); got != "tools" {
+		t.Fatalf("unicode escaped tools key should normalize to tools, got %q", got)
+	}
+	if got := normalizeCodexTOMLKey(`"Tools"`); got != "Tools" {
+		t.Fatalf("TOML keys are case-sensitive, got %q", got)
 	}
 }
 

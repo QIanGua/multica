@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/multica-ai/multica/server/pkg/redact"
 )
@@ -1145,6 +1146,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		attempt:              attempt,
 		activeLaunches:       activeLaunches,
 		notificationProtocol: "unknown",
+		collectCtx:           runCtx,
 		acceptNotification:   turnNotificationGate.accept,
 		onDiscardedNotification: func(string, map[string]any) {
 			// Any app-server notification proves the process made semantic
@@ -2239,6 +2241,9 @@ type codexClient struct {
 	emittedUserInputFingerprints         map[string]struct{}
 	requestUserInputRPCCount             int
 	userInputFallbackText                string
+	lastNativeUserInputResult            map[string]any
+	collectCtx                           context.Context
+	collectWG                            sync.WaitGroup
 }
 
 // codexTurnNotificationGate keeps resume-time history replay from mutating the
@@ -2690,24 +2695,32 @@ func (c *codexClient) useNativeRequestUserInput() bool {
 }
 
 func (c *codexClient) handleRequestUserInput(id int, params json.RawMessage) {
-	if c.useNativeRequestUserInput() {
-		if result, ok := c.cfg.CollectCodexInteractiveUserInput(params); ok && result != nil {
-			if c.onSemanticActivity != nil {
-				c.onSemanticActivity(codexMethodRequestUserInput)
-			}
-			c.respond(id, result)
-			return
-		}
-	}
 	text, answers, itemID, fingerprint := codexDegradeRequestUserInput(params)
 	switch c.trackRequestUserInput(itemID, fingerprint) {
 	case codexRequestUserInputReject:
 		c.respondError(id, -32603, "requestUserInput retry limit exceeded")
 		return
 	case codexRequestUserInputAckOnly:
-		c.respond(id, map[string]any{"answers": answers})
+		c.respond(id, c.ackRequestUserInputResult(answers))
 		return
 	}
+	if c.useNativeRequestUserInput() {
+		c.startNativeRequestUserInputCollect(id, params, text, answers)
+		return
+	}
+	c.emitDegradedRequestUserInput(id, text, answers)
+}
+
+func (c *codexClient) ackRequestUserInputResult(answers map[string]any) any {
+	c.userInputMu.Lock()
+	defer c.userInputMu.Unlock()
+	if c.lastNativeUserInputResult != nil {
+		return c.lastNativeUserInputResult
+	}
+	return map[string]any{"answers": answers}
+}
+
+func (c *codexClient) emitDegradedRequestUserInput(id int, text string, answers map[string]any) {
 	if text != "" && c.onMessage != nil {
 		if c.onSemanticActivity != nil {
 			c.onSemanticActivity(codexMethodRequestUserInput)
@@ -2716,6 +2729,62 @@ func (c *codexClient) handleRequestUserInput(id int, params json.RawMessage) {
 		c.onMessage(Message{Type: MessageText, Content: text})
 	}
 	c.respond(id, map[string]any{"answers": answers})
+}
+
+func (c *codexClient) startNativeRequestUserInputCollect(id int, params json.RawMessage, text string, answers map[string]any) {
+	collector := c.cfg.CollectCodexInteractiveUserInput
+	if collector == nil {
+		c.emitDegradedRequestUserInput(id, text, answers)
+		return
+	}
+	ctx := c.collectCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.collectWG.Add(1)
+	go func() {
+		defer c.collectWG.Done()
+		if c.onSemanticActivity != nil {
+			c.onSemanticActivity(codexMethodRequestUserInput)
+		}
+		type collectOutcome struct {
+			result map[string]any
+			ok     bool
+		}
+		resultCh := make(chan collectOutcome, 1)
+		go func() {
+			result, ok := collector(ctx, params)
+			resultCh <- collectOutcome{result: result, ok: ok}
+		}()
+		interval := c.cfg.codexCollectHeartbeat
+		if interval <= 0 {
+			interval = time.Second
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case got := <-resultCh:
+				if ctx.Err() != nil {
+					c.respond(id, c.ackRequestUserInputResult(answers))
+					return
+				}
+				if got.ok && got.result != nil {
+					c.userInputMu.Lock()
+					c.lastNativeUserInputResult = got.result
+					c.userInputMu.Unlock()
+					c.respond(id, got.result)
+					return
+				}
+				c.emitDegradedRequestUserInput(id, text, answers)
+				return
+			case <-ticker.C:
+				if c.onSemanticActivity != nil {
+					c.onSemanticActivity(codexMethodRequestUserInput)
+				}
+			}
+		}
+	}()
 }
 
 func (c *codexClient) trackRequestUserInput(itemID, fingerprint string) codexRequestUserInputAction {
@@ -2918,10 +2987,10 @@ var codexRequestUserInputBlockRe = regexp.MustCompile(
 		`.*?^` + regexp.QuoteMeta(multicaCodexRequestUserInputEndMarker) + `\n*`)
 
 var userCodexRequestUserInputKeyRe = regexp.MustCompile(
-	`(?i)^experimental_request_user_input(?:\..*)?$`)
+	`^experimental_request_user_input(?:\..*)?$`)
 
 var userCodexRequestUserInputDottedKeyRe = regexp.MustCompile(
-	`(?i)^tools\.experimental_request_user_input(?:\..*)?$`)
+	`^tools\.experimental_request_user_input(?:\..*)?$`)
 
 func ensureCodexRequestUserInputDisabled(configPath string, logger *slog.Logger) error {
 	data, err := os.ReadFile(configPath)
@@ -3047,10 +3116,7 @@ func codexTOMLTableHeader(line string) (name, rest string, ok bool) {
 func normalizeCodexTOMLKey(key string) string {
 	parts := parseCodexTOMLKeySegments(key)
 	if len(parts) == 0 {
-		return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), " ", ""))
-	}
-	for i := range parts {
-		parts[i] = strings.ToLower(parts[i])
+		return strings.ReplaceAll(strings.TrimSpace(key), " ", "")
 	}
 	return strings.Join(parts, ".")
 }
@@ -3135,6 +3201,24 @@ func scanCodexTOMLBasicString(s string, i int) (string, int, bool) {
 				b.WriteByte('\r')
 			case '"', '\\':
 				b.WriteByte(c)
+			case 'u':
+				r, next, ok := decodeCodexTOMLHexRune(s, i+1, 4)
+				if !ok {
+					return "", i, false
+				}
+				b.WriteRune(r)
+				esc = false
+				i = next
+				continue
+			case 'U':
+				r, next, ok := decodeCodexTOMLHexRune(s, i+1, 8)
+				if !ok {
+					return "", i, false
+				}
+				b.WriteRune(r)
+				esc = false
+				i = next
+				continue
 			default:
 				b.WriteByte(c)
 			}
@@ -3154,6 +3238,32 @@ func scanCodexTOMLBasicString(s string, i int) (string, int, bool) {
 		i++
 	}
 	return "", i, false
+}
+
+func decodeCodexTOMLHexRune(s string, i, width int) (rune, int, bool) {
+	if width <= 0 || i < 0 || i+width > len(s) {
+		return 0, i, false
+	}
+	var v rune
+	for j := 0; j < width; j++ {
+		h := s[i+j]
+		var n rune
+		switch {
+		case h >= '0' && h <= '9':
+			n = rune(h - '0')
+		case h >= 'a' && h <= 'f':
+			n = rune(h - 'a' + 10)
+		case h >= 'A' && h <= 'F':
+			n = rune(h - 'A' + 10)
+		default:
+			return 0, i, false
+		}
+		v = v<<4 | n
+	}
+	if !utf8.ValidRune(v) {
+		return 0, i, false
+	}
+	return v, i + width, true
 }
 
 func scanCodexTOMLLiteralString(s string, i int) (string, int, bool) {

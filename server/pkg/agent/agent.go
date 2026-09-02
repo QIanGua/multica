@@ -284,7 +284,15 @@ type Config struct {
 	// 0.149.1/0.150.1 initialize responses do not echo a requestUserInput
 	// capability, so requiring that advertisement would make native collection
 	// unreachable under the production protocol.
-	CollectCodexInteractiveUserInput func(params json.RawMessage) (map[string]any, bool)
+	//
+	// The collector must respect ctx (cancel and deadline) and must not assume
+	// it runs on the stdout reader. The app-server client invokes it off that
+	// reader so a blocking wait cannot stall JSON-RPC, and it heartbeats turn
+	// activity until the collector returns.
+	CollectCodexInteractiveUserInput func(ctx context.Context, params json.RawMessage) (map[string]any, bool)
+	// codexCollectHeartbeat is a test hook for native requestUserInput waits.
+	// Zero uses a 1s production interval.
+	codexCollectHeartbeat time.Duration
 }
 
 // New creates a Backend for the given agent type.
